@@ -191,6 +191,129 @@ struct TF32MMASelector {
     using type = decltype(select_type());
 };
 
+template <int N_, typename MMA>
+struct FP8MMARS {
+    template <size_t ...Idx>
+    CUTLASS_DEVICE static void call_fma_impl(uint32_t const* a, uint64_t const& desc_b, float* d, bool scale_d, cute::index_sequence<Idx...>) {
+        using namespace cute::SM90::GMMA;
+        MMA::fma(a[0], a[1], a[2], a[3], desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
+    }
+
+    CUTLASS_DEVICE static void wgmma(uint32_t const* a, uint64_t const& desc_b, float* d, bool scale_d) {
+        call_fma_impl(a, desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
+    }
+
+    static constexpr int M = 64;
+    static constexpr int N = N_;
+    static constexpr int K = 32;
+    static constexpr int kNumAccum = M * N / 128;
+};
+
+// FP8 e4m3 WGMMA with the A operand in registers (RS form). Used by the
+// MXFP4 RF-decode path: weights are decoded straight into A fragments.
+template <int N>
+struct FP8MMARSSelector {
+    static constexpr auto select_mma() {
+        using namespace cute::SM90::GMMA;
+        if constexpr (N == 8) return MMA_64x8x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 16) return MMA_64x16x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 24) return MMA_64x24x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 32) return MMA_64x32x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 40) return MMA_64x40x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 48) return MMA_64x48x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 56) return MMA_64x56x32_F32E4M3E4M3_RS_TN();
+        if constexpr (N == 64) return MMA_64x64x32_F32E4M3E4M3_RS_TN();
+        DG_STATIC_ASSERT(N <= 64 and N % 8 == 0, "Invalid N for FP8 RS WGMMA");
+    }
+
+    using type = FP8MMARS<N, decltype(select_mma())>;
+};
+
+// INT8 s8*s8->s32 WGMMA with the A operand in registers (RS form). Used by the
+// W4A8-integer RF-decode path: int4 weights sign-extend into A fragments and
+// IGMMA accumulates the raw integer products in int32. Mirrors FP8MMARS; the
+// accumulator is int32 (cute types its CRegisters as uint32_t).
+template <int N_, typename MMA>
+struct INT8MMARS {
+    template <size_t ...Idx>
+    CUTLASS_DEVICE static void call_fma_impl(uint32_t const* a, uint64_t const& desc_b, int32_t* d, bool scale_d, cute::index_sequence<Idx...>) {
+        using namespace cute::SM90::GMMA;
+        MMA::fma(a[0], a[1], a[2], a[3], desc_b,
+                 reinterpret_cast<uint32_t&>(d[Idx])..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
+    }
+
+    CUTLASS_DEVICE static void wgmma(uint32_t const* a, uint64_t const& desc_b, int32_t* d, bool scale_d) {
+        call_fma_impl(a, desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
+    }
+
+    static constexpr int M = 64;
+    static constexpr int N = N_;
+    static constexpr int K = 32;
+    static constexpr int kNumAccum = M * N / 128;
+};
+
+// NOTE: int8 RS GMMA atoms exist only at N in {8,16,32,64,96,128,192,256}
+// (coarser than the FP8 every-8 grid), so the swapAB caller must round
+// valid_m up to one of these sizes.
+template <int N>
+struct INT8MMARSSelector {
+    static constexpr auto select_mma() {
+        using namespace cute::SM90::GMMA;
+        if constexpr (N == 8) return MMA_64x8x32_S32S8S8_RS_TN();
+        if constexpr (N == 16) return MMA_64x16x32_S32S8S8_RS_TN();
+        if constexpr (N == 32) return MMA_64x32x32_S32S8S8_RS_TN();
+        if constexpr (N == 64) return MMA_64x64x32_S32S8S8_RS_TN();
+        DG_STATIC_ASSERT(N == 8 or N == 16 or N == 32 or N == 64,
+                         "Invalid N for INT8 RS WGMMA (must be 8/16/32/64)");
+    }
+
+    using type = INT8MMARS<N, decltype(select_mma())>;
+};
+
+// INT8 s8*s8->s32 WGMMA with both operands in SMEM (SS form). Used by the
+// W4A8-integer non-swapAB (large M) path: int4 weights are decoded to int8 in
+// SMEM by the dequant stage and IGMMA accumulates raw products in int32.
+template <int N_, typename MMA>
+struct INT8MMA {
+    template <size_t ...Idx>
+    CUTLASS_DEVICE static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, int32_t* d, bool scale_d, cute::index_sequence<Idx...>) {
+        using namespace cute::SM90::GMMA;
+        MMA::fma(desc_a, desc_b,
+                 reinterpret_cast<uint32_t&>(d[Idx])..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
+    }
+
+    CUTLASS_DEVICE static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, int32_t* d, bool scale_d) {
+        call_fma_impl(desc_a, desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
+    }
+
+    static constexpr int M = 64;
+    static constexpr int N = N_;
+    static constexpr int K = 32;
+    static constexpr int kNumAccum = M * N / 128;
+};
+
+// NOTE: like the RS form, int8 SS GMMA atoms exist only at the coarser
+// N in {8,16,32,64,96,128,192,256} grid.
+template <int N>
+struct INT8MMASelector {
+    static constexpr auto select_mma() {
+        using namespace cute::SM90::GMMA;
+        if constexpr (N == 8) return MMA_64x8x32_S32S8S8_SS_TN();
+        if constexpr (N == 16) return MMA_64x16x32_S32S8S8_SS_TN();
+        if constexpr (N == 32) return MMA_64x32x32_S32S8S8_SS_TN();
+        if constexpr (N == 64) return MMA_64x64x32_S32S8S8_SS_TN();
+        if constexpr (N == 96) return MMA_64x96x32_S32S8S8_SS_TN();
+        if constexpr (N == 128) return MMA_64x128x32_S32S8S8_SS_TN();
+        if constexpr (N == 192) return MMA_64x192x32_S32S8S8_SS_TN();
+        if constexpr (N == 256) return MMA_64x256x32_S32S8S8_SS_TN();
+        DG_STATIC_ASSERT(N == 8 or N == 16 or N == 32 or N == 64 or
+                         N == 96 or N == 128 or N == 192 or N == 256,
+                         "Invalid N for INT8 SS WGMMA");
+    }
+
+    using type = INT8MMA<N, decltype(select_mma())>;
+};
+
 /// Shared memory descriptor
 template <class PointerType>
 CUTLASS_DEVICE cute::GmmaDescriptor

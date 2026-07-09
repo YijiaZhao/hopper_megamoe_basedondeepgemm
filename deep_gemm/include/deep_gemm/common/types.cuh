@@ -7,12 +7,17 @@ namespace deep_gemm {
 enum class MmaKind {
     BF16        = 0,
     MXFP8FP4    = 1,
+    // SM90 MegaMoE family: FP8 activations (per-128 float SF) with packed
+    // MXFP4 weights decoded in-kernel via RS WGMMA. The W4A8-int variants
+    // ride the same buffer contract (int8 bytes over the FP8 views).
+    FP8MXFP4    = 2,
 };
 
 constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
     switch (mma_kind) {
         case MmaKind::BF16:     return 2;
         case MmaKind::MXFP8FP4: return 1;
+        case MmaKind::FP8MXFP4: return 1;
         default: return 0;
     }
 }

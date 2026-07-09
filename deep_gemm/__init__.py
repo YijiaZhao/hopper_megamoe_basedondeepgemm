@@ -87,6 +87,12 @@ from .mega import (
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
     bf16_mega_moe,
+    get_nvfp4_mega_moe_sm90_block_n,
+    get_nvfp4_mega_moe_sm90_weight_layout,
+    get_mxfp4_mega_moe_sm90_block_n,
+    transform_mxfp4_weights_for_mega_moe_sm90,
+    mxfp4_mega_moe,
+    int4_mega_moe,
 )
 
 # Some utils

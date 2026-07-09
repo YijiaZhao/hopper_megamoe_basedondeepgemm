@@ -79,6 +79,7 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
         return CU_TENSOR_MAP_DATA_TYPE_TFLOAT32;
 
     switch (dtype) {
+        case torch::kUInt8:         return CU_TENSOR_MAP_DATA_TYPE_UINT8;
         case torch::kInt:           return CU_TENSOR_MAP_DATA_TYPE_INT32;
         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
