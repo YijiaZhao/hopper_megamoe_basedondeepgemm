@@ -6,6 +6,15 @@
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 
+// NOTES: device-side `printf` in the barrier wait loops is NOT free even when
+// never executed: it adds call sites (vprintf ABI), a per-thread stack frame
+// and extra convergence barriers, which degrade ptxas scheduling of the WHOLE
+// kernel (P4C: SM90 MegaMoE gemm_core +15% at mid M came from exactly this).
+// Keep the diagnostics opt-in for debugging hangs; default to trap-only.
+#ifndef DG_COMM_BARRIER_TIMEOUT_PRINTF
+#define DG_COMM_BARRIER_TIMEOUT_PRINTF 0
+#endif
+
 namespace deep_gemm::comm {
 
 // 60s timeout, at 2 GHz
@@ -30,15 +39,23 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
         const auto old_value = ptx::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
         uint32_t new_value;
+#if DG_COMM_BARRIER_TIMEOUT_PRINTF
         const auto start_clock = clock64();
         do {
             new_value = ptx::ld_acq(count_ptr);
             if (clock64() - start_clock >= kNumTimeoutCycles) {
                 printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
                        sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
-                DG_DEVICE_ASSERT(false and "Grid sync timeout");
+                DG_TRAP_ONLY_DEVICE_ASSERT(false and "Grid sync timeout");
             }
         } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+#else
+        // Bare wait loop: no `clock64` per poll iteration and, critically, no
+        // `printf` machinery anywhere in the kernel image (see header notes)
+        do {
+            new_value = ptx::ld_acq(count_ptr);
+        } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+#endif
     }
     sync_scope();
 }
@@ -75,9 +92,11 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             const auto start_clock = clock64();
             while (ptx::ld_acq_sys(signal_ptr) != target) {
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
+#if DG_COMM_BARRIER_TIMEOUT_PRINTF
                     printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
                            sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
-                    DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+#endif
+                    DG_TRAP_ONLY_DEVICE_ASSERT(false and "NVLink barrier timeout");
                 }
             }
         }
