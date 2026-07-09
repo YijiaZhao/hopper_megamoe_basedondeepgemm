@@ -47,7 +47,10 @@ def quantize_qoq(weight, group=128):
         w4 = (w8g / s2 + z).round().clamp(0, 15)
         dec8 = ((w4 - z) * s2).view(E, N, K)
         assert dec8.abs().max().item() <= 127
-        plane = (s1w | (z.squeeze(-1).to(torch.int32) << 8)
+        # Prepack the negated-offset byte the kernel LUT needs directly:
+        # nz = (-z*s2) mod 256 (kernel reads it instead of recomputing from z).
+        nz = (z * s2).to(torch.int32).neg().remainder(256)
+        plane = (s1w | (nz.squeeze(-1) << 8)
                      | s2.squeeze(-1).to(torch.int32)).contiguous()
     else:
         amax8 = w8g.abs().amax(dim=-1, keepdim=True)

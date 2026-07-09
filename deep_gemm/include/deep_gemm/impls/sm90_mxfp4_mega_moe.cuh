@@ -128,7 +128,9 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_unscaled(
         const uint32_t cw = reinterpret_cast<const uint32_t*>(coeff_smem)[row];
         qoq_s2 = cw & 0xffu;
 #if DG_W4A8_INT_QOQ_ZP
-        const uint32_t nz = (0u - ((cw >> 8) & 0xffu) * qoq_s2) & 0xffu;
+        // Byte 1 of the coeff word carries nz = (-z*s2) mod 256, precomputed
+        // at PREPACK time (saves the per-row multiply+negate here).
+        const uint32_t nz = (cw >> 8) & 0xffu;
         qoq_lut_lo = __vadd4(qoq_s2 * 0x03020100u, nz * 0x01010101u);
         qoq_lut_hi = __vadd4(qoq_s2 * 0x07060504u, nz * 0x01010101u);
 #else
@@ -2048,14 +2050,16 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 int32_t iacc[kSwapAccum];
                                 [[maybe_unused]] int32_t iacc2[kSwapAccum];
 #if DG_W4A8_INT_QOQ
-                                // Inline QoQ: coeff word = [s2:u8 | pad:u8 | s1:bf16-hi16].
+                                // Inline QoQ: coeff word = [s2:u8 | nz:u8 | s1:bf16-hi16]
+                                // (nz = (-z*s2) mod 256 under ZP, pad otherwise).
                                 // s2 bakes into the decode LUT (fold-at-decode in the
                                 // integer domain); s1 rides the promote as before.
                                 const uint32_t s2_r0 = cw_word_r0 & 0xffu;
                                 const uint32_t s2_r1 = cw_word_r1 & 0xffu;
 #if DG_W4A8_INT_QOQ_ZP
-                                const uint32_t nz_r0 = (0u - ((cw_word_r0 >> 8) & 0xffu) * s2_r0) & 0xffu;
-                                const uint32_t nz_r1 = (0u - ((cw_word_r1 >> 8) & 0xffu) * s2_r1) & 0xffu;
+                                // Coeff byte 1 = prepack-precomputed nz = (-z*s2) mod 256.
+                                const uint32_t nz_r0 = (cw_word_r0 >> 8) & 0xffu;
+                                const uint32_t nz_r1 = (cw_word_r1 >> 8) & 0xffu;
                                 const uint32_t lutlo_r0 = __vadd4(s2_r0 * 0x03020100u, nz_r0 * 0x01010101u);
                                 const uint32_t luthi_r0 = __vadd4(s2_r0 * 0x07060504u, nz_r0 * 0x01010101u);
                                 const uint32_t lutlo_r1 = __vadd4(s2_r1 * 0x03020100u, nz_r1 * 0x01010101u);
@@ -2642,8 +2646,9 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 const uint32_t s2_r0 = cw_word_r0 & 0xffu;
                                 const uint32_t s2_r1 = cw_word_r1 & 0xffu;
 #if DG_W4A8_INT_QOQ_ZP
-                                const uint32_t nz_r0 = (0u - ((cw_word_r0 >> 8) & 0xffu) * s2_r0) & 0xffu;
-                                const uint32_t nz_r1 = (0u - ((cw_word_r1 >> 8) & 0xffu) * s2_r1) & 0xffu;
+                                // Coeff byte 1 = prepack-precomputed nz = (-z*s2) mod 256.
+                                const uint32_t nz_r0 = (cw_word_r0 >> 8) & 0xffu;
+                                const uint32_t nz_r1 = (cw_word_r1 >> 8) & 0xffu;
                                 const uint32_t lutlo_r0 = __vadd4(s2_r0 * 0x03020100u, nz_r0 * 0x01010101u);
                                 const uint32_t luthi_r0 = __vadd4(s2_r0 * 0x07060504u, nz_r0 * 0x01010101u);
                                 const uint32_t lutlo_r1 = __vadd4(s2_r1 * 0x03020100u, nz_r1 * 0x01010101u);

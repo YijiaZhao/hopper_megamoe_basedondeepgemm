@@ -103,10 +103,11 @@ DG_INT4_INLINE uint2 decode_int4_prmt_groups_to_int8_pair_lut(
 }
 
 // Asymmetric (zero-point) variant: weights are uint4 in [0,15] with
-// w8 = (w4 - z) * s2. The caller folds -z*s2 into every LUT entry
-// (lut = s2*{0..3|4..7} + ((-z*s2) mod 256)*0x01010101), so the low-3-bit
-// lookup already carries the offset; lanes with bit3 set ADD 8*s2 (the
-// +8 half of the uint4 range) instead of the symmetric variant's subtract.
+// w8 = (w4 - z) * s2. The caller folds nz = (-z*s2) mod 256 into every LUT
+// entry (lut = s2*{0..3|4..7} + nz*0x01010101; nz is PREPACK-precomputed in
+// the coeff word's second byte), so the low-3-bit lookup already carries the
+// offset; lanes with bit3 set ADD 8*s2 (the +8 half of the uint4 range)
+// instead of the symmetric variant's subtract.
 DG_INT4_INLINE uint2 decode_uint4_prmt_groups_to_int8_pair_lut_zp(
         const uint32_t uq, const uint32_t lut_lo, const uint32_t lut_hi,
         const uint32_t s2) {
