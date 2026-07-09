@@ -709,9 +709,33 @@ static int get_num_experts_per_wave_for_mega_moe_sm90(
         (policy.expected_tokens_per_expert < 1.0f or policy.expected_tokens_per_expert > 4.0f)) {
         return num_experts_per_rank;
     }
-    return get_num_experts_per_wave_for_mega_moe(
-        num_experts_per_rank, num_tokens, num_topk,
-        intermediate_hidden, block_m, block_n, num_sms);
+    // Legacy (pre-#364) wave sizing, kept verbatim for SM90: the upstream
+    // helper now takes ring/rank arguments and allows partial waves, while
+    // the SM90 candidate machinery still requires evenly-dividing waves.
+    const float expected_tokens_per_expert = policy.expected_tokens_per_expert;
+    if (expected_tokens_per_expert < 1) {
+        // Most experts don't have tokens, calculate all experts at once
+        return num_experts_per_rank;
+    }
+
+    // Reduce per-expert block count by this factor since uneven routing leaves some experts with fewer tokens
+    constexpr int kImbalanceFactor = 2;
+
+    // Count L1 blocks per expert assuming tokens are evenly spread across experts
+    const int num_m_blocks = ceil_div(static_cast<int>(std::ceil(expected_tokens_per_expert)), block_m);
+    const int num_n_blocks = (2 * intermediate_hidden) / block_n;
+    const int num_l1_blocks_per_expert = num_m_blocks * num_n_blocks;
+
+    // Pick the smallest value whose total blocks (after imbalance reduction) can keep all SMs busy
+    int num_experts_per_wave = num_l1_blocks_per_expert > 0
+        ? ceil_div(kImbalanceFactor * num_sms, num_l1_blocks_per_expert) : 1;
+    num_experts_per_wave = std::min(num_experts_per_wave, num_experts_per_rank);
+
+    // Round up to the nearest divisor of num_experts_per_rank so every wave processes the same count
+    while (num_experts_per_wave < num_experts_per_rank and num_experts_per_rank % num_experts_per_wave != 0)
+        ++ num_experts_per_wave;
+
+    return num_experts_per_wave;
 }
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
