@@ -89,8 +89,10 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     if int(os.environ.get('DG_USE_NVIDIA_TOOLS', 0)):
         return (1, ) * len(kernel_names) if is_tuple else 1
 
-    # By default, flush L2 with an excessive 8 GB memset to give the GPU some (literal) chill time without full idle
-    flush_l2_size = int(8e9 // 4)
+    # By default, flush L2 with an excessive 8 GB memset to give the GPU some (literal) chill time without full idle.
+    # Large MoE benchmark runs can use shared nodes with limited free memory, so allow lowering the flush buffer.
+    flush_l2_bytes = int(os.environ.get('DG_BENCH_FLUSH_L2_BYTES', str(int(8e9))))
+    flush_l2_size = max(0, flush_l2_bytes // 4)
 
     # For some auto-tuning kernels with prints
     fn()
@@ -104,7 +106,7 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
         with profiler:
             for i in range(2):
                 for _ in range(num_tests):
-                    if flush_l2:
+                    if flush_l2 and flush_l2_size > 0:
                         torch.empty(flush_l2_size, dtype=torch.int, device='cuda').zero_()
                     if barrier is not None:
                         # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead
@@ -141,6 +143,11 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
                         total_time += float(time_str.replace(unit, '')) / scale * int(num_str)
                         total_num += int(num_str)
                         break
-        kernel_times.append(total_time / total_num if total_num > 0 else 0)
+        if total_num > 0 and with_multiple_kernels:
+            # Multiple matching kernels can belong to one logical benchmarked op
+            # (e.g. split MegaMoE L1/L2). Report summed CUDA time per fn() call.
+            kernel_times.append(total_time / num_tests)
+        else:
+            kernel_times.append(total_time / total_num if total_num > 0 else 0)
 
     return tuple(kernel_times) if is_tuple else kernel_times[0]
