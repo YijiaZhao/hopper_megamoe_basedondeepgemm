@@ -952,10 +952,17 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
     // lap == 0 forever, which makes the ring protocol degenerate to the old
     // full-pool behaviour. Ring tightening (lap > 0) is future work and needs
     // the full l1/l2 full+empty counter protocol in the kernels.
-    DG_HOST_ASSERT(num_ring_tokens >= get_num_wave_pool_tokens(
-        num_ranks, num_topk, num_max_tokens_per_rank, num_experts_per_rank,
-        layout::kLCMCandidateBlockM) and
-        "SM90 MegaMoE requires a full-pool ring (allocate the symm buffer with the max ring limit)");
+    // The bound is the legacy (pre-rewrite) full-pool size: one
+    // `kMaxCandidateBlockM` padding block per expert (every real `block_m`
+    // candidate is <= kMaxCandidateBlockM, so all pool offsets stay covered),
+    // capped by the "all tokens hit all experts in one wave" absolute maximum.
+    DG_HOST_ASSERT(num_ring_tokens >= std::min(
+        static_cast<int>(layout::get_num_max_pool_tokens(
+            num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank)),
+        get_num_wave_pool_tokens(
+            num_ranks, num_topk, num_max_tokens_per_rank, num_experts_per_rank,
+            layout::kLCMCandidateBlockM)) and
+        "SM90 MegaMoE requires a full-pool ring (allocate the symm buffer with at least the legacy pool size)");
     const int block_k = 128;
     const int num_sms = device_runtime->get_num_sms();
 

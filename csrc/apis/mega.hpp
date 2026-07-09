@@ -28,6 +28,18 @@ static std::pair<int, int> get_ring_limit_for_mega_moe(
     };
 }
 
+// Legacy (pre-rewrite, bdb4395) full-pool sizing: worst-case routed tokens plus a
+// single `kMaxCandidateBlockM` padding block per expert, aligned to
+// `kLCMCandidateBlockM`. The wave-pool max above pads with `kLCMCandidateBlockM - 1`
+// per expert instead (two `kMaxCandidateBlockM` blocks), inflating the working set
+// by ~10-14% on typical decode shapes. Any real `block_m` candidate is <=
+// `kMaxCandidateBlockM`, so this value still covers every pool offset the SM90
+// kernels can address (lap == 0 stays valid).
+static int get_legacy_pool_tokens_for_mega_moe(
+    const int& num_max_tokens_per_rank, const int& num_experts_per_rank, const int& num_topk, const int& num_ranks) {
+    return layout::get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+}
+
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
@@ -467,6 +479,7 @@ static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_ring_limit_for_mega_moe", &get_ring_limit_for_mega_moe);
+    m.def("get_legacy_pool_tokens_for_mega_moe", &get_legacy_pool_tokens_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);

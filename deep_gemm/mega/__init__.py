@@ -98,8 +98,15 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
     # The SM90 MegaMoE family (`fp8xmxfp4`, including the W4A8-int variants)
     # currently runs the legacy arrival-count protocol expressed over the ring
     # counters; it requires the ring to cover the full pool (lap == 0 forever).
+    # Use the legacy (pre-rewrite) full-pool size: one kMaxCandidateBlockM (192)
+    # padding block per expert instead of the max ring limit's two, which
+    # inflates the acts/SF working set by ~10-14% on typical decode shapes.
+    # Every real block_m candidate is <= 192, so all pool offsets stay covered
+    # and lap == 0 remains valid (also >= the one-expert-per-wave minimum).
     if mma_type == 'fp8xmxfp4':
-        num_ring_tokens = num_max_ring_tokens
+        num_ring_tokens = _C.get_legacy_pool_tokens_for_mega_moe(
+            num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
+        num_ring_tokens = max(num_min_ring_tokens, min(num_ring_tokens, num_max_ring_tokens))
 
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
