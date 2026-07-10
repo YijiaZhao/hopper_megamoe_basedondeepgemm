@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>W4A8-int (QServe式) MoE Kernel 计算全流程</title>
+<style>
+  body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background:#f6f7f9; color:#1a202c; margin:0; padding:32px; line-height:1.6; }
+  h1 { font-size:22px; } h2 { font-size:17px; margin:28px 0 10px; border-left:4px solid #3182ce; padding-left:10px; }
+  .lane { background:#fff; border:1px solid #dde2e8; border-radius:10px; padding:18px 22px; margin:14px 0; }
+  .box { display:inline-block; background:#edf2f7; border:1px solid #cbd5e0; border-radius:8px; padding:8px 14px; margin:6px 4px; vertical-align:middle; font-size:13.5px; }
+  .int  { background:#e6fffa; border-color:#81e6d9; }   /* 整数域 */
+  .flt  { background:#fff5f5; border-color:#feb2b2; }   /* 浮点域 */
+  .mem  { background:#fefcbf; border-color:#f6e05e; }   /* 存储/搬运 */
+  .hw   { background:#ebf4ff; border-color:#90cdf4; }   /* 硬件单元 */
+  .arrow{ color:#718096; font-size:16px; margin:0 2px; }
+  .note { font-size:12.5px; color:#4a5568; background:#f7fafc; border-left:3px solid #a0aec0; padding:6px 10px; margin:8px 0; }
+  .warn { border-left-color:#e53e3e; }
+  code  { background:#edf2f7; padding:1px 5px; border-radius:4px; font-size:12.5px; }
+  table { border-collapse:collapse; font-size:13px; margin:8px 0; }
+  td,th { border:1px solid #cbd5e0; padding:5px 10px; }
+  th { background:#edf2f7; }
+  .legend span { margin-right:14px; }
+</style>
+</head>
+<body>
+
+<h1>W4A8-int（QServe 两级量化 + zero point）MoE 专家层计算全流程 — H20 / SM90</h1>
+<div class="legend">
+  <span class="box int">整数域（bit 精确）</span>
+  <span class="box flt">浮点域</span>
+  <span class="box mem">存储 / 搬运</span>
+  <span class="box hw">硬件执行单元</span>
+</div>
+
+<h2>〇、离线准备：权重的两级量化（每个专家、每层各做一次，存盘）</h2>
+<div class="lane">
+  <span class="box flt">原始权重（bf16）</span><span class="arrow">→</span>
+  <span class="box">第一级：每个输出通道（每一行）求最大绝对值，得到<b>行缩放 s1</b>（bf16，一行一个），把整行除以 s1 量化到 8 位整数（限制在 ±112，为下一步留余量）</span><span class="arrow">→</span>
+  <span class="box">第二级：每 128 个 K 元素为一组，非对称量化到 4 位无符号整数——每组求最小/最大值，得到<b>整数组缩放 s2</b>（1 字节整数）和<b>零点 z</b>（4 位），使得 8 位值 ≈ (4位值 − z) × s2</span>
+  <div class="note">重建值 (w4−z)×s2 按构造不超过 ±127，永远装得进 8 位整数——这是后面"整数域折叠"合法的前提。</div>
+  <span class="box mem">落盘三样东西：① 4 位打包权重（每字节两个权重，长驻显存）② 元数据字（每行每 128 个 K 一个 32 位字：低字节放 s2、次字节放 z、高 16 位放 s1 的 bf16 位模式）③ 布局按 kernel 需要重排（gate/up 交织、tile 优先）</span>
+</div>
+
+<h2>一、激活怎么进来（每次前向、动态量化）</h2>
+<div class="lane">
+  <span class="box flt">token 激活 x（bf16，来自上一算子）</span><span class="arrow">→</span>
+  <span class="box">每个 token 独立求整行最大绝对值 ÷127 得到<b>token 缩放</b>（每 token 一个浮点数）</span><span class="arrow">→</span>
+  <span class="box int">量化成 8 位整数</span><span class="arrow">→</span>
+  <span class="box mem">整数字节 + 缩放一起经通信缓冲区，按路由结果分发到各专家所在的卡（跨卡流量也因此减半）</span>
+  <div class="note">缩放不是 per-tensor：token 之间幅度差可达一个数量级，必须每 token 自适应。</div>
+</div>
+
+<h2>二、分两段跑：按 token 数自动选实现（唯一开关：1024）</h2>
+
+<h2>二A、token 数 ≤ 1024：swapAB 路径（权重 4 位直进 kernel，寄存器里查表解码）</h2>
+<div class="lane">
+  <b>循环沿 K 方向推进，每次处理 128 个 K（一个流水段）：</b><br>
+  <span class="box hw">TMA 搬运引擎</span><span class="arrow">→</span>
+  <span class="box mem">4 位打包权重 + 元数据字 + 激活整数字节，装进共享内存（6 级流水，边算边搬）</span><br>
+
+  <span class="box">① 数学 warp 读本行元数据字：取出 s2、z、s1</span><span class="arrow">→</span>
+  <span class="box int">② <b>现场建表</b>（每行每段重建，只占 2 个寄存器/张）：表 = { (0−z)×s2, (1−z)×s2, …, (7−z)×s2 }，用两条 32 位乘法 + 一条按字节加法一次生成 4 个表项（注意必须按字节加，普通加法会跨字节进位——踩过的坑）</span><br>
+
+  <span class="box int">③ <b>查表解码</b>：每个权重取 4 位中的低 3 位当索引，一条 byte_perm 指令同时查 4 个权重，直接吐出"乘好 s2、减好 z"的 8 位整数；高位半区（原值 ≥8 的）再统一按字节加上 8×s2。产物留在寄存器，用完即弃，不占长期空间</span><span class="arrow">→</span>
+  <span class="box hw">④ tensor core：WGMMA 指令（固定形状 m64×n×k32，8 位输入的 k 永远是 32），权重当 A 从寄存器喂、token 当 B（这就是 swapAB：token 少时换个方向填满 64 行的硬件格子），<b>4 条指令首尾相接累进同一个 32 位整数累加器</b>（同一把尺子才能同账累加——s2 已折光，所以合法）</span><br>
+
+  <span class="box flt">⑤ <b>promote（补缩放）</b>：4 条指令全部落定后，把整数累加器转成浮点，乘上「该 token 的缩放 × 该行的 s1」（两个缩放沿不同轴变化，只能在输出网格上逐元素补），累进最终浮点累加器。每 128 个 K 才做一次，且实测不在关键路径上（同一 SM 上邻居 warp 的搬运和矩阵乘自然把它盖住），所以不必额外买重叠</span>
+  <div class="note">解码的 ALU 全部发生在上一批 WGMMA 的异步空窗里（发射完矩阵乘指令后 tensor core 自己转几百拍，CUDA core 正好去解下一批的码）——tensor core 和 CUDA core 是两种独立硬件，流水并行。</div>
+</div>
+
+<h2>二B、token 数 ≥ 1280：预解码路径（先整层解好码，GEMM 里不再解码）</h2>
+<div class="lane">
+  <span class="box int">① 前置 kernel（每层跑一次，成本固定 ~0.5ms，和 token 数无关）：读 4 位权重和 s2、z，逐元素算 (w4−z)×s2，写出 8 位整数权重到临时缓冲区。这里用朴素乘法不心疼——该 kernel 是带宽瓶颈，算术单元大量空闲</span><span class="arrow">→</span>
+  <span class="box mem">② 主 kernel 的 TMA 直接搬 8 位权重行（每行 128 字节）进共享内存——解码工序、查表、同步栅栏整段消失</span><span class="arrow">→</span>
+  <span class="box hw">③ 大 tile（BLOCK_N=256）的 SS 形态 WGMMA；因为 s1 沿 K 恒定、token 缩放也沿 K 恒定，<b>整条 K 的几十条指令一链到底</b>，主循环里零次补缩放</span><span class="arrow">→</span>
+  <span class="box flt">④ 循环结束只补一次：token 缩放 × s1 × 整数转浮点</span>
+  <div class="note">为什么大 token 数换这条路：swapAB 路径里同一份权重每 64 个 token 就要重新解码一遍（解码开销随 token 数线性涨）；预解码把它变成每层一次，token 再多也共享。反过来小 token 数绝不能走这条路——0.5ms 固定成本比整个 GEMM 还贵。</div>
+</div>
+
+<h2>三、第一层（gate/up 投影）算完之后：融合出口（epilogue）</h2>
+<div class="lane">
+  <span class="box flt">最终浮点累加器（gate 和 up 交织排列）</span><span class="arrow">→</span>
+  <span class="box flt">乘专家全局缩放（如有）→ gate 上限截断、up 双向截断 → SwiGLU：silu(gate)×up → 乘路由权重</span><span class="arrow">→</span>
+  <span class="box">每 (token, 64 个通道) 求最大绝对值 ÷127 = 中间激活缩放（为什么是 64：一个 CTA 的权重 tile 宽 128 行，swiglu 两两合并后只剩 64 个通道——出口只看得见自己这 64 个，这是 tile 几何定的，与指令无关；碰巧 64 也是精度甜点）</span><span class="arrow">→</span>
+  <span class="box int">量化成 8 位整数（截到 ±126、把 −1 改写成 0——这些字节借住在 fp8 类型的缓冲区里，必须避开 fp8 的两个 NaN 位模式）</span><span class="arrow">→</span>
+  <span class="box mem">整数 tile 经 TMA 写中间激活池，缩放写缩放池</span>
+</div>
+
+<h2>四、第二层（down 投影）与出口</h2>
+<div class="lane">
+  <span class="box">GEMM 流程与第一层相同（同一套查表/预解码、同一套 s1/s2/z），唯一区别：输入的缩放是 per-(token, 64)，沿 K 每 64 个元素换一次"尺子"——所以累加器按 64 一段分两本账（不同尺子的裸乘积不能混账），每半段各补一次中间激活缩放；s1 照旧攒到最后乘</span><span class="arrow">→</span>
+  <span class="box flt">最终累加器 → 转 bf16</span><span class="arrow">→</span>
+  <span class="box mem">按 token 元数据经 NVLink 直接散射写回源卡的合并缓冲区 → 各卡把 topk 份专家贡献求和 → 输出 y</span>
+</div>
+
+<h2>五、一张总账：每个量在哪一步被"乘回来"</h2>
+<table>
+  <tr><th>量</th><th>粒度</th><th>处理位置</th><th>为什么在那里</th></tr>
+  <tr><td>组缩放 s2（整数）</td><td>每行 × 每 128 个 K</td><td>解码时折进查表/预解码乘法（整数域，精确）</td><td>整数可以无损吸收整数缩放</td></tr>
+  <tr><td>零点 z</td><td>每行 × 每 128 个 K</td><td>同上（−z×s2 折进表项）</td><td>同上</td></tr>
+  <tr><td>行缩放 s1（bf16）</td><td>每输出通道</td><td>promote：整数累加完成后乘（沿 K 恒定→大 M 整条 K 只乘一次）</td><td>任意浮点进不了整数值域，只能事后乘；恒定所以可无限推迟</td></tr>
+  <tr><td>token 缩放</td><td>每 token</td><td>promote，同上</td><td>它是激活量化的定义本身，唯一位置就是乘回累加器，任何方案都一样</td></tr>
+  <tr><td>中间激活缩放</td><td>每 token × 每 64 通道</td><td>第二层 promote，按 64 一段</td><td>沿 K 会变，链到 64 就得结账</td></tr>
+</table>
+<div class="note warn">核心不变式：<b>WGMMA 前后是一条"整数国境线"</b>——所有能折进整数域的缩放（s2、z）在解码前搞定，所有必须是浮点的缩放（s1、token 缩放）在累加后搞定，中间的矩阵乘累加是纯整数、bit 精确、零舍入。</div>
+
+<p style="color:#718096;font-size:12px">对应实现：deepgemm_mxfp4 / sm90_mxfp4_mega_moe.cuh（开关 DG_W4A8_INT / _PRE / _QOQ / _QOQ_ZP）；细节与实验记录见同目录 W4A8_INT_HANDOFF.md。2026-07-09。</p>
+</body>
+</html>

@@ -22,3 +22,6 @@ stubs/
 
 # Symlinks to compiled extensions
 deep_gemm/*.so
+# Internal dev notes (IPs, machine names) - never ship
+docs/plans/
+docs/W4A8_INT_HANDOFF.md
