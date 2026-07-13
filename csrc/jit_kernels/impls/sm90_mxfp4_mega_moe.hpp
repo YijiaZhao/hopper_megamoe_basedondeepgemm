@@ -106,9 +106,22 @@ public:
              w4a8_int_qoq_zp and w4a8_int_qoq and not w4a8_int_pre) ? 1 : 0;
         // PRELUT_CONST: direct __constant__ LUT fetch, no smem staging (and
         // no 4KB smem_size addition -- keep in sync with the size code below).
+        // M-gated dispatch (same pattern as occ2): measured H20 wins are the
+        // flash-family M8 (-4.3%) / M32 (-2.4%), ties elsewhere, flash M1
+        // LOSS (+27%) -> the default gate engages only for IH < 3072 at
+        // M in [8, 32]. _MIN_M/_MAX_M env-override; pro-family default is
+        // disabled (min > max).
+        const int prelut_const_min_m = get_env<int>(
+            "DG_W4A8_INT_QOQ_ZP_PRELUT_CONST_MIN_M",
+            args.intermediate_hidden >= 3072 ? 1 : 8);
+        const int prelut_const_max_m = get_env<int>(
+            "DG_W4A8_INT_QOQ_ZP_PRELUT_CONST_MAX_M",
+            args.intermediate_hidden >= 3072 ? 0 : 32);
         const int w4a8_int_qoq_zp_prelut_const =
             (w4a8_int_qoq_zp_prelut and
-             get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST", 0) != 0) ? 1 : 0;
+             get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST", 0) != 0 and
+             args.num_tokens >= prelut_const_min_m and
+             args.num_tokens <= prelut_const_max_m) ? 1 : 0;
         // Diagnostic-only: compile the comm-barrier timeout printf path in
         // (degrades scheduling; never enable for perf runs).
         const int comm_barrier_printf = get_env<int>("DG_COMM_BARRIER_TIMEOUT_PRINTF", 0) != 0 ? 1 : 0;
@@ -289,8 +302,13 @@ static void sm90_mxfp4_mega_moe(
         get_env<int>("DG_W4A8_INT_QOQ_ZP", 0) != 0 and
         get_env<int>("DG_W4A8_INT_QOQ", 0) != 0 and not pre_decoded_b;
     // PRELUT_CONST reads the table straight from __constant__: no smem copy.
+    // MUST mirror generate_impl's M-gate exactly (host smem_size contract).
     const bool zp_prelut_const = zp_prelut and
-        get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST", 0) != 0;
+        get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST", 0) != 0 and
+        num_tokens >= get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST_MIN_M",
+                                   intermediate_hidden >= 3072 ? 1 : 8) and
+        num_tokens <= get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST_MAX_M",
+                                   intermediate_hidden >= 3072 ? 0 : 32);
     const int zp_prelut_smem_size = (zp_prelut and not zp_prelut_const) ? 4096 : 0;
     config.num_epilogue_threads = deployment_block_n == 256 ? 256 :
         (config.swap_ab ? 256 : 128);
