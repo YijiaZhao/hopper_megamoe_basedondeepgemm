@@ -72,6 +72,14 @@
 #ifndef DG_W4A8_INT_QOQ_ZP
 #define DG_W4A8_INT_QOQ_ZP 0
 #endif
+// Prestored ZP decode LUT: the per-(row, K128) arithmetic LUT build (nz
+// extract + 2 IMAD + 2 vadd4) is replaced by one LDS.64 from a 4KB smem
+// table (copied from constant memory at kernel start; see int4_dequant.cuh,
+// which also owns the default #define). Coeff byte 1 then carries the RAW
+// zero point z instead of nz. The host forces this off under PRE.
+#ifndef DG_W4A8_INT_QOQ_ZP_PRELUT
+#define DG_W4A8_INT_QOQ_ZP_PRELUT 0
+#endif
 
 // iter17: relative pre-scaled LUT fold. Each K32 group inside a K128 block is
 // decoded against the LUT row for d = e_max - e_group, so the four WGMMAs of a
@@ -115,7 +123,8 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_unscaled(
         uint8_t* __restrict__ smem_b,
         const uint8_t* __restrict__ packed_b,
         const uint32_t row,
-        uint8_t* __restrict__ coeff_smem) {
+        uint8_t* __restrict__ coeff_smem,
+        [[maybe_unused]] const uint2* __restrict__ zplut = nullptr) {
     const uint8_t* __restrict__ row_ptr = packed_b + row * 64;
     const uint4* __restrict__ fp4_src = reinterpret_cast<const uint4*>(row_ptr);
     uint4 fp4_quads[4];
@@ -128,11 +137,19 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_unscaled(
         const uint32_t cw = reinterpret_cast<const uint32_t*>(coeff_smem)[row];
         qoq_s2 = cw & 0xffu;
 #if DG_W4A8_INT_QOQ_ZP
+#if DG_W4A8_INT_QOQ_ZP_PRELUT
+        // Byte 1 carries the raw zero point z; one LDS.64 fetches the
+        // prestored LUT row instead of the arithmetic build below.
+        const uint2 zl = zplut[((qoq_s2 & 0x1fu) << 4) | ((cw >> 8) & 0xfu)];
+        qoq_lut_lo = zl.x;
+        qoq_lut_hi = zl.y;
+#else
         // Byte 1 of the coeff word carries nz = (-z*s2) mod 256, precomputed
         // at PREPACK time (saves the per-row multiply+negate here).
         const uint32_t nz = (cw >> 8) & 0xffu;
         qoq_lut_lo = __vadd4(qoq_s2 * 0x03020100u, nz * 0x01010101u);
         qoq_lut_hi = __vadd4(qoq_s2 * 0x07060504u, nz * 0x01010101u);
+#endif
 #else
         qoq_lut_lo = qoq_s2 * 0x03020100u;
         qoq_lut_hi = qoq_s2 * 0x07060504u;
@@ -776,6 +793,17 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
     auto dequant_barriers  = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + i; });
     auto combine_barriers  = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages * 3 + i; });
 
+#if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_PRELUT
+    // Prestored ZP decode LUT: 32 s2 rows x 16 zero points x uint2 = 4096B,
+    // placed after the barriers (outside the combine SMEM alias region).
+    // The barrier region is a multiple of 8 bytes, so the uint2 (LDS.64)
+    // alignment requirement holds. The host adds the 4096B to smem_size.
+    const auto smem_zplut = reinterpret_cast<const uint2*>(
+        barrier_start_ptr + kNumDispatchWarps + kNumStages * 3 + kNumEpilogueWarps * 2);
+#else
+    constexpr const uint2* smem_zplut = nullptr;
+#endif
+
     // =====================================================================
     // Initialization
     // =====================================================================
@@ -811,6 +839,15 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
         }
         cutlass::arch::fence_barrier_init();
     }
+#if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_PRELUT
+    // Stage the prestored ZP decode LUT into shared memory once; decode
+    // sites then replace the per-row arithmetic LUT build with one LDS.64.
+    {
+        auto zplut_dst = reinterpret_cast<uint32_t*>(const_cast<uint2*>(smem_zplut));
+        for (uint32_t i = thread_idx; i < 1024; i += kNumThreads)
+            zplut_dst[i] = int4q::kZpPreLutConst[i];
+    }
+#endif
     if constexpr (kClusterSize > 1) {
         cute::cluster_sync();
     } else {
@@ -848,7 +885,7 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
                      row += kNumNonEpilogueThreads) {
                     mxfp4::dequant_smem_b_from_packed_unscaled<kUsePRMTGroups, kIntDecodeB, kQoQFoldB>(
                         reinterpret_cast<uint8_t*>(smem_b[stage]),
-                        smem_packed_b[stage], row, smem_b_coeff[stage]);
+                        smem_packed_b[stage], row, smem_b_coeff[stage], smem_zplut);
                 }
                 asm volatile("bar.sync 8, %0;" : : "n"(kNumNonEpilogueThreads));
                 if (non_epilogue_thread_idx == 0)
@@ -1488,7 +1525,7 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
                     mxfp4::dequant_smem_b_from_packed_unscaled<kUsePRMTGroups, kIntDecodeB, kQoQFoldB>(
                         reinterpret_cast<uint8_t*>(smem_b[stage]),
                         smem_packed_b[stage], epilogue_thread_idx,
-                        smem_b_coeff[stage]);
+                        smem_b_coeff[stage], smem_zplut);
                     asm volatile("bar.sync 8, 256;" ::: "memory");
                     cutlass::arch::fence_view_async_shared();
                 } else {
@@ -2057,6 +2094,14 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 const uint32_t s2_r0 = cw_word_r0 & 0xffu;
                                 const uint32_t s2_r1 = cw_word_r1 & 0xffu;
 #if DG_W4A8_INT_QOQ_ZP
+#if DG_W4A8_INT_QOQ_ZP_PRELUT
+                                // Coeff byte 1 = raw zero point z; one LDS.64
+                                // fetches the prestored LUT row [s2][z].
+                                const uint2 zl_r0 = smem_zplut[((s2_r0 & 0x1fu) << 4) | ((cw_word_r0 >> 8) & 0xfu)];
+                                const uint2 zl_r1 = smem_zplut[((s2_r1 & 0x1fu) << 4) | ((cw_word_r1 >> 8) & 0xfu)];
+                                const uint32_t lutlo_r0 = zl_r0.x, luthi_r0 = zl_r0.y;
+                                const uint32_t lutlo_r1 = zl_r1.x, luthi_r1 = zl_r1.y;
+#else
                                 // Coeff byte 1 = prepack-precomputed nz = (-z*s2) mod 256.
                                 const uint32_t nz_r0 = (cw_word_r0 >> 8) & 0xffu;
                                 const uint32_t nz_r1 = (cw_word_r1 >> 8) & 0xffu;
@@ -2064,6 +2109,7 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 const uint32_t luthi_r0 = __vadd4(s2_r0 * 0x07060504u, nz_r0 * 0x01010101u);
                                 const uint32_t lutlo_r1 = __vadd4(s2_r1 * 0x03020100u, nz_r1 * 0x01010101u);
                                 const uint32_t luthi_r1 = __vadd4(s2_r1 * 0x07060504u, nz_r1 * 0x01010101u);
+#endif
 #else
                                 const uint32_t lutlo_r0 = s2_r0 * 0x03020100u, luthi_r0 = s2_r0 * 0x07060504u;
                                 const uint32_t lutlo_r1 = s2_r1 * 0x03020100u, luthi_r1 = s2_r1 * 0x07060504u;
@@ -2480,7 +2526,7 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                         mxfp4::dequant_smem_b_from_packed_unscaled<kUsePRMTGroups, kIntDecodeB, kQoQFoldB>(
                                             reinterpret_cast<uint8_t*>(smem_b[next_stage]),
                                             smem_packed_b[next_stage], epilogue_thread_idx,
-                                            smem_b_coeff[next_stage]);
+                                            smem_b_coeff[next_stage], smem_zplut);
                                     }
                                     asm volatile("bar.sync 8, 256;" ::: "memory");
                                     cutlass::arch::fence_view_async_shared();
@@ -2646,6 +2692,14 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 const uint32_t s2_r0 = cw_word_r0 & 0xffu;
                                 const uint32_t s2_r1 = cw_word_r1 & 0xffu;
 #if DG_W4A8_INT_QOQ_ZP
+#if DG_W4A8_INT_QOQ_ZP_PRELUT
+                                // Coeff byte 1 = raw zero point z; one LDS.64
+                                // fetches the prestored LUT row [s2][z].
+                                const uint2 zl_r0 = smem_zplut[((s2_r0 & 0x1fu) << 4) | ((cw_word_r0 >> 8) & 0xfu)];
+                                const uint2 zl_r1 = smem_zplut[((s2_r1 & 0x1fu) << 4) | ((cw_word_r1 >> 8) & 0xfu)];
+                                const uint32_t lutlo_r0 = zl_r0.x, luthi_r0 = zl_r0.y;
+                                const uint32_t lutlo_r1 = zl_r1.x, luthi_r1 = zl_r1.y;
+#else
                                 // Coeff byte 1 = prepack-precomputed nz = (-z*s2) mod 256.
                                 const uint32_t nz_r0 = (cw_word_r0 >> 8) & 0xffu;
                                 const uint32_t nz_r1 = (cw_word_r1 >> 8) & 0xffu;
@@ -2653,6 +2707,7 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 const uint32_t luthi_r0 = __vadd4(s2_r0 * 0x07060504u, nz_r0 * 0x01010101u);
                                 const uint32_t lutlo_r1 = __vadd4(s2_r1 * 0x03020100u, nz_r1 * 0x01010101u);
                                 const uint32_t luthi_r1 = __vadd4(s2_r1 * 0x07060504u, nz_r1 * 0x01010101u);
+#endif
 #else
                                 const uint32_t lutlo_r0 = s2_r0 * 0x03020100u, luthi_r0 = s2_r0 * 0x07060504u;
                                 const uint32_t lutlo_r1 = s2_r1 * 0x03020100u, luthi_r1 = s2_r1 * 0x07060504u;
@@ -2731,7 +2786,7 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                         mxfp4::dequant_smem_b_from_packed_unscaled<kUsePRMTGroups, kIntDecodeB, kQoQFoldB>(
                                             reinterpret_cast<uint8_t*>(smem_b[next_stage]),
                                             smem_packed_b[next_stage], epilogue_thread_idx,
-                                            smem_b_coeff[next_stage]);
+                                            smem_b_coeff[next_stage], smem_zplut);
                                     }
                                     asm volatile("bar.sync 8, 256;" ::: "memory");
                                     cutlass::arch::fence_view_async_shared();

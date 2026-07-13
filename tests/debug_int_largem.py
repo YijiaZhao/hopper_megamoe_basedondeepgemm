@@ -26,6 +26,7 @@ from deep_gemm.mega import _interleave_l1_weights as _il1
 PRE = os.environ.get("DG_W4A8_INT_PRE", "0") == "1"
 QOQ = os.environ.get("DG_W4A8_INT_QOQ", "0") == "1"
 ZP = os.environ.get("DG_W4A8_INT_QOQ_ZP", "0") == "1"
+PRELUT = os.environ.get("DG_W4A8_INT_QOQ_ZP_PRELUT", "0") == "1"
 
 
 def quantize_qoq(weight, group=128):
@@ -47,10 +48,15 @@ def quantize_qoq(weight, group=128):
         w4 = (w8g / s2 + z).round().clamp(0, 15)
         dec8 = ((w4 - z) * s2).view(E, N, K)
         assert dec8.abs().max().item() <= 127
-        # Prepack the negated-offset byte the kernel LUT needs directly:
-        # nz = (-z*s2) mod 256 (kernel reads it instead of recomputing from z).
-        nz = (z * s2).to(torch.int32).neg().remainder(256)
-        plane = (s1w | (nz.squeeze(-1) << 8)
+        # Prepack byte 1: under PRELUT the kernel looks up a prestored smem
+        # LUT row [s2][z], so store the RAW zero point z; otherwise store the
+        # negated offset nz = (-z*s2) mod 256 the arithmetic LUT build needs.
+        if PRELUT:
+            assert s2.max().item() <= 31, "s2 exceeds prestored ZP LUT rows"
+            b1 = z.to(torch.int32)
+        else:
+            b1 = (z * s2).to(torch.int32).neg().remainder(256)
+        plane = (s1w | (b1.squeeze(-1) << 8)
                      | s2.squeeze(-1).to(torch.int32)).contiguous()
     else:
         amax8 = w8g.abs().amax(dim=-1, keepdim=True)

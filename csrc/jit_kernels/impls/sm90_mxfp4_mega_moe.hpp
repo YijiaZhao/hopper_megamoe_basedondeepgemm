@@ -87,6 +87,14 @@ public:
         const int w4a8_int_shadow = get_env<int>("DG_W4A8_INT_SHADOW", 0) != 0 ? 1 : 0;
         const int w4a8_int_qoq = get_env<int>("DG_W4A8_INT_QOQ", 0) != 0 ? 1 : 0;
         const int w4a8_int_qoq_zp = get_env<int>("DG_W4A8_INT_QOQ_ZP", 0) != 0 ? 1 : 0;
+        // Prestored ZP decode LUT: replaces the per-row arithmetic LUT build
+        // with one LDS.64 from a 4KB smem table. Only meaningful on the
+        // in-kernel QoQ+ZP decode path; PRE mode's prologue dequant never
+        // runs it, so force the define off there (keeps PRE bit-identical).
+        // Keep this gating in sync with the smem_size addition below.
+        const int w4a8_int_qoq_zp_prelut =
+            (get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT", 0) != 0 and
+             w4a8_int_qoq_zp and w4a8_int_qoq and not w4a8_int_pre) ? 1 : 0;
         return fmt::format(R"(
 #define DG_MXFP4_REL_LUT {}
 #define DG_W4A8_INT {}
@@ -95,6 +103,7 @@ public:
 #define DG_W4A8_INT_SHADOW {}
 #define DG_W4A8_INT_QOQ {}
 #define DG_W4A8_INT_QOQ_ZP {}
+#define DG_W4A8_INT_QOQ_ZP_PRELUT {}
 #include <deep_gemm/impls/sm90_mxfp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -129,6 +138,7 @@ static void __instantiate_kernel() {{
     w4a8_int_shadow,
     w4a8_int_qoq,
     w4a8_int_qoq_zp,
+    w4a8_int_qoq_zp_prelut,
     kernel_symbol,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
@@ -232,6 +242,12 @@ static void sm90_mxfp4_mega_moe(
     const bool pre_decoded_b = get_env<int>("DG_W4A8_INT_PRE", 0) != 0;
     if (pre_decoded_b)
         config.swap_ab = false;
+    // Prestored ZP decode LUT smem: 32 x 16 uint2 = 4096 bytes staged after
+    // the barrier region. Mirror generate_impl's gating (off under PRE).
+    const bool zp_prelut = get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT", 0) != 0 and
+        get_env<int>("DG_W4A8_INT_QOQ_ZP", 0) != 0 and
+        get_env<int>("DG_W4A8_INT_QOQ", 0) != 0 and not pre_decoded_b;
+    const int zp_prelut_smem_size = zp_prelut ? 4096 : 0;
     config.num_epilogue_threads = deployment_block_n == 256 ? 256 :
         (config.swap_ab ? 256 : 128);
     const bool compact_frontend = deployment_block_n == 256 or config.swap_ab;
@@ -282,7 +298,8 @@ static void sm90_mxfp4_mega_moe(
         const int mxfp4_smem_size = fp8_smem_size -
             num_stages * rf_reclaim_per_stage +
             num_stages * (packed_scratch_per_stage + deployment_block_n * 4 +
-                          static_cast<int>(sizeof(uint64_t)));
+                          static_cast<int>(sizeof(uint64_t))) +
+            zp_prelut_smem_size;
         if (mxfp4_smem_size <= SM90ArchSpec::smem_capacity) {
             config.num_stages = num_stages;
             config.smem_size = mxfp4_smem_size;
