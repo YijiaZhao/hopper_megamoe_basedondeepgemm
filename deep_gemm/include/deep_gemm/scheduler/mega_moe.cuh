@@ -7,6 +7,11 @@
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
+// Diagnostic-only bounded spins (see sm90_mxfp4_mega_moe host codegen).
+#ifndef DG_OCC2_SPIN_TRAP_SCHED
+#define DG_OCC2_SPIN_TRAP_SCHED 0
+#endif
+
 namespace deep_gemm::sched {
 
 // Computation phase for the current block
@@ -215,8 +220,15 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
+#if DG_OCC2_SPIN_TRAP_SCHED
+                const auto spin_start = clock64();
+#endif
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+#if DG_OCC2_SPIN_TRAP_SCHED
+                    if (clock64() - spin_start > 120000000000ll)
+                        __trap();
+#endif
                 } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);

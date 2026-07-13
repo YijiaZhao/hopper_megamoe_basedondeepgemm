@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_set>
+
 #include <torch/python.h>
 #include "../../jit/compiler.hpp"
 #include "../../jit/kernel_runtime.hpp"
@@ -38,6 +40,13 @@ public:
         bool phase_profile;
         bool l2_nmajor_schedule;
         bool one_warp_cleanup;
+        // Small-M 2-CTAs/SM slim variant (DG_W4A8_INT_SMALLM_OCC2): doubled
+        // grid, shallow pipeline, halved per-CTA register budget.
+        bool occ2;
+        // Diagnostic bisect (DG_W4A8_INT_SMALLM_OCC2_NO2X=1): slim config
+        // (stages/regs/pad) but single grid -- isolates the slim pipeline
+        // from the doubled-grid protocol.
+        bool occ2_doubled;
         KernelPhase kernel_phase;
         MegaMoESM90Config config;
 
@@ -95,7 +104,29 @@ public:
         const int w4a8_int_qoq_zp_prelut =
             (get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT", 0) != 0 and
              w4a8_int_qoq_zp and w4a8_int_qoq and not w4a8_int_pre) ? 1 : 0;
+        // PRELUT_CONST: direct __constant__ LUT fetch, no smem staging (and
+        // no 4KB smem_size addition -- keep in sync with the size code below).
+        const int w4a8_int_qoq_zp_prelut_const =
+            (w4a8_int_qoq_zp_prelut and
+             get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST", 0) != 0) ? 1 : 0;
+        // Diagnostic-only: compile the comm-barrier timeout printf path in
+        // (degrades scheduling; never enable for perf runs).
+        const int comm_barrier_printf = get_env<int>("DG_COMM_BARRIER_TIMEOUT_PRINTF", 0) != 0 ? 1 : 0;
+        const int occ2_spin_trap = get_env<int>("DG_OCC2_SPIN_TRAP", 0) != 0 ? 1 : 0;
+        const int occ2_spin_trap_l1full =
+            (occ2_spin_trap or get_env<int>("DG_OCC2_SPIN_TRAP_L1FULL", 0) != 0) ? 1 : 0;
+        const int occ2_spin_trap_sched =
+            (occ2_spin_trap or get_env<int>("DG_OCC2_SPIN_TRAP_SCHED", 0) != 0) ? 1 : 0;
+        const int occ2_baseline_regs = get_env<int>("DG_OCC2_BASELINE_REGS", 0) != 0 ? 1 : 0;
+        const int occ2_lb1 = get_env<int>("DG_OCC2_LB1", 0) != 0 ? 1 : 0;
+        const int occ2_no_pad = get_env<int>("DG_OCC2_NO_PAD", 0) != 0 ? 1 : 0;
         return fmt::format(R"(
+#define DG_OCC2_LB1 {}
+#define DG_OCC2_NO_PAD {}
+#define DG_COMM_BARRIER_TIMEOUT_PRINTF {}
+#define DG_OCC2_SPIN_TRAP_L1FULL {}
+#define DG_OCC2_SPIN_TRAP_SCHED {}
+#define DG_OCC2_BASELINE_REGS {}
 #define DG_MXFP4_REL_LUT {}
 #define DG_W4A8_INT {}
 #define DG_W4A8_INT_L2 {}
@@ -104,6 +135,7 @@ public:
 #define DG_W4A8_INT_QOQ {}
 #define DG_W4A8_INT_QOQ_ZP {}
 #define DG_W4A8_INT_QOQ_ZP_PRELUT {}
+#define DG_W4A8_INT_QOQ_ZP_PRELUT_CONST {}
 #include <deep_gemm/impls/sm90_mxfp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -127,10 +159,17 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
 )",
+    occ2_lb1,
+    occ2_no_pad,
+    comm_barrier_printf,
+    occ2_spin_trap_l1full,
+    occ2_spin_trap_sched,
+    occ2_baseline_regs,
     rel_lut,
     w4a8_int,
     w4a8_int_l2,
@@ -139,6 +178,7 @@ static void __instantiate_kernel() {{
     w4a8_int_qoq,
     w4a8_int_qoq_zp,
     w4a8_int_qoq_zp_prelut,
+    w4a8_int_qoq_zp_prelut_const,
     kernel_symbol,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
@@ -158,7 +198,8 @@ static void __instantiate_kernel() {{
     args.phase_profile ? "true" : "false",
     args.l2_nmajor_schedule ? "true" : "false",
     args.one_warp_cleanup ? "true" : "false",
-    args.config.swap_ab ? "true" : "false");
+    args.config.swap_ab ? "true" : "false",
+    args.occ2 ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -247,7 +288,10 @@ static void sm90_mxfp4_mega_moe(
     const bool zp_prelut = get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT", 0) != 0 and
         get_env<int>("DG_W4A8_INT_QOQ_ZP", 0) != 0 and
         get_env<int>("DG_W4A8_INT_QOQ", 0) != 0 and not pre_decoded_b;
-    const int zp_prelut_smem_size = zp_prelut ? 4096 : 0;
+    // PRELUT_CONST reads the table straight from __constant__: no smem copy.
+    const bool zp_prelut_const = zp_prelut and
+        get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST", 0) != 0;
+    const int zp_prelut_smem_size = (zp_prelut and not zp_prelut_const) ? 4096 : 0;
     config.num_epilogue_threads = deployment_block_n == 256 ? 256 :
         (config.swap_ab ? 256 : 128);
     const bool compact_frontend = deployment_block_n == 256 or config.swap_ab;
@@ -307,6 +351,75 @@ static void sm90_mxfp4_mega_moe(
         }
         DG_HOST_ASSERT(num_stages > 2);
         requested_stages = num_stages - 1;
+    }
+
+    // ------------------------------------------------------------------
+    // Small-M OCC2 slim variant (env-gated, default off): run 2 CTAs/SM on
+    // the compact swapAB RF path by shrinking the pipeline so the per-CTA
+    // footprint fits under half the SM SMEM (H20/H100: 228KB carveout, 1KB
+    // per-CTA reserve -> 115712B budget) and halving the register budget in
+    // the kernel (kOcc2). The grid doubles; every kNumSMs-templated protocol
+    // (grid sync, NVLink barrier, scheduler striding, dispatch pull) scales
+    // with the doubled CTA count consistently.
+    // The SMEM accounting below mirrors the kernel layout EXACTLY for the
+    // swapAB + packed-scratch + (optional) ZP-PRELUT configuration.
+    // ------------------------------------------------------------------
+    // Default M gate is empirical (H20 paired medians, 2026-07-13): M2-8 win
+    // on both models (flash M2 -14%, M4/M8 -3%; pro -4..-5%), pro M1 wins
+    // (-4.7%) but flash M1 regresses (+12%, protocol-bound at 6 active
+    // experts) -> M1 only engages for the larger FFN (IH >= 3072).
+    const int occ2_min_m_default = intermediate_hidden >= 3072 ? 1 : 2;
+    bool occ2 = get_env<int>("DG_W4A8_INT_SMALLM_OCC2", 0) != 0 and
+                get_env<int>("DG_W4A8_INT", 0) != 0 and
+                not pre_decoded_b and config.swap_ab and
+                num_tokens >= get_env<int>("DG_W4A8_INT_SMALLM_OCC2_MIN_M", occ2_min_m_default) and
+                num_tokens <= get_env<int>("DG_W4A8_INT_SMALLM_OCC2_MAX_M", 8);
+    if (occ2) {
+        constexpr int kOcc2SmemBudget = 115712;
+        const int num_epilogue_warps_o = config.num_epilogue_threads / 32;      // 8
+        const int num_epilogue_wgs_o = config.num_epilogue_threads / 128;       // 2
+        const int wg_block_n_o = config.block_n / num_epilogue_wgs_o;           // 64 (split-N)
+        const int smem_expert = align(num_experts * 4, 1024);
+        const int smem_send = align(hidden * (config.num_dispatch_threads / 32), 1024);
+        const int cd_l1 = num_epilogue_wgs_o * 64 * (wg_block_n_o / 2);          // FP8
+        const int cd_l2 = num_epilogue_wgs_o * 64 * wg_block_n_o * 2;            // BF16
+        const int cd_swap = 64 * (config.block_n / 2) * (4 + 1);                 // FP32 + FP8
+        const int cd_base = align(std::max(std::max(cd_l1, cd_l2), cd_swap), 1024);
+        // swapAB RF decode: no decoded-B buffer; packed scratch is 64B/row.
+        const int per_stage_data = 64 * config.block_k /* A (FP8) */ +
+                                   config.block_n * 64 /* packed B  */ +
+                                   config.block_n * 4  /* B coeff   */;
+        const int sfa_per_stage = 2 * align(64 * 4, 128);
+        const int two_chunk_alias = 3 * num_epilogue_warps_o * hidden;
+        int stages = std::min(get_env<int>("DG_W4A8_INT_SMALLM_OCC2_STAGES", 4),
+                              config.num_stages);
+        bool fitted = false;
+        for (; stages >= 2; -- stages) {
+            const int pre_barrier_base = smem_expert + smem_send + cd_base +
+                                         stages * per_stage_data;
+            // Mirror the kernel's SMEM_CD_PAD_SIZE (keep 2-chunk combine).
+            int cd_pad = 0;
+            if (get_env<int>("DG_OCC2_NO_PAD", 0) == 0 and
+                hidden % 2 == 0 and hidden <= 2 * 32 * 128 and
+                pre_barrier_base < two_chunk_alias and
+                two_chunk_alias - pre_barrier_base <= 4096)
+                cd_pad = align(two_chunk_alias - pre_barrier_base, 1024);
+            const int smem_barriers = (config.num_dispatch_threads / 32 +
+                                       3 * stages + 2 * num_epilogue_warps_o) * 8;
+            const int total = pre_barrier_base + cd_pad + stages * sfa_per_stage +
+                              smem_barriers + zp_prelut_smem_size;
+            if (total <= kOcc2SmemBudget) {
+                config.num_stages = stages;
+                config.smem_size = total;
+                fitted = true;
+                break;
+            }
+        }
+        if (not fitted)
+            occ2 = false;
+        if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS"))
+            printf("W4A8-int small-M OCC2: %s (num_tokens=%d, stages=%d, smem_size=%d)\n",
+                   occ2 ? "on" : "off (no fit)", num_tokens, config.num_stages, config.smem_size);
     }
 
     // Activation descriptors stay FP8. Packed weights use one unswizzled 80B
@@ -410,6 +523,8 @@ static void sm90_mxfp4_mega_moe(
         .phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0,
         .l2_nmajor_schedule = config.l2_nmajor_schedule,
         .one_warp_cleanup = config.one_warp_cleanup,
+        .occ2 = occ2,
+        .occ2_doubled = occ2 and get_env<int>("DG_W4A8_INT_SMALLM_OCC2_NO2X", 0) == 0,
         .kernel_phase = SM90MXFP4MegaMoERuntime::KernelPhase::Linear1,
         .config = config,
         .y = y.data_ptr(),
@@ -427,7 +542,8 @@ static void sm90_mxfp4_mega_moe(
         .tensor_map_l2_weights = tensor_map_l2_weights,
         .tensor_map_l2_weights_sf = tensor_map_l2_weights_sf,
         .l2_global_scales = l2_global_scales_ptr,
-        .launch_args = LaunchArgs(num_sms, config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
+        .launch_args = LaunchArgs(((occ2 and get_env<int>("DG_W4A8_INT_SMALLM_OCC2_NO2X", 0) == 0) ? 2 : 1) * num_sms,
+                                  config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
                                   config.smem_size, config.cluster_size)
     };
     const auto launch_with_phase = [&](const SM90MXFP4MegaMoERuntime::KernelPhase kernel_phase,
@@ -436,6 +552,21 @@ static void sm90_mxfp4_mega_moe(
         split_args.kernel_phase = kernel_phase;
         const auto code = SM90MXFP4MegaMoERuntime::generate(split_args);
         const auto runtime = compiler->build(kernel_name, code);
+        if (split_args.occ2 and split_args.occ2_doubled) {
+            // The doubled grid relies on 2 CTAs/SM co-residency: at 1 CTA/SM
+            // the second half of the persistent grid never launches and the
+            // grid sync deadlocks. Verify occupancy once per loaded kernel.
+            static std::unordered_set<void*> verified_kernels;
+            const auto handle_key = reinterpret_cast<void*>(runtime->kernel);
+            if (verified_kernels.count(handle_key) == 0) {
+                const int max_blocks = get_max_active_blocks_per_sm(
+                    runtime->kernel, split_args.launch_args.num_threads,
+                    split_args.launch_args.smem_size);
+                DG_HOST_ASSERT(max_blocks >= 2 and
+                               "W4A8-int small-M OCC2 kernel failed 2-CTAs/SM occupancy");
+                verified_kernels.insert(handle_key);
+            }
+        }
         SM90MXFP4MegaMoERuntime::launch(runtime, split_args);
     };
 

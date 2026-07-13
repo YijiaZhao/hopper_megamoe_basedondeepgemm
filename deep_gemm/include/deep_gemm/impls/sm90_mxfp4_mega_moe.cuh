@@ -81,6 +81,14 @@
 #define DG_W4A8_INT_QOQ_ZP_PRELUT 0
 #endif
 
+// PRELUT_CONST: read the prestored ZP decode LUT straight from __constant__
+// memory instead of staging a 4KB smem copy (frees the smem; repeated (s2,z)
+// pairs broadcast in the constant cache, divergent indices serialize).
+// Env-gated by the host: DG_W4A8_INT_QOQ_ZP_PRELUT_CONST=1 (requires PRELUT).
+#ifndef DG_W4A8_INT_QOQ_ZP_PRELUT_CONST
+#define DG_W4A8_INT_QOQ_ZP_PRELUT_CONST 0
+#endif
+
 // iter17: relative pre-scaled LUT fold. Each K32 group inside a K128 block is
 // decoded against the LUT row for d = e_max - e_group, so the four WGMMAs of a
 // block share one scale (2^(e_max - 127)) and one accumulator: the per-K32
@@ -118,6 +126,18 @@ __device__ __forceinline__ uint2 decode_mxfp4_split_pair(const uint32_t packed) 
 // array (layout: uint32 per row = coeff bytes [row * 4 + k32_group]) and
 // applied as float multipliers in the WGMMA promotion.
 
+#if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_PRELUT
+__device__ __forceinline__ uint2 zp_prelut_fetch(
+        [[maybe_unused]] const uint2* __restrict__ zplut, const uint32_t& idx) {
+#if DG_W4A8_INT_QOQ_ZP_PRELUT_CONST
+    return make_uint2(int4q::kZpPreLutConst[idx * 2u],
+                      int4q::kZpPreLutConst[idx * 2u + 1u]);
+#else
+    return zplut[idx];
+#endif
+}
+#endif
+
 template <bool kUsePRMTGroups, bool kIntDecode = false, bool kQoQFold = false>
 __device__ __forceinline__ void dequant_smem_b_from_packed_unscaled(
         uint8_t* __restrict__ smem_b,
@@ -140,7 +160,7 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_unscaled(
 #if DG_W4A8_INT_QOQ_ZP_PRELUT
         // Byte 1 carries the raw zero point z; one LDS.64 fetches the
         // prestored LUT row instead of the arithmetic build below.
-        const uint2 zl = zplut[((qoq_s2 & 0x1fu) << 4) | ((cw >> 8) & 0xfu)];
+        const uint2 zl = zp_prelut_fetch(zplut, ((qoq_s2 & 0x1fu) << 4) | ((cw >> 8) & 0xfu));
         qoq_lut_lo = zl.x;
         qoq_lut_hi = zl.y;
 #else
@@ -408,6 +428,7 @@ using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
     bool kL2NMajorScheduleRequested = false, \
     bool kOneWarpCleanupRequested = false, \
     bool kMXFP4SwapAB = false, \
+    bool kOcc2 = false, \
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2, \
     uint32_t L1_SHAPE_K = kHidden, \
     uint32_t L2_SHAPE_N = kHidden, \
@@ -470,6 +491,7 @@ using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
     kNumNonEpilogueThreads, kNumEpilogueThreads, kClusterSize, kNumSMs, \
     kNumRanks, kActivationClamp, kFastMath, kDirectL2ScatterRequested, \
     kPhaseProfileRequested, kL2NMajorScheduleRequested, kOneWarpCleanupRequested, kMXFP4SwapAB, \
+    kOcc2, \
     L1_SHAPE_N, \
     L1_SHAPE_K, L2_SHAPE_N, L2_SHAPE_K, kNumDispatchWarps, \
     kNumMMANonEpilogueWarps, kNumEpilogueWarps, kNumEpilogueWarpgroups, \
@@ -614,6 +636,12 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
     // RF decode: swapAB WGMMAs take the A operand from registers, decoded
     // per-thread straight from the packed scratch (fragment-ordered prepack).
     constexpr bool kRFDecode = kSwapABActive;
+    // OCC2 slim variant (small-M latency): 2 CTAs/SM via a shallow pipeline
+    // that fits under half the SM's SMEM plus a halved register budget. Only
+    // validated for the compact swapAB RF path (the host gates it there).
+    DG_STATIC_ASSERT(!kOcc2 or (kSwapABActive and kNumEpilogueThreads == 256 and
+                     kNumDispatchThreads == 64 and kNumNonEpilogueThreads == 64),
+                     "OCC2 requires the compact-frontend swapAB path");
     constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
     DG_STATIC_ASSERT(not kSwapABEligible or (BLOCK_M % 8 == 0),
                      "swapAB epilogue token chunks assume BLOCK_M is a multiple of 8");
@@ -716,8 +744,29 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t SMEM_CD_OUTPUT_WITH_SWAP_SIZE =
         SMEM_CD_OUTPUT_UNALIGNED_SIZE > SMEM_CD_SWAP_L1_SIZE ?
             SMEM_CD_OUTPUT_UNALIGNED_SIZE : SMEM_CD_SWAP_L1_SIZE;
-    constexpr uint32_t SMEM_CD_OUTPUT_SIZE = math::constexpr_align(
+    constexpr uint32_t SMEM_CD_OUTPUT_ALIGNED_BASE_SIZE = math::constexpr_align(
         SMEM_CD_OUTPUT_WITH_SWAP_SIZE, kSharedMemoryAlignment);
+    // OCC2: with the shallow pipeline the pre-barrier scratch can fall just
+    // short of the 2-chunk combine alias; pad the CD region (<= 4KB) so the
+    // chunking matches the deep-pipeline baseline instead of regressing to 4
+    // chunks. Mirror any change here in the host occ2 smem accounting.
+    constexpr uint32_t kOcc2TwoChunkAliasBytes = 3u * kNumEpilogueWarps * kHidden;  // 3 slots * (kHidden * 2B / 2 chunks)
+    constexpr uint32_t kOcc2PreBarrierBaseSize =
+        SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_ACCUM_SIZE +
+        SMEM_CD_OUTPUT_ALIGNED_BASE_SIZE +
+        kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE +
+                      SMEM_PACKED_B_SIZE_PER_STAGE + SMEM_B_COEFF_SIZE_PER_STAGE);
+    constexpr uint32_t kOcc2TwoChunkDeficit =
+        (kOcc2 and kHidden % 2 == 0 and kHidden <= 2 * 32 * 128 and
+         kOcc2PreBarrierBaseSize < kOcc2TwoChunkAliasBytes)
+            ? kOcc2TwoChunkAliasBytes - kOcc2PreBarrierBaseSize : 0u;
+#ifndef DG_OCC2_NO_PAD
+#define DG_OCC2_NO_PAD 0
+#endif
+    constexpr uint32_t SMEM_CD_PAD_SIZE =
+        (!DG_OCC2_NO_PAD and kOcc2TwoChunkDeficit > 0u and kOcc2TwoChunkDeficit <= 4096u)
+            ? math::constexpr_align(kOcc2TwoChunkDeficit, kSharedMemoryAlignment) : 0u;
+    constexpr uint32_t SMEM_CD_OUTPUT_SIZE = SMEM_CD_OUTPUT_ALIGNED_BASE_SIZE + SMEM_CD_PAD_SIZE;
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_ACCUM_SIZE + SMEM_CD_OUTPUT_SIZE;
 
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
@@ -793,7 +842,7 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
     auto dequant_barriers  = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + i; });
     auto combine_barriers  = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages * 3 + i; });
 
-#if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_PRELUT
+#if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_PRELUT && !DG_W4A8_INT_QOQ_ZP_PRELUT_CONST
     // Prestored ZP decode LUT: 32 s2 rows x 16 zero points x uint2 = 4096B,
     // placed after the barriers (outside the combine SMEM alias region).
     // The barrier region is a multiple of 8 bytes, so the uint2 (LDS.64)
@@ -839,7 +888,7 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
         }
         cutlass::arch::fence_barrier_init();
     }
-#if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_PRELUT
+#if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_PRELUT && !DG_W4A8_INT_QOQ_ZP_PRELUT_CONST
     // Stage the prestored ZP decode LUT into shared memory once; decode
     // sites then replace the per-row arithmetic LUT build with one LDS.64.
     {
@@ -925,15 +974,33 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
     //   128*48 + 128*40 + 256*208 = 64512 exactly.
     // The 512-epilogue-thread split-MN path trims front-end roles so the
     // four WGMMA warpgroups fit under the 64K CTA register budget.
-    constexpr uint32_t kNumDispatchRegisters    = kNumEpilogueThreads == 512 ? 32 : 48;
+    // OCC2 halves the per-CTA register budget (2 co-resident CTAs share the
+    // 64K SM register file): front-end warpgroup drops to the setmaxnreg
+    // floor (24) and the math warpgroups run at 80.
+    // IMPORTANT (root-caused 2026-07-13): the math alloc must stay within the
+    // ptxas per-thread budget implied by launch_bounds minBlocks=2 (65536/768
+    // = 85 -> 80 after setmaxnreg granularity). An inc target above that
+    // budget (112) silently produced broken code: dispatch pulls never
+    // completed -> l1_full deadlock even at 1 CTA/SM (LB1 bisect passed).
+    // DG_OCC2_BASELINE_REGS is a diagnostic-only codegen define (see host):
+    // keep the baseline 48/48/208 setmaxnreg values under kOcc2 to bisect
+    // register-reconfiguration bugs (only valid with a single-CTA grid).
+#ifndef DG_OCC2_BASELINE_REGS
+#define DG_OCC2_BASELINE_REGS 0
+#endif
+    constexpr bool kOcc2SlimRegs = kOcc2 and !DG_OCC2_BASELINE_REGS;
+    constexpr uint32_t kNumDispatchRegisters    = kOcc2SlimRegs ? 24 :
+        (kNumEpilogueThreads == 512 ? 32 : 48);
     constexpr bool kCompactFrontendWarpgroup = (kNumDispatchWarps == 2 and kNumMMANonEpilogueWarps == 2);
-    constexpr uint32_t kNumNonEpilogueRegisters = kNumEpilogueThreads == 512 ? 24 :
-        (kCompactFrontendWarpgroup ? kNumDispatchRegisters : 40);
-    constexpr uint32_t kNumEpilogueRegisters    = kNumEpilogueThreads == 512 ? 112 :
-        ((kSerialNWarpgroups or kWideNWarpgroups) ? 256 : 208);
+    constexpr uint32_t kNumNonEpilogueRegisters = kOcc2SlimRegs ? 24 :
+        (kNumEpilogueThreads == 512 ? 24 :
+        (kCompactFrontendWarpgroup ? kNumDispatchRegisters : 40));
+    constexpr uint32_t kNumEpilogueRegisters    = kOcc2SlimRegs ? 80 :
+        (kNumEpilogueThreads == 512 ? 112 :
+        ((kSerialNWarpgroups or kWideNWarpgroups) ? 256 : 208));
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
-                     kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
+                     kNumEpilogueRegisters * kNumEpilogueThreads <= (kOcc2SlimRegs ? 32256 : 64512),
                      "Too many registers");
 
     constexpr uint32_t kDispatchGridSyncIndex = 0;
@@ -1310,7 +1377,15 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
                 if (is_linear1_phase) {
                     const auto ptr = workspace.get_l1_full_count_ptr(pool_block_idx);
                     const auto expected = valid_m;
+#if DG_OCC2_SPIN_TRAP_L1FULL
+                    const auto spin_start = clock64();
+                    while (ptx::ld_acq(ptr) != expected) {
+                        if (clock64() - spin_start > 120000000000ll)
+                            __trap();
+                    }
+#else
                     while (ptx::ld_acq(ptr) != expected);
+#endif
                 }
             }
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -1439,7 +1514,15 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
                 if (is_linear1_phase) {
                     const auto ptr = workspace.get_l1_full_count_ptr(pool_block_idx);
                     const auto expected = valid_m;
+#if DG_OCC2_SPIN_TRAP_L1FULL
+                    const auto spin_start = clock64();
+                    while (ptx::ld_acq(ptr) != expected) {
+                        if (clock64() - spin_start > 120000000000ll)
+                            __trap();
+                    }
+#else
                     while (ptx::ld_acq(ptr) != expected);
+#endif
                 }
             }
 
@@ -2097,8 +2180,8 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
 #if DG_W4A8_INT_QOQ_ZP_PRELUT
                                 // Coeff byte 1 = raw zero point z; one LDS.64
                                 // fetches the prestored LUT row [s2][z].
-                                const uint2 zl_r0 = smem_zplut[((s2_r0 & 0x1fu) << 4) | ((cw_word_r0 >> 8) & 0xfu)];
-                                const uint2 zl_r1 = smem_zplut[((s2_r1 & 0x1fu) << 4) | ((cw_word_r1 >> 8) & 0xfu)];
+                                const uint2 zl_r0 = mxfp4::zp_prelut_fetch(smem_zplut, ((s2_r0 & 0x1fu) << 4) | ((cw_word_r0 >> 8) & 0xfu));
+                                const uint2 zl_r1 = mxfp4::zp_prelut_fetch(smem_zplut, ((s2_r1 & 0x1fu) << 4) | ((cw_word_r1 >> 8) & 0xfu));
                                 const uint32_t lutlo_r0 = zl_r0.x, luthi_r0 = zl_r0.y;
                                 const uint32_t lutlo_r1 = zl_r1.x, luthi_r1 = zl_r1.y;
 #else
@@ -2695,8 +2778,8 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
 #if DG_W4A8_INT_QOQ_ZP_PRELUT
                                 // Coeff byte 1 = raw zero point z; one LDS.64
                                 // fetches the prestored LUT row [s2][z].
-                                const uint2 zl_r0 = smem_zplut[((s2_r0 & 0x1fu) << 4) | ((cw_word_r0 >> 8) & 0xfu)];
-                                const uint2 zl_r1 = smem_zplut[((s2_r1 & 0x1fu) << 4) | ((cw_word_r1 >> 8) & 0xfu)];
+                                const uint2 zl_r0 = mxfp4::zp_prelut_fetch(smem_zplut, ((s2_r0 & 0x1fu) << 4) | ((cw_word_r0 >> 8) & 0xfu));
+                                const uint2 zl_r1 = mxfp4::zp_prelut_fetch(smem_zplut, ((s2_r1 & 0x1fu) << 4) | ((cw_word_r1 >> 8) & 0xfu));
                                 const uint32_t lutlo_r0 = zl_r0.x, luthi_r0 = zl_r0.y;
                                 const uint32_t lutlo_r1 = zl_r1.x, luthi_r1 = zl_r1.y;
 #else
@@ -4131,15 +4214,19 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
 #endif
 }
 
+#ifndef DG_OCC2_LB1
+#define DG_OCC2_LB1 0
+#endif
+
 template <DG_SM90_MXFP4_MOE_TEMPLATE_PARAMS>
-CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
+CUTLASS_GLOBAL __launch_bounds__(kNumThreads, (kOcc2 and !DG_OCC2_LB1) ? 2 : 1) void
 sm90_mxfp4_mega_moe_l1_impl(DG_SM90_MXFP4_MOE_KERNEL_ARGS_DECL) {
     sm90_mxfp4_mega_moe_core<DG_SM90_MXFP4_MOE_CORE_TEMPLATE_ARGS(MegaMoELinear1Phase)>(
         DG_SM90_MXFP4_MOE_KERNEL_ARGS);
 }
 
 template <DG_SM90_MXFP4_MOE_TEMPLATE_PARAMS>
-CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
+CUTLASS_GLOBAL __launch_bounds__(kNumThreads, (kOcc2 and !DG_OCC2_LB1) ? 2 : 1) void
 sm90_mxfp4_mega_moe_l2_impl(DG_SM90_MXFP4_MOE_KERNEL_ARGS_DECL) {
     sm90_mxfp4_mega_moe_core<DG_SM90_MXFP4_MOE_CORE_TEMPLATE_ARGS(MegaMoELinear2Phase)>(
         DG_SM90_MXFP4_MOE_KERNEL_ARGS);

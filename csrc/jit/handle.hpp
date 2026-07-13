@@ -113,6 +113,20 @@ static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& 
     return cudaLaunchKernelExC(&config, kernel, ptr_args);
 }
 
+static int get_max_active_blocks_per_sm(const KernelHandle& kernel, const int& num_threads, const int& smem_size) {
+    if (smem_size > 0) {
+        DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        // Multi-CTA/SM launches need the full SMEM carveout: the occupancy
+        // query assumes it, but the launch-time driver heuristic with a
+        // default preference may select a smaller split and silently halve
+        // the actual residency. Pin the preference to max shared.
+        DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    }
+    int num_blocks = 0;
+    DG_CUDA_RUNTIME_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks, kernel, num_threads, smem_size));
+    return num_blocks;
+}
+
 #else
 
 // Use CUDA driver API
@@ -216,6 +230,22 @@ template<typename... ActTypes>
 static auto launch_kernel(const KernelHandle& kernel, const LaunchConfigHandle& config, ActTypes&&... args) {
     void *ptr_args[] = { &args... };
     return lazy_cuLaunchKernelEx(&config, kernel, ptr_args, nullptr);
+}
+
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuOccupancyMaxActiveBlocksPerMultiprocessor);
+
+static int get_max_active_blocks_per_sm(const KernelHandle& kernel, const int& num_threads, const int& smem_size) {
+    if (smem_size > 0) {
+        DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
+        // Multi-CTA/SM launches need the full SMEM carveout: the occupancy
+        // query assumes it, but the launch-time driver heuristic with a
+        // default preference may select a smaller split and silently halve
+        // the actual residency. Pin the preference to max shared.
+        DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(kernel, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100));
+    }
+    int num_blocks = 0;
+    DG_CUDA_DRIVER_CHECK(lazy_cuOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks, kernel, num_threads, smem_size));
+    return num_blocks;
 }
 #endif
 
