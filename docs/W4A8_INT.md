@@ -276,8 +276,7 @@ python3 tests/bench_int_prologue.py --qoq --block-n 256 \
 
 ## 五、附件与边界
 
-- `docs/w4a8_int_flowchart.html` —— SVG 计算流程图（两段实现/量化/promote 全细节）;
-- `docs/w4a8_int_flow.html` —— 分段文字版流程说明;
+- `docs/w4a8_int_flow.html` —— 计算流程（上半 SVG 总览图 + 下半分段文字说明,一个文件）;
 - 已知边界:swapAB 段要求 block_n=128 prepack,PRE 段建议 block_n=256（两份
   scale plane 可共存）;实验性开关（`_SHADOW/_QOQ_FULLK/_SMALLN_DUAL/_PRELUT_CONST`
   等）默认关,为实测无收益或场景特定的留档;
