@@ -86,7 +86,7 @@
 <line x1="910" y1="578" x2="910" y2="604" class="e"/>
 <rect x="690" y="604" width="440" height="58" class="b flt"/><text x="700" y="625" class="t">promote 只做一次（K循环结束后）</text><text x="700" y="643" class="s">×token缩放×s1×整数转浮点</text>
 <line x1="910" y1="662" x2="910" y2="796" class="e"/>
-<rect x="690" y="672" width="440" height="118" class="b" style="fill:#f0fdf4;stroke:#16a34a"/><text x="700" y="692" class="t" font-weight="700">v3 实际行为：每个 SM 住几个 CTA（逐点矩阵）</text><text x="710" y="714" class="s" font-family="monospace">        M1    M2~M8    M16~1024   M≥1280(B路径)</text><text x="710" y="733" class="s" font-family="monospace">flash    1      2         1           1</text><text x="710" y="752" class="s" font-family="monospace">pro      2      2         1           1</text><text x="700" y="774" class="s">2=双CTA低延迟档（实测 M8：flash −15% / pro −12%）。flash M1 例外：协议开销主导，</text><text x="700" y="788" class="s">开双CTA实测 +43% 故排除；M≥16 吞吐受限需 8 段深流水，双CTA无益，自动单CTA。</text>
+<rect x="690" y="672" width="440" height="118" class="b" style="fill:#f0fdf4;stroke:#16a34a"/><text x="700" y="692" class="t" font-weight="700">v3 实际行为：每个 SM 住几个 CTA（逐点矩阵）</text><text x="710" y="714" class="s" font-family="monospace">        M1    M2~M8    M16~1024   M≥1280(B路径)</text><text x="710" y="733" class="s" font-family="monospace">flash    1      2         1           1</text><text x="710" y="752" class="s" font-family="monospace">pro      2      2         1           1</text><text x="700" y="770" class="s">表中数字 = 每个SM同时驻留的CTA个数：<tspan font-weight="700">1=常规档</tspan>（单CTA独占SM，流水8段深预取）；</text><text x="700" y="784" class="s"><tspan font-weight="700">2=低延迟档</tspan>（双CTA共驻，各4段流水互填空转；M8实测flash−15%/pro−12%。flash M1开2实测+43%故为1）</text>
 
 <!-- 汇合：L1 epilogue -->
 <rect x="60" y="796" width="1070" height="96" class="b pl"/>
@@ -162,7 +162,7 @@
   <div class="note">解码的 ALU 全部发生在上一批 WGMMA 的异步空窗里（发射完矩阵乘指令后 tensor core 自己转几百拍，CUDA core 正好去解下一批的码）——tensor core 和 CUDA core 是两种独立硬件，流水并行。</div>
   <div class="note"><b>v3 实际行为：每个 SM 住几个 CTA（逐点矩阵，运行时自动）</b><br><pre style="margin:6px 0;font-size:12.5px">        M1    M2~M8    M16~1024   M≥1280(预解码路径)
 flash    1      2         1           1
-pro      2      2         1           1</pre>为什么：双CTA（=2）用于延迟受限的极小 M——两条独立流水线互相填等待气泡（实测 M8：flash −15%、pro −12%）。flash M1 是唯一例外：该点协议开销主导、没有数学气泡可填，开双CTA实测反而 +43%，故排除。M≥16 起流水线被吞吐喂饱，需要 8 段深预取，双CTA无益，自动回单CTA（路径与 v2 逐位一致）。</div>
+pro      2      2         1           1</pre>表中数字 = 每个 SM 同时驻留的 CTA 个数：<b>1 = 常规档</b>（单 CTA 独占整个 SM 的共享内存/寄存器，流水线 8 段深预取，适合吞吐受限场景）；<b>2 = 低延迟档</b>（两个瘦身 CTA 共驻一个 SM，各 4 段流水，互相填补等待空转，适合延迟受限的极小 M）。<br>为什么：双CTA（=2）用于延迟受限的极小 M——两条独立流水线互相填等待气泡（实测 M8：flash −15%、pro −12%）。flash M1 是唯一例外：该点协议开销主导、没有数学气泡可填，开双CTA实测反而 +43%，故排除。M≥16 起流水线被吞吐喂饱，需要 8 段深预取，双CTA无益，自动回单CTA（路径与 v2 逐位一致）。</div>
 </div>
 
 <h2>二B、token 数 ≥ 1280：预解码路径（先整层解好码，GEMM 里不再解码）</h2>
