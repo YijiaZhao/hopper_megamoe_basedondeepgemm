@@ -55,7 +55,7 @@
 <line x1="910" y1="578" x2="910" y2="604" class="e"/>
 <rect x="690" y="604" width="440" height="58" class="b flt"/><text x="700" y="625" class="t">promote 只做一次（K循环结束后）</text><text x="700" y="643" class="s">×token缩放×s1×整数转浮点</text>
 <line x1="910" y1="662" x2="910" y2="796" class="e"/>
-<rect x="690" y="676" width="440" height="106" class="b" style="fill:#f0fdf4;stroke:#16a34a"/><text x="700" y="698" class="t" font-weight="700">v3 低延迟档（A路径内，自动门控：pro M1-8 / flash M2-8）</text><text x="700" y="717" class="s">小token时流水线是延迟受限（4位读量仅FP8一半却只打平→带宽没用满）</text><text x="700" y="734" class="s">流水线8段→4段瘦身 + 寄存器按角色配给 → 两个CTA共驻一个SM</text><text x="700" y="751" class="s">两条独立流水线互相填掉对方等搬运/等唤醒的空转（SM级预取总量不变）</text><text x="700" y="768" class="s">实测 pro M8 −12% / flash M8 −15%；token≥16 自动回单CTA深流水</text>
+<rect x="690" y="672" width="440" height="118" class="b" style="fill:#f0fdf4;stroke:#16a34a"/><text x="700" y="692" class="t" font-weight="700">v3 判定：每个 SM 住几个 CTA？（运行时自动，按 M 与模型）</text><rect x="700" y="700" width="420" height="24" class="b int"/><text x="708" y="716" class="s">pro M1~8｜flash M2~8　→　<tspan font-weight="700">2 个CTA</tspan>（流水4段×2，互填空转；M8实测−12~−15%）</text><rect x="700" y="728" width="420" height="24" class="b" style="fill:#fff7ed;stroke:#ea580c"/><text x="708" y="744" class="s">flash M1　→　<tspan font-weight="700">1 个</tspan>（协议开销主导、无气泡可填；双CTA实测+43%，禁用）</text><rect x="700" y="756" width="420" height="24" class="b" style="fill:#f8fafc;stroke:#94a3b8"/><text x="708" y="772" class="s">M≥16 及 B 预解码路径　→　<tspan font-weight="700">1 个</tspan>（吞吐受限，要 8 段深流水；双CTA无益）</text>
 
 <!-- 汇合：L1 epilogue -->
 <rect x="60" y="796" width="1070" height="96" class="b pl"/>
