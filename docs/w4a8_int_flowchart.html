@@ -34,7 +34,7 @@
 
 <!-- 左列：swapAB -->
 <text x="60" y="305" class="h">A. token≤1024：预存表解码（v3）+ 小M双CTA档</text>
-<rect x="60" y="320" width="440" height="58" class="b hw"/><text x="70" y="341" class="t">TMA 搬运引擎（6级流水，边算边搬）</text><text x="70" y="359" class="s">4位打包权重 + 元数据字 + 激活8位字节 → 共享内存</text>
+<rect x="60" y="320" width="440" height="58" class="b hw"/><text x="70" y="341" class="t">TMA 搬运引擎（4~8级流水（按档位自动选），边算边搬）</text><text x="70" y="359" class="s">4位打包权重 + 元数据字 + 激活8位字节 → 共享内存</text>
 <line x1="280" y1="378" x2="280" y2="404" class="e"/>
 <rect x="60" y="404" width="440" height="74" class="b int"/><text x="70" y="425" class="t">取预存解码表（v3：编译期算好，启动搬一次）</text><text x="70" y="443" class="s">表项={(0−z)×s2,…,(7−z)×s2}；(s2,z)组合仅18×16=288种→全部预存(2.3KB)</text><text x="70" y="460" class="s">按本组(s2,z)取8字节一行，建表指令归零（flash M1 −23%）；对称格式仍现场建（2条乘法）</text>
 <line x1="280" y1="478" x2="280" y2="504" class="e"/>
