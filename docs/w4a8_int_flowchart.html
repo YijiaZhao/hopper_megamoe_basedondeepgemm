@@ -12,7 +12,7 @@
 </style>
 </defs>
 
-<text x="30" y="34" class="h" font-size="19">W4A8-int（QServe两级量化+零点）专家层计算流程 — H20</text>
+<text x="30" y="34" class="h" font-size="19">W4A8-int（QServe两级量化+零点）专家层计算流程 — H20（v3）</text>
 <text x="30" y="56" class="s">绿=整数域(bit精确)　红=浮点域　黄=存储搬运　蓝=硬件单元</text>
 
 <!-- 离线量化 -->
@@ -33,10 +33,10 @@
 <line x1="715" y1="252" x2="900" y2="252" class="e"/><text x="750" y="245" class="s">否 → 预解码路径</text>
 
 <!-- 左列：swapAB -->
-<text x="60" y="305" class="h">A. token≤1024：寄存器查表解码</text>
+<text x="60" y="305" class="h">A. token≤1024：预存表解码（v3）+ 小M双CTA档</text>
 <rect x="60" y="320" width="440" height="58" class="b hw"/><text x="70" y="341" class="t">TMA 搬运引擎（6级流水，边算边搬）</text><text x="70" y="359" class="s">4位打包权重 + 元数据字 + 激活8位字节 → 共享内存</text>
 <line x1="280" y1="378" x2="280" y2="404" class="e"/>
-<rect x="60" y="404" width="440" height="74" class="b int"/><text x="70" y="425" class="t">现场建表（每行、每128个K重建；2寄存器/张）</text><text x="70" y="443" class="s">表项 = {(0−z)×s2, (1−z)×s2, …, (7−z)×s2}</text><text x="70" y="460" class="s">两条32位乘法生成 + 按字节加合并（普通加法会跨字节进位→坑）</text>
+<rect x="60" y="404" width="440" height="74" class="b int"/><text x="70" y="425" class="t">取预存解码表（v3：编译期算好，启动搬一次）</text><text x="70" y="443" class="s">表项={(0−z)×s2,…,(7−z)×s2}；(s2,z)组合仅18×16=288种→全部预存(2.3KB)</text><text x="70" y="460" class="s">按本组(s2,z)取8字节一行，建表指令归零（flash M1 −23%）；对称格式仍现场建（2条乘法）</text>
 <line x1="280" y1="478" x2="280" y2="504" class="e"/>
 <rect x="60" y="504" width="440" height="74" class="b int"/><text x="70" y="525" class="t">查表解码（藏在上一批矩阵乘的异步空窗里）</text><text x="70" y="543" class="s">低3位作索引，byte_perm 一条查4个权重 → 直接得 (w4−z)×s2 的8位整数</text><text x="70" y="560" class="s">高半区按字节加 8×s2；产物留寄存器，即用即弃</text>
 <line x1="280" y1="578" x2="280" y2="604" class="e"/>
@@ -55,6 +55,7 @@
 <line x1="910" y1="578" x2="910" y2="604" class="e"/>
 <rect x="690" y="604" width="440" height="58" class="b flt"/><text x="700" y="625" class="t">promote 只做一次（K循环结束后）</text><text x="700" y="643" class="s">×token缩放×s1×整数转浮点</text>
 <line x1="910" y1="662" x2="910" y2="796" class="e"/>
+<rect x="690" y="676" width="440" height="106" class="b" style="fill:#f0fdf4;stroke:#16a34a"/><text x="700" y="698" class="t" font-weight="700">v3 低延迟档（A路径内，自动门控：pro M1-8 / flash M2-8）</text><text x="700" y="717" class="s">小token时流水线是延迟受限（4位读量仅FP8一半却只打平→带宽没用满）</text><text x="700" y="734" class="s">流水线8段→4段瘦身 + 寄存器按角色配给 → 两个CTA共驻一个SM</text><text x="700" y="751" class="s">两条独立流水线互相填掉对方等搬运/等唤醒的空转（SM级预取总量不变）</text><text x="700" y="768" class="s">实测 pro M8 −12% / flash M8 −15%；token≥16 自动回单CTA深流水</text>
 
 <!-- 汇合：L1 epilogue -->
 <rect x="60" y="796" width="1070" height="96" class="b pl"/>
@@ -88,6 +89,6 @@
 
 <text x="60" y="1300" class="s">分段依据：swapAB段权重每64个token重复解码一遍（开销∝token数），预解码段每层一次全场共享（固定0.5ms）→ 交叉点≈1024</text>
 <text x="60" y="1320" class="s">指令事实：SM90的WGMMA形状 m64 × n(8..256可选) × k(8位输入固定32)；"扩大K"发生在累加器链长层面而非指令层面</text>
-<text x="60" y="1340" class="s">对应实现：sm90_mxfp4_mega_moe.cuh（DG_W4A8_INT/_PRE/_QOQ/_QOQ_ZP）；实验记录见 W4A8_INT_HANDOFF.md　2026-07-09</text>
+<text x="60" y="1340" class="s">对应实现：sm90_mxfp4_mega_moe.cuh（DG_W4A8_INT/_L2/_QOQ/_QOQ_ZP/_QOQ_ZP_PRELUT/_SMALLM_OCC2/_PRE，前六项全开=v3最快配置）；设计与性能表见 W4A8_INT.md　2026-07-14（v3）</text>
 </svg>
 </body></html>

@@ -24,7 +24,7 @@
 </head>
 <body>
 
-<h1>W4A8-int（QServe 两级量化 + zero point）MoE 专家层计算全流程 — H20 / SM90</h1>
+<h1>W4A8-int（QServe 两级量化 + zero point）MoE 专家层计算全流程 — H20 / SM90（v3）</h1>
 <div class="legend">
   <span class="box int">整数域（bit 精确）</span>
   <span class="box flt">浮点域</span>
@@ -59,13 +59,14 @@
   <span class="box mem">4 位打包权重 + 元数据字 + 激活整数字节，装进共享内存（6 级流水，边算边搬）</span><br>
 
   <span class="box">① 数学 warp 读本行元数据字：取出 s2、z、s1</span><span class="arrow">→</span>
-  <span class="box int">② <b>现场建表</b>（每行每段重建，只占 2 个寄存器/张）：表 = { (0−z)×s2, (1−z)×s2, …, (7−z)×s2 }，用两条 32 位乘法 + 一条按字节加法一次生成 4 个表项（注意必须按字节加，普通加法会跨字节进位——踩过的坑）</span><br>
+  <span class="box int">② <b>取解码表</b>（v3 起为预存表）：表 = { (0−z)×s2, (1−z)×s2, …, (7−z)×s2 }。关键观察：(s2, z) 的组合总共只有 18×16=288 种 → 全部 288 行乘积表在<b>编译期</b>就算好、写死在程序体里，kernel 启动时一次性搬进共享内存（2.3KB），解码时按本组的 (s2,z) 直接取 8 字节一行——建表指令归零（此优化 flash M1 −23%）。早期的"现场建表"（两条 32 位乘法批量生成表项，合并零点必须按字节加、普通加法会跨字节进位——踩过的坑）保留为对称格式（无零点）路径，因其本来就只要 2 条指令</span><br>
 
   <span class="box int">③ <b>查表解码</b>：每个权重取 4 位中的低 3 位当索引，一条 byte_perm 指令同时查 4 个权重，直接吐出"乘好 s2、减好 z"的 8 位整数；高位半区（原值 ≥8 的）再统一按字节加上 8×s2。产物留在寄存器，用完即弃，不占长期空间</span><span class="arrow">→</span>
   <span class="box hw">④ tensor core：WGMMA 指令（固定形状 m64×n×k32，8 位输入的 k 永远是 32），权重当 A 从寄存器喂、token 当 B（这就是 swapAB：token 少时换个方向填满 64 行的硬件格子），<b>4 条指令首尾相接累进同一个 32 位整数累加器</b>（同一把尺子才能同账累加——s2 已折光，所以合法）</span><br>
 
   <span class="box flt">⑤ <b>promote（补缩放）</b>：4 条指令全部落定后，把整数累加器转成浮点，乘上「该 token 的缩放 × 该行的 s1」（两个缩放沿不同轴变化，只能在输出网格上逐元素补），累进最终浮点累加器。每 128 个 K 才做一次，且实测不在关键路径上（同一 SM 上邻居 warp 的搬运和矩阵乘自然把它盖住），所以不必额外买重叠</span>
   <div class="note">解码的 ALU 全部发生在上一批 WGMMA 的异步空窗里（发射完矩阵乘指令后 tensor core 自己转几百拍，CUDA core 正好去解下一批的码）——tensor core 和 CUDA core 是两种独立硬件，流水并行。</div>
+  <div class="note"><b>v3 低延迟档（小 token 数专用，自动启用：pro M1-8 / flash M2-8）</b>：token 很少时流水线是"延迟受限"而非带宽受限（证据：4 位权重读量只有 FP8 的一半却只能打平 → 带宽根本没用满，时间耗在等搬运/等唤醒的空转里）。做法：把流水线从 8 段瘦身到 4 段、寄存器按角色重新配给，让<b>两个 CTA 共驻同一个 SM</b>——两条独立流水线互相填掉对方的空转气泡（SM 级预取总量不变，2×4=8 段，变的只是组织方式）。实测 pro M8 −12%、flash M8 −15%；token 数 ≥16 后流水线自然喂饱，自动回到单 CTA 深流水，路径逐位不变。</div>
 </div>
 
 <h2>二B、token 数 ≥ 1280：预解码路径（先整层解好码，GEMM 里不再解码）</h2>
@@ -104,6 +105,6 @@
 </table>
 <div class="note warn">核心不变式：<b>WGMMA 前后是一条"整数国境线"</b>——所有能折进整数域的缩放（s2、z）在解码前搞定，所有必须是浮点的缩放（s1、token 缩放）在累加后搞定，中间的矩阵乘累加是纯整数、bit 精确、零舍入。</div>
 
-<p style="color:#718096;font-size:12px">对应实现：deepgemm_mxfp4 / sm90_mxfp4_mega_moe.cuh（开关 DG_W4A8_INT / _PRE / _QOQ / _QOQ_ZP）；细节与实验记录见同目录 W4A8_INT_HANDOFF.md。2026-07-09。</p>
+<p style="color:#718096;font-size:12px">对应实现：deep_gemm/include/deep_gemm/impls/sm90_mxfp4_mega_moe.cuh（开关 DG_W4A8_INT / _L2 / _QOQ / _QOQ_ZP / _QOQ_ZP_PRELUT / _SMALLM_OCC2 / _PRE，最快配置为前六项全开即 v3）；设计、优化策略与性能表见同目录 W4A8_INT.md。2026-07-14（v3）。</p>
 </body>
 </html>
