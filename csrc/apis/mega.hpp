@@ -71,8 +71,22 @@ get_symm_buffer_size_for_mega_moe(
     const auto bf16_token_layout = layout::Data(hidden * 2);
     const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
     const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0);
+    // The intermediate (L2 acts) SF region is M-major in every consumer: the
+    // kernel writes via `sf_base[k_sf_idx * sf_ring_stride_tokens + token]`,
+    // and the TMA descriptor + python view stride the same token count
+    // (`{1, num_sf_ring_tokens}`). The per-token byte count here is therefore
+    // a pure region-sizing quantity, never a TMA row -- skip the 16B
+    // per-token alignment requirement (shapes like IH=640 have IH/16 = 40B
+    // and are otherwise fully supported). What alignment actually needs is
+    // asserted below: `num_sf_ring_tokens % 4 == 0` (the real M-major
+    // stride, keeps the TMA row stride 16B-aligned) and
+    // `intermediate_hidden % 128 == 0` (with S % 4 == 0 this keeps the
+    // region TOTAL 16B-aligned, so the next buffer's base stays TMA-legal).
+    // Must stay in sync with the kernel-side layout mirror in
+    // impls/sm90_mxfp4_mega_moe.cuh (same flag there).
     const auto intermediate_sf_layout = layout::Data(
-        get_num_intermediate_sf_bytes_per_token(mma_kind, intermediate_hidden));
+        get_num_intermediate_sf_bytes_per_token(mma_kind, intermediate_hidden),
+        /*require_tma_alignment=*/false);
     // SM90 (`fp8xmxfp4`) exposes SF as per-128 (input) / per-64 (intermediate)
     // channel floats; SM100 packs 4 UE8M0 bytes per int. Byte counts for the
     // input SF match, so only the view dtype and the L2 SF width differ.

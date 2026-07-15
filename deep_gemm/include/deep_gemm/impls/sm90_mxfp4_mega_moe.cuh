@@ -589,8 +589,14 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
     constexpr auto fp8_intermediate_token_layout = layout::Data(kIntermediateHidden);
     // Per-128 K float SF: 4 bytes per per-128 group => `kHidden / 32` bytes/token (same as SM100 packing)
     constexpr auto fp8_sf_layout                 = layout::Data(kHidden / 32);
-    // Per-64 K float SF (SM90 only): 4 bytes per per-64 group => `kIntermediateHidden / 16` bytes/token
-    constexpr auto fp8_intermediate_sf_layout    = layout::Data(kIntermediateHidden / 16);
+    // Per-64 K float SF (SM90 only): 4 bytes per per-64 group => `kIntermediateHidden / 16` bytes/token.
+    // The SF region is M-major (writes stride kSFRingStrideTokens; TMA map /
+    // python view stride kNumSFRingTokens) -- the per-token byte count only
+    // sizes the region and is never a TMA row, so it is exempt from the 16B
+    // per-token alignment check (e.g. IH=640 -> 40B/token). The region TOTAL
+    // stays 16B-aligned via kNumSFRingTokens % 4 == 0 and IH % 128 == 0.
+    // Mirrors the host-side layout in csrc/apis/mega.hpp (same flag).
+    constexpr auto fp8_intermediate_sf_layout    = layout::Data(kIntermediateHidden / 16, false);
     constexpr auto input_topk_idx_layout         = layout::Data(kNumTopk * sizeof(int64_t), false);
     constexpr auto input_topk_weights_layout     = layout::Data(kNumTopk * sizeof(float), false);
     constexpr auto l1_topk_weights_layout        = layout::Data(sizeof(float), false);
