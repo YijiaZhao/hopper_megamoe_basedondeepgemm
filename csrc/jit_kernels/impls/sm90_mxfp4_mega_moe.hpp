@@ -96,6 +96,14 @@ public:
         const int w4a8_int_shadow = get_env<int>("DG_W4A8_INT_SHADOW", 0) != 0 ? 1 : 0;
         const int w4a8_int_qoq = get_env<int>("DG_W4A8_INT_QOQ", 0) != 0 ? 1 : 0;
         const int w4a8_int_qoq_zp = get_env<int>("DG_W4A8_INT_QOQ_ZP", 0) != 0 ? 1 : 0;
+        // SHIFTXOR (customer-suggested decode variant): shift+mask + per-byte
+        // z-subtract decode with s2 deferred to the fp32 promote. Replaces
+        // PRELUT entirely (mutually exclusive; SHIFTXOR wins when both are
+        // set) and needs no smem table. Same prepack as PRELUT (byte 1 = raw
+        // z). Off under PRE (the prologue bakes (w4-z)*s2 already).
+        const int w4a8_int_qoq_zp_shiftxor =
+            (get_env<int>("DG_W4A8_INT_QOQ_ZP_SHIFTXOR", 0) != 0 and
+             w4a8_int_qoq_zp and w4a8_int_qoq and not w4a8_int_pre) ? 1 : 0;
         // Prestored ZP decode LUT: replaces the per-row arithmetic LUT build
         // with one LDS.64 from a 4KB smem table. Only meaningful on the
         // in-kernel QoQ+ZP decode path; PRE mode's prologue dequant never
@@ -103,7 +111,8 @@ public:
         // Keep this gating in sync with the smem_size addition below.
         const int w4a8_int_qoq_zp_prelut =
             (get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT", 0) != 0 and
-             w4a8_int_qoq_zp and w4a8_int_qoq and not w4a8_int_pre) ? 1 : 0;
+             w4a8_int_qoq_zp and w4a8_int_qoq and not w4a8_int_pre and
+             not w4a8_int_qoq_zp_shiftxor) ? 1 : 0;
         // PRELUT_CONST: direct __constant__ LUT fetch, no smem staging (and
         // no 4KB smem_size addition -- keep in sync with the size code below).
         // M-gated dispatch (same pattern as occ2): measured H20 wins are the
@@ -149,6 +158,7 @@ public:
 #define DG_W4A8_INT_QOQ_ZP {}
 #define DG_W4A8_INT_QOQ_ZP_PRELUT {}
 #define DG_W4A8_INT_QOQ_ZP_PRELUT_CONST {}
+#define DG_W4A8_INT_QOQ_ZP_SHIFTXOR {}
 #include <deep_gemm/impls/sm90_mxfp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -192,6 +202,7 @@ static void __instantiate_kernel() {{
     w4a8_int_qoq_zp,
     w4a8_int_qoq_zp_prelut,
     w4a8_int_qoq_zp_prelut_const,
+    w4a8_int_qoq_zp_shiftxor,
     kernel_symbol,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
@@ -297,10 +308,12 @@ static void sm90_mxfp4_mega_moe(
     if (pre_decoded_b)
         config.swap_ab = false;
     // Prestored ZP decode LUT smem: 32 x 16 uint2 = 4096 bytes staged after
-    // the barrier region. Mirror generate_impl's gating (off under PRE).
+    // the barrier region. Mirror generate_impl's gating (off under PRE, and
+    // off under SHIFTXOR which replaces PRELUT with a table-free decode).
     const bool zp_prelut = get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT", 0) != 0 and
         get_env<int>("DG_W4A8_INT_QOQ_ZP", 0) != 0 and
-        get_env<int>("DG_W4A8_INT_QOQ", 0) != 0 and not pre_decoded_b;
+        get_env<int>("DG_W4A8_INT_QOQ", 0) != 0 and not pre_decoded_b and
+        get_env<int>("DG_W4A8_INT_QOQ_ZP_SHIFTXOR", 0) == 0;
     // PRELUT_CONST reads the table straight from __constant__: no smem copy.
     // MUST mirror generate_impl's M-gate exactly (host smem_size contract).
     const bool zp_prelut_const = zp_prelut and

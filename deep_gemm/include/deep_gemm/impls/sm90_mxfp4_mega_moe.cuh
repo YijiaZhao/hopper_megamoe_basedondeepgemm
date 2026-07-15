@@ -89,6 +89,28 @@
 #define DG_W4A8_INT_QOQ_ZP_PRELUT_CONST 0
 #endif
 
+// SHIFTXOR (customer-suggested decode variant): the swapAB RF decode becomes
+// a pure shift+mask nibble spread + per-byte z subtract (see int4_dequant's
+// decode_uint4_prmt_groups_to_int8_pair_zsub) emitting (w4 - z); s2 is NOT
+// folded at decode -- its group width (128) equals the K128 promote segment,
+// so it rides the fp32 promote like s1 (exact: |s2 * acc| < 2^24). Replaces
+// PRELUT entirely: no smem/constant table, no staging, no per-row LUT build.
+// Coeff byte 1 carries the RAW zero point z (same prepack as PRELUT). The
+// non-swapAB smem decode keeps fold-at-decode, building its arithmetic LUT
+// from the raw z. Env-gated by the host: DG_W4A8_INT_QOQ_ZP_SHIFTXOR=1.
+#ifndef DG_W4A8_INT_QOQ_ZP_SHIFTXOR
+#define DG_W4A8_INT_QOQ_ZP_SHIFTXOR 0
+#endif
+#if DG_W4A8_INT_QOQ_ZP_SHIFTXOR && DG_W4A8_INT_QOQ_ZP_PRELUT
+#error "SHIFTXOR replaces PRELUT; the host must enable at most one"
+#endif
+#if DG_W4A8_INT_QOQ_ZP_SHIFTXOR && !(DG_W4A8_INT_QOQ && DG_W4A8_INT_QOQ_ZP)
+#error "SHIFTXOR requires the QoQ zero-point path"
+#endif
+#if DG_W4A8_INT_QOQ_ZP_SHIFTXOR && DG_W4A8_INT_QOQ_FULLK
+#error "SHIFTXOR defers s2 per K128; incompatible with the full-K chain"
+#endif
+
 // iter17: relative pre-scaled LUT fold. Each K32 group inside a K128 block is
 // decoded against the LUT row for d = e_max - e_group, so the four WGMMAs of a
 // block share one scale (2^(e_max - 127)) and one accumulator: the per-K32
@@ -163,6 +185,14 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_unscaled(
         const uint2 zl = zp_prelut_fetch(zplut, ((qoq_s2 & 0x1fu) << 4) | ((cw >> 8) & 0xfu));
         qoq_lut_lo = zl.x;
         qoq_lut_hi = zl.y;
+#elif DG_W4A8_INT_QOQ_ZP_SHIFTXOR
+        // SHIFTXOR prepack: byte 1 carries the RAW zero point z. This
+        // non-swapAB smem decode keeps fold-at-decode; build the LUT from z:
+        // per byte (i*s2 - z*s2) mod 256 == ((i - z) * s2) mod 256, exactly
+        // the values the nz build below produces.
+        const uint32_t zs2 = ((cw >> 8) & 0xffu) * qoq_s2;
+        qoq_lut_lo = __vsub4(qoq_s2 * 0x03020100u, zs2 * 0x01010101u);
+        qoq_lut_hi = __vsub4(qoq_s2 * 0x07060504u, zs2 * 0x01010101u);
 #else
         // Byte 1 of the coeff word carries nz = (-z*s2) mod 256, precomputed
         // at PREPACK time (saves the per-row multiply+negate here).
@@ -2177,7 +2207,17 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 const uint32_t s2_r0 = cw_word_r0 & 0xffu;
                                 const uint32_t s2_r1 = cw_word_r1 & 0xffu;
 #if DG_W4A8_INT_QOQ_ZP
-#if DG_W4A8_INT_QOQ_ZP_PRELUT
+#if DG_W4A8_INT_QOQ_ZP_SHIFTXOR
+                                // SHIFTXOR: coeff byte 1 = raw zero point z; no
+                                // LUT at all. z is splatted for the per-byte
+                                // subtract in the shift+mask decode and s2 is
+                                // deferred to the promote (exact there: the
+                                // integer product s2 * acc stays below 2^24).
+                                const uint32_t zz_r0 = ((cw_word_r0 >> 8) & 0xffu) * 0x01010101u;
+                                const uint32_t zz_r1 = ((cw_word_r1 >> 8) & 0xffu) * 0x01010101u;
+                                const float s2f_r0 = static_cast<float>(s2_r0);
+                                const float s2f_r1 = static_cast<float>(s2_r1);
+#elif DG_W4A8_INT_QOQ_ZP_PRELUT
                                 // Coeff byte 1 = raw zero point z; one LDS.64
                                 // fetches the prestored LUT row [s2][z].
                                 const uint2 zl_r0 = mxfp4::zp_prelut_fetch(smem_zplut, ((s2_r0 & 0x1fu) << 4) | ((cw_word_r0 >> 8) & 0xfu));
@@ -2210,7 +2250,12 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                     const uint32_t w1 = B == 0 ? rf_words1.x : B == 1 ? rf_words1.y :
                                                         B == 2 ? rf_words1.z : rf_words1.w;
 #if DG_W4A8_INT_QOQ
-#if DG_W4A8_INT_QOQ_ZP
+#if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_SHIFTXOR
+                                    // Shift+mask spread + per-byte z subtract;
+                                    // emits (w4 - z), s2 deferred to promote.
+                                    const uint2 d0 = int4q::decode_uint4_prmt_groups_to_int8_pair_zsub(w0, zz_r0);
+                                    const uint2 d1 = int4q::decode_uint4_prmt_groups_to_int8_pair_zsub(w1, zz_r1);
+#elif DG_W4A8_INT_QOQ_ZP
                                     const uint2 d0 = int4q::decode_uint4_prmt_groups_to_int8_pair_lut_zp(
                                         w0, lutlo_r0, luthi_r0, s2_r0);
                                     const uint2 d1 = int4q::decode_uint4_prmt_groups_to_int8_pair_lut_zp(
@@ -2325,10 +2370,21 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                     const auto acc_at = [&](const uint32_t j) {
                                         return kIntChainAccum ? iacc[j] : iacc[j] + iacc2[j];
                                     };
+#if DG_W4A8_INT_QOQ && DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_SHIFTXOR
+                                    // Deferred s2: float(acc) * float(s2) is
+                                    // EXACT (integer product < 2^24), so the
+                                    // promote sequence below stays bit-identical
+                                    // to the fold-at-decode paths.
+                                    const float s0 = static_cast<float>(acc_at(i*4+0)) * s2f_r0;
+                                    const float s2 = static_cast<float>(acc_at(i*4+2)) * s2f_r1;
+                                    const float s1 = static_cast<float>(acc_at(i*4+1)) * s2f_r0;
+                                    const float s3 = static_cast<float>(acc_at(i*4+3)) * s2f_r1;
+#else
                                     const float s0 = static_cast<float>(acc_at(i*4+0));
                                     const float s2 = static_cast<float>(acc_at(i*4+2));
                                     const float s1 = static_cast<float>(acc_at(i*4+1));
                                     const float s3 = static_cast<float>(acc_at(i*4+3));
+#endif
                                     final_accum[i * 4 + 0] += itok[i][0] * gate_sf * w_r0 * s0;
                                     final_accum[i * 4 + 2] += itok[i][0] * up_sf   * w_r1 * s2;
                                     final_accum[i * 4 + 1] += itok[i][1] * gate_sf * w_r0 * s1;
@@ -2775,7 +2831,17 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 const uint32_t s2_r0 = cw_word_r0 & 0xffu;
                                 const uint32_t s2_r1 = cw_word_r1 & 0xffu;
 #if DG_W4A8_INT_QOQ_ZP
-#if DG_W4A8_INT_QOQ_ZP_PRELUT
+#if DG_W4A8_INT_QOQ_ZP_SHIFTXOR
+                                // SHIFTXOR: coeff byte 1 = raw zero point z; no
+                                // LUT at all. z is splatted for the per-byte
+                                // subtract in the shift+mask decode and s2 is
+                                // deferred to the promote (exact there: the
+                                // integer product s2 * acc stays below 2^24).
+                                const uint32_t zz_r0 = ((cw_word_r0 >> 8) & 0xffu) * 0x01010101u;
+                                const uint32_t zz_r1 = ((cw_word_r1 >> 8) & 0xffu) * 0x01010101u;
+                                const float s2f_r0 = static_cast<float>(s2_r0);
+                                const float s2f_r1 = static_cast<float>(s2_r1);
+#elif DG_W4A8_INT_QOQ_ZP_PRELUT
                                 // Coeff byte 1 = raw zero point z; one LDS.64
                                 // fetches the prestored LUT row [s2][z].
                                 const uint2 zl_r0 = mxfp4::zp_prelut_fetch(smem_zplut, ((s2_r0 & 0x1fu) << 4) | ((cw_word_r0 >> 8) & 0xfu));
@@ -2808,7 +2874,12 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                     const uint32_t w1 = B == 0 ? rf_words1.x : B == 1 ? rf_words1.y :
                                                         B == 2 ? rf_words1.z : rf_words1.w;
 #if DG_W4A8_INT_QOQ
-#if DG_W4A8_INT_QOQ_ZP
+#if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_SHIFTXOR
+                                    // Shift+mask spread + per-byte z subtract;
+                                    // emits (w4 - z), s2 deferred to promote.
+                                    const uint2 d0 = int4q::decode_uint4_prmt_groups_to_int8_pair_zsub(w0, zz_r0);
+                                    const uint2 d1 = int4q::decode_uint4_prmt_groups_to_int8_pair_zsub(w1, zz_r1);
+#elif DG_W4A8_INT_QOQ_ZP
                                     const uint2 d0 = int4q::decode_uint4_prmt_groups_to_int8_pair_lut_zp(
                                         w0, lutlo_r0, luthi_r0, s2_r0);
                                     const uint2 d1 = int4q::decode_uint4_prmt_groups_to_int8_pair_lut_zp(
@@ -2841,10 +2912,21 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 auto promote_int_half = [&](int32_t (&acc)[kSwapAccum], const uint32_t h) {
                                     #pragma unroll
                                     for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
+#if DG_W4A8_INT_QOQ && DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_SHIFTXOR
+                                        // Deferred s2: float(acc) * float(s2) is
+                                        // EXACT (integer product < 2^24) -> the
+                                        // promote stays bit-identical to the
+                                        // fold-at-decode paths.
+                                        final_accum[i*4+0] += w_r0 * tok_scale[h][i][0] * (static_cast<float>(acc[i*4+0]) * s2f_r0);
+                                        final_accum[i*4+2] += w_r1 * tok_scale[h][i][0] * (static_cast<float>(acc[i*4+2]) * s2f_r1);
+                                        final_accum[i*4+1] += w_r0 * tok_scale[h][i][1] * (static_cast<float>(acc[i*4+1]) * s2f_r0);
+                                        final_accum[i*4+3] += w_r1 * tok_scale[h][i][1] * (static_cast<float>(acc[i*4+3]) * s2f_r1);
+#else
                                         final_accum[i*4+0] += w_r0 * tok_scale[h][i][0] * static_cast<float>(acc[i*4+0]);
                                         final_accum[i*4+2] += w_r1 * tok_scale[h][i][0] * static_cast<float>(acc[i*4+2]);
                                         final_accum[i*4+1] += w_r0 * tok_scale[h][i][1] * static_cast<float>(acc[i*4+1]);
                                         final_accum[i*4+3] += w_r1 * tok_scale[h][i][1] * static_cast<float>(acc[i*4+3]);
+#endif
                                     }
                                 };
                                 issue_int(iacc_lo, 0u);

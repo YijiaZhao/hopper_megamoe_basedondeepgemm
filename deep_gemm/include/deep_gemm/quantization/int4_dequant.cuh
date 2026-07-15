@@ -125,6 +125,26 @@ DG_INT4_INLINE uint2 decode_uint4_prmt_groups_to_int8_pair_lut_zp(
     return make_uint2(__vadd4(mag0, add0), __vadd4(mag1, add1));
 }
 
+// SHIFTXOR decode (DG_W4A8_INT_QOQ_ZP_SHIFTXOR=1, customer-suggested): pure
+// shift+mask nibble spread + per-byte zero-point subtract. NO s2 fold, NO
+// table, NO per-row LUT build -- s2's group width (128) equals the inline
+// tier's K128 promote segment, so s2 is deferred to the fp32 promote like s1.
+// Output byte i = (w4_i - z), int8 in [-15, 15]. zz is the zero point
+// splatted across bytes (z * 0x01010101); __vsub4 keeps the subtract inside
+// byte lanes (a plain sub would borrow across lanes). The grouped-PRMT byte
+// order is preserved: out.x = nibbles 0..3, out.y = nibbles 4..7 as bytes.
+DG_INT4_INLINE uint2 decode_uint4_prmt_groups_to_int8_pair_zsub(
+        const uint32_t uq, const uint32_t zz) {
+    // One PRMT each spreads the source bytes with zero gaps:
+    // t0 = [b0, 0, b1, 0], t1 = [b2, 0, b3, 0]; then (t | t<<4) & 0x0F0F0F0F
+    // drops every nibble into its own byte lane (SHF + one LOP3).
+    const uint32_t t0 = __byte_perm(uq, 0u, 0x4140u);
+    const uint32_t t1 = __byte_perm(uq, 0u, 0x4342u);
+    const uint32_t w0 = (t0 | (t0 << 4)) & 0x0F0F0F0Fu;
+    const uint32_t w1 = (t1 | (t1 << 4)) & 0x0F0F0F0Fu;
+    return make_uint2(__vsub4(w0, zz), __vsub4(w1, zz));
+}
+
 // Prestored ZP decode LUT (DG_W4A8_INT_QOQ_ZP_PRELUT=1): instead of building
 // the per-(row, K128) LUT arithmetically (nz extract + 2 IMAD + 2 vadd4), the
 // decode site issues one LDS.64 from a shared-memory table copied from this

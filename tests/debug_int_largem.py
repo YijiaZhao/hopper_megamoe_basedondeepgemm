@@ -27,6 +27,7 @@ PRE = os.environ.get("DG_W4A8_INT_PRE", "0") == "1"
 QOQ = os.environ.get("DG_W4A8_INT_QOQ", "0") == "1"
 ZP = os.environ.get("DG_W4A8_INT_QOQ_ZP", "0") == "1"
 PRELUT = os.environ.get("DG_W4A8_INT_QOQ_ZP_PRELUT", "0") == "1"
+SHIFTXOR = os.environ.get("DG_W4A8_INT_QOQ_ZP_SHIFTXOR", "0") == "1"
 
 
 def quantize_qoq(weight, group=128):
@@ -49,10 +50,13 @@ def quantize_qoq(weight, group=128):
         dec8 = ((w4 - z) * s2).view(E, N, K)
         assert dec8.abs().max().item() <= 127
         # Prepack byte 1: under PRELUT the kernel looks up a prestored smem
-        # LUT row [s2][z], so store the RAW zero point z; otherwise store the
-        # negated offset nz = (-z*s2) mod 256 the arithmetic LUT build needs.
-        if PRELUT:
-            assert s2.max().item() <= 31, "s2 exceeds prestored ZP LUT rows"
+        # LUT row [s2][z] and under SHIFTXOR z is subtracted per byte (and the
+        # smem-decode LUT built from it), so store the RAW zero point z;
+        # otherwise store the negated offset nz = (-z*s2) mod 256 the
+        # arithmetic LUT build needs.
+        if PRELUT or SHIFTXOR:
+            if PRELUT:
+                assert s2.max().item() <= 31, "s2 exceeds prestored ZP LUT rows"
             b1 = z.to(torch.int32)
         else:
             b1 = (z * s2).to(torch.int32).neg().remainder(256)
