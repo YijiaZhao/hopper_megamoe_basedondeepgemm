@@ -81,11 +81,22 @@ public:
         // promotion tax dominates (measured crossovers on H20: flash ~M128,
         // pro ~M256). DG_MXFP4_REL_LUT=0/1 forces; the define lands in the
         // generated source so it participates in the JIT cache key.
+        // K32P study (2026-07-16, 10-rep paired A/B, MXFP4_K32P_STATUS.md):
+        // the mid-M crossovers re-confirmed (flash M128 tie, M256 rel-LUT
+        // -34%; pro M128 K32 -3.5%, M256 rel-LUT -8%), and the plain per-K32
+        // path stays the winner at flash M2-64 / pro M1-128. The one flip:
+        // flash M1 (protocol-bound) prefers the single-accumulator rel-LUT
+        // (median -25%; the per-K32 arm was bimodal with a 270-350us slow
+        // mode in 5/10 reps, rel-LUT slow-mode-free) -> engage rel-LUT at
+        // M <= 1 for the small-IH family (pro M1 measured the other way).
         const int rel_lut_env = get_env<int>("DG_MXFP4_REL_LUT", -1);
         const int rel_lut_min_m = get_env<int>("DG_MXFP4_REL_LUT_MIN_M",
             args.intermediate_hidden <= 2048 ? 128 : 256);
+        const int rel_lut_smallm_max = get_env<int>("DG_MXFP4_REL_LUT_SMALLM_MAX",
+            args.intermediate_hidden <= 2048 ? 1 : 0);
         const int rel_lut = rel_lut_env >= 0 ? (rel_lut_env != 0 ? 1 : 0) :
-            (args.num_tokens >= rel_lut_min_m ? 1 : 0);
+            ((args.num_tokens >= rel_lut_min_m or
+              args.num_tokens <= rel_lut_smallm_max) ? 1 : 0);
         // W4A8-integer variant: int4 weights + int8 activations through the same
         // swapAB-RF pipeline. Off by default; DG_W4A8_INT=1 selects it.
         const int w4a8_int = get_env<int>("DG_W4A8_INT", 0) != 0 ? 1 : 0;
@@ -292,12 +303,16 @@ static void sm90_mxfp4_mega_moe(
     // iter17: when the relative-LUT fold engages it frees the accumulator
     // registers that capped swapAB, and inline REL_LUT beats the prologue
     // tier up to ~M1024 (measured) -> extend the default cap accordingly.
-    // Keep this mirror of generate_impl's rel_lut heuristic in sync.
+    // Keep this mirror of generate_impl's rel_lut heuristic in sync (incl.
+    // the K32P-study small-M term; it only fires at M <= 1 where both
+    // swap_ab caps are >= M, so it cannot change the swap_ab decision).
     const int rel_lut_env = get_env<int>("DG_MXFP4_REL_LUT", -1);
     const int rel_lut_min_m = get_env<int>("DG_MXFP4_REL_LUT_MIN_M",
         intermediate_hidden <= 2048 ? 128 : 256);
+    const int rel_lut_smallm_max = get_env<int>("DG_MXFP4_REL_LUT_SMALLM_MAX",
+        intermediate_hidden <= 2048 ? 1 : 0);
     const bool rel_lut_engaged = rel_lut_env >= 0 ? rel_lut_env != 0 :
-        num_tokens >= rel_lut_min_m;
+        (num_tokens >= rel_lut_min_m or num_tokens <= rel_lut_smallm_max);
     const int default_swap_ab_max_m = rel_lut_engaged ? 1024 : 256;
     if (deployment_block_n == 128 and not config.swap_ab and num_tokens > 0 and
         num_tokens <= get_env<int>("DG_MXFP4_SWAP_AB_MAX_M", default_swap_ab_max_m))
