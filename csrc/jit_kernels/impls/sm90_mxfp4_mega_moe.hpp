@@ -415,8 +415,7 @@ static void sm90_mxfp4_mega_moe(
     // (-4.7%) but flash M1 regresses (+12%, protocol-bound at 6 active
     // experts) -> M1 only engages for the larger FFN (IH >= 3072).
     const int occ2_min_m_default = intermediate_hidden >= 3072 ? 1 : 2;
-    bool occ2 = get_env<int>("DG_W4A8_INT_SMALLM_OCC2", 0) != 0 and
-                get_env<int>("DG_W4A8_INT", 0) != 0 and
+    bool occ2 = ((get_env<int>("DG_W4A8_INT_SMALLM_OCC2", 0) != 0 and get_env<int>("DG_W4A8_INT", 0) != 0) or get_env<int>("DG_MXFP4_OCC2", 0) != 0) and
                 not pre_decoded_b and config.swap_ab and
                 num_tokens >= get_env<int>("DG_W4A8_INT_SMALLM_OCC2_MIN_M", occ2_min_m_default) and
                 num_tokens <= get_env<int>("DG_W4A8_INT_SMALLM_OCC2_MAX_M", 8);
