@@ -318,3 +318,86 @@ python3 tests/bench_int_prologue.py --qoq --block-n 256 \
   等）默认关,为实测无收益或场景特定的留档;
 - 待办:PRE/QoQ/ZP 并入 8 卡主 gate 矩阵、prepack API 产品化（现在 tests/ 的
   量化器里）。
+
+---
+
+## 六、客户形状对比:MegaMoE vs FlashInfer grouped-GEMM + 2×AR（同机统一口径，2026-07-21）
+
+回答"MegaMoE 相对纯 grouped-GEMM 到底有没有优势"。客户形状
+**H=4096, I=640(N=1280), E=128, topk=6, m∈{4,8,16,32,44,48,64}**。
+
+### 6.1 测量口径（务必全部对齐，缺一即不可比）
+
+- **同一台机器**:8×H20-3e，锁频 1830，跑前 `nvidia-smi --query-compute-apps` 确认清场（旁边有租户容器会引入 jitter，median 也压不平）；
+- **统一计时 = CUDA-event wall-clock**（整操作端到端，含 launch 间隙）：
+  MegaMoE 用 `DG_WALL_BENCH=1`；FlashInfer bench 本身就是整调用 event。
+  **不要**一边 kineto 逐 kernel 累加、一边 full-call event——两者不可直接比大小；
+- **两边都均衡路由**（禁止随机）：MegaMoE `DG_BALANCED_ROUTING=1`；FI bench 打
+  `DG_FI_BALANCED=1` 补丁（round-robin `sel=(arange(m*topk)%e)`）。每专家 token=3m/8，
+  仅 8|m（m=8/16/32/48/64）严格完美均衡，m=4/44 天然 ±1 余数（两边同模式，仍公平）；
+- **FI 取库默认 tactic**（`--mode fixed --g1 -1 --g2 -1`）——小 MoE 形状库默认走
+  autotuner 搜索空间之外的手写小-M kernel，**比 autotune 快 ~50%**（隔离逐 m 真调 53s
+  仍慢），所以给 FI 最好成绩就是用默认，别开 autotune；
+- **median-of-5**（清机后极稳，如 int4-SX m4 五跑 107/106/109/105/106）。
+
+### 6.2 复现命令
+
+```bash
+# --- MegaMoE int4-SX，8卡EP8，均衡，wall-clock ---
+E="DG_BALANCED_ROUTING=1 DG_WALL_BENCH=1 DG_W4A8_INT=1 DG_W4A8_INT_L2=1 DG_W4A8_INT_QOQ=1 \
+   DG_W4A8_INT_QOQ_ZP=1 DG_W4A8_INT_QOQ_ZP_SHIFTXOR=1 DG_W4A8_INT_SMALLM_OCC2=1"
+for r in 1 2 3 4 5; do env $E python3 tests/bench_mxfp4_mega_moe_sm90.py \
+  --num-processes 8 --hidden 4096 --intermediate-hidden 640 --num-experts 128 \
+  --num-topk 6 --block-n 128 --batches 4 8 16 32 44 48 64 | grep WALL; done
+# mxfp4 基线:同上去掉全部 DG_W4A8_INT* 开关（DG_W4A8_INT=0）
+# 单卡:--num-processes 1（其余不变；单卡=纯计算无跨卡通信）
+
+# --- FlashInfer grouped-GEMM（纯 GEMM，无跨卡通信），均衡，库默认 ---
+FLASHINFER_DISABLE_VERSION_CHECK=1 DG_FI_BALANCED=1 python3 bench_fi_mxfp4fp8_scope.py \
+  --hidden 4096 --inter 640 --experts 16 --topk 6 --tokens 4,8,16,32,44,48,64 \
+  --mode fixed --scope full --out /tmp/fi.json     # experts=16=128/8 一个rank的分片
+# 单卡对照:--experts 128
+
+# --- 2×custom AR（SGLang，L1前+L2后各一次），message=m×hidden×bf16 ---
+# 8进程 mp.spawn，CustomAllreduce(ps._WORLD.cpu_group, dev, max_size=8MB)，
+# 每 m 跑 t=randn(m,4096,bf16)，custom_all_reduce×100 取均值，结果×2。
+```
+
+### 6.3 结果（外部纯 grouped-GEMM 数据作交叉验证，量级与 FI 默认列一致，不单列）
+
+**单卡 1-rank（无跨卡通信）· us**
+
+| m | FI grouped-GEMM(默认) | MegaMoE int4-SX | MegaMoE mxfp4 |
+|---|---|---|---|
+| 4  | 112 | 145 | 153 |
+| 8  | 181 | 201 | 232 |
+| 16 | 307 | 331 | 387 |
+| 32 | 400 | 417 | 488 |
+| 44 | 392 | 418 | 487 |
+| 48 | 397 | 422 | 490 |
+| 64 | 401 | 435 | 500 |
+
+**8卡 EP8（含跨卡通信）· wall · median-of-5 · us**
+
+| m | MegaMoE int4-SX<br>(真8卡含通信) | MegaMoE mxfp4<br>(真8卡含通信) | FI GG默认<br>(单卡shard) | 2×AR | **FI GG+2×AR**<br>(公平对比) |
+|---|---|---|---|---|---|
+| 4  | **106** | 118 | 98  | 28 | 126 |
+| 8  | **105** | 118 | 96  | 28 | 124 |
+| 16 | **110** | 119 | 95  | 28 | 123 |
+| 32 | **126** | 139 | 95  | 34 | 129 |
+| 44 | **142** | 161 | 114 | 35 | 148 |
+| 48 | **145** | 164 | 132 | 35 | 167 |
+| 64 | **146** | 165 | 135 | 36 | 171 |
+
+> 外部纯 grouped-GEMM 数据（第三方自测 2-GEMM，H20-96G）与上表 FI GG默认列量级一致，
+> 作交叉验证，不在表内单列。
+
+### 6.4 结论（两个 regime 相反）
+
+- **单卡:FlashInfer 更快**。FI 去融合，GEMM 独占 smem 做深 prefetch；MegaMoE 融合内核
+  单卡吃 per-GEMM 惩罚且无通信可省。→ 单卡场景用 FlashInfer。
+- **8卡 EP8:MegaMoE int4-SX 全程赢 FI GG+2×AR 2~16%**。加回真实 dispatch/combine
+  通信（2×custom AR=28~36us）后，FI 那点 GEMM 优势被通信吃掉；MegaMoE 把通信**融进计算**
+  的护城河兑现。→ 多卡 EP 用 MegaMoE(int4-SX)。
+- **必须用 int4-SX，不是 mxfp4**:mxfp4 每 K32 promote（int4 的 4×）拖慢 GEMM，
+  仅与 FI GG+2×AR 打平，吃掉了融合优势。
