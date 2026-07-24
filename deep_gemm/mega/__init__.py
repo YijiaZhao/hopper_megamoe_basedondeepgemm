@@ -1,3 +1,4 @@
+import os
 import torch
 import types
 import warnings
@@ -276,8 +277,11 @@ def transform_mxfp4_weights_for_mega_moe_sm90(
     l2_packed, l2_scale = l2_weights
     hidden = l1_packed.size(-1) * 2
     intermediate_hidden = l2_packed.size(-1) * 2
-    # MXFP4 always uses grouped-PRMT selectors (kernel policy is unconditional).
-    use_prmt_groups = True
+    direct_int4 = (
+        os.environ.get("DG_W4A8_INT", "0") != "0" and
+        os.environ.get("DG_W4A8_INT_DIRECT_NIBBLE", "0") != "0"
+    )
+    use_prmt_groups = not direct_int4
     if block_n is None:
         block_n = get_mxfp4_mega_moe_sm90_block_n(
             hidden, intermediate_hidden, expected_m_per_rank)

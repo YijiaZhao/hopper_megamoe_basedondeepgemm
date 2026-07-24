@@ -67,7 +67,8 @@ def transform_int4(packed, scale, is_l1, block_n=128):
     sc_tm = _int4_scale_tm(scale, block_n=block_n)
     pk = mxfp4_fuse_packed_with_scale_tile_major(
         packed.contiguous(), sc_tm, block_k=128,
-        use_prmt_groups=True, use_rf_fragments=True)
+        use_prmt_groups=os.environ.get("DG_W4A8_INT_DIRECT_NIBBLE", "0") == "0",
+        use_rf_fragments=True)
     return pk, sc_tm
 
 def per_token_int8(x_bf):

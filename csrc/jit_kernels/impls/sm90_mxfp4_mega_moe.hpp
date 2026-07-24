@@ -97,6 +97,8 @@ public:
         const int rel_lut = rel_lut_env >= 0 ? (rel_lut_env != 0 ? 1 : 0) :
             ((args.num_tokens >= rel_lut_min_m or
               args.num_tokens <= rel_lut_smallm_max) ? 1 : 0);
+        const int abs_scale256 =
+            get_env<int>("DG_MXFP4_ABS_SCALE256", 0) != 0 ? 1 : 0;
         // W4A8-integer variant: int4 weights + int8 activations through the same
         // swapAB-RF pipeline. Off by default; DG_W4A8_INT=1 selects it.
         const int w4a8_int = get_env<int>("DG_W4A8_INT", 0) != 0 ? 1 : 0;
@@ -115,6 +117,9 @@ public:
         const int w4a8_int_qoq_zp_shiftxor =
             (get_env<int>("DG_W4A8_INT_QOQ_ZP_SHIFTXOR", 0) != 0 and
              w4a8_int_qoq_zp and w4a8_int_qoq and not w4a8_int_pre) ? 1 : 0;
+        const int w4a8_int_direct_nibble =
+            (get_env<int>("DG_W4A8_INT_DIRECT_NIBBLE", 0) != 0 and
+             w4a8_int_qoq_zp_shiftxor) ? 1 : 0;
         // Prestored ZP decode LUT: replaces the per-row arithmetic LUT build
         // with one LDS.64 from a 4KB smem table. Only meaningful on the
         // in-kernel QoQ+ZP decode path; PRE mode's prologue dequant never
@@ -161,6 +166,7 @@ public:
 #define DG_OCC2_SPIN_TRAP_SCHED {}
 #define DG_OCC2_BASELINE_REGS {}
 #define DG_MXFP4_REL_LUT {}
+#define DG_MXFP4_ABS_SCALE256 {}
 #define DG_W4A8_INT {}
 #define DG_W4A8_INT_L2 {}
 #define DG_W4A8_INT_PRE {}
@@ -170,6 +176,7 @@ public:
 #define DG_W4A8_INT_QOQ_ZP_PRELUT {}
 #define DG_W4A8_INT_QOQ_ZP_PRELUT_CONST {}
 #define DG_W4A8_INT_QOQ_ZP_SHIFTXOR {}
+#define DG_W4A8_INT_DIRECT_NIBBLE {}
 #include <deep_gemm/impls/sm90_mxfp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -205,6 +212,7 @@ static void __instantiate_kernel() {{
     occ2_spin_trap_sched,
     occ2_baseline_regs,
     rel_lut,
+    abs_scale256,
     w4a8_int,
     w4a8_int_l2,
     w4a8_int_pre,
@@ -214,6 +222,7 @@ static void __instantiate_kernel() {{
     w4a8_int_qoq_zp_prelut,
     w4a8_int_qoq_zp_prelut_const,
     w4a8_int_qoq_zp_shiftxor,
+    w4a8_int_direct_nibble,
     kernel_symbol,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,

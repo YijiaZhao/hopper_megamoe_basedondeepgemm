@@ -5,6 +5,7 @@ per 32 K-elements. Unlike the NVFP4 path, the kernel decodes values UNSCALED
 (E2M1 -> E4M3 is exact) and multiplies the E8M0 coefficient in the WGMMA
 promotion, so the packed layout carries the raw E8M0 bytes.
 """
+import os
 import torch
 
 
@@ -251,7 +252,11 @@ def dequantize_mxfp4_to_fp32(packed: torch.Tensor, scale_e8m0: torch.Tensor,
             # Fused MXFP4 rows carry word-transposed grouped-PRMT selectors
             # over the RF-fragment element order; invert all three.
             packed = _mxfp4_word_transpose(packed)
-            packed = _mxfp4_prmt_groups_to_marlin(packed)
+            if not (
+                os.environ.get("DG_W4A8_INT", "0") != "0" and
+                os.environ.get("DG_W4A8_INT_DIRECT_NIBBLE", "0") != "0"
+            ):
+                packed = _mxfp4_prmt_groups_to_marlin(packed)
             packed = _mxfp4_apply_rf_fragment_order(packed, forward=False)
         scale_e8m0 = (
             scale_e8m0.permute(0, 1, 3, 2, 4)

@@ -117,6 +117,17 @@ DG_MXFP4_INLINE uint2 decode_mxfp4_prmt_groups_to_fp8_pair_lut(
     return make_uint2(out0, out1);
 }
 
+// Absolute E8M0-scaled decode used by the Kernel Factory scaled-PRMT path.
+// The emitted E4M3 values include an exact x256 factor, removed once during
+// accumulator promotion. Valid for E8M0 codes 121..125.
+DG_MXFP4_INLINE uint2 decode_mxfp4_prmt_groups_to_fp8_pair_scaled256(
+        const uint32_t uq, const uint32_t scale) {
+    const uint32_t exponent = scale - 113u;
+    const uint32_t lut_lo = exponent * 0x08080800u + 0x0c080000u;
+    const uint32_t lut_hi = exponent * 0x08080808u + 0x1c181410u;
+    return decode_mxfp4_prmt_groups_to_fp8_pair_lut(uq, lut_lo, lut_hi);
+}
+
 #undef DG_MXFP4_INLINE
 
 } // namespace mxfp4

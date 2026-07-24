@@ -2,7 +2,8 @@
 
 > 一份把 W4A8-int + MXFP4 MegaMoE 的**代码、仓库、设计、benchmark、环境、机器**串起来的入口文档。
 > 深度设计细节见 [`W4A8_INT.md`](W4A8_INT.md)；早期 handoff 见 [`W4A8_INT_HANDOFF.md`](W4A8_INT_HANDOFF.md)；
-> 计算流程图见 [`w4a8_int_flow.html`](w4a8_int_flow.html)。最后更新 2026-07-24。
+> 计算流程图见 [`w4a8_int_flow.html`](w4a8_int_flow.html)；Kernel Factory 新策略与七点表见
+> [`KERNEL_FACTORY_OPT_20260724.md`](KERNEL_FACTORY_OPT_20260724.md)。最后更新 2026-07-24。
 
 ---
 
@@ -12,6 +13,8 @@
 **W4A8-int（int4 权重 + int8 激活，QoQ 两级 + zero-point + SHIFTXOR 解码）** 与
 **MXFP4×FP8（e2m1 权重 + e8m0 scale）**——把 dispatch + GG1 + SwiGLU + requant + GG2 + combine
 **融进 2 个 kernel**，跨卡通信藏进计算。核心价值：**8 卡 EP 下 int4-SX 比 FlashInfer grouped-GEMM+通信快 2~16%**。
+2026-07-24 新增实验路径：Kernel Factory scaled-MXFP4 在客户七点中赢 4 点，
+direct-nibble int4-SX 赢 3 点；两者均默认关闭，详见新优化记录。
 
 ---
 
@@ -53,6 +56,7 @@ tests/
   test_int4_mega_moe_correctness.py      ← 正确性门 (逐位/cosine)
   debug_int_l2_instrument.py             ← L2 int 调试 (Python 读 buffer 重建对比)
 docs/W4A8_INT.md                         ← 设计 + 18点表 + 第6章 7点对比 (方法学+表)
+docs/KERNEL_FACTORY_OPT_20260724.md      ← KF scaled-MXFP4/direct-int4 策略 + 新七点表
 ```
 
 编译走 **NVRTC 运行时 JIT**（读 .cuh，`/root/.deep_gemm` 缓存）；改 .cuh 无需重编，改 csrc 跑 `develop.sh`。
@@ -64,6 +68,10 @@ docs/W4A8_INT.md                         ← 设计 + 18点表 + 第6章 7点对
 - **量化格式**：
   - **int4-SX (QoQ 两级)**：s2 int per-K128 组 + z uint4 + s1 bf16 per-channel + zero point。解码 = shift+mask+vsub4 减 z（无 xor，名字是历史遗留）。s2 延到 promote（组=128 对齐 BLOCK_K=128，每 K128 promote 一次）。
   - **mxfp4**：e2m1 权重 + e8m0 scale per-K32。解码 = prmt 从寄存器常量表（幅值非线性 {0,.5,1,1.5,2,3,4,6}）+ e8m0 折进 fp8 指数。**每 K32 promote（int4 的 4×）→ 比 int4 慢 ~16%**。
+  - **KF scaled-mxfp4（实验）**：group 仍为 K32，但把 E8M0 scale 与 `×256` 直接折进
+    E4M3 decode；L1 每 K128 promotion 一次，L2 每 K128 两次。
+  - **KF direct-int4（实验）**：改变 RF prepack，直接 shift/mask 拆高低 nibble，删除
+    SHIFTXOR 热路径的两条 PRMT。通过 `DG_W4A8_INT_DIRECT_NIBBLE=1` 启用。
 - **融合内核（2 kernel，warp-specialized）**：dispatch warp（NVLink 拉 token）/ TMA producer warp / 专职 decode warp / math warpgroup（WGMMA + SwiGLU/requant/combine epilogue）。三级 pingpong + mbarrier full/empty/decoded 流水。**通信（dispatch/combine）与 GEMM 同时在飞 = 护城河**。
 - **两个 GEMM 非等量**：GG1(gate+up, N=2I=1280) FLOP = **2×** GG2(down, K=I=640)。bench 权重形状实测确认（`2*intermediate_hidden`）。
 - **根因（为何单 GEMM 比 FlashInfer 慢）**：融合内核 smem 被 dispatch ring/coeff/SFA/SFB/decode 吃掉 → weight prefetch 只 3-4 级（需 8）→ latency-bound。FlashInfer 去融合让 GEMM 独占 smem 深 prefetch 更快，但没有跨卡通信融合。

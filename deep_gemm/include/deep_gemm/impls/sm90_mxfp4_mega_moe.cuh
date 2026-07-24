@@ -101,6 +101,9 @@
 #ifndef DG_W4A8_INT_QOQ_ZP_SHIFTXOR
 #define DG_W4A8_INT_QOQ_ZP_SHIFTXOR 0
 #endif
+#ifndef DG_W4A8_INT_DIRECT_NIBBLE
+#define DG_W4A8_INT_DIRECT_NIBBLE 0
+#endif
 #if DG_W4A8_INT_QOQ_ZP_SHIFTXOR && DG_W4A8_INT_QOQ_ZP_PRELUT
 #error "SHIFTXOR replaces PRELUT; the host must enable at most one"
 #endif
@@ -119,6 +122,9 @@
 // the JIT frontend when DG_MXFP4_REL_LUT=1.
 #ifndef DG_MXFP4_REL_LUT
 #define DG_MXFP4_REL_LUT 0
+#endif
+#ifndef DG_MXFP4_ABS_SCALE256
+#define DG_MXFP4_ABS_SCALE256 0
 #endif
 
 namespace deep_gemm {
@@ -2259,8 +2265,13 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
 #if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_SHIFTXOR
                                     // Shift+mask spread + per-byte z subtract;
                                     // emits (w4 - z), s2 deferred to promote.
+#if DG_W4A8_INT_DIRECT_NIBBLE
+                                    const uint2 d0 = int4q::decode_uint4_direct_to_int8_pair_zsub(w0, zz_r0);
+                                    const uint2 d1 = int4q::decode_uint4_direct_to_int8_pair_zsub(w1, zz_r1);
+#else
                                     const uint2 d0 = int4q::decode_uint4_prmt_groups_to_int8_pair_zsub(w0, zz_r0);
                                     const uint2 d1 = int4q::decode_uint4_prmt_groups_to_int8_pair_zsub(w1, zz_r1);
+#endif
 #elif DG_W4A8_INT_QOQ_ZP
                                     const uint2 d0 = int4q::decode_uint4_prmt_groups_to_int8_pair_lut_zp(
                                         w0, lutlo_r0, luthi_r0, s2_r0);
@@ -2463,6 +2474,7 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 // promotion happens once per K128 with the row's
                                 // max coefficient. Kills 3 of 4 promote passes and
                                 // 3 of 4 accumulator buffers.
+#if !DG_MXFP4_ABS_SCALE256
                                 uint32_t t0 = __vmaxu4(cw_word_r0, cw_word_r0 >> 16);
                                 t0 = __vmaxu4(t0, t0 >> 8);
                                 const uint32_t em_r0 = t0 & 0xffu;
@@ -2473,6 +2485,7 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                     __vsub4(em_r0 * 0x01010101u, cw_word_r0), 0x0D0D0D0Du);
                                 const uint32_t dw_r1 = __vminu4(
                                     __vsub4(em_r1 * 0x01010101u, cw_word_r1), 0x0D0D0D0Du);
+#endif
                                 // Same interleaved issue shape as the default
                                 // path (decode B+1 hides under batch B's WGMMA),
                                 // but all four batches accumulate into ONE
@@ -2484,12 +2497,19 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                                         B == 2 ? rf_words0.z : rf_words0.w;
                                     const uint32_t w1 = B == 0 ? rf_words1.x : B == 1 ? rf_words1.y :
                                                         B == 2 ? rf_words1.z : rf_words1.w;
+#if DG_MXFP4_ABS_SCALE256
+                                    const uint2 d0 = mxfp4::decode_mxfp4_prmt_groups_to_fp8_pair_scaled256(
+                                        w0, (cw_word_r0 >> (B * 8)) & 0xffu);
+                                    const uint2 d1 = mxfp4::decode_mxfp4_prmt_groups_to_fp8_pair_scaled256(
+                                        w1, (cw_word_r1 >> (B * 8)) & 0xffu);
+#else
                                     const uint32_t d0i = (dw_r0 >> (B * 8)) & 0xffu;
                                     const uint32_t d1i = (dw_r1 >> (B * 8)) & 0xffu;
                                     const uint2 d0 = mxfp4::decode_mxfp4_prmt_groups_to_fp8_pair_lut(
                                         w0, mxfp4::kE2M1RelLut[d0i][0], mxfp4::kE2M1RelLut[d0i][1]);
                                     const uint2 d1 = mxfp4::decode_mxfp4_prmt_groups_to_fp8_pair_lut(
                                         w1, mxfp4::kE2M1RelLut[d1i][0], mxfp4::kE2M1RelLut[d1i][1]);
+#endif
                                     frag[0] = d0.x; frag[1] = d1.x;
                                     frag[2] = d0.y; frag[3] = d1.y;
                                     #pragma unroll
@@ -2516,8 +2536,13 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 // Token scales were preloaded above; all SMEM reads
                                 // (scratch words, coeffs, WGMMA activations) done.
                                 arrive_empty_barrier(stage_idx);
+#if DG_MXFP4_ABS_SCALE256
+                                constexpr float cw_r0 = 1.0f / 256.0f;
+                                constexpr float cw_r1 = 1.0f / 256.0f;
+#else
                                 const float cw_r0 = mxfp4::e8m0_to_float(em_r0);
                                 const float cw_r1 = mxfp4::e8m0_to_float(em_r1);
+#endif
                                 #pragma unroll
                                 for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
                                     final_accum[i * 4 + 0] += tok_scale[i][0] * gate_sf * cw_r0 * swap_accum[i * 4 + 0];
@@ -2883,8 +2908,13 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
 #if DG_W4A8_INT_QOQ_ZP && DG_W4A8_INT_QOQ_ZP_SHIFTXOR
                                     // Shift+mask spread + per-byte z subtract;
                                     // emits (w4 - z), s2 deferred to promote.
+#if DG_W4A8_INT_DIRECT_NIBBLE
+                                    const uint2 d0 = int4q::decode_uint4_direct_to_int8_pair_zsub(w0, zz_r0);
+                                    const uint2 d1 = int4q::decode_uint4_direct_to_int8_pair_zsub(w1, zz_r1);
+#else
                                     const uint2 d0 = int4q::decode_uint4_prmt_groups_to_int8_pair_zsub(w0, zz_r0);
                                     const uint2 d1 = int4q::decode_uint4_prmt_groups_to_int8_pair_zsub(w1, zz_r1);
+#endif
 #elif DG_W4A8_INT_QOQ_ZP
                                     const uint2 d0 = int4q::decode_uint4_prmt_groups_to_int8_pair_lut_zp(
                                         w0, lutlo_r0, luthi_r0, s2_r0);
@@ -2982,6 +3012,7 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                 // and {2,3}) -> two accumulators, two promotions
                                 // per K128 instead of four. Half 0's promotion
                                 // still overlaps half 1's in-flight WGMMAs.
+#if !DG_MXFP4_ABS_SCALE256
                                 uint32_t em_h[2][2], dw_h[2][2];
                                 #pragma unroll
                                 for (uint32_t h = 0; h < 2; ++ h) {
@@ -2995,6 +3026,7 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                         dw_h[h][r] = min(em - b0, 13u) | (min(em - b1, 13u) << 8);
                                     }
                                 }
+#endif
                                 // Interleaved issue (decode B+1 hides under batch
                                 // B's WGMMA) with per-half accumulators: the two
                                 // batches of a half accumulate across commit
@@ -3005,12 +3037,19 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                                         B == 2 ? rf_words0.z : rf_words0.w;
                                     const uint32_t w1 = B == 0 ? rf_words1.x : B == 1 ? rf_words1.y :
                                                         B == 2 ? rf_words1.z : rf_words1.w;
+#if DG_MXFP4_ABS_SCALE256
+                                    const uint2 d0 = mxfp4::decode_mxfp4_prmt_groups_to_fp8_pair_scaled256(
+                                        w0, (cw_word_r0 >> (B * 8)) & 0xffu);
+                                    const uint2 d1 = mxfp4::decode_mxfp4_prmt_groups_to_fp8_pair_scaled256(
+                                        w1, (cw_word_r1 >> (B * 8)) & 0xffu);
+#else
                                     const uint32_t d0i = (dw_h[B / 2][0] >> ((B % 2) * 8)) & 0xffu;
                                     const uint32_t d1i = (dw_h[B / 2][1] >> ((B % 2) * 8)) & 0xffu;
                                     const uint2 d0 = mxfp4::decode_mxfp4_prmt_groups_to_fp8_pair_lut(
                                         w0, mxfp4::kE2M1RelLut[d0i][0], mxfp4::kE2M1RelLut[d0i][1]);
                                     const uint2 d1 = mxfp4::decode_mxfp4_prmt_groups_to_fp8_pair_lut(
                                         w1, mxfp4::kE2M1RelLut[d1i][0], mxfp4::kE2M1RelLut[d1i][1]);
+#endif
                                     frag[0] = d0.x; frag[1] = d1.x;
                                     frag[2] = d0.y; frag[3] = d1.y;
                                     #pragma unroll
@@ -3030,8 +3069,13 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                                         ptx::warpgroup_fence_operand(acc[i]);
                                 };
                                 auto promote_half = [&](float (&acc)[kSwapAccum], const uint32_t h) {
+#if DG_MXFP4_ABS_SCALE256
+                                    constexpr float cw_r0 = 1.0f / 256.0f;
+                                    constexpr float cw_r1 = 1.0f / 256.0f;
+#else
                                     const float cw_r0 = mxfp4::e8m0_to_float(em_h[h][0]);
                                     const float cw_r1 = mxfp4::e8m0_to_float(em_h[h][1]);
+#endif
                                     #pragma unroll
                                     for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
                                         final_accum[i * 4 + 0] += tok_scale[h][i][0] * l2_sf_lo * cw_r0 * acc[i * 4 + 0];

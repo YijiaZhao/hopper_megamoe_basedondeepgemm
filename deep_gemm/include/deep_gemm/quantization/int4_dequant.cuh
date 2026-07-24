@@ -145,6 +145,17 @@ DG_INT4_INLINE uint2 decode_uint4_prmt_groups_to_int8_pair_zsub(
     return make_uint2(__vsub4(w0, zz), __vsub4(w1, zz));
 }
 
+// Direct Marlin-word decode for the RF-fragment reordered layout. Keeping the
+// four source bytes intact makes the high and low nibbles directly usable as
+// the two IGMMA register words, eliminating both PRMT nibble-spread ops.
+DG_INT4_INLINE uint2 decode_uint4_direct_to_int8_pair_zsub(
+        const uint32_t uq, const uint32_t zz) {
+    constexpr uint32_t kNibbleMask = 0x0F0F0F0Fu;
+    const uint32_t w0 = (uq >> 4) & kNibbleMask;
+    const uint32_t w1 = uq & kNibbleMask;
+    return make_uint2(__vsub4(w0, zz), __vsub4(w1, zz));
+}
+
 // Prestored ZP decode LUT (DG_W4A8_INT_QOQ_ZP_PRELUT=1): instead of building
 // the per-(row, K128) LUT arithmetically (nz extract + 2 IMAD + 2 vadd4), the
 // decode site issues one LDS.64 from a shared-memory table copied from this
