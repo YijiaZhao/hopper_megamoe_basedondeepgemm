@@ -70,22 +70,65 @@ DG_W4A8_INT_DIRECT_NIBBLE=1
 fragment decode 已与 grouped-PRMT 路径逐 word 对比一致，但进入默认部署前仍需使用
 真实 QoQ+ZP checkpoint 完成完整生产 correctness gate。
 
+## 3.5 int4-SX ZSUB_XOR（uint8 域 + XOR，2026-07-29）
+
+来源：LiquidGEMM（arXiv 2509.01229，ByteDance Seed + 上交）的 LiquidQuant 思路——
+**留在 uint8 域算，最后一条 XOR 翻 MSB 换回 int8 补码**，从而避开非原生的字节级减法。
+
+原 SHIFTXOR 的 z-subtract 用 `__vsub4`（模拟指令）。改为：
+
+```cpp
+const uint32_t zz128 = 0x80808080u - zz;   // (128-z) splat；z<=15 故不借位
+return make_uint2((w0 + zz128) ^ 0x80808080u,
+                  (w1 + zz128) ^ 0x80808080u);
+```
+
+每字节 `w4 + (128-z) ∈ [113,143]`，**恒在 [0,255] 内 ⇒ 跨 lane 不进位**，
+所以可用普通 32-bit 加法替掉 `__vsub4`。
+
+- **SASS 实测（sm_90a，每 8 元素）**：算术指令 **13 → 8（-38%）**
+  （7 LOP3 + 2 IMAD.IADD → 4 LOP3）。
+- **等价性**：合法 `z ∈ [0,15]` × 4096 图案 × 128 线程穷举，与 `__vsub4` **逐 bit 零失配**。
+- **成立条件**：`zz` 每字节 ≤ 128（合法 zero point 必然满足）。垃圾 coeff（如在
+  MXFP4 编码权重上跑 perf bench）会超出该条件，此时两式结果不同——**只影响数值，不影响计时**。
+
+实验开关（仅在 SHIFTXOR 下生效）：
+
+```bash
+DG_W4A8_INT_ZSUB_XOR=1
+```
+
+**正确性 gate 现状**：`test_int4_mega_moe_correctness.py` 的 **QoQ+ZP 档本身即失败
+（baseline cosine≈0.0001，与本改动无关；纯 int4+L2 档 cosine=1.0 PASS）**，对应
+`W4A8_INT.md` 已记的待办「PRE/QoQ/ZP 尚未并入 8 卡主 gate 矩阵」。
+本路径进默认前，必须先用真实 QoQ+ZP checkpoint 补齐该 gate。
+
 ## 4. 完整 MegaMoE 七点表
 
 单位：微秒，数值越小越好。
 
-| M | 原 int4-SX | direct int4-SX | scaled MXFP4 | 最快 |
-|---:|---:|---:|---:|---|
-| 4  | 106.3 | 107.0 | **103.7** | MXFP4 |
-| 8  | 106.0 | **104.2** | 105.5 | int4-SX |
-| 16 | 108.8 | **104.7** | 107.9 | int4-SX |
-| 32 | 124.5 | **119.2** | 120.0 | int4-SX |
-| 44 | 141.1 | 137.7 | **132.5** | MXFP4 |
-| 48 | 143.2 | 140.1 | **134.7** | MXFP4 |
-| 64 | 143.8 | 140.8 | **136.2** | MXFP4 |
+单位：微秒，数值越小越好。前三列为 2026-07-24 KF 批次；ZSUB_XOR 列为 2026-07-29 单独批次
+（配对 baseline 见表下，跨批次绝对值不可直接比，只看各自 delta）。
+
+| M | 原 int4-SX | direct int4-SX | scaled MXFP4 | int4-SX+ZSUB_XOR★ | 最快 |
+|---:|---:|---:|---:|---:|---|
+| 4  | 106.3 | 107.0 | **103.7** | 108.9 | scaled MXFP4 |
+| 8  | 106.0 | **104.2** | 105.5 | 105.5 | direct int4-SX |
+| 16 | 108.8 | **104.7** | 107.9 | 110.1 | direct int4-SX |
+| 32 | 124.5 | **119.2** | 120.0 | 122.9 | direct int4-SX |
+| 44 | 141.1 | 137.7 | **132.5** | 139.5 | scaled MXFP4 |
+| 48 | 143.2 | 140.1 | **134.7** | 143.1 | scaled MXFP4 |
+| 64 | 143.8 | 140.8 | **136.2** | 142.2 | scaled MXFP4 |
+
+> 「最快」列写全名：赢 M=8/16/32 的是 **direct** int4-SX（不是原 SHIFTXOR），
+> 赢 M=4/44/48/64 的是 **scaled** MXFP4。**原 int4-SX（当前默认路径）七点全输。**
+>
+> ★ ZSUB_XOR 同批次的 SHIFTXOR baseline = 110.2 / 104.3 / 112.2 / 126.1 / 141.7 / 144.8 / 145.7。
+> 相对自身 baseline：**M≥32 快 1.2~2.5%**（ON/OFF 三跑区间不重叠，非噪声）；M≤16 在噪声内。
+> 它改的是原 SHIFTXOR 的 z-subtract，与 direct-nibble 的「删两条 PRMT」**互不冲突，可叠加**（未测）。
 
 direct int4-SX 在 M=8..64 相对原 SHIFTXOR 快约 `1.7%..4.3%`，M4 回退约
-`0.7%`。与 scaled MXFP4 比较，int4-SX 赢 M=8/16/32，MXFP4 赢 M=4/44/48/64。
+`0.7%`。与 scaled MXFP4 比较，direct int4-SX 赢 M=8/16/32，scaled MXFP4 赢 M=4/44/48/64。
 
 ## 5. 当前结论
 
