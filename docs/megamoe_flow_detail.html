@@ -151,7 +151,7 @@
 <!-- ============================================================ -->
 <h2>3. KERNEL 1 (l1_impl) —— 逐角色展开</h2>
 
-<h3>3.1 dispatch warp：counting sort + scatter（排 token 到 expert）</h3>
+<h3>3.1 dispatch warp：counting sort → scatter（送索引）→ pull（拉数据）</h3>
 <div class="panel">
 <pre><span class="c"># ① 数：本 SM 每个 expert 收到几个 (token,topk) 对</span>
 <span class="k">for</span> (tok, k) <span class="k">in</span> my_tokens × topk:
@@ -171,12 +171,46 @@
     slot     = atomicAdd_block(smem_cnt[e], 1)      <span class="c"># 在该 expert 内排第几个</span>
     <span class="s">*sym_buffer.map(dst_ptr, dst_rank) = token_topk_idx</span>      <span class="c"># ★ scatter</span>
 
-<span class="c"># ④ 拉：从远端把属于本卡 expert 的 token（fp8）与 SF（per-128ch float）拉进 L1 pool</span>
-<span class="k">for</span> token_idx <span class="k">in</span> my_share:
-    remote_read(token) → local_L1_pool[slot]
-    remote_read(SF)    → local_sf[k_chunk * padded_pool_tokens + token_idx]
-    dispatch_barriers[warp].arrive()
+<span class="c"># ④ 拉（pull）：方向与 ③ 相反 —— 把散落在各卡、路由到「我负责的 expert」的 token 搬过来</span>
+<span class="k">for</span> token_slot <span class="k">in</span> my_share:
+    <span class="c"># ③ 阶段各卡只写了索引，这里先解出它是谁</span>
+    src = workspace.get_src_token_topk_idx(expert, src_rank, token_idx_in_rank)
+    src_token_idx = src // topk        <span class="c"># 哪个 token</span>
+    src_topk_idx  = src %  topk        <span class="c"># 它的第几个 expert 选择</span>
+
+    <span class="c"># ①激活数据：TMA 1D 从远端拉 kHidden 字节（fp8/int8）</span>
+    <span class="s">ptx::tma_load_1d</span>(pull_buffer,
+                     sym_buffer.map(input_token[src_token_idx], src_rank),
+                     pull_mbarrier, <span class="s">kHidden</span>)
+
+    <span class="c"># ②激活 SF：per-128 K 一个 float（H=4096 → 32 个），逐 lane 线性写入本地 SF pool</span>
+    <span class="k">for</span> j <span class="k">in</span> range(kHidden // 128):
+        local_sf[j * kSFRingStrideTokens + sf_pool_token_idx] = remote_sf[j]
+
+    <span class="c"># ③routing weight：留到最后 COMBINE 加权用，提前搬来省一次远程读</span>
+    weight = *sym_buffer.map(input_topk_weights + src, src_rank)
+    l1_topk_weights[pool_token_idx] = weight
+
+    <span class="s">mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden)</span>
+    mbarrier_wait_and_flip_phase(pull_mbarrier, phase)
+
+<span class="c"># 落地位置：pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert</span>
+<span class="c">#   ⇒ 同一 expert 的 token 在本地连续，GEMM 直接当稠密矩阵算，无需 gather</span>
 </pre>
+
+<table style="margin-top:14px">
+<tr><th>pull 搬的三样</th><th>每 token 大小</th><th>搬运方式</th><th>用途</th></tr>
+<tr><td><b>① token 激活数据</b></td><td><code>kHidden</code> 字节（fp8/int8，H=4096）</td><td><b>TMA 1D</b> <code>tma_load_1d</code></td><td>喂给 GG1 当 A 矩阵</td></tr>
+<tr><td><b>② 激活 SF</b></td><td><code>kHidden/128</code> 个 float（=32）</td><td>逐 lane 拷贝</td><td>GG1 的 per-token × K128 scale</td></tr>
+<tr><td><b>③ topk_weight</b></td><td>1 个 float</td><td>单线程读</td><td>L1 epilogue 先乘进 amax；<br>最后 COMBINE 做 <code>Σ w<sub>k</sub>·result<sub>k</sub></code></td></tr>
+</table>
+
+<div class="note warn" style="margin-top:12px">
+  <b>scatter 与 pull 方向相反，别搞混：</b>
+  <br>· <b>scatter（③）</b>：我卡上的 token → 写到「拥有该 expert 的那张卡」，写的只是<b>索引</b>；
+  <br>· <b>pull（④）</b>：我卡负责的 expert → 按这些索引，把真正的<b>数据</b>从各远端卡拉过来。
+  <br>两步合起来才完成一次 all-to-all 语义的 dispatch，但全程是<b>单向远程访问、无集合汇合点</b>。
+</div>
 <div class="note ok">
   <b>为什么不需要独立 permute kernel：</b>槽位由原子加当场算出，token 直接写到「目标卡 + 该 expert 区间内的位置」，
   <b>落地即按 expert 连续排好</b>；SF 用简单线性映射同步排好（无需 4×32 转置）。
