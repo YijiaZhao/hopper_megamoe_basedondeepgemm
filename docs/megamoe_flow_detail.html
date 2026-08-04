@@ -398,14 +398,14 @@ grid_barrier()                                      <span class="c"># 等所有�
   <text x="10" y="16" fill="#95a3bf" font-size="12">时间 →（每格 = 一个 K128 block）</text>
   <line x1="150" y1="26" x2="1150" y2="26" stroke="#3a4560"/>
 
-  <text x="10" y="56" fill="#f0883e" font-size="11.5" font-weight="600">dispatch warp</text>
+  <text x="10" y="56" fill="#6f7f9e" font-size="11.5" font-weight="600">dispatch warp</text>
   <text x="10" y="101" fill="#58a6ff" font-size="11.5" font-weight="600">TMA producer</text>
   <text x="10" y="146" fill="#bc8cff" font-size="11.5" font-weight="600">decode warp</text>
   <text x="10" y="191" fill="#3fb950" font-size="11.5" font-weight="600">math WG0 (WGMMA)</text>
   <text x="10" y="232" fill="#e3b341" font-size="11.5" font-weight="600">math WG1 (epilogue)</text>
 
-  <rect x="150" y="40" width="1000" height="22" rx="4" fill="#3a2410" stroke="var(--disp)"/>
-  <text x="650" y="55" fill="#f0883e" font-size="11" text-anchor="middle">NVLink pull / scatter —— 全程与计算重叠（这就是通信被藏掉的地方）</text>
+  <rect x="150" y="40" width="1000" height="22" rx="4" fill="#141b2b" stroke="#4a5878" stroke-dasharray="5,4"/>
+  <text x="650" y="55" fill="#8b98b5" font-size="11" text-anchor="middle">（不参与本 tile 的 K 循环 —— 它在为「后面还没轮到的 pool block」拉 token，是一条独立的流）</text>
 
   <g font-size="10.5">
     <rect x="150" y="85"  width="118" height="22" rx="4" fill="#10243a" stroke="var(--tma)"/><text x="209" y="100" fill="#58a6ff" text-anchor="middle">TMA k0</text>
@@ -441,7 +441,13 @@ grid_barrier()                                      <span class="c"># 等所有�
   <text x="600" y="203" fill="#e879f9" font-size="9.5">empty（回收 stage 给 TMA）</text>
 </svg>
 <div class="note warn">
-  <b>这是 ExCP 结构（专职 decode warp）。</b>LiquidGEMM（arXiv 2509.01229）实测该结构<b>在小 batch 是负收益</b>
+  <b>dispatch warp 为什么是虚线：</b>本图横轴是<b>一个 tile 内部的 K-block 迭代</b>，
+  而 dispatch warp 不参与这个循环 —— K 循环用 <code>full/dequant/empty</code> 三组 barrier，
+  dispatch 用的是<b>另一组</b> <code>dispatch_barriers</code>，两者只通过 <code>l1_full_count</code> 计数器间接握手
+  （GEMM 自旋等某个 pool block 填满才开算）。它的工作量也是<b>有限的</b>：
+  数 expert → 抢 offset → scatter 索引 → 拉完自己那份 token → <code>cleanup_workspace</code>，干完即收工，
+  通常早于 GEMM 结束。tile 之间的真实错拍见 <b>5.1</b>。
+  <br><br><b>这是 ExCP 结构（专职 decode warp）。</b>LiquidGEMM（arXiv 2509.01229）实测该结构<b>在小 batch 是负收益</b>
   —— RF↔SMEM 往返 + 显式同步的开销盖过重叠收益；其 ImFP 方案改为
   <b>每个 Compute WG 自解码自 MMA、不回写 SMEM</b>。我们客户形状 m=4~64 <b>全在小 batch 区</b>，这是待验证的优化方向。
 </div>
