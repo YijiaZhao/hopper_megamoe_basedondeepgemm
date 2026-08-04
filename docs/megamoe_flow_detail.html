@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>MegaMoE 详细流程（SM90 / H20）</title>
+<style>
+  :root{
+    --bg:#0f1420; --panel:#161d2e; --panel2:#1a2233; --line:#2b3550; --txt:#e6ebf5; --dim:#95a3bf;
+    --disp:#f0883e; --tma:#58a6ff; --dec:#bc8cff; --math:#3fb950; --comm:#f85149; --epi:#e3b341; --bar:#e879f9;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:30px 34px;background:var(--bg);color:var(--txt);
+       font:14px/1.75 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+  h1{font-size:25px;margin:0 0 4px}
+  h2{font-size:18px;margin:40px 0 6px;padding-left:11px;border-left:4px solid var(--tma)}
+  h3{font-size:15px;margin:22px 0 6px;color:#cfd9ea}
+  .sub{color:var(--dim);margin-bottom:6px;font-size:13.5px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;margin:12px 0}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin:12px 0 0}
+  .lg{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--dim)}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+  code{background:#0b0f1a;padding:1px 6px;border-radius:4px;font-size:12.5px;color:#9fe0b0}
+  pre{background:#0b0f1a;border:1px solid var(--line);border-radius:8px;padding:14px 16px;
+      overflow-x:auto;font-size:12.5px;line-height:1.65;color:#c9d5e8;margin:10px 0}
+  pre .c{color:#6b7a99}       /* 注释 */
+  pre .k{color:#ff9db4}       /* 关键字 */
+  pre .s{color:#e3b341}       /* 强调 */
+  pre .g{color:#3fb950}
+  table{border-collapse:collapse;width:100%;margin-top:10px;font-size:12.8px}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#1b2337;color:var(--dim);font-weight:600}
+  .note{color:var(--dim);font-size:12.8px;margin-top:10px;padding:10px 12px;
+        background:#131a29;border-left:3px solid var(--epi);border-radius:0 6px 6px 0}
+  .warn{border-left-color:var(--comm)}
+  .ok{border-left-color:var(--math)}
+  .tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;margin-right:5px}
+  .verified{background:#12301c;color:#3fb950;border:1px solid #2d6b3f}
+</style>
+</head>
+<body>
+
+<h1>MegaMoE 详细流程（SM90 / H20，EP8）</h1>
+<div class="sub">
+  <span class="tag verified">nsys 实测核实</span>
+  整层 MoE = <b>2 个 kernel</b>（<code>l1_impl</code> + <code>l2_impl</code>），5 类 warp 角色，3 组 mbarrier，2 处 NVLink scatter。
+</div>
+
+<div class="legend">
+  <span class="lg"><i class="dot" style="background:var(--disp)"></i>dispatch warp</span>
+  <span class="lg"><i class="dot" style="background:var(--tma)"></i>TMA producer</span>
+  <span class="lg"><i class="dot" style="background:var(--dec)"></i>decode warp</span>
+  <span class="lg"><i class="dot" style="background:var(--math)"></i>math WG (WGMMA)</span>
+  <span class="lg"><i class="dot" style="background:var(--epi)"></i>epilogue</span>
+  <span class="lg"><i class="dot" style="background:var(--comm)"></i>NVLink scatter</span>
+  <span class="lg"><i class="dot" style="background:var(--bar)"></i>mbarrier</span>
+</div>
+
+<!-- ============================================================ -->
+<h2>0. 实测基线（nsys，单卡 H4096/I640/E128，M=8）</h2>
+<div class="panel">
+<table>
+<tr><th>kernel 符号</th><th>instances</th><th>avg</th><th>承载的工作</th></tr>
+<tr><td><code>sm90_mxfp4_mega_moe_l1_impl</code></td><td>8（=4 调用 × 2 半 grid）</td><td><b>112.9 us</b></td><td>dispatch + GG1 + SwiGLU + requant</td></tr>
+<tr><td><code>sm90_mxfp4_mega_moe_l2_impl</code></td><td>8</td><td><b>73.3 us</b></td><td>GG2 + scatter + combine</td></tr>
+</table>
+<div class="note ok">
+  <b>整层只有这 2 个 kernel 符号</b>，profile 里没有第三个（host 侧 <code>launch_with_phase</code> 也只有两次 launch）。
+  <b>L1 : L2 ≈ 1.55 : 1</b> —— GG1 的 FLOP 是 GG2 的 2×（N=2I vs K=I），但 L1 还背 dispatch、L2 还背 scatter+combine，所以没到 2:1。
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. 线程编排（实际 JIT 配置）</h2>
+<div class="panel">
+<table>
+<tr><th>角色</th><th>线程数</th><th>warp 数</th><th>寄存器策略</th><th>职责</th></tr>
+<tr><td style="color:var(--disp)"><b>dispatch</b></td><td>128（compact 模式 64）</td><td>4（或 2）</td><td><code>reg_dealloc</code> 少寄存器</td><td>counting sort + NVLink 拉/散 token 与 SF</td></tr>
+<tr><td style="color:var(--tma)"><b>TMA producer</b></td><td>64</td><td>2（A+SFA / B+SFB）</td><td><code>reg_dealloc</code></td><td>发 <code>cp.async.bulk.tensor</code>，单线程下发</td></tr>
+<tr><td style="color:var(--dec)"><b>decode</b></td><td>128（compact 64）</td><td>4（或 2）</td><td><code>reg_dealloc</code></td><td>4bit → 8bit 就地解码于 smem</td></tr>
+<tr><td style="color:var(--math)"><b>math WG</b></td><td>128 或 256</td><td>4 或 8（1~2 WG）</td><td><code>reg_alloc</code> 吃满寄存器</td><td>WGMMA + promote + epilogue + combine</td></tr>
+</table>
+<div class="note">
+  <code>num_epilogue_threads</code> 在 <code>block_n=256</code> 时取 256（2 个 math WG 做 pingpong），否则 128。
+  非 epilogue warp 也必须参与 <code>setmaxnreg.dec</code> 的 warpgroup 集体操作，否则 math WG 的 <code>reg_alloc</code> 会失败 —— 这是代码里专门留注释的坑。
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Shared memory 布局与 mbarrier 分组</h2>
+<div class="panel">
+<svg viewBox="0 0 1160 210" width="100%">
+  <text x="8" y="16" fill="#95a3bf" font-size="12">SMEM（一个 CTA 内，按地址从低到高）</text>
+
+  <rect x="8"   y="28" width="150" height="46" rx="6" fill="#3a2410" stroke="var(--disp)"/>
+  <text x="83" y="48" fill="#f0883e" font-size="11.5" text-anchor="middle">expert_count</text>
+  <text x="83" y="64" fill="#c9a184" font-size="10.5" text-anchor="middle">+ send_buffer（ring）</text>
+
+  <rect x="164" y="28" width="230" height="46" rx="6" fill="#10243a" stroke="var(--tma)"/>
+  <text x="279" y="48" fill="#58a6ff" font-size="11.5" text-anchor="middle">smem_a[stage] × N_STAGES</text>
+  <text x="279" y="64" fill="#8fbde8" font-size="10.5" text-anchor="middle">激活 tile（BLOCK_M × BLOCK_K）</text>
+
+  <rect x="400" y="28" width="230" height="46" rx="6" fill="#10243a" stroke="var(--tma)"/>
+  <text x="515" y="48" fill="#58a6ff" font-size="11.5" text-anchor="middle">smem_b[stage] × N_STAGES</text>
+  <text x="515" y="64" fill="#8fbde8" font-size="10.5" text-anchor="middle">权重 tile（打包 4bit → 解码原地变 8bit）</text>
+
+  <rect x="636" y="28" width="150" height="46" rx="6" fill="#2a1d3d" stroke="var(--dec)"/>
+  <text x="711" y="48" fill="#bc8cff" font-size="11.5" text-anchor="middle">smem_b_coeff</text>
+  <text x="711" y="64" fill="#cbb0e8" font-size="10.5" text-anchor="middle">e8m0 / s2·z 系数</text>
+
+  <rect x="792" y="28" width="150" height="46" rx="6" fill="#1b2337" stroke="#4a5878"/>
+  <text x="867" y="48" fill="#c3cee2" font-size="11.5" text-anchor="middle">SFA × N_STAGES</text>
+  <text x="867" y="64" fill="#95a3bf" font-size="10.5" text-anchor="middle">激活 scale</text>
+
+  <rect x="948" y="28" width="204" height="46" rx="6" fill="#3a1450" stroke="var(--bar)"/>
+  <text x="1050" y="48" fill="#e879f9" font-size="11.5" text-anchor="middle">mbarriers</text>
+  <text x="1050" y="64" fill="#d7a6e8" font-size="10.5" text-anchor="middle">5 组（见下）</text>
+
+  <!-- barrier detail -->
+  <text x="8" y="105" fill="#e879f9" font-size="12" font-weight="600">mbarrier 分组（barrier_start_ptr 起，按序排布）</text>
+  <g font-size="10.8">
+    <rect x="8"   y="116" width="196" height="34" rx="5" fill="#3a1450" stroke="var(--bar)"/>
+    <text x="106" y="131" fill="#e879f9" text-anchor="middle">dispatch_barriers</text>
+    <text x="106" y="145" fill="#d7a6e8" text-anchor="middle">[N_dispatch_warps]</text>
+
+    <rect x="210" y="116" width="196" height="34" rx="5" fill="#3a1450" stroke="var(--bar)"/>
+    <text x="308" y="131" fill="#e879f9" text-anchor="middle">full_barriers</text>
+    <text x="308" y="145" fill="#d7a6e8" text-anchor="middle">[N_STAGES] · TMA 到齐</text>
+
+    <rect x="412" y="116" width="196" height="34" rx="5" fill="#3a1450" stroke="var(--bar)"/>
+    <text x="510" y="131" fill="#e879f9" text-anchor="middle">empty_barriers</text>
+    <text x="510" y="145" fill="#d7a6e8" text-anchor="middle">[N_STAGES] · consumer 用完</text>
+
+    <rect x="614" y="116" width="196" height="34" rx="5" fill="#3a1450" stroke="var(--bar)"/>
+    <text x="712" y="131" fill="#e879f9" text-anchor="middle">dequant_barriers</text>
+    <text x="712" y="145" fill="#d7a6e8" text-anchor="middle">[N_STAGES] · 解码完成</text>
+
+    <rect x="816" y="116" width="196" height="34" rx="5" fill="#3a1450" stroke="var(--bar)"/>
+    <text x="914" y="131" fill="#e879f9" text-anchor="middle">combine_barriers</text>
+    <text x="914" y="145" fill="#d7a6e8" text-anchor="middle">仅 L2</text>
+  </g>
+  <text x="8" y="176" fill="#95a3bf" font-size="11.5">流水核心三组 = <tspan fill="#e879f9">full</tspan>（TMA→decode）· <tspan fill="#e879f9">dequant</tspan>（decode→math）· <tspan fill="#e879f9">empty</tspan>（math→TMA），构成闭环</text>
+  <text x="8" y="196" fill="#6f7f9e" font-size="11">每绕环一圈 phase(parity) 翻转 —— waiter 必须观察每一轮 parity，否则死锁/读脏</text>
+</svg>
+<div class="note warn">
+  <b>N_STAGES 是性能瓶颈所在：</b>smem 被 dispatch ring + coeff + SFA/SFB + decode 缓冲挤占后，
+  权重 prefetch 只剩 <b>3~4 级</b>（理想需 8 级）→ latency-bound，DRAM 只到 26% roofline。
+  这就是「融合内核单 GEMM 比 FlashInfer 慢」的根因：FlashInfer 去融合，GEMM 独占 smem 做深 prefetch。
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. KERNEL 1 (l1_impl) —— 逐角色展开</h2>
+
+<h3>3.1 dispatch warp：counting sort + scatter（排 token 到 expert）</h3>
+<div class="panel">
+<pre><span class="c"># ① 数：本 SM 每个 expert 收到几个 (token,topk) 对</span>
+<span class="k">for</span> (tok, k) <span class="k">in</span> my_tokens × topk:
+    e = topk_idx[tok][k]
+    atomicAdd_block(smem_cnt[e], 1)
+
+<span class="c"># ② 抢：全局原子加，拿到本 SM 在每个 expert 里的连续区间起点</span>
+<span class="c">#    高 32 位计 SM 数、低 32 位计 token 数，一次原子加同时更新两者</span>
+<span class="k">for</span> e <span class="k">in</span> experts:
+    send_value  = (1 &lt;&lt; 32) | smem_cnt[e]
+    smem_cnt[e] = <span class="s">atomic_add</span>(global_expert_send_count[e], send_value)   <span class="c"># 返回旧值=我的起点</span>
+
+<span class="c"># ③ 散：算出目标卡 + 槽位，NVLink 直写 —— 排布与通信合一</span>
+<span class="k">for</span> (tok, k) <span class="k">in</span> my_tokens × topk:
+    e        = topk_idx[tok][k]
+    dst_rank = e // E_per_rank                      <span class="c"># 该 expert 在哪张卡</span>
+    slot     = atomicAdd_block(smem_cnt[e], 1)      <span class="c"># 在该 expert 内排第几个</span>
+    <span class="s">*sym_buffer.map(dst_ptr, dst_rank) = token_topk_idx</span>      <span class="c"># ★ scatter</span>
+
+<span class="c"># ④ 拉：从远端把属于本卡 expert 的 token（fp8）与 SF（per-128ch float）拉进 L1 pool</span>
+<span class="k">for</span> token_idx <span class="k">in</span> my_share:
+    remote_read(token) → local_L1_pool[slot]
+    remote_read(SF)    → local_sf[k_chunk * padded_pool_tokens + token_idx]
+    dispatch_barriers[warp].arrive()
+</pre>
+<div class="note ok">
+  <b>为什么不需要独立 permute kernel：</b>槽位由原子加当场算出，token 直接写到「目标卡 + 该 expert 区间内的位置」，
+  <b>落地即按 expert 连续排好</b>；SF 用简单线性映射同步排好（无需 4×32 转置）。
+</div>
+</div>
+
+<h3>3.2 TMA producer + decode：多级流水的前两级</h3>
+<div class="panel">
+<pre><span class="c"># TMA warp（B = 权重）</span>
+<span class="k">for</span> k_blk <span class="k">in</span> K_blocks:
+    <span class="s">empty_barriers[stage].wait(phase)</span>          <span class="c"># 等 math WG 腾出这一级</span>
+    cp.async.bulk.tensor(W_gmem[k_blk] → smem_b[stage],
+                         mbar=<span class="s">full_barriers[stage]</span>)  <span class="c"># 到齐字节数自动 arrive（expect_tx）</span>
+    advance(stage)                                <span class="c"># index+1，绕环则 phase 翻转</span>
+
+<span class="c"># decode warp（4bit → 8bit，就地在 smem）</span>
+<span class="k">for</span> k_blk <span class="k">in</span> K_blocks:
+    <span class="s">full_barriers[stage].wait(phase)</span>
+    <span class="c"># int4-SX ：t = prmt(uq); w = (t|t&lt;&lt;4)&amp;0x0F0F0F0F; d = vsub4(w, z)</span>
+    <span class="c">#           新变体 ZSUB_XOR： d = (w + (0x80808080-z)) ^ 0x80808080  （省 vsub4）</span>
+    <span class="c"># mxfp4  ：lut = exp_offset*0x08080808 + base;  d = prmt(lut_hi, lut_lo, code&amp;0x7777)</span>
+    smem_b[stage] = decode(smem_b[stage], coeff)
+    <span class="s">dequant_barriers[stage].arrive()</span>
+</pre>
+</div>
+
+<h3>3.3 math warpgroup：WGMMA + promote + epilogue</h3>
+<div class="panel">
+<pre><span class="k">for</span> (expert, m_blk, n_blk) <span class="k">in</span> my_tiles:
+    final_acc = 0
+    <span class="c"># ---------- mainloop：一段 = BLOCK_K = 128 ----------</span>
+    <span class="k">for</span> k_blk <span class="k">in</span> K_blocks:
+        <span class="s">dequant_barriers[stage].wait(phase)</span>
+        wgmma.fence()
+        <span class="k">for</span> j <span class="k">in</span> range(4):                       <span class="c"># 4 条 K32 WGMMA</span>
+            wgmma.mma_async(acc, smem_a[stage], smem_b[stage][j])   <span class="c"># 异步，发了就走</span>
+        wgmma.commit_group();  wgmma.wait_group(0)  <span class="c"># 读 acc 前必须 wait</span>
+        <span class="s">empty_barriers[stage].arrive()</span>            <span class="c"># 还给 TMA</span>
+
+        <span class="c"># ★★ promote：三种格式性能差异的唯一来源 ★★</span>
+        <span class="c">#   int4-SX      : 每 K128 一次（s2 组宽=128，天然对齐 BLOCK_K）</span>
+        <span class="c">#   mxfp4        : 每 K32 四次（e8m0 组宽=32）→ 比 int4 慢 ~13%</span>
+        <span class="c">#   scaled-MXFP4 : 每 K128 一次（scale 已折进 decode 的 LUT）→ 反超 int4</span>
+        final_acc += <span class="s">promote</span>(acc, scale)
+        advance(stage)
+
+    <span class="c"># ---------- L1 epilogue：SwiGLU + per-token 量化 ----------</span>
+    <span class="k">for</span> p <span class="k">in</span> pairs:                                <span class="c"># gate/up 交错布局（granularity-8）</span>
+        y[p] = silu(clamp(gate[p])) * clamp(up[p])
+        amax_r0 = max(amax_r0, |y[p]|)              <span class="c"># 每行（=每 token）各自累</span>
+    amax_r0 *= |topk_weight|
+    amax_r0 = <span class="s">warp_reduce&lt;4&gt;</span>(amax_r0, Max)         <span class="c"># ★ 只跨 4 lane，不跨 CTA</span>
+
+    sf_inv = 127.0 / amax_r0                        <span class="c"># int8；fp8 e4m3 则用 448</span>
+    q      = quantize(y, sf_inv)                    <span class="c"># int8 借 fp8 buffer 搬运 → 避开 NaN 位型</span>
+    TMA_store(q → L1_out)
+    write_float(sf → L2_acts_SF_buf)                <span class="c"># per-token × per-K64</span>
+</pre>
+<div class="note ok">
+  <b><code>warp_reduce&lt;4&gt;</code> 这一行是免掉 reduce kernel 的关键：</b>
+  L2 激活 SF 的分组宽度（K64）<b>特意等于一个 L1 N-block 的输出宽度</b>，
+  所以 per-token amax 的规约完全在 block 内（寄存器 + 4 lane shuffle）完成。
+  若改成「全局 per-token」scale，一个 token 的行横跨所有 N block → 必须跨 CTA 规约 → 得单独插 reduce kernel（CuTeDSL 那条路的困境）。
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. KERNEL 2 (l2_impl) —— GG2 + scatter + combine</h2>
+<div class="panel">
+<pre><span class="c"># dispatch warp 在 L2 只做一件事：取回各 expert 实收计数，然后清理 workspace</span>
+<span class="k">if</span> is_linear2_only:
+    scheduler.fetch_expert_recv_count()
+    nvlink_barrier(...)                             <span class="c"># 跨卡同步一次</span>
+    cleanup_workspace()
+
+<span class="c"># mainloop 同 L1（TMA → decode → WGMMA → promote），K = I = 640</span>
+<span class="c"># 注意：L2 激活 SF 在 K64 边界变化 → 每 K128 需要两条累加链（promote 两次）</span>
+
+<span class="c"># ---------- L2 epilogue：cast + scatter ----------</span>
+bf16 = cast(final_acc)
+STSM(bf16 → smem)                                   <span class="c"># 先进 smem 整理</span>
+<span class="k">for</span> row <span class="k">in</span> rows:
+    dst_rank = orig_rank_of(row)
+    <span class="s">*sym_buffer.map(combine_buf_ptr, dst_rank) = bf16_row</span>   <span class="c"># ★ scatter 回原卡</span>
+
+<span class="c"># ---------- COMBINE：top-k 规约 ----------</span>
+grid_barrier()                                      <span class="c"># 等所有卡的 scatter 落地</span>
+<span class="k">for</span> tok <span class="k">in</span> my_tokens:
+    out[tok] = Σ_k  topk_weight[tok][k] * combine_buf[tok][k]    <span class="c"># BF16 加权求和</span>
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. 三级流水时序（一个 CTA 内）</h2>
+<div class="panel">
+<svg viewBox="0 0 1160 262" width="100%">
+  <text x="10" y="16" fill="#95a3bf" font-size="12">时间 →（每格 = 一个 K128 block）</text>
+  <line x1="150" y1="26" x2="1150" y2="26" stroke="#3a4560"/>
+
+  <text x="10" y="56" fill="#f0883e" font-size="11.5" font-weight="600">dispatch warp</text>
+  <text x="10" y="101" fill="#58a6ff" font-size="11.5" font-weight="600">TMA producer</text>
+  <text x="10" y="146" fill="#bc8cff" font-size="11.5" font-weight="600">decode warp</text>
+  <text x="10" y="191" fill="#3fb950" font-size="11.5" font-weight="600">math WG0 (WGMMA)</text>
+  <text x="10" y="232" fill="#e3b341" font-size="11.5" font-weight="600">math WG1 (epilogue)</text>
+
+  <rect x="150" y="40" width="1000" height="22" rx="4" fill="#3a2410" stroke="var(--disp)"/>
+  <text x="650" y="55" fill="#f0883e" font-size="11" text-anchor="middle">NVLink pull / scatter —— 全程与计算重叠（这就是通信被藏掉的地方）</text>
+
+  <g font-size="10.5">
+    <rect x="150" y="85"  width="118" height="22" rx="4" fill="#10243a" stroke="var(--tma)"/><text x="209" y="100" fill="#58a6ff" text-anchor="middle">TMA k0</text>
+    <rect x="276" y="85"  width="118" height="22" rx="4" fill="#10243a" stroke="var(--tma)"/><text x="335" y="100" fill="#58a6ff" text-anchor="middle">TMA k1</text>
+    <rect x="402" y="85"  width="118" height="22" rx="4" fill="#10243a" stroke="var(--tma)"/><text x="461" y="100" fill="#58a6ff" text-anchor="middle">TMA k2</text>
+    <rect x="528" y="85"  width="118" height="22" rx="4" fill="#10243a" stroke="var(--tma)"/><text x="587" y="100" fill="#58a6ff" text-anchor="middle">TMA k3</text>
+    <rect x="654" y="85"  width="118" height="22" rx="4" fill="#10243a" stroke="var(--tma)"/><text x="713" y="100" fill="#58a6ff" text-anchor="middle">TMA k4</text>
+
+    <rect x="276" y="130" width="118" height="22" rx="4" fill="#2a1d3d" stroke="var(--dec)"/><text x="335" y="145" fill="#bc8cff" text-anchor="middle">decode k0</text>
+    <rect x="402" y="130" width="118" height="22" rx="4" fill="#2a1d3d" stroke="var(--dec)"/><text x="461" y="145" fill="#bc8cff" text-anchor="middle">decode k1</text>
+    <rect x="528" y="130" width="118" height="22" rx="4" fill="#2a1d3d" stroke="var(--dec)"/><text x="587" y="145" fill="#bc8cff" text-anchor="middle">decode k2</text>
+    <rect x="654" y="130" width="118" height="22" rx="4" fill="#2a1d3d" stroke="var(--dec)"/><text x="713" y="145" fill="#bc8cff" text-anchor="middle">decode k3</text>
+
+    <rect x="402" y="175" width="118" height="22" rx="4" fill="#12301c" stroke="var(--math)"/><text x="461" y="190" fill="#3fb950" text-anchor="middle">WGMMA k0</text>
+    <rect x="528" y="175" width="118" height="22" rx="4" fill="#12301c" stroke="var(--math)"/><text x="587" y="190" fill="#3fb950" text-anchor="middle">WGMMA k1</text>
+    <rect x="654" y="175" width="118" height="22" rx="4" fill="#12301c" stroke="var(--math)"/><text x="713" y="190" fill="#3fb950" text-anchor="middle">WGMMA k2</text>
+    <rect x="780" y="175" width="118" height="22" rx="4" fill="#12301c" stroke="var(--math)"/><text x="839" y="190" fill="#3fb950" text-anchor="middle">WGMMA k3</text>
+
+    <rect x="528" y="216" width="180" height="20" rx="4" fill="#3a3410" stroke="var(--epi)"/><text x="618" y="230" fill="#e3b341" text-anchor="middle">SwiGLU/quant tile0</text>
+    <rect x="780" y="216" width="180" height="20" rx="4" fill="#3a3410" stroke="var(--epi)"/><text x="870" y="230" fill="#e3b341" text-anchor="middle">scatter tile1</text>
+  </g>
+
+  <!-- barrier arrows -->
+  <g stroke="var(--bar)" stroke-width="1.3" stroke-dasharray="3,3" fill="none">
+    <path d="M209,107 L209,120 L335,120 L335,130" marker-end="url(#bm)"/>
+    <path d="M335,152 L335,165 L461,165 L461,175" marker-end="url(#bm)"/>
+    <path d="M461,197 L461,205 L900,205 L900,112 L713,112 L713,107" marker-end="url(#bm)"/>
+  </g>
+  <defs><marker id="bm" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+    <path d="M0,0 L7,3.5 L0,7 z" fill="#e879f9"/></marker></defs>
+  <text x="230" y="118" fill="#e879f9" font-size="9.5">full</text>
+  <text x="356" y="163" fill="#e879f9" font-size="9.5">dequant</text>
+  <text x="600" y="203" fill="#e879f9" font-size="9.5">empty（回收 stage 给 TMA）</text>
+</svg>
+<div class="note warn">
+  <b>这是 ExCP 结构（专职 decode warp）。</b>LiquidGEMM（arXiv 2509.01229）实测该结构<b>在小 batch 是负收益</b>
+  —— RF↔SMEM 往返 + 显式同步的开销盖过重叠收益；其 ImFP 方案改为
+  <b>每个 Compute WG 自解码自 MMA、不回写 SMEM</b>。我们客户形状 m=4~64 <b>全在小 batch 区</b>，这是待验证的优化方向。
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. 量化 / scale 粒度与 promote 频率</h2>
+<div class="panel">
+<table>
+<tr><th>对象</th><th>格式</th><th>scale 粒度</th><th>每 K128 promote</th><th>说明</th></tr>
+<tr><td>L1 输入激活 X</td><td>fp8 / int8</td><td><b>per-token × per-K128</b></td><td>—</td><td>随 dispatch 一起搬运（per-128ch float）</td></tr>
+<tr><td>L2 输入激活</td><td>fp8 / int8</td><td><b>per-token × per-K64</b></td><td>—</td><td>粒度 = 一个 N block 宽 ⇒ amax 不跨 CTA</td></tr>
+<tr><td>权重 int4-SX</td><td>uint4 + zero point</td><td>s2 整数/K128 + s1 bf16/channel</td><td><b>1 次</b></td><td>组宽对齐 BLOCK_K，最省</td></tr>
+<tr><td>权重 mxfp4</td><td>e2m1 + e8m0</td><td>per-K32</td><td><b>4 次</b></td><td>← 比 int4 慢 ~8-13% 的根因</td></tr>
+<tr><td>权重 scaled-MXFP4<br><span style="color:var(--dim)">（实验）</span></td><td>e2m1 + e8m0 折进 fp8 指数</td><td>per-K32（折进 decode）</td><td><b>1 次</b></td><td>指数 +1 ⟺ 字节 +0x08，一条 IMAD 造表</td></tr>
+<tr><td>权重 nvfp4<br><span style="color:var(--dim)">（SM90 未实现）</span></td><td>e2m1 + ue4m3 + 全局 fp32</td><td>per-K16</td><td><b>8 次</b></td><td>ue4m3 带尾数 → 折不进指数；属 SM100</td></tr>
+</table>
+<div class="note">
+  <b>int8 与 fp8 共用同一套 SF 结构</b>，只差量化除数：int8 用 <code>amax/127</code>，fp8 e4m3 用 <code>amax/448</code>。
+  int8 中间结果借 fp8 类型 buffer 搬运，因此要避开 fp8 的两个 NaN 位型（0x7F / 0xFF）——代码把范围钳到 ±126 并把 −1 映射为 0。
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. 两处 scatter = 通信融合的全部</h2>
+<div class="panel">
+<table>
+<tr><th></th><th>① dispatch scatter</th><th>② L2 epilogue scatter</th></tr>
+<tr><td>位置</td><td>L1 kernel 开头</td><td>L2 kernel 结尾</td></tr>
+<tr><td>做什么</td><td>排 token 到 expert + 跨卡送</td><td>把部分结果散回 token 原属卡</td></tr>
+<tr><td>粒度</td><td>逐 (token, topk) 对</td><td>逐 row</td></tr>
+<tr><td>之后</td><td>本地 L1 pool 已按 expert 连续</td><td>COMBINE 做 top-k 加权规约</td></tr>
+</table>
+<div class="note ok">
+  <b>为什么用 scatter 而不是 all-to-all / allreduce：</b>scatter 是<b>逐 token 的细粒度远程写</b>，不是集合原语，
+  <b>不需要全卡同步</b>，因此可以由专职 warp 发出并与 WGMMA 重叠。集合原语必须等全体到齐，藏不掉。
+  <br>这正是 EP8 下 MegaMoE 能赢 FlashInfer 的原因：对手要在 GEMM 之后串行做 2 次 allreduce（实测 28~36 us），我们把它藏进了计算。
+</div>
+</div>
+
+<div class="note" style="margin-top:28px;border-left-color:var(--tma)">
+生成 2026-08-04 · 全部依据 <code>deep_gemm/include/deep_gemm/impls/sm90_mxfp4_mega_moe.cuh</code>、
+<code>quantization/{int4,mxfp4}_dequant.cuh</code>、<code>csrc/jit_kernels/impls/sm90_mxfp4_mega_moe.hpp</code> 实际代码，
+kernel 数量与耗时经 nsys 实测核实 ·
+配套：<code>W4A8_INT.md</code> / <code>W4A8_MASTER_INDEX.md</code> / <code>KERNEL_FACTORY_OPT_20260724.md</code> / <code>megamoe_flow.html</code>（简版）
+</div>
+
+</body>
+</html>
