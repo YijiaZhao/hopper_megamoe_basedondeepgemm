@@ -270,7 +270,95 @@ grid_barrier()                                      <span class="c"># 等所有�
 </div>
 
 <!-- ============================================================ -->
-<h2>5. 三级流水时序（一个 CTA 内）</h2>
+<h2>5. 流水时序 —— 计算与通信如何逐 tile 错开</h2>
+
+<h3>5.1 tile 级：通信是「算完一个 tile 发一波」，不是背景常驻</h3>
+<div class="panel">
+<svg viewBox="0 0 1160 300" width="100%">
+  <text x="10" y="16" fill="#95a3bf" font-size="12">时间 →</text>
+  <line x1="132" y1="26" x2="1150" y2="26" stroke="#3a4560"/>
+
+  <text x="10" y="58"  fill="#f0883e" font-size="11.5" font-weight="600">dispatch 拉取</text>
+  <text x="10" y="104" fill="#3fb950" font-size="11.5" font-weight="600">GEMM (WGMMA)</text>
+  <text x="10" y="150" fill="#e3b341" font-size="11.5" font-weight="600">epilogue</text>
+  <text x="10" y="196" fill="#f85149" font-size="11.5" font-weight="600">NVLink scatter</text>
+
+  <g font-size="10.5">
+    <!-- dispatch pull: tile N+2 -->
+    <rect x="132" y="42" width="150" height="24" rx="4" fill="#3a2410" stroke="var(--disp)"/><text x="207" y="58" fill="#f0883e" text-anchor="middle">pull tile0</text>
+    <rect x="290" y="42" width="150" height="24" rx="4" fill="#3a2410" stroke="var(--disp)"/><text x="365" y="58" fill="#f0883e" text-anchor="middle">pull tile1</text>
+    <rect x="448" y="42" width="150" height="24" rx="4" fill="#3a2410" stroke="var(--disp)"/><text x="523" y="58" fill="#f0883e" text-anchor="middle">pull tile2</text>
+    <rect x="606" y="42" width="150" height="24" rx="4" fill="#3a2410" stroke="var(--disp)"/><text x="681" y="58" fill="#f0883e" text-anchor="middle">pull tile3</text>
+    <rect x="764" y="42" width="150" height="24" rx="4" fill="#3a2410" stroke="var(--disp)"/><text x="839" y="58" fill="#f0883e" text-anchor="middle">pull tile4</text>
+
+    <!-- GEMM: 落后一拍 -->
+    <rect x="290" y="88" width="150" height="24" rx="4" fill="#12301c" stroke="var(--math)"/><text x="365" y="104" fill="#3fb950" text-anchor="middle">GEMM tile0</text>
+    <rect x="448" y="88" width="150" height="24" rx="4" fill="#12301c" stroke="var(--math)"/><text x="523" y="104" fill="#3fb950" text-anchor="middle">GEMM tile1</text>
+    <rect x="606" y="88" width="150" height="24" rx="4" fill="#12301c" stroke="var(--math)"/><text x="681" y="104" fill="#3fb950" text-anchor="middle">GEMM tile2</text>
+    <rect x="764" y="88" width="150" height="24" rx="4" fill="#12301c" stroke="var(--math)"/><text x="839" y="104" fill="#3fb950" text-anchor="middle">GEMM tile3</text>
+
+    <!-- epilogue -->
+    <rect x="440" y="134" width="76" height="24" rx="4" fill="#3a3410" stroke="var(--epi)"/><text x="478" y="150" fill="#e3b341" text-anchor="middle">epi0</text>
+    <rect x="598" y="134" width="76" height="24" rx="4" fill="#3a3410" stroke="var(--epi)"/><text x="636" y="150" fill="#e3b341" text-anchor="middle">epi1</text>
+    <rect x="756" y="134" width="76" height="24" rx="4" fill="#3a3410" stroke="var(--epi)"/><text x="794" y="150" fill="#e3b341" text-anchor="middle">epi2</text>
+    <rect x="914" y="134" width="76" height="24" rx="4" fill="#3a3410" stroke="var(--epi)"/><text x="952" y="150" fill="#e3b341" text-anchor="middle">epi3</text>
+
+    <!-- scatter: 每 tile 一波 -->
+    <rect x="516" y="180" width="82" height="24" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="557" y="196" fill="#f85149" text-anchor="middle">scat0</text>
+    <rect x="674" y="180" width="82" height="24" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="715" y="196" fill="#f85149" text-anchor="middle">scat1</text>
+    <rect x="832" y="180" width="82" height="24" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="873" y="196" fill="#f85149" text-anchor="middle">scat2</text>
+    <rect x="990" y="180" width="82" height="24" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="1031" y="196" fill="#f85149" text-anchor="middle">scat3</text>
+  </g>
+
+  <!-- 竖线标出"同一时刻" -->
+  <line x1="640" y1="34" x2="640" y2="212" stroke="#e879f9" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <text x="648" y="228" fill="#e879f9" font-size="11" font-weight="600">← 同一时刻：tile3 在拉 · tile2 在算 · tile1 在做 epilogue · tile0 的结果在 NVLink 上飞</text>
+
+  <text x="10" y="258" fill="#95a3bf" font-size="11.5">每个 tile 的链条是串行的（拉→算→epi→散），但<tspan fill="#3fb950" font-weight="600">不同 tile 的不同阶段同时占用不同硬件</tspan>，于是通信被计算盖住。</text>
+  <text x="10" y="280" fill="#6f7f9e" font-size="11">scatter 发出即返回（单向远程写，无汇合点），所以 math WG 不必等它落地就能开算下一个 tile。</text>
+</svg>
+<div class="note warn">
+  <b>头尾藏不掉：</b>第一个 tile 的 pull（prologue）没有前序计算可盖；最后的 grid barrier + COMBINE 必须等所有卡 scatter 落地。
+  M 越小 tile 越少 → 头尾占比越大 → 重叠窗口越短。这解释了为什么小 M 时相对 FlashInfer 的优势更小（m32 仅 +2%，m64 达 +15%）。
+</div>
+</div>
+
+<h3>5.2 对比：为什么 FlashInfer 藏不掉</h3>
+<div class="panel">
+<svg viewBox="0 0 1160 170" width="100%">
+  <text x="10" y="20" fill="#3fb950" font-size="12.5" font-weight="600">MegaMoE（scatter，逐 tile 错拍）</text>
+  <g font-size="10.5">
+    <rect x="132" y="30" width="120" height="22" rx="4" fill="#12301c" stroke="var(--math)"/><text x="192" y="45" fill="#3fb950" text-anchor="middle">GEMM t0</text>
+    <rect x="256" y="30" width="120" height="22" rx="4" fill="#12301c" stroke="var(--math)"/><text x="316" y="45" fill="#3fb950" text-anchor="middle">GEMM t1</text>
+    <rect x="380" y="30" width="120" height="22" rx="4" fill="#12301c" stroke="var(--math)"/><text x="440" y="45" fill="#3fb950" text-anchor="middle">GEMM t2</text>
+    <rect x="504" y="30" width="120" height="22" rx="4" fill="#12301c" stroke="var(--math)"/><text x="564" y="45" fill="#3fb950" text-anchor="middle">GEMM t3</text>
+    <rect x="256" y="56" width="70" height="20" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="291" y="70" fill="#f85149" text-anchor="middle">scat0</text>
+    <rect x="380" y="56" width="70" height="20" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="415" y="70" fill="#f85149" text-anchor="middle">scat1</text>
+    <rect x="504" y="56" width="70" height="20" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="539" y="70" fill="#f85149" text-anchor="middle">scat2</text>
+    <rect x="628" y="56" width="70" height="20" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="663" y="70" fill="#f85149" text-anchor="middle">scat3</text>
+    <rect x="628" y="30" width="80" height="22" rx="4" fill="#3a3410" stroke="var(--epi)"/><text x="668" y="45" fill="#e3b341" text-anchor="middle">combine</text>
+  </g>
+  <line x1="708" y1="24" x2="708" y2="84" stroke="#3fb950" stroke-width="2"/>
+  <text x="716" y="48" fill="#3fb950" font-size="11.5" font-weight="600">总时长 ≈ GEMM（通信藏在里面）</text>
+
+  <text x="10" y="112" fill="#f85149" font-size="12.5" font-weight="600">FlashInfer（allreduce，集合原语必须汇合）</text>
+  <g font-size="10.5">
+    <rect x="132" y="122" width="480" height="22" rx="4" fill="#10243a" stroke="var(--tma)"/><text x="372" y="137" fill="#58a6ff" text-anchor="middle">grouped GEMM 全部算完</text>
+    <rect x="616" y="122" width="96" height="22" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="664" y="137" fill="#f85149" text-anchor="middle">AR ①</text>
+    <rect x="716" y="122" width="96" height="22" rx="4" fill="#3a1414" stroke="var(--comm)"/><text x="764" y="137" fill="#f85149" text-anchor="middle">AR ②</text>
+  </g>
+  <line x1="812" y1="116" x2="812" y2="150" stroke="#f85149" stroke-width="2"/>
+  <text x="820" y="137" fill="#f85149" font-size="11.5" font-weight="600">总时长 = GEMM + 2×AR（实测 +28~36 us）</text>
+</svg>
+<div class="note ok">
+  <b>差别的本质不是「谁通信快」，是「能不能错拍」。</b>
+  allreduce 是集合原语，要求所有 rank 到齐才能进行，天然是同步点，只能排在 GEMM 之后；
+  scatter 是<b>单向逐 tile 的远程写，发出即返回、没有汇合点</b>，所以能与后续 tile 的计算重叠。
+  这 28~36 us 的差，就是 EP8 下 MegaMoE 赢 FlashInfer 的全部来源。
+</div>
+</div>
+
+<h3>5.3 CTA 内部：三级 mbarrier 流水（GEMM 一个 tile 内部的展开）</h3>
 <div class="panel">
 <svg viewBox="0 0 1160 262" width="100%">
   <text x="10" y="16" fill="#95a3bf" font-size="12">时间 →（每格 = 一个 K128 block）</text>
