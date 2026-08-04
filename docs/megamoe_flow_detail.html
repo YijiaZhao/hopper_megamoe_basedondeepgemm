@@ -351,6 +351,14 @@ grid_barrier()                                      <span class="c"># 等所有�
   <text x="10" y="258" fill="#95a3bf" font-size="11.5">每个 tile 的链条是串行的（拉→算→epi→散），但<tspan fill="#3fb950" font-weight="600">不同 tile 的不同阶段同时占用不同硬件</tspan>，于是通信被计算盖住。</text>
   <text x="10" y="280" fill="#6f7f9e" font-size="11">scatter 发出即返回（单向远程写，无汇合点），所以 math WG 不必等它落地就能开算下一个 tile。</text>
 </svg>
+<div class="note" style="border-left-color:var(--tma)">
+  <b>本图的放大倍数：</b>横轴是 <b>tile 序号</b>，一个 <code>GEMM tN</code> 方框 = 一整个 tile 的计算，
+  内部的 TMA 取权重 / decode / WGMMA 全被折叠进这个方框 —— 那一层展开见 <b>5.3</b>。
+  <br>本图只画 <b>跨卡</b>的两处数据流（<span style="color:var(--disp)">dispatch pull</span> 与
+  <span style="color:var(--comm)">scatter</span>），因为第 5 节的主题是<b>计算与通信重叠</b>；
+  权重加载是<b>卡内</b>行为（权重在 EP 下不跨卡，每张卡永久持有自己 expert 的权重），故不在本图出现。
+</div>
+
 <div class="note warn">
   <b>头尾藏不掉：</b>第一个 tile 的 pull（prologue）没有前序计算可盖；最后的 grid barrier + COMBINE 必须等所有卡 scatter 落地。
   M 越小 tile 越少 → 头尾占比越大 → 重叠窗口越短。这解释了为什么小 M 时相对 FlashInfer 的优势更小（m32 仅 +2%，m64 达 +15%）。
@@ -392,7 +400,7 @@ grid_barrier()                                      <span class="c"># 等所有�
 </div>
 </div>
 
-<h3>5.3 CTA 内部：三级 mbarrier 流水（GEMM 一个 tile 内部的展开）</h3>
+<h3>5.3 CTA 内部：三级 mbarrier 流水 —— 放大 5.1 里的一个 <code>GEMM tN</code> 方框</h3>
 <div class="panel">
 <svg viewBox="0 0 1160 262" width="100%">
   <text x="10" y="16" fill="#95a3bf" font-size="12">时间 →（每格 = 一个 K128 block）</text>
