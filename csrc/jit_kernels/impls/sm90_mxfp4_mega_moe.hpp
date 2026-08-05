@@ -120,6 +120,11 @@ public:
         const int w4a8_int_direct_nibble =
             (get_env<int>("DG_W4A8_INT_DIRECT_NIBBLE", 0) != 0 and
              w4a8_int_qoq_zp_shiftxor) ? 1 : 0;
+        // ZSUB_XOR (LiquidGEMM-style): keep the z-subtract in the uint8 domain
+        // (add 128-z, carry-free) and flip the MSB with one XOR, replacing __vsub4.
+        const int w4a8_int_zsub_xor =
+            (get_env<int>("DG_W4A8_INT_ZSUB_XOR", 0) != 0 and
+             w4a8_int_qoq_zp_shiftxor) ? 1 : 0;
         // Prestored ZP decode LUT: replaces the per-row arithmetic LUT build
         // with one LDS.64 from a 4KB smem table. Only meaningful on the
         // in-kernel QoQ+ZP decode path; PRE mode's prologue dequant never
@@ -177,6 +182,7 @@ public:
 #define DG_W4A8_INT_QOQ_ZP_PRELUT_CONST {}
 #define DG_W4A8_INT_QOQ_ZP_SHIFTXOR {}
 #define DG_W4A8_INT_DIRECT_NIBBLE {}
+#define DG_W4A8_INT_ZSUB_XOR {}
 #include <deep_gemm/impls/sm90_mxfp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -223,6 +229,7 @@ static void __instantiate_kernel() {{
     w4a8_int_qoq_zp_prelut_const,
     w4a8_int_qoq_zp_shiftxor,
     w4a8_int_direct_nibble,
+    w4a8_int_zsub_xor,
     kernel_symbol,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,

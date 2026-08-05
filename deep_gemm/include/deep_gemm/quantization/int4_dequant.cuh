@@ -133,6 +133,10 @@ DG_INT4_INLINE uint2 decode_uint4_prmt_groups_to_int8_pair_lut_zp(
 // splatted across bytes (z * 0x01010101); __vsub4 keeps the subtract inside
 // byte lanes (a plain sub would borrow across lanes). The grouped-PRMT byte
 // order is preserved: out.x = nibbles 0..3, out.y = nibbles 4..7 as bytes.
+#ifndef DG_W4A8_INT_ZSUB_XOR
+#define DG_W4A8_INT_ZSUB_XOR 0
+#endif
+
 DG_INT4_INLINE uint2 decode_uint4_prmt_groups_to_int8_pair_zsub(
         const uint32_t uq, const uint32_t zz) {
     // One PRMT each spreads the source bytes with zero gaps:
@@ -153,7 +157,14 @@ DG_INT4_INLINE uint2 decode_uint4_direct_to_int8_pair_zsub(
     constexpr uint32_t kNibbleMask = 0x0F0F0F0Fu;
     const uint32_t w0 = (uq >> 4) & kNibbleMask;
     const uint32_t w1 = uq & kNibbleMask;
+#if DG_W4A8_INT_ZSUB_XOR
+    // LiquidQuant-style: stay in the uint8 domain so no byte ever borrows,
+    // then one XOR flips the MSB back into int8 two's complement.
+    const uint32_t zz128 = 0x80808080u - zz;
+    return make_uint2((w0 + zz128) ^ 0x80808080u, (w1 + zz128) ^ 0x80808080u);
+#else
     return make_uint2(__vsub4(w0, zz), __vsub4(w1, zz));
+#endif
 }
 
 // Prestored ZP decode LUT (DG_W4A8_INT_QOQ_ZP_PRELUT=1): instead of building
