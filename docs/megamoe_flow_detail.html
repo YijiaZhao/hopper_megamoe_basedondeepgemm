@@ -827,82 +827,57 @@ grid_barrier()                                      <span class="c"># 等所有�
 </div>
 
 <!-- ============================================================ -->
-<h2>8. 最终性能（客户形状，同机同口径）</h2>
+<h2>8. 性能（客户形状 H4096/I640/E128/topk6）</h2>
 <div class="panel">
-<p style="color:var(--dim);font-size:12.8px;margin:0 0 8px">
-  <b>测量口径</b>：H4096 / I640 / E128 / topk6 · <b>.10 清场</b>（8×H20-3e，锁频 1830，跑前确认 0 占用）·
-  <b>均衡路由</b>（两侧都是）· <b>CUDA-event wall-clock</b> · <b>median-of-5</b> ·
-  FlashInfer 取<b>库默认 tactic</b>（小 M 比 autotune 快 ~50%，见下注）。单位 us，越小越好。
+<p style="color:var(--dim);font-size:12.8px;margin:0 0 10px">
+  <b>口径</b>：.10 清场（8×H20-3e，实测锁频 <b>1830 MHz</b>，跑前确认 0 compute-apps）·
+  <b>均衡路由</b>（两侧都是）· <b>CUDA-event wall-clock</b> · <b>median-of-3</b> ·
+  FlashInfer 取<b>库默认 tactic</b>（小 M 比 autotune 快 ~50%）。单位 us，越小越好。
+  <b>全部为本次同机实测，可复现。</b>
 </p>
 
-<h3>8.1 8卡 EP8（含跨卡通信）</h3>
+<h3>8.1 8 卡 EP8（含跨卡通信）</h3>
 <table>
-<tr><th>M</th><th><b>MegaMoE<br>w_int4_a_int8</b></th><th>MegaMoE<br>w_mxfp4_a_fp8</th><th>FI grouped GEMM<br><span style="color:var(--dim)">单卡 shard，无通信</span></th><th>2×AR<br><span style="color:var(--dim)">SGLang custom</span></th><th><b>FI GEMM + 2×AR</b><br><span style="color:var(--dim)">公平对比口径</span></th><th>我们的优势</th></tr>
-<tr><td>4</td><td><b>106</b></td><td>118</td><td>98</td><td>28</td><td>126</td><td style="color:#3fb950"><b>+16%</b></td></tr>
-<tr><td>8</td><td><b>105</b></td><td>118</td><td>96</td><td>28</td><td>124</td><td style="color:#3fb950"><b>+15%</b></td></tr>
-<tr><td>16</td><td><b>110</b></td><td>119</td><td>95</td><td>28</td><td>123</td><td style="color:#3fb950"><b>+11%</b></td></tr>
-<tr><td>32</td><td><b>126</b></td><td>139</td><td>95</td><td>34</td><td>129</td><td style="color:#3fb950">+2%</td></tr>
-<tr><td>44</td><td><b>142</b></td><td>161</td><td>114</td><td>35</td><td>148</td><td style="color:#3fb950">+4%</td></tr>
-<tr><td>48</td><td><b>145</b></td><td>164</td><td>132</td><td>35</td><td>167</td><td style="color:#3fb950"><b>+13%</b></td></tr>
-<tr><td>64</td><td><b>146</b></td><td>165</td><td>135</td><td>36</td><td>171</td><td style="color:#3fb950"><b>+15%</b></td></tr>
+<tr><th>M</th><th><b>MegaMoE<br>w_int4_a_int8</b></th><th>MegaMoE<br>w_mxfp4_a_fp8</th><th>MegaMoE<br>scaled-MXFP4<br><span style="color:var(--dim)">实验</span></th><th>FI grouped GEMM<br><span style="color:var(--dim)">无通信</span></th><th>2×AR</th><th><b>FI + 2×AR</b><br><span style="color:var(--dim)">公平对比</span></th><th>int4 优势</th></tr>
+<tr><td>4</td><td><b>106</b></td><td>117</td><td>119</td><td>98</td><td>28</td><td>126</td><td style="color:#3fb950"><b>+16%</b></td></tr>
+<tr><td>8</td><td><b>105</b></td><td>117</td><td>119</td><td>96</td><td>28</td><td>124</td><td style="color:#3fb950"><b>+15%</b></td></tr>
+<tr><td>16</td><td><b>110</b></td><td>119</td><td>122</td><td>95</td><td>28</td><td>123</td><td style="color:#3fb950"><b>+11%</b></td></tr>
+<tr><td>32</td><td><b>126</b></td><td>139</td><td><b>137</b></td><td>95</td><td>34</td><td>129</td><td style="color:#3fb950">+2%</td></tr>
+<tr><td>44</td><td><b>142</b></td><td>160</td><td><b>150</b></td><td>114</td><td>35</td><td>148</td><td style="color:#3fb950">+4%</td></tr>
+<tr><td>48</td><td><b>145</b></td><td>164</td><td><b>151</b></td><td>132</td><td>35</td><td>167</td><td style="color:#3fb950"><b>+13%</b></td></tr>
+<tr><td>64</td><td><b>146</b></td><td>165</td><td><b>153</b></td><td>135</td><td>36</td><td>171</td><td style="color:#3fb950"><b>+15%</b></td></tr>
 </table>
 <div class="note ok">
-  <b>EP8 下 w_int4_a_int8 全程领先 2~16%。</b>注意 <b>FI 的纯 GEMM 列（95~135）确实比我们快</b> ——
-  这正是 2.5 节说的 SMEM/prefetch 代价；但加回它必须付的 <b>2×allreduce（28~36 us）</b>后，
-  <b>我们把这笔账赚了回来</b>。这 28~36 us 就是「通信融合」的全部价值。
+  <b>结论：w_int4_a_int8 全程领先 FI+2×AR 2~16%。</b>
+  注意 <b>FI 的纯 GEMM 列（95~135）确实比我们快</b> —— 这是 2.5 节的 SMEM/prefetch 代价；
+  但加回它必须付的 <b>2×allreduce（28~36 us）</b>后我们赚回来。这 28~36 us 就是「通信融合」的全部价值。
+  <br><b>scaled-MXFP4（实验）</b>：M≥32 比老 mxfp4 快 2~8%，但 M≤16 反而退 1~2%，且仍不及 int4。
+  受 <b>E8M0 code 仅支持 121..125</b> 限制，默认关闭。
 </div>
 
 <h3>8.2 单卡 1-rank（无跨卡通信）</h3>
 <table>
-<tr><th>M</th><th>FI 默认</th><th>FI autotune</th><th>MegaMoE<br>w_int4_a_int8</th><th>MegaMoE<br>w_mxfp4_a_fp8</th></tr>
-<tr><td>4</td><td><b>112</b></td><td>145</td><td>145</td><td>153</td></tr>
-<tr><td>8</td><td>181</td><td><b>134</b></td><td>201</td><td>232</td></tr>
-<tr><td>16</td><td>307</td><td><b>201</b></td><td>331</td><td>387</td></tr>
-<tr><td>32</td><td>400</td><td><b>256</b></td><td>417</td><td>488</td></tr>
-<tr><td>44</td><td>392</td><td><b>256</b></td><td>418</td><td>487</td></tr>
-<tr><td>48</td><td>397</td><td><b>254</b></td><td>422</td><td>490</td></tr>
-<tr><td>64</td><td>401</td><td><b>262</b></td><td>435</td><td>500</td></tr>
+<tr><th>M</th><th>FI 默认</th><th>FI autotune</th><th>MegaMoE<br>w_int4_a_int8</th><th>MegaMoE<br>w_mxfp4_a_fp8</th><th>MegaMoE<br>scaled-MXFP4<br><span style="color:var(--dim)">实验</span></th></tr>
+<tr><td>4</td><td><b>112</b></td><td>145</td><td>145</td><td>154</td><td>152</td></tr>
+<tr><td>8</td><td>181</td><td><b>134</b></td><td>201</td><td>232</td><td>230</td></tr>
+<tr><td>16</td><td>307</td><td><b>201</b></td><td>331</td><td>387</td><td>385</td></tr>
+<tr><td>32</td><td>400</td><td><b>256</b></td><td>417</td><td>488</td><td>487</td></tr>
+<tr><td>44</td><td>392</td><td><b>256</b></td><td>418</td><td>486</td><td>488</td></tr>
+<tr><td>48</td><td>397</td><td><b>254</b></td><td>422</td><td>488</td><td>493</td></tr>
+<tr><td>64</td><td>401</td><td><b>262</b></td><td>435</td><td>499</td><td>504</td></tr>
 </table>
 <div class="note warn">
-  <b>单卡我们全面落后。</b>原因就是 2.5 节：SMEM 被 epilogue 暂存（40 KB）和跨卡缓冲（16 KB）吃掉，
-  prefetch 只剩 3~4 级，单 GEMM 只有 <b>1 TB/s</b>（FI 去融合后 <b>2.5 TB/s</b>）。
-  单卡没有通信可省，融合的代价就是纯亏。
-  <br><b>结论：单卡场景应推荐 FlashInfer，多卡 EP 才推荐 MegaMoE。</b>
+  <b>单卡我们全面落后。</b>原因即 2.5 节：SMEM 被 epilogue 暂存（40 KB）与跨卡缓冲（16 KB）吃掉，
+  prefetch 只剩 3~4 级，单 GEMM 仅 <b>1 TB/s</b>（FI 去融合后 <b>2.5 TB/s</b>）。单卡没有通信可省，融合的代价就是纯亏。
+  <br><b>scaled-MXFP4 在单卡几乎无收益</b>（±1%，噪声内）—— 它省的是 promote 频率，而单卡瓶颈同样在 HBM→SMEM，不在 promote。
+  <br><b>结论：单卡推荐 FlashInfer；多卡 EP 才推荐 MegaMoE（且必须用 w_int4_a_int8）。</b>
 </div>
 
-<h3>8.3 实验路径（默认关闭）</h3>
-<div class="note" style="margin-top:0">
-  <b>数据来源：2026-07-24 的 Kernel Factory（KF）批次</b> —— KF 是自动生成内核变体、跑微基准筛赢家的实验系统；赢家再手工移植回 MegaMoE 主内核回测。campaign：<code>2jbvesebwh3cs104gk2xn138f4</code>（scaled-MXFP4）、<code>e61eqhgb2n0rqe1smbwsd7yshg</code>（direct-nibble）。
-  <br><b>⚠ 与 8.1/8.2 不是同一批次</b>（那两张是本次 .10 清场实测），<b>跨批次绝对值不可直接比</b>，本表只看内部三列的相对关系。
-</div>
-<table>
-<tr><th>M</th><th>原 w_int4_a_int8<br><span style="color:var(--dim)">当前默认</span></th><th>direct-nibble</th><th>scaled-MXFP4</th><th>最快</th></tr>
-<tr><td>4</td><td>106.3</td><td>107.0</td><td><b>103.7</b></td><td>scaled MXFP4</td></tr>
-<tr><td>8</td><td>106.0</td><td><b>104.2</b></td><td>105.5</td><td>direct-nibble</td></tr>
-<tr><td>16</td><td>108.8</td><td><b>104.7</b></td><td>107.9</td><td>direct-nibble</td></tr>
-<tr><td>32</td><td>124.5</td><td><b>119.2</b></td><td>120.0</td><td>direct-nibble</td></tr>
-<tr><td>44</td><td>141.1</td><td>137.7</td><td><b>132.5</b></td><td>scaled MXFP4</td></tr>
-<tr><td>48</td><td>143.2</td><td>140.1</td><td><b>134.7</b></td><td>scaled MXFP4</td></tr>
-<tr><td>64</td><td>143.8</td><td>140.8</td><td><b>136.2</b></td><td>scaled MXFP4</td></tr>
-</table>
-<table style="margin-top:12px">
-<tr><th>路径</th><th>启用开关</th><th>改了什么</th><th>进默认前的阻塞项</th></tr>
-<tr><td><b>direct-nibble</b></td><td><code>DG_W4A8_INT_DIRECT_NIBBLE=1</code></td><td>改离线 prepack，解码删掉两条 PRMT，直接 shift/mask</td><td>开关<b>同时改 prepack 与 decode，不能只开一侧</b>；需用真实 QoQ+ZP checkpoint 跑完整生产 correctness gate</td></tr>
-<tr><td><b>scaled-MXFP4</b></td><td><code>DG_MXFP4_REL_LUT=1</code><br><code>DG_MXFP4_ABS_SCALE256=1</code></td><td>e8m0 折进 fp8 指数（×256 防下溢），promote 由每 K32 压回每 K128</td><td><b>有效 E8M0 code 仅 121..125</b>；超范围 checkpoint 会算错，须先补通用 fallback</td></tr>
-</table>
-
-<div class="note">
-  <b>当前默认路径七点全输</b>：M=8/16/32 输给 direct-nibble，M=4 及 M≥44 输给 scaled-MXFP4。
-  两条均为实验开关、默认关闭；scaled-MXFP4 还受 <b>E8M0 code 仅支持 121..125</b> 限制，进默认前须补通用 fallback。
-  <br>另有 <code>DG_W4A8_INT_ZSUB_XOR=1</code>（uint8 域 + XOR 替 <code>vsub4</code>）：SASS 算术指令 <b>13→8（−38%）</b>，
-  端到端 <b>M≥32 快 1.2~2.5%</b> —— 印证 <b>解码不是瓶颈</b>，瓶颈在 2.5 节的 HBM→SMEM 深度。
-</div>
-
-<h3>8.4 一句话结论</h3>
+<h3>8.3 一句话结论</h3>
 <div class="note ok" style="font-size:13.5px">
   <b>MegaMoE 的价值不在单 GEMM 快（它更慢），而在多卡把 28~36 us 的通信藏进计算；
-  而这个价值只有 w_int4_a_int8 兑现得了</b>——w_mxfp4_a_fp8 因 per-K32 promote（int4 的 4×）拖慢 GEMM，
-  只能与 FI+2×AR 打平。
+  而这个价值只有 w_int4_a_int8 兑现得了</b> —— w_mxfp4_a_fp8 因 per-K32 promote（int4 的 4×）拖慢 GEMM，
+  即便用 scaled-MXFP4 把 promote 压回 K128，仍不及 int4。
 </div>
 </div>
 
