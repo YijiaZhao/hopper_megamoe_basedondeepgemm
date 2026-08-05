@@ -833,7 +833,7 @@ grid_barrier()                                      <span class="c"># 等所有�
   <b>口径</b>：.10 清场（8×H20-3e，实测锁频 <b>1830 MHz</b>，跑前确认 0 compute-apps）·
   <b>均衡路由</b>（两侧都是）· <b>CUDA-event wall-clock</b> · <b>median-of-3</b> ·
   FlashInfer 取<b>库默认 tactic</b>（小 M 比 autotune 快 ~50%）。单位 us，越小越好。
-  <b>全部为本次同机实测，可复现。</b>
+  <b>全部为本次同机、同批次实测（int4 / mxfp4 / scaled-MXFP4 连续跑完，锁频 1830 已核实），可复现。</b>
 </p>
 
 <h3>8.0 计时范围：两边各包含什么</h3>
@@ -861,8 +861,8 @@ grid_barrier()                                      <span class="c"># 等所有�
 <h3>8.1 8 卡 EP8（含跨卡通信）</h3>
 <table>
 <tr><th>M</th><th><b>MegaMoE<br>w_int4_a_int8</b></th><th>MegaMoE<br>w_mxfp4_a_fp8</th><th>MegaMoE<br>scaled-MXFP4<br><span style="color:var(--dim)">实验</span></th><th>FI grouped GEMM<br><span style="color:var(--dim)">无通信</span></th><th>2×AR</th><th><b>FI + 2×AR</b><br><span style="color:var(--dim)">公平对比</span></th><th>int4 优势</th></tr>
-<tr><td>4</td><td><b>106</b></td><td>117</td><td>119</td><td>98</td><td>28</td><td>126</td><td style="color:#3fb950"><b>+16%</b></td></tr>
-<tr><td>8</td><td><b>105</b></td><td>117</td><td>119</td><td>96</td><td>28</td><td>124</td><td style="color:#3fb950"><b>+15%</b></td></tr>
+<tr><td>4</td><td><b>110</b></td><td>117</td><td>119</td><td>98</td><td>28</td><td>126</td><td style="color:#3fb950"><b>+13%</b></td></tr>
+<tr><td>8</td><td><b>107</b></td><td>117</td><td>119</td><td>96</td><td>28</td><td>124</td><td style="color:#3fb950"><b>+14%</b></td></tr>
 <tr><td>16</td><td><b>110</b></td><td>119</td><td>122</td><td>95</td><td>28</td><td>123</td><td style="color:#3fb950"><b>+11%</b></td></tr>
 <tr><td>32</td><td><b>126</b></td><td>139</td><td><b>137</b></td><td>95</td><td>34</td><td>129</td><td style="color:#3fb950">+2%</td></tr>
 <tr><td>44</td><td><b>142</b></td><td>160</td><td><b>150</b></td><td>114</td><td>35</td><td>148</td><td style="color:#3fb950">+4%</td></tr>
@@ -880,13 +880,13 @@ grid_barrier()                                      <span class="c"># 等所有�
 <h3>8.2 单卡 1-rank（无跨卡通信）</h3>
 <table>
 <tr><th>M</th><th>FI 默认</th><th>FI autotune</th><th>MegaMoE<br>w_int4_a_int8</th><th>MegaMoE<br>w_mxfp4_a_fp8</th><th>MegaMoE<br>scaled-MXFP4<br><span style="color:var(--dim)">实验</span></th></tr>
-<tr><td>4</td><td><b>112</b></td><td>145</td><td>145</td><td>154</td><td>152</td></tr>
+<tr><td>4</td><td><b>112</b></td><td>145</td><td>144</td><td>154</td><td>152</td></tr>
 <tr><td>8</td><td>181</td><td><b>134</b></td><td>201</td><td>232</td><td>230</td></tr>
-<tr><td>16</td><td>307</td><td><b>201</b></td><td>331</td><td>387</td><td>385</td></tr>
+<tr><td>16</td><td>307</td><td><b>201</b></td><td>330</td><td>387</td><td>385</td></tr>
 <tr><td>32</td><td>400</td><td><b>256</b></td><td>417</td><td>488</td><td>487</td></tr>
 <tr><td>44</td><td>392</td><td><b>256</b></td><td>418</td><td>486</td><td>488</td></tr>
-<tr><td>48</td><td>397</td><td><b>254</b></td><td>422</td><td>488</td><td>493</td></tr>
-<tr><td>64</td><td>401</td><td><b>262</b></td><td>435</td><td>499</td><td>504</td></tr>
+<tr><td>48</td><td>397</td><td><b>254</b></td><td>421</td><td>488</td><td>493</td></tr>
+<tr><td>64</td><td>401</td><td><b>262</b></td><td>434</td><td>499</td><td>504</td></tr>
 </table>
 <div class="note warn">
   <b>单卡我们全面落后。</b>原因即 2.5 节：SMEM 被 epilogue 暂存（40 KB）与跨卡缓冲（16 KB）吃掉，
