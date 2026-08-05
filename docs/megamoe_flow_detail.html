@@ -169,13 +169,13 @@
 <tr><td>ring buffer / L1 pool / combine buffer</td><td>—</td><td>—</td><td>dispatch 与 combine 的中转区</td><td>kernel 自用</td></tr>
 <tr><td><code>handle.buffer_ptrs</code></td><td><code>[8]</code> ptr</td><td>—</td><td><b>8 张卡的对称地址</b>，scatter / pull 跨卡靠它</td><td>初始化时建立</td></tr>
 </table>
-<h4 style="font-size:14px;margin:20px 0 4px;color:#cfd9ea">int4-SX 与 mxfp4 在这里的差别</h4>
+<h4 style="font-size:14px;margin:20px 0 4px;color:#cfd9ea">w_int4_a_int8 与 w_mxfp4_a_fp8 在这里的差别</h4>
 <p style="color:var(--dim);font-size:12.8px;margin:4px 0 0">
   <b>字段结构完全相同</b>（同样的 4 个字段、同样的形状与布局，TMA 搬运字节级一致）；
   差别只在 <code>buffer.x</code> / <code>buffer.x_sf</code> 里<b>装的是什么数值格式</b>，以及内核内部的消费方式。
 </p>
 <table>
-<tr><th></th><th>w_int4_a_int8</th><th>w_mxfp4_a_fp8</th></tr>
+<tr><th></th><th><b>w_int4_a_int8</b>（QoQ）</th><th><b>w_mxfp4_a_fp8</b></th></tr>
 <tr><td><b><code>buffer.x</code>（L1 输入激活）</b></td><td><b>int8</b><br><span style="color:var(--dim)">量化：<code>per_token_int8</code>，<code>clamp(-127,127)</code></span></td><td><b>fp8 e4m3</b><br><span style="color:var(--dim)">量化：<code>per_token_cast_to_fp8(gran_k=128)</code></span></td></tr>
 <tr><td><code>buffer.x_sf</code></td><td colspan="2" style="text-align:center">float，<b>per-token × K128（两路相同）</b></td></tr>
 <tr><td><code>topk_idx</code> / <code>topk_weights</code></td><td colspan="2" style="text-align:center"><b>完全相同</b>（与量化格式无关）</td></tr>
@@ -202,15 +202,15 @@
 </div>
 </div>
 
-<h3>0.5.4 权重侧量化：int4 的两级 scale + zero point</h3>
+<h3>0.5.4 权重侧量化：w_int4_a_int8（QoQ）的两级 scale + zero point</h3>
 <div class="panel">
 <p style="color:var(--dim);font-size:12.8px;margin:0 0 8px">
   权重量化<b>不在 <code>sym_buffer</code> 里</b>，它随 <code>l1_weights = (packed, scale_meta)</code> 一起离线 prepack 好传入。
-  int4 走 QoQ 非对称两级量化（下表）。
+  我们的 int4 <b>就是 QoQ</b>（两级 scale + zero point），没有第二种 int4。
 </p>
 
 <table>
-<tr><th></th><th><b>int4-SX（QoQ 非对称）</b></th><th>mxfp4</th></tr>
+<tr><th></th><th><b>w_int4_a_int8（QoQ）</b></th><th>mxfp4</th></tr>
 <tr><td>权重取值</td><td><b>uint4</b>，[0, 15]</td><td>e2m1（4bit 浮点）</td></tr>
 <tr><td>zero point</td><td><b>有：z（uint4，每组一个）</b></td><td>无</td></tr>
 <tr><td>第一级 scale</td><td><b>s2：整数，per-K128 组</b></td><td>e8m0（2 的幂），per-K32 组</td></tr>
@@ -228,7 +228,7 @@
   <br>· <b>z 是 uint4</b> —— 让权重能用无符号 [0,15] 全量程（非对称分布的权重比对称 [−7,7] 精度更好）。
 </div>
 
-<h4 style="font-size:14px;margin:18px 0 4px;color:#cfd9ea">int4 的解码变体（<code>int4_dequant.cuh</code>）</h4>
+<h4 style="font-size:14px;margin:18px 0 4px;color:#cfd9ea">QoQ 的解码实现变体（<code>int4_dequant.cuh</code>，同一格式的不同解码写法）</h4>
 <table>
 <tr><th>变体</th><th>s2 何时应用</th><th>解码热路径做的事</th><th>状态</th></tr>
 <tr><td>scaled-LUT <code>..._pair_lut</code></td><td><b>折进 LUT</b><br><code>lut = s2·{0..3 | 4..7}</code></td><td>查表即得 <code>w4·s2</code>（整数域 fold-at-decode）<br><span style="color:var(--dim)">不溢出：7·s2 ≤ 126</span></td><td>QoQ 用</td></tr>
@@ -403,7 +403,7 @@
 <span class="c"># decode warp（4bit → 8bit，就地在 smem）</span>
 <span class="k">for</span> k_blk <span class="k">in</span> K_blocks:
     <span class="s">full_barriers[stage].wait(phase)</span>
-    <span class="c"># int4-SX ：t = prmt(uq); w = (t|t&lt;&lt;4)&amp;0x0F0F0F0F; d = vsub4(w, z)</span>
+    <span class="c"># w_int4_a_int8 ：t = prmt(uq); w = (t|t&lt;&lt;4)&amp;0x0F0F0F0F; d = vsub4(w, z)</span>
     <span class="c">#           新变体 ZSUB_XOR： d = (w + (0x80808080-z)) ^ 0x80808080  （省 vsub4）</span>
     <span class="c"># mxfp4  ：lut = exp_offset*0x08080808 + base;  d = prmt(lut_hi, lut_lo, code&amp;0x7777)</span>
     smem_b[stage] = decode(smem_b[stage], coeff)
@@ -425,7 +425,7 @@
         <span class="s">empty_barriers[stage].arrive()</span>            <span class="c"># 还给 TMA</span>
 
         <span class="c"># ★★ promote：三种格式性能差异的唯一来源 ★★</span>
-        <span class="c">#   int4-SX      : 每 K128 一次（s2 组宽=128，天然对齐 BLOCK_K）</span>
+        <span class="c">#   w_int4_a_int8      : 每 K128 一次（s2 组宽=128，天然对齐 BLOCK_K）</span>
         <span class="c">#   mxfp4        : 每 K32 四次（e8m0 组宽=32）→ 比 int4 慢 ~13%</span>
         <span class="c">#   scaled-MXFP4 : 每 K128 一次（scale 已折进 decode 的 LUT）→ 反超 int4</span>
         final_acc += <span class="s">promote</span>(acc, scale)
@@ -642,9 +642,9 @@ grid_barrier()                                      <span class="c"># 等所有�
 <tr><th>对象</th><th>格式</th><th>scale 粒度</th><th>每 K128 promote</th><th>说明</th></tr>
 <tr><td>L1 输入激活 X</td><td>fp8 / int8</td><td><b>per-token × per-K128</b></td><td>—</td><td>随 dispatch 一起搬运（per-128ch float）</td></tr>
 <tr><td>L2 输入激活</td><td>fp8 / int8</td><td><b>per-token × per-K64</b></td><td>—</td><td>粒度 = 一个 N block 宽 ⇒ amax 不跨 CTA</td></tr>
-<tr><td>权重 int4-SX</td><td>uint4 + zero point</td><td>s2 整数/K128 + s1 bf16/channel</td><td><b>1 次</b></td><td>组宽对齐 BLOCK_K，最省</td></tr>
-<tr><td>权重 mxfp4</td><td>e2m1 + e8m0</td><td>per-K32</td><td><b>4 次</b></td><td>← 比 int4 慢 ~8-13% 的根因</td></tr>
-<tr><td>权重 scaled-MXFP4<br><span style="color:var(--dim)">（实验）</span></td><td>e2m1 + e8m0 折进 fp8 指数</td><td>per-K32（折进 decode）</td><td><b>1 次</b></td><td>指数 +1 ⟺ 字节 +0x08，一条 IMAD 造表</td></tr>
+<tr><td>权重 <b>w_int4_a_int8</b>（QoQ）</td><td>uint4 + zero point</td><td>s2 整数/K128 + s1 bf16/channel</td><td><b>1 次</b></td><td>组宽对齐 BLOCK_K，最省</td></tr>
+<tr><td>权重 <b>w_mxfp4_a_fp8</b></td><td>e2m1 + e8m0</td><td>per-K32</td><td><b>4 次</b></td><td>← 比 int4 慢 ~8-13% 的根因</td></tr>
+<tr><td>权重 scaled-MXFP4（实验）<br><span style="color:var(--dim)">（实验）</span></td><td>e2m1 + e8m0 折进 fp8 指数</td><td>per-K32（折进 decode）</td><td><b>1 次</b></td><td>指数 +1 ⟺ 字节 +0x08，一条 IMAD 造表</td></tr>
 <tr><td>权重 nvfp4<br><span style="color:var(--dim)">（SM90 未实现）</span></td><td>e2m1 + ue4m3 + 全局 fp32</td><td>per-K16</td><td><b>8 次</b></td><td>ue4m3 带尾数 → 折不进指数；属 SM100</td></tr>
 </table>
 <div class="note">
