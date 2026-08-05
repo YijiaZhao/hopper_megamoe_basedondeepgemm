@@ -870,7 +870,11 @@ grid_barrier()                                      <span class="c"># 等所有�
   <br><b>结论：单卡场景应推荐 FlashInfer，多卡 EP 才推荐 MegaMoE。</b>
 </div>
 
-<h3>8.3 实验路径（默认关闭，2026-07-24 KF 批次）</h3>
+<h3>8.3 实验路径（默认关闭）</h3>
+<div class="note" style="margin-top:0">
+  <b>数据来源：2026-07-24 的 Kernel Factory（KF）批次</b> —— KF 是自动生成内核变体、跑微基准筛赢家的实验系统；赢家再手工移植回 MegaMoE 主内核回测。campaign：<code>2jbvesebwh3cs104gk2xn138f4</code>（scaled-MXFP4）、<code>e61eqhgb2n0rqe1smbwsd7yshg</code>（direct-nibble）。
+  <br><b>⚠ 与 8.1/8.2 不是同一批次</b>（那两张是本次 .10 清场实测），<b>跨批次绝对值不可直接比</b>，本表只看内部三列的相对关系。
+</div>
 <table>
 <tr><th>M</th><th>原 w_int4_a_int8<br><span style="color:var(--dim)">当前默认</span></th><th>direct-nibble</th><th>scaled-MXFP4</th><th>最快</th></tr>
 <tr><td>4</td><td>106.3</td><td>107.0</td><td><b>103.7</b></td><td>scaled MXFP4</td></tr>
@@ -881,6 +885,12 @@ grid_barrier()                                      <span class="c"># 等所有�
 <tr><td>48</td><td>143.2</td><td>140.1</td><td><b>134.7</b></td><td>scaled MXFP4</td></tr>
 <tr><td>64</td><td>143.8</td><td>140.8</td><td><b>136.2</b></td><td>scaled MXFP4</td></tr>
 </table>
+<table style="margin-top:12px">
+<tr><th>路径</th><th>启用开关</th><th>改了什么</th><th>进默认前的阻塞项</th></tr>
+<tr><td><b>direct-nibble</b></td><td><code>DG_W4A8_INT_DIRECT_NIBBLE=1</code></td><td>改离线 prepack，解码删掉两条 PRMT，直接 shift/mask</td><td>开关<b>同时改 prepack 与 decode，不能只开一侧</b>；需用真实 QoQ+ZP checkpoint 跑完整生产 correctness gate</td></tr>
+<tr><td><b>scaled-MXFP4</b></td><td><code>DG_MXFP4_REL_LUT=1</code><br><code>DG_MXFP4_ABS_SCALE256=1</code></td><td>e8m0 折进 fp8 指数（×256 防下溢），promote 由每 K32 压回每 K128</td><td><b>有效 E8M0 code 仅 121..125</b>；超范围 checkpoint 会算错，须先补通用 fallback</td></tr>
+</table>
+
 <div class="note">
   <b>当前默认路径七点全输</b>：M=8/16/32 输给 direct-nibble，M=4 及 M≥44 输给 scaled-MXFP4。
   两条均为实验开关、默认关闭；scaled-MXFP4 还受 <b>E8M0 code 仅支持 121..125</b> 限制，进默认前须补通用 fallback。
