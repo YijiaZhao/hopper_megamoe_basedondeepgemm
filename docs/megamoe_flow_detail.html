@@ -177,8 +177,9 @@
 </p>
 <table>
 <tr><th></th><th><b>w_int4_a_int8</b>（QoQ）</th><th><b>w_mxfp4_a_fp8</b></th></tr>
-<tr><td><b><code>buffer.x</code>（L1 输入激活）</b></td><td><b>int8</b><br><span style="color:var(--dim)">量化：<code>per_token_int8</code>，<code>clamp(-127,127)</code></span></td><td><b>fp8 e4m3</b><br><span style="color:var(--dim)">量化：<code>per_token_cast_to_fp8(gran_k=128)</code></span></td></tr>
-<tr><td><code>buffer.x_sf</code></td><td>float，<b>per-token 整行一个</b>（<code>amax(dim=-1)/127</code>）<br><span style="color:var(--dim)">形状 <code>[m]</code>，H=4096 时每 token <b>1 个</b> scale</span></td><td>float，<b>per-token × 每 K128 一个</b>（<code>amax/448</code>）<br><span style="color:var(--dim)">形状 <code>[m, H/128]</code>，H=4096 时每 token <b>32 个</b></span></td></tr>
+<tr><td><b><code>buffer.x</code>（L1 输入激活）</b></td><td><b>int8 字节</b><br><span style="color:var(--dim)">量化 <code>per_token_int8</code>（clamp ±127），再 <code>.view(torch.float8_e4m3fn)</code> <b>按 fp8 类型塞入同一 buffer</b><br>（这就是内核注释说的 byte-identical）</span></td><td><b>fp8 e4m3</b><br><span style="color:var(--dim)">量化：<code>per_token_cast_to_fp8(gran_k=128)</code></span></td></tr>
+<tr><td><code>buffer.x_sf</code><br><span style="color:var(--dim)">布局</span></td><td colspan="2" style="text-align:center">float <code>[m, H/128]</code> —— <b>两路布局相同</b>（内核 SF 通路共用）</td></tr>
+<tr><td><code>buffer.x_sf</code><br><span style="color:var(--dim)">数值粒度</span></td><td><b>per-token 整行一个</b>：<code>amax(dim=-1)/127</code> 得 <code>[m]</code>，<br>再 <code>.unsqueeze(1).repeat(1, H//128)</code> <b>广播</b>成 <code>[m,H/128]</code><br><span style="color:#f85149">32 份是复制品，只有 1 个真实 scale</span></td><td><b>per-token × 每 K128 各一个</b>：<code>amax(dim=2)/448</code><br><span style="color:var(--dim)">32 个值各不相同</span></td></tr>
 <tr><td><code>topk_idx</code> / <code>topk_weights</code></td><td colspan="2" style="text-align:center"><b>完全相同</b>（与量化格式无关）</td></tr>
 <tr><td><b>权重量化结构</b></td><td><b>两级 scale + zero point</b><br>　<b>s1</b>：bf16 位型，<b>per-row</b>（amax/120）<br>　<b>s2</b>：<b>整数</b> [1,127]，<b>per-K128 组</b><br>　<b>z</b>：<b>uint4</b> [0,15]，<b>per-K128 组</b><br><span style="color:var(--dim)">三者打包进一个 32-bit plane 字</span></td><td><b>单级 scale，无 zero point</b><br>　<b>e8m0</b>：2 的幂（8bit 指数），<b>per-K32 组</b></td></tr>
 <tr><td><b>权重反量化式</b></td><td><code>w = ((w4 − z) · s2) · s1</code></td><td><code>w = e2m1 · 2^(e−127)</code></td></tr>
@@ -685,8 +686,8 @@ grid_barrier()                                      <span class="c"># 等所有�
 <div class="panel">
 <table>
 <tr><th>对象</th><th>格式</th><th>scale 粒度</th><th>每 K128 promote</th><th>说明</th></tr>
-<tr><td>L1 输入激活 X<br><span style="color:var(--dim)">（mxfp4 路）</span></td><td>fp8 e4m3</td><td><b>per-token × per-K128</b><br><span style="color:var(--dim)">[m, H/128]，amax/448</span></td><td>—</td><td>随 dispatch 一起搬运</td></tr>
-<tr><td>L1 输入激活 X<br><span style="color:var(--dim)">（int 路）</span></td><td>int8</td><td><b>per-token 整行一个</b><br><span style="color:#f85149">[m]，amax/127 —— 与 mxfp4 路不同</span></td><td>—</td><td>同上</td></tr>
+<tr><td>L1 输入激活 X<br><span style="color:var(--dim)">（mxfp4 路）</span></td><td>fp8 e4m3</td><td><b>per-token × per-K128</b><br><span style="color:var(--dim)">[m, H/128]，amax/448，32 个值各不同</span></td><td>—</td><td>随 dispatch 一起搬运</td></tr>
+<tr><td>L1 输入激活 X<br><span style="color:var(--dim)">（int 路）</span></td><td>int8 字节<br><span style="color:var(--dim)">view 成 fp8 类型</span></td><td>布局同为 <code>[m, H/128]</code><br><span style="color:#f85149">但真实粒度是 per-token 整行一个（amax/127），32 份为广播复制</span></td><td>—</td><td>同上</td></tr>
 <tr><td>L2 输入激活</td><td>fp8 / int8</td><td><b>per-token × per-K64</b></td><td>—</td><td>粒度 = 一个 N block 宽 ⇒ amax 不跨 CTA</td></tr>
 <tr><td>权重 <b>w_int4_a_int8</b>（QoQ）</td><td>uint4 + zero point</td><td>s2 整数[1,127]/K128 + z uint4/K128<br>+ s1 bf16 <b>per-row</b></td><td><b>1 次</b></td><td>s2 组宽 = BLOCK_K，s2·s1 在 promote 一次乘完</td></tr>
 <tr><td>权重 <b>w_mxfp4_a_fp8</b></td><td>e2m1 + e8m0</td><td>per-K32</td><td><b>4 次</b></td><td>← 比 int4 慢 ~8-13% 的根因</td></tr>
