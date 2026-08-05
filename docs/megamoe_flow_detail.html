@@ -833,7 +833,7 @@ grid_barrier()                                      <span class="c"># 等所有�
   <b>口径</b>：.10 清场（8×H20-3e，实测锁频 <b>1830 MHz</b>，跑前确认 0 compute-apps）·
   <b>均衡路由</b>（两侧都是）· <b>CUDA-event wall-clock</b> · <b>median-of-3</b> ·
   FlashInfer 取<b>库默认 tactic</b>（小 M 比 autotune 快 ~50%）。单位 us，越小越好。
-  <b>全部为本次同机、同批次实测（int4 / mxfp4 / scaled-MXFP4 连续跑完，锁频 1830 已核实），可复现。</b><br><b>⚠ 并行配置：attention DP + MoE EP</b> —— 每张卡持有<b>不同的</b> token（bench 的随机种子含 <code>rank_idx</code>，API 参数名为 <code>num_max_tokens_per_rank</code>）。<b>因此表中的 M 是「每卡 token 数」，不是全局 batch</b>：8 卡表里 M=64 表示全局 64×8=512 个 token。
+  <b>全部为本次同机、同批次实测（int4 / mxfp4 / scaled-MXFP4 连续跑完，锁频 1830 已核实），可复现。</b><br><b>⚠ 并行配置：attention DP + MoE EP</b> —— 每张卡持有<b>不同的</b> token（bench 的随机种子含 <code>rank_idx</code>，API 参数名为 <code>num_max_tokens_per_rank</code>）。<b>因此表中的 M 是「每卡 token 数」，不是全局 batch</b>：8 卡表里 M=64 表示全局 64×8=512 个 token。<br><b>口径缺口（诚实标注）</b>：三条 MegaMoE 路径是<b>同一批连续跑完</b>的；FI 三列为本 session 稍早测得（同机、同锁频，但<b>非同一批次</b>）。
 </p>
 
 <h3>8.0 计时范围：两边各包含什么</h3>
@@ -891,6 +891,33 @@ grid_barrier()                                      <span class="c"># 等所有�
   prefetch 只剩 3~4 级，单 GEMM 仅 <b>1 TB/s</b>（FI 去融合后 <b>2.5 TB/s</b>）。
   <br><b>单卡 direct-nibble 全面领先</b>（比 int4 默认快 3.5~4.5%），是三条路里单卡最优。
   <br><b>结论：单卡推荐 FlashInfer；多卡 EP 推荐 MegaMoE。</b>
+</div>
+
+<h3>8.2b 实验路径相对 int4 默认的增益</h3>
+<table>
+<tr><th rowspan="2">M</th><th colspan="2">8 卡 EP8</th><th colspan="2">单卡</th></tr>
+<tr><th>direct-nibble</th><th>scaled-MXFP4</th><th>direct-nibble</th><th>scaled-MXFP4</th></tr>
+<tr><td>4</td><td style="color:#f85149">−1.7%</td><td style="color:#3fb950"><b>+2.7%</b></td><td style="color:#3fb950">+3.3%</td><td style="color:#3fb950"><b>+7.4%</b></td></tr>
+<tr><td>8</td><td style="color:#f85149">−0.7%</td><td>0.0%</td><td style="color:#3fb950"><b>+4.7%</b></td><td style="color:#3fb950">+1.3%</td></tr>
+<tr><td>16</td><td style="color:#3fb950"><b>+1.5%</b></td><td style="color:#f85149">−1.5%</td><td style="color:#3fb950"><b>+4.1%</b></td><td style="color:#3fb950">+1.3%</td></tr>
+<tr><td>32</td><td style="color:#3fb950">+1.2%</td><td style="color:#3fb950"><b>+3.2%</b></td><td style="color:#3fb950"><b>+4.5%</b></td><td style="color:#3fb950">+0.9%</td></tr>
+<tr><td>44</td><td style="color:#3fb950">+2.7%</td><td style="color:#3fb950"><b>+5.8%</b></td><td style="color:#3fb950"><b>+4.1%</b></td><td style="color:#3fb950">+1.0%</td></tr>
+<tr><td>48</td><td style="color:#3fb950">+1.9%</td><td style="color:#3fb950"><b>+5.5%</b></td><td style="color:#3fb950"><b>+4.4%</b></td><td style="color:#3fb950">+1.5%</td></tr>
+<tr><td>64</td><td style="color:#3fb950">+2.1%</td><td style="color:#3fb950"><b>+4.7%</b></td><td style="color:#3fb950"><b>+4.0%</b></td><td style="color:#3fb950">+1.0%</td></tr>
+</table>
+<div class="note ok">
+  <b>两条路互补，没有单一赢家：</b>
+  <br>· <b>8 卡 M≥32 → scaled-MXFP4 最优</b>（+3.2~5.8%）；小 M 优势不明显甚至略退。
+  <br>· <b>单卡 → direct-nibble 全面最优</b>（+3.3~4.7%）；scaled-MXFP4 仅在 M=4 突出（+7.4%）。
+  <br>· 部署建议：<b>多卡大 M 用 scaled-MXFP4，单卡 / 小 M 用 direct-nibble</b>。
+</div>
+
+<div class="note warn">
+  <b>本轮修掉的关键 bug：</b><code>decode_mxfp4_prmt_groups_to_fp8_pair_scaled256</code>
+  <b>此前只有调用、没有定义</b>（提交 <code>2fd53b8</code> 遗漏），导致 scaled-MXFP4 一直
+  <b>编译失败并静默回退</b>到普通 REL_LUT 路径 —— 此前测得的「收益很小」是假象。补上定义后数据如上。
+  <br><b>两条实验路径进生产前仍需</b>：direct-nibble 用真实 QoQ+ZP checkpoint 跑完整 correctness gate；
+  scaled-MXFP4 补 E8M0 范围（当前仅 121..125）的通用 fallback。
 </div>
 
 <h3>8.3 一句话结论</h3>
