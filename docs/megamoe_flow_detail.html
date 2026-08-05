@@ -370,6 +370,95 @@
 </div>
 
 <!-- ============================================================ -->
+<h2>2.5 SMEM 预算：为什么 MegaMoE 的 prefetch 开不深</h2>
+<div class="panel">
+<p style="color:var(--dim);font-size:12.8px;margin:0 0 10px">
+  这是 <b>MegaMoE 单 GEMM 比 FlashInfer 慢的根因</b>。以下大小按代码公式代入客户形状算出：
+  <code>BLOCK_M=128, BLOCK_N=128, BLOCK_K=128, H=4096, 4 个 dispatch warp</code>。Hopper 每 SM 共 <b>228 KB</b> SMEM。
+</p>
+
+<h3 style="margin-top:6px">2.5.1 固定开销：MoE 独有的部分</h3>
+<table>
+<tr><th>占用者</th><th>代码常量</th><th>公式</th><th>大小</th><th>纯 GEMM 有吗</th></tr>
+<tr><td><b>① epilogue 暂存（fp32）</b></td><td><code>SMEM_CD_SWAP_L1_FP32_SIZE</code></td><td><code>BLOCK_M × (BLOCK_N/2) × 4B</code></td><td><b>32 KB</b></td><td>❌</td></tr>
+<tr><td><b>② epilogue 暂存（fp8）</b></td><td><code>SMEM_CD_SWAP_L1_FP8_SIZE</code></td><td><code>BLOCK_M × (BLOCK_N/2) × 1B</code></td><td><b>8 KB</b></td><td>❌</td></tr>
+<tr><td><b>③ 跨卡搬 token</b></td><td><code>SMEM_SEND_BUFFER_SIZE</code></td><td><code>kHidden × kNumDispatchWarps</code></td><td><b>16 KB</b></td><td>❌</td></tr>
+<tr><td>④ expert 计数</td><td><code>SMEM_EXPERT_COUNT_SIZE</code></td><td><code>kNumExperts × 4B</code></td><td>0.5 KB</td><td>❌</td></tr>
+<tr><td>⑤ combine 别名区 + 5 组 mbarrier</td><td>—</td><td>—</td><td>~3 KB</td><td>部分</td></tr>
+<tr><td colspan="3" style="text-align:right"><b>MegaMoE 固定开销合计</b></td><td><b>≈ 60 KB</b></td><td><b>纯 GEMM ≈ 8 KB</b></td></tr>
+</table>
+
+<h3>2.5.2 每级 stage 开销</h3>
+<table>
+<tr><th>项</th><th>公式</th><th>大小</th></tr>
+<tr><td>激活 tile</td><td><code>LOAD_BLOCK_M × BLOCK_K × 1B</code></td><td>16 KB</td></tr>
+<tr><td>打包权重（4bit）</td><td><code>LOAD_BLOCK_N × BLOCK_K / 2</code></td><td>8 KB</td></tr>
+<tr><td>权重系数 plane</td><td><code>LOAD_BLOCK_N × 4B</code></td><td>0.5 KB</td></tr>
+<tr><td>SFA + dequant barrier</td><td>—</td><td>~0.5 KB</td></tr>
+<tr><td colspan="2" style="text-align:right"><b>每级合计</b></td><td><b>≈ 25 KB</b></td></tr>
+</table>
+<div class="note">
+  注：<code>kRFDecode = kSwapABActive</code> 为真时 <code>SMEM_B_SIZE_PER_STAGE = 0</code> ——
+  解码后的权重放<b>寄存器</b>而非 SMEM，已经省掉每级 16 KB。这是我们已做的优化。
+</div>
+
+<h3>2.5.3 结果：级数被挤掉一半</h3>
+<pre>MegaMoE :  (228 − 60) / 25  ≈  6.7  →  实际 <span class="s">3~4 级</span>   （还要扣对齐 padding、occ2 双 CTA 腰斩）
+纯 GEMM :  (228 −  8) / 25  ≈  8.8  →  <span class="g">8 级</span> ✓
+</pre>
+<div class="note warn">
+  <b>后果链：</b>级数不足 → 同时在飞的 HBM→SMEM 请求不够填满 ~600ns 的 HBM 延迟 →
+  Tensor Core 周期性空等（<b>latency-bound</b>）→ <b>DRAM 只跑到 26% roofline</b>。
+  <br>实测印证：<b>FlashInfer 单 GEMM 2.5 TB/s，我们 1 TB/s</b> —— 差的正是这段有效带宽。
+  <br><b>注意大头是 epilogue 暂存（40 KB），不是通信（16 KB）</b>：即便完全不融合通信，SMEM 依然紧张。
+</div>
+
+<h3>2.5.4 那 40 KB 为什么省不掉：per-token 动态量化的「全行依赖」</h3>
+<pre>WGMMA 累加器（寄存器，fp32）
+   │
+   ├─① SwiGLU: silu(gate) × up  ────────► <span class="s">落 SMEM 第一次（fp32，32 KB）</span>
+   │                                        <span class="c"># 因为 ② 要跨 lane 规约，数据必须先摊到共享位置</span>
+   ├─② 求每行 amax（warp_reduce&lt;4&gt;）
+   │
+   ├─③ 量化: fp32 × (127/amax) → fp8 ────► <span class="s">落 SMEM 第二次（fp8，8 KB）</span>
+   │                                        <span class="c"># 因为 TMA 只能 shared→global，不能寄存器→global</span>
+   └─④ TMA store → 显存
+</pre>
+<div class="note">
+  <b>两道硬件限制，缺一不可：</b>
+  <br>· <b>求 amax 要跨线程</b> —— 一行的数据分散在多个 lane 的寄存器里，必须先摊到 SMEM 才能规约；
+  <br>· <b>TMA 只能从 SMEM 出发</b> —— <code>cp.async.bulk</code> 的语义是 shared ↔ global，量化结果也得先进 SMEM。
+  <br><br><b>本质是「全行依赖」：</b>必须先算完整行才能求出 amax，在此之前所有中间结果<b>无处可去</b>，只能压在 SMEM 里。
+</div>
+
+<h3>2.5.5 别人为什么不需要这块暂存</h3>
+<table>
+<tr><th>方案</th><th>中间激活怎么处理</th><th>要暂存吗</th><th>代价</th></tr>
+<tr><td>纯 grouped GEMM</td><td>输出 bf16，<b>不量化</b></td><td>❌ 流式输出</td><td>第二个 GEMM 吃不了 W4A8</td></tr>
+<tr><td>per-tensor 量化<br><span style="color:var(--dim)">（CuTeDSL Hopper MoE）</span></td><td>全张量一个固定 scale</td><td>❌ 不依赖整行</td><td><b>精度差</b>（离群值一来其余全废）</td></tr>
+<tr><td>拆成两个 kernel</td><td>中间落显存，<b>另起 kernel 求 amax</b></td><td>❌ 依赖挪到 kernel 外</td><td>多一次 launch + <b>多一遍显存读写</b></td></tr>
+<tr style="background:#12301c"><td><b>MegaMoE</b></td><td><b>kernel 内、per-token × K64 动态求 amax</b></td><td>⚠️ <b>40 KB</b></td><td>SMEM 紧 → prefetch 浅 → 单 GEMM 慢</td></tr>
+</table>
+<div class="note ok">
+  <b>这是有意的权衡，不是实现缺陷：</b>我们用 40 KB SMEM，买下了
+  「<b>per-token 高精度</b> + <b>不多跑一个 kernel</b> + <b>不多一遍显存往返</b>」。
+  <br>而且 SF 分组宽度（K64）<b>特意等于一个 N-block 的输出宽</b>，使 amax 规约只需
+  <code>warp_reduce&lt;4&gt;</code>、<b>完全不跨 CTA</b> —— 若改成全局 per-token，一个 token 的行会横跨所有 N block，
+  就必须跨 CTA 规约，只能再插一个 reduce kernel。
+  <br><br><b>代价的去向很清楚：</b>单卡没有通信可省 ⇒ 纯亏，FlashInfer 更快；
+  EP8 下省掉的 28~36 us 通信 &gt; GEMM 慢的部分 ⇒ <b>我们赢 2~16%</b>。
+</div>
+
+<h3>2.5.6 除 SMEM 外的其它资源竞争</h3>
+<table>
+<tr><th>资源</th><th>MegaMoE</th><th>纯 GEMM</th></tr>
+<tr><td>math WG 的寄存器</td><td>累加器 + 解码权重(RF) + SwiGLU 中间值 + amax/scale/topk_weight</td><td>只有累加器</td></tr>
+<tr><td>warp 角色数</td><td><b>5 类</b>（dispatch×4 / TMA×2 / decode×4 / math×4~8）</td><td>2 类（Load / Compute）</td></tr>
+<tr><td>连带约束</td><td>非 epilogue warp 也必须参与 <code>setmaxnreg.dec</code> 集体操作，牵制 math WG 能申请的寄存器上限</td><td>无</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
 <h2>3. KERNEL 1 (l1_impl) —— 逐角色展开</h2>
 
 <h3>3.1 dispatch warp：counting sort → scatter（送索引）→ pull（拉数据）</h3>
