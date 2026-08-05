@@ -791,15 +791,34 @@ grid_barrier()                                      <span class="c"># 等所有�
 </div>
 
 <!-- ============================================================ -->
-<h2>7. 两处 scatter = 通信融合的全部</h2>
+<h2>7. 跨卡通信：5 类动作，全部是单向细粒度访问</h2>
 <div class="panel">
 <table>
-<tr><th></th><th>① dispatch scatter</th><th>② L2 epilogue scatter</th></tr>
-<tr><td>位置</td><td>L1 kernel 开头</td><td>L2 kernel 结尾</td></tr>
-<tr><td>做什么</td><td>排 token 到 expert + 跨卡送</td><td>把部分结果散回 token 原属卡</td></tr>
-<tr><td>粒度</td><td>逐 (token, topk) 对</td><td>逐 row</td></tr>
-<tr><td>之后</td><td>本地 L1 pool 已按 expert 连续</td><td>COMBINE 做 top-k 加权规约</td></tr>
+<tr><th>#</th><th>代码位置</th><th>动作</th><th>方向</th><th>每 token 数据量</th><th>阶段</th></tr>
+<tr><td>1</td><td>:1195</td><td>scatter <b>索引</b>（token_topk_idx）</td><td>写远端</td><td>4 B</td><td>L1 dispatch</td></tr>
+<tr><td>2</td><td>:1209 / :1213</td><td>写远端 <b>expert 收发计数</b></td><td>写远端</td><td>4 B</td><td>L1 dispatch</td></tr>
+<tr style="background:#1b2337"><td><b>3</b></td><td>:1317-1343</td><td><b>pull：激活 + SF + topk_weight</b></td><td><b>读远端</b></td><td><b>≈ 4.2 KB</b></td><td>L1 dispatch</td></tr>
+<tr style="background:#1b2337"><td><b>4</b></td><td>:2101 / :4016-4151</td><td><b>scatter 结果</b>（bf16）</td><td><b>写远端</b></td><td><b>≈ 8 KB</b>（×topk）</td><td>L2 epilogue</td></tr>
+<tr><td>5</td><td>:1149 / :1219 / :1380</td><td><code>nvlink_barrier</code> × 3</td><td>同步</td><td>—</td><td>L1/L2 各阶段</td></tr>
 </table>
+<div class="note warn">
+  <b>数据量的大头是 ③ pull 和 ④ 结果 scatter</b>（KB 级），
+  ①② 只是 4 字节的索引与计数。<b>不要把「通信」简化成「两处 scatter」</b> ——
+  真正搬数据的是「先 scatter 索引 → 再 pull 数据」这一对，加上末尾把结果 scatter 回去。
+</div>
+
+<h3>为什么这些能和计算重叠</h3>
+<table>
+<tr><th></th><th>MegaMoE（①~④）</th><th>allreduce / all-to-all</th></tr>
+<tr><td>原语类型</td><td><b>单向远程读写</b>（one-sided，NVLink P2P）</td><td><b>集合原语</b>（collective）</td></tr>
+<tr><td>是否需要全体到齐</td><td><b>否</b> —— 发出即返回，无汇合点</td><td><b>是</b> —— 天然同步点</td></tr>
+<tr><td>粒度</td><td>逐 token / 逐 tile</td><td>整个张量</td></tr>
+<tr><td>能否被计算盖住</td><td><b>能</b>（由专职 warp 发出，与 WGMMA 并行）</td><td><b>不能</b>（只能排在 GEMM 之后）</td></tr>
+</table>
+<div class="note ok">
+  <b>关键不是「用了 scatter」，而是「用的是单向、无汇合点的细粒度访问」。</b>
+  ③ 的 pull 是<b>读</b>不是 scatter，同样能重叠 —— 因为它也是 one-sided、发出即返回。
+  <br>第 ⑤ 类 <code>nvlink_barrier</code> 是唯一藏不掉的部分（3 次），对应 5.1 图里说的「头尾藏不掉」。
 <div class="note ok">
   <b>为什么用 scatter 而不是 all-to-all / allreduce：</b>scatter 是<b>逐 token 的细粒度远程写</b>，不是集合原语，
   <b>不需要全卡同步</b>，因此可以由专职 warp 发出并与 WGMMA 重叠。集合原语必须等全体到齐，藏不掉。
