@@ -169,6 +169,31 @@
 <tr><td>ring buffer / L1 pool / combine buffer</td><td>—</td><td>—</td><td>dispatch 与 combine 的中转区</td><td>kernel 自用</td></tr>
 <tr><td><code>handle.buffer_ptrs</code></td><td><code>[8]</code> ptr</td><td>—</td><td><b>8 张卡的对称地址</b>，scatter / pull 跨卡靠它</td><td>初始化时建立</td></tr>
 </table>
+<h4 style="font-size:14px;margin:20px 0 4px;color:#cfd9ea">int4-SX 与 mxfp4 在这里的差别</h4>
+<p style="color:var(--dim);font-size:12.8px;margin:4px 0 0">
+  <b>字段结构完全相同</b>（同样的 4 个字段、同样的形状与布局，TMA 搬运字节级一致）；
+  差别只在 <code>buffer.x</code> / <code>buffer.x_sf</code> 里<b>装的是什么数值格式</b>，以及内核内部的消费方式。
+</p>
+<table>
+<tr><th></th><th>w_int4_a_int8</th><th>w_mxfp4_a_fp8</th></tr>
+<tr><td><b><code>buffer.x</code>（L1 输入激活）</b></td><td><b>int8</b><br><span style="color:var(--dim)">量化：<code>per_token_int8</code>，<code>clamp(-127,127)</code></span></td><td><b>fp8 e4m3</b><br><span style="color:var(--dim)">量化：<code>per_token_cast_to_fp8(gran_k=128)</code></span></td></tr>
+<tr><td><code>buffer.x_sf</code></td><td colspan="2" style="text-align:center">float，<b>per-token × K128（两路相同）</b></td></tr>
+<tr><td><code>topk_idx</code> / <code>topk_weights</code></td><td colspan="2" style="text-align:center"><b>完全相同</b>（与量化格式无关）</td></tr>
+<tr><td>L1 权重解码</td><td>int4 → int8（shift/mask + 减 zero point）</td><td>e2m1 → e4m3（PRMT 查表）</td></tr>
+<tr><td>L1 MMA</td><td><b>IGMMA，int32 累加</b>，epilogue 走 I2F</td><td>WGMMA，fp32 累加</td></tr>
+<tr><td>中间激活（L2 输入）</td><td><b>int8</b>，SF = <code>amax/127</code></td><td><b>fp8</b>，SF = <code>amax/448</code></td></tr>
+<tr><td>promote 频率（每 K128）</td><td><b>1 次</b>（s2 组宽 128，对齐 BLOCK_K）</td><td><b>4 次</b>（e8m0 组宽 32）</td></tr>
+</table>
+<div class="note warn">
+  <b>两个容易踩的坑：</b>
+  <br>· 内核注释里的「weight/act TMA is <b>byte-identical</b> to MXFP4/FP8」指的是<b>搬运布局字节级一致</b>（所以能复用同一条 swapAB-RF 流水），
+  <b>不是</b>说数值是同一份 —— int 路的激活是真 int8。
+  <br>· <b>perf bench 对两条路都用 <code>per_token_cast_to_fp8</code></b>，因为测速只看指令数与布局、不看数值；
+  真正区分格式的是 <code>tests/test_int4_mega_moe_correctness.py</code> 里的 <code>per_token_int8()</code>。
+  拿 perf bench 的输出做数值判断会得到错误结论。
+  <br>· 「a_int8」指的是<b>中间激活</b>（L2 的输入）与 L1 的 int8 激活，不要和权重的 int4 混淆。
+</div>
+
 <div class="note ok">
   <b>为什么数据输入不是独立参数、而全塞在 <code>sym_buffer</code> 里：</b>
   因为激活、SF、路由信息都要被<b>其它卡远程访问</b>（scatter 写索引、pull 拉数据），
