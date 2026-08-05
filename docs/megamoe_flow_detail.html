@@ -170,6 +170,7 @@
 <tr><td><code>handle.buffer_ptrs</code></td><td><code>[8]</code> ptr</td><td>—</td><td><b>8 张卡的对称地址</b>，scatter / pull 跨卡靠它</td><td>初始化时建立</td></tr>
 </table>
 <h4 style="font-size:14px;margin:20px 0 4px;color:#cfd9ea">w_int4_a_int8 与 w_mxfp4_a_fp8 在这里的差别</h4>
+<p style="color:var(--dim);font-size:12.8px;margin:4px 0 0"><b>w_int4_a_int8 列即 QoQ 方案</b>：其三要素 <code>z</code>（解码时减）、<code>s2</code> 与 <code>s1</code>（promote 时乘）在下表对应行标出；权重侧完整结构见 <b>0.5.4</b>。</p>
 <p style="color:var(--dim);font-size:12.8px;margin:4px 0 0">
   <b>字段结构完全相同</b>（同样的 4 个字段、同样的形状与布局，TMA 搬运字节级一致）；
   差别只在 <code>buffer.x</code> / <code>buffer.x_sf</code> 里<b>装的是什么数值格式</b>，以及内核内部的消费方式。
@@ -179,10 +180,10 @@
 <tr><td><b><code>buffer.x</code>（L1 输入激活）</b></td><td><b>int8</b><br><span style="color:var(--dim)">量化：<code>per_token_int8</code>，<code>clamp(-127,127)</code></span></td><td><b>fp8 e4m3</b><br><span style="color:var(--dim)">量化：<code>per_token_cast_to_fp8(gran_k=128)</code></span></td></tr>
 <tr><td><code>buffer.x_sf</code></td><td colspan="2" style="text-align:center">float，<b>per-token × K128（两路相同）</b></td></tr>
 <tr><td><code>topk_idx</code> / <code>topk_weights</code></td><td colspan="2" style="text-align:center"><b>完全相同</b>（与量化格式无关）</td></tr>
-<tr><td>L1 权重解码</td><td>int4 → int8（shift/mask + 减 zero point）</td><td>e2m1 → e4m3（PRMT 查表）</td></tr>
+<tr><td>L1 权重解码</td><td>uint4 → int8：shift/mask + <b>减 z</b>（SHIFTXOR）<br><span style="color:var(--dim)">s2、s1 都不在解码里，延到 promote</span></td><td>e2m1 → e4m3：PRMT 查表</td></tr>
 <tr><td>L1 MMA</td><td><b>IGMMA，int32 累加</b>，epilogue 走 I2F</td><td>WGMMA，fp32 累加</td></tr>
 <tr><td>中间激活（L2 输入）</td><td><b>int8</b>，SF = <code>amax/127</code></td><td><b>fp8</b>，SF = <code>amax/448</code></td></tr>
-<tr><td>promote 频率（每 K128）</td><td><b>1 次</b>（s2 组宽 128，对齐 BLOCK_K）</td><td><b>4 次</b>（e8m0 组宽 32）</td></tr>
+<tr><td>promote 做什么 / 频率</td><td>乘 <b>s2 × s1</b>，<b>每 K128 一次</b><br><span style="color:var(--dim)">s2 组宽 128 恰好对齐 BLOCK_K；s1 是 per-channel bf16</span></td><td>乘 <b>2^(e−127)</b>，<b>每 K32 一次 → 每 K128 四次</b></td></tr>
 </table>
 <div class="note warn">
   <b>两个容易踩的坑：</b>
