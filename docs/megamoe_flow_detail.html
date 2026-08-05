@@ -183,7 +183,7 @@
 <tr><td>L1 权重解码</td><td>uint4 → int8：shift/mask + <b>减 z</b>（SHIFTXOR）<br><span style="color:var(--dim)">s2、s1 都不在解码里，延到 promote</span></td><td>e2m1 → e4m3：PRMT 查表</td></tr>
 <tr><td>L1 MMA</td><td><b>IGMMA，int32 累加</b>，epilogue 走 I2F</td><td>WGMMA，fp32 累加</td></tr>
 <tr><td>中间激活（L2 输入）</td><td><b>int8</b>，SF = <code>amax/127</code></td><td><b>fp8</b>，SF = <code>amax/448</code></td></tr>
-<tr><td>promote 做什么 / 频率</td><td>乘 <b>s2 × s1</b>，<b>每 K128 一次</b><br><span style="color:var(--dim)">s2 组宽 128 恰好对齐 BLOCK_K；s1 是 per-channel bf16</span></td><td>乘 <b>2^(e−127)</b>，<b>每 K32 一次 → 每 K128 四次</b></td></tr>
+<tr><td>promote 做什么 / 频率</td><td>乘 <b>s2 × s1</b>，<b>每 K128 一次</b><br><span style="color:var(--dim)">s2 组宽 128 恰好对齐 BLOCK_K；s1 是 <b>per-row</b>（bf16 位型，amax/120）</span></td><td>乘 <b>2^(e−127)</b>，<b>每 K32 一次 → 每 K128 四次</b></td></tr>
 </table>
 <div class="note warn">
   <b>两个容易踩的坑：</b>
@@ -675,9 +675,9 @@ grid_barrier()                                      <span class="c"># 等所有�
 <tr><th>对象</th><th>格式</th><th>scale 粒度</th><th>每 K128 promote</th><th>说明</th></tr>
 <tr><td>L1 输入激活 X</td><td>fp8 / int8</td><td><b>per-token × per-K128</b></td><td>—</td><td>随 dispatch 一起搬运（per-128ch float）</td></tr>
 <tr><td>L2 输入激活</td><td>fp8 / int8</td><td><b>per-token × per-K64</b></td><td>—</td><td>粒度 = 一个 N block 宽 ⇒ amax 不跨 CTA</td></tr>
-<tr><td>权重 <b>w_int4_a_int8</b>（QoQ）</td><td>uint4 + zero point</td><td>s2 整数/K128 + s1 bf16/channel</td><td><b>1 次</b></td><td>组宽对齐 BLOCK_K，最省</td></tr>
+<tr><td>权重 <b>w_int4_a_int8</b>（QoQ）</td><td>uint4 + zero point</td><td>s2 整数[1,127]/K128 + z uint4/K128<br>+ s1 bf16 <b>per-row</b></td><td><b>1 次</b></td><td>s2 组宽 = BLOCK_K，s2·s1 在 promote 一次乘完</td></tr>
 <tr><td>权重 <b>w_mxfp4_a_fp8</b></td><td>e2m1 + e8m0</td><td>per-K32</td><td><b>4 次</b></td><td>← 比 int4 慢 ~8-13% 的根因</td></tr>
-<tr><td>权重 scaled-MXFP4（实验）<br><span style="color:var(--dim)">（实验）</span></td><td>e2m1 + e8m0 折进 fp8 指数</td><td>per-K32（折进 decode）</td><td><b>1 次</b></td><td>指数 +1 ⟺ 字节 +0x08，一条 IMAD 造表</td></tr>
+<tr><td>权重 scaled-MXFP4<br><span style="color:var(--dim)">（实验，默认关）</span></td><td>e2m1 + e8m0 折进 fp8 指数</td><td>per-K32（折进 decode）</td><td><b>1 次</b></td><td>指数 +1 ⟺ 字节 +0x08，一条 IMAD 造表</td></tr>
 <tr><td>权重 nvfp4<br><span style="color:var(--dim)">（SM90 未实现）</span></td><td>e2m1 + ue4m3 + 全局 fp32</td><td>per-K16</td><td><b>8 次</b></td><td>ue4m3 带尾数 → 折不进指数；属 SM100</td></tr>
 </table>
 <div class="note">
