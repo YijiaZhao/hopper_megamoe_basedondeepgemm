@@ -202,6 +202,48 @@
 </div>
 </div>
 
+<h3>0.5.4 权重侧量化：int4 的两级 scale + zero point</h3>
+<div class="panel">
+<p style="color:var(--dim);font-size:12.8px;margin:0 0 8px">
+  权重量化<b>不在 <code>sym_buffer</code> 里</b>，它随 <code>l1_weights = (packed, scale_meta)</code> 一起离线 prepack 好传入。
+  int4 有<b>两种</b>变体，客户用的是下面的 QoQ 非对称版。
+</p>
+
+<table>
+<tr><th></th><th>对称 int4</th><th><b>QoQ 非对称（int4-SX，客户在用）</b></th><th>mxfp4</th></tr>
+<tr><td>权重取值</td><td><b>signed</b> int4，[−7, 7]</td><td><b>uint4</b>，[0, 15]</td><td>e2m1（4bit 浮点）</td></tr>
+<tr><td>zero point</td><td><b>无</b></td><td><b>有：z（uint4，每组一个）</b></td><td>无</td></tr>
+<tr><td>第一级 scale</td><td colspan="1">scale = amax/7（fp32，per-group）</td><td><b>s2：整数，per-K128 组</b></td><td>e8m0（2 的幂），per-K32 组</td></tr>
+<tr><td>第二级 scale</td><td>—</td><td><b>s1：bf16，per-channel</b></td><td>—</td></tr>
+<tr><td>反量化式</td><td><code>w = q · scale</code></td><td><code>w = ((w4 − z) · s2) · s1</code></td><td><code>w = e2m1 · 2^(e−127)</code></td></tr>
+<tr><td>解码阶段做什么</td><td>符号扩展 + 查表</td><td><b>只做 (w4 − z)</b>（SHIFTXOR）<br><span style="color:var(--dim)">s2 与 s1 都延到 promote</span></td><td>PRMT 查表出 e4m3</td></tr>
+<tr><td>promote 阶段做什么</td><td>乘 scale</td><td><b>乘 s2 × s1</b>，每 K128 一次</td><td>乘 2^(e−127)，每 K32 一次</td></tr>
+</table>
+
+<div class="note ok">
+  <b>为什么 QoQ 要拆成两级：</b>
+  <br>· <b>s2 是整数、组宽 128</b> —— 组宽<b>恰好等于 <code>BLOCK_K</code></b>，所以一个 K-block 内 scale 恒定，
+  可以四条 K32 WGMMA 共用一个累加器、<b>每 K128 只 promote 一次</b>。这是 int4 比 mxfp4（每 K32 四次）快 8~13% 的<b>唯一来源</b>。
+  <br>· <b>s1 是 bf16、per-channel</b> —— 负责跨通道的量纲差异，在 epilogue 一次性乘上，不进热路径。
+  <br>· <b>z 是 uint4</b> —— 让权重能用无符号 [0,15] 全量程（非对称分布的权重比对称 [−7,7] 精度更好）。
+</div>
+
+<h4 style="font-size:14px;margin:18px 0 4px;color:#cfd9ea">三种解码变体（都在 <code>int4_dequant.cuh</code>）</h4>
+<table>
+<tr><th>变体</th><th>s2 何时应用</th><th>解码热路径做的事</th><th>状态</th></tr>
+<tr><td>对称 <code>..._to_int8_pair</code></td><td>promote</td><td>PRMT 查表 + 符号扩展（vsub4 减 8）</td><td>基础版</td></tr>
+<tr><td>scaled-LUT <code>..._pair_lut</code></td><td><b>折进 LUT</b><br><code>lut = s2·{0..3 | 4..7}</code></td><td>查表即得 <code>w4·s2</code>（整数域 fold-at-decode）<br><span style="color:var(--dim)">不溢出：7·s2 ≤ 126</span></td><td>QoQ 用</td></tr>
+<tr><td>ZP <code>..._pair_lut_zp</code></td><td>折进 LUT + <code>nz = (−z·s2) mod 256</code></td><td>查表已带偏移，bit3 置位的 lane 改为 <b>加</b> 8·s2</td><td>QoQ+ZP</td></tr>
+<tr><td><b>SHIFTXOR</b> <code>..._pair_zsub</code></td><td><b>延到 promote</b></td><td><b>纯 shift+mask + vsub4 减 z</b><br>无表、无 per-row LUT 构建</td><td><b>客户建议，当前推荐</b></td></tr>
+</table>
+<div class="note">
+  SHIFTXOR 之所以能「不折 s2」还更快：<b>s2 的组宽（128）正好等于 inline 档的 K128 promote 段</b>，
+  所以 s2 可以和 s1 一样延到 fp32 promote 一次算完 —— 省掉了每次解码构建带 s2 的 LUT。
+  <br>新实验开关 <code>DG_W4A8_INT_ZSUB_XOR=1</code> 进一步把 <code>vsub4</code> 换成
+  <code>(w + (128−z)) ^ 0x80</code>（uint8 域不借位 + 一条 XOR 翻回 int8），SASS 算术指令 13 → 8。
+</div>
+</div>
+
 <!-- ============================================================ -->
 <h2>1. 线程编排（实际 JIT 配置）</h2>
 <div class="panel">
