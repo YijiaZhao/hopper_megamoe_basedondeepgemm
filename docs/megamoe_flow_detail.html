@@ -836,6 +836,28 @@ grid_barrier()                                      <span class="c"># 等所有�
   <b>全部为本次同机实测，可复现。</b>
 </p>
 
+<h3>8.0 计时范围：两边各包含什么</h3>
+<table>
+<tr><th>环节</th><th>FlashInfer<br><code>--scope full</code></th><th>MegaMoE<br><code>DG_WALL_BENCH=1</code></th></tr>
+<tr><td>softmax + topk 路由</td><td style="color:#f85149">❌ 计时外（预算好）</td><td style="color:#f85149">❌ 计时外（预算好）</td></tr>
+<tr><td>输入激活量化（bf16→fp8/int8）</td><td style="color:#f85149">❌ 计时外</td><td style="color:#f85149">❌ 计时外</td></tr>
+<tr><td><b>按 expert 重排 token</b></td><td style="color:#3fb950">✅ 在内（内部 permute）</td><td style="color:#3fb950">✅ 在内（counting sort）</td></tr>
+<tr><td>GEMM1（gate+up）</td><td style="color:#3fb950">✅</td><td style="color:#3fb950">✅</td></tr>
+<tr><td><b>SwiGLU 激活</b></td><td style="color:#3fb950">✅ 在内</td><td style="color:#3fb950">✅ 在内</td></tr>
+<tr><td><b>中间激活重量化</b></td><td style="color:#3fb950">✅ 在内（per-token FP8）</td><td style="color:#3fb950">✅ 在内</td></tr>
+<tr><td>GEMM2（down）</td><td style="color:#3fb950">✅</td><td style="color:#3fb950">✅</td></tr>
+<tr><td><b>top-k 加权 combine</b></td><td style="color:#3fb950">✅ 在内（unpermute + 加权）</td><td style="color:#3fb950">✅ 在内</td></tr>
+<tr><td>跨卡通信</td><td style="color:#f85149">❌ 无此能力<br>（8卡对比时外挂 2×AR）</td><td style="color:#3fb950">✅ 融合在内<br>（单卡时退化）</td></tr>
+</table>
+<div class="note warn">
+  <b>两边都不是「纯 2-GEMM」</b> —— 都包含 permute、SwiGLU、重量化、combine 的完整 MoE 计算，
+  只有<b>路由</b>和<b>输入激活量化</b>在计时外（两边一致，见 0.5.1 的边界图）。
+  <br>FI bench 的 <code>--scope full</code> 原文定义：<i>"timed region = the single <code>cutlass_fused_moe</code> call"</i>。
+  <br><b>唯一的口径差</b>：MegaMoE 即便在单卡也会跑它为多卡设计的 dispatch/combine 机制（counting sort、pool 填充、
+  combine 规约），这是 FI 没有的固定开销 —— 也是 8.2 单卡表里我们落后的原因之一。
+  <br><b>注意</b>：另有一种 nsys 口径只抽 grouped GEMM 内核行（纯 2-GEMM），数值更小，<b>本文表格未采用该口径</b>，勿混用。
+</div>
+
 <h3>8.1 8 卡 EP8（含跨卡通信）</h3>
 <table>
 <tr><th>M</th><th><b>MegaMoE<br>w_int4_a_int8</b></th><th>MegaMoE<br>w_mxfp4_a_fp8</th><th>MegaMoE<br>scaled-MXFP4<br><span style="color:var(--dim)">实验</span></th><th>FI grouped GEMM<br><span style="color:var(--dim)">无通信</span></th><th>2×AR</th><th><b>FI + 2×AR</b><br><span style="color:var(--dim)">公平对比</span></th><th>int4 优势</th></tr>
