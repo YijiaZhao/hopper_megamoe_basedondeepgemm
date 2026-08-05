@@ -833,7 +833,7 @@ grid_barrier()                                      <span class="c"># 等所有�
   <b>口径</b>：.10 清场（8×H20-3e，实测锁频 <b>1830 MHz</b>，跑前确认 0 compute-apps）·
   <b>均衡路由</b>（两侧都是）· <b>CUDA-event wall-clock</b> · <b>median-of-3</b> ·
   FlashInfer 取<b>库默认 tactic</b>（小 M 比 autotune 快 ~50%）。单位 us，越小越好。
-  <b>全部为本次同机、同批次实测（int4 / mxfp4 / scaled-MXFP4 连续跑完，锁频 1830 已核实），可复现。</b>
+  <b>全部为本次同机、同批次实测（int4 / mxfp4 / scaled-MXFP4 连续跑完，锁频 1830 已核实），可复现。</b><br><b>⚠ 并行配置：attention DP + MoE EP</b> —— 每张卡持有<b>不同的</b> token（bench 的随机种子含 <code>rank_idx</code>，API 参数名为 <code>num_max_tokens_per_rank</code>）。<b>因此表中的 M 是「每卡 token 数」，不是全局 batch</b>：8 卡表里 M=64 表示全局 64×8=512 个 token。
 </p>
 
 <h3>8.0 计时范围：两边各包含什么</h3>
