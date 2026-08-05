@@ -70,6 +70,114 @@
 </div>
 
 <!-- ============================================================ -->
+<h2>0.5 输入 / 输出：MegaMoE 的边界在哪</h2>
+
+<h3>0.5.1 什么在 kernel 外，什么在里面</h3>
+<div class="panel">
+<svg viewBox="0 0 1160 250" width="100%">
+  <text x="10" y="18" fill="#95a3bf" font-size="12">一层 MoE 的完整链路（灰色 = 框架侧，绿色 = MegaMoE 融合范围）</text>
+
+  <rect x="14" y="32" width="146" height="40" rx="7" fill="#1b2337" stroke="#4a5878"/>
+  <text x="87" y="57" fill="#c3cee2" font-size="12" text-anchor="middle">hidden_state</text>
+
+  <rect x="176" y="32" width="150" height="40" rx="7" fill="#1b2337" stroke="#4a5878"/>
+  <text x="251" y="50" fill="#c3cee2" font-size="12" text-anchor="middle">gate 线性层</text>
+  <text x="251" y="65" fill="#7d8db0" font-size="10.5" text-anchor="middle">→ logits</text>
+
+  <rect x="342" y="32" width="182" height="40" rx="7" fill="#2d2418" stroke="#8a7040"/>
+  <text x="433" y="50" fill="#e3b341" font-size="12" text-anchor="middle" font-weight="600">router：softmax + topk</text>
+  <text x="433" y="65" fill="#c0a870" font-size="10.5" text-anchor="middle">→ topk_idx, topk_weights</text>
+
+  <rect x="540" y="32" width="182" height="40" rx="7" fill="#1b2337" stroke="#4a5878"/>
+  <text x="631" y="50" fill="#c3cee2" font-size="12" text-anchor="middle">激活量化 bf16→fp8</text>
+  <text x="631" y="65" fill="#7d8db0" font-size="10.5" text-anchor="middle">→ x_fp8, x_sf（per-token×K128）</text>
+
+  <line x1="162" y1="52" x2="174" y2="52" stroke="#7d8db0" stroke-width="2" marker-end="url(#a2)"/>
+  <line x1="328" y1="52" x2="340" y2="52" stroke="#7d8db0" stroke-width="2" marker-end="url(#a2)"/>
+  <line x1="526" y1="52" x2="538" y2="52" stroke="#7d8db0" stroke-width="2" marker-end="url(#a2)"/>
+  <defs><marker id="a2" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+    <path d="M0,0 L9,4.5 L0,9 z" fill="#7d8db0"/></marker></defs>
+
+  <text x="738" y="56" fill="#6f7f9e" font-size="11">全部由框架侧完成 →</text>
+
+  <!-- 填 buffer -->
+  <rect x="14" y="96" width="708" height="34" rx="7" fill="#131a29" stroke="#3a4560" stroke-dasharray="5,4"/>
+  <text x="368" y="118" fill="#95a3bf" font-size="11.5" text-anchor="middle">
+    填入对称内存：buffer.x ← x_fp8 ｜ buffer.x_sf ← x_sf ｜ buffer.topk_idx ｜ buffer.topk_weights
+  </text>
+  <line x1="368" y1="76" x2="368" y2="94" stroke="#7d8db0" stroke-width="2" marker-end="url(#a2)"/>
+  <line x1="368" y1="132" x2="368" y2="150" stroke="#7d8db0" stroke-width="2" marker-end="url(#a2)"/>
+
+  <!-- MegaMoE -->
+  <rect x="14" y="152" width="708" height="76" rx="10" fill="#141b2b" stroke="#3fb950" stroke-width="1.8"/>
+  <text x="30" y="174" fill="#3fb950" font-size="13" font-weight="700">MegaMoE（2 kernels）</text>
+  <text x="30" y="195" fill="#8fd4a0" font-size="11.5">L1: dispatch（counting sort → scatter 索引 → pull 数据）→ GG1 → SwiGLU → requant</text>
+  <text x="30" y="215" fill="#8fd4a0" font-size="11.5">L2: GG2 → scatter 回原卡 → COMBINE（Σ topk_weight × 部分结果）</text>
+
+  <line x1="730" y1="190" x2="762" y2="190" stroke="#7d8db0" stroke-width="2" marker-end="url(#a2)"/>
+  <rect x="766" y="168" width="120" height="44" rx="7" fill="#12301c" stroke="var(--math)"/>
+  <text x="826" y="186" fill="#3fb950" font-size="12" text-anchor="middle" font-weight="600">y [m, H]</text>
+  <text x="826" y="202" fill="#8fd4a0" font-size="10.5" text-anchor="middle">bf16</text>
+
+  <rect x="902" y="152" width="244" height="76" rx="8" fill="#3a2410" stroke="var(--disp)"/>
+  <text x="1024" y="172" fill="#f0883e" font-size="12" text-anchor="middle" font-weight="600">权重（离线 prepack）</text>
+  <text x="1024" y="191" fill="#c9a184" font-size="10.5" text-anchor="middle">L1 [E_local, 2I, H] · L2 [E_local, H, I]</text>
+  <text x="1024" y="209" fill="#c9a184" font-size="10.5" text-anchor="middle">E_local = E/8，<tspan fill="#e3b341">EP 下权重永不跨卡</tspan></text>
+  <line x1="900" y1="190" x2="888" y2="190" stroke="#f0883e" stroke-width="2" marker-end="url(#a2)"/>
+</svg>
+<div class="note warn">
+  <b>router 不在 MegaMoE 里。</b>gate 线性层、softmax+topk、以及输入激活的量化，<b>全部由框架侧（PyTorch 或独立 kernel）完成</b>；
+  MegaMoE 只接管「已知每个 token 去哪些 expert、激活已量化」之后的全部工作。
+</div>
+</div>
+
+<h3>0.5.2 API 参数总表</h3>
+<div class="panel">
+<pre>deep_gemm.<span class="s">mxfp4_mega_moe</span>(
+    y,                                   <span class="c"># ① 输出（预分配）</span>
+    l1_weights,                          <span class="c"># ② tuple(packed, scale_meta)</span>
+    l2_weights,                          <span class="c"># ③ tuple(packed, scale_meta)</span>
+    sym_buffer,                          <span class="c"># ④ 输入数据 + 通信中转 + 跨卡拓扑</span>
+    cumulative_local_expert_recv_stats,  <span class="c"># ⑤ 输出：每 expert 实收 token 数</span>
+    l1_global_scales, l2_global_scales,  <span class="c"># ⑥ 可选 per-expert 标量</span>
+    recipe=(128, block_n, 128),          <span class="c"># ⑦ (BLOCK_M, BLOCK_N, BLOCK_K)</span>
+    activation="swiglu", activation_clamp=10.0, fast_math=True)
+</pre>
+
+<table>
+<tr><th>#</th><th>参数</th><th>类型 / 形状</th><th>方向</th><th>说明</th></tr>
+<tr><td>①</td><td><code>y</code></td><td><code>[m, H]</code> bf16</td><td><b>输出</b></td><td>预分配，kernel 直接写入，不返回新 tensor</td></tr>
+<tr><td>②</td><td><code>l1_weights</code></td><td><b>tuple</b>(packed, scale_meta)</td><td>输入</td><td>L1 <code>[E_local, 2I, H]</code>；scale_meta 是 <b>5 维</b>，<code>size(3)</code> 藏着 block_n</td></tr>
+<tr><td>③</td><td><code>l2_weights</code></td><td><b>tuple</b>(packed, scale_meta)</td><td>输入</td><td>L2 <code>[E_local, H, I]</code>；<code>E_local = E/8</code>，每卡只持有自己的 expert</td></tr>
+<tr><td>④</td><td><code>sym_buffer</code></td><td>SymmBuffer</td><td><b>输入+中转</b></td><td>三合一，见下表</td></tr>
+<tr><td>⑤</td><td><code>cumulative_local_expert_recv_stats</code></td><td><code>[E_local]</code> int32</td><td><b>输出</b></td><td>本卡各 expert 实收 token 数；L2 靠它知道每 expert 算多少行</td></tr>
+<tr><td>⑥</td><td><code>l1/l2_global_scales</code></td><td><code>[E_local]</code> float / None</td><td>输入</td><td>per-expert 标量补偿（权重量纲差异）；与 per-K 组 scale 是<b>两个层级</b></td></tr>
+<tr><td>⑦</td><td><code>recipe</code></td><td><code>(BM, BN, BK)</code></td><td>配置</td><td><b>BN 必须 == prepack 时的 block_n</b>（代码有 assert）；<b>BK 写死 128</b>，因为 int4 的 s2 组宽也是 128，对齐才能每 K128 只 promote 一次</td></tr>
+<tr><td>⑧</td><td><code>activation_clamp</code></td><td>float</td><td>配置</td><td>钳 ±10，防 SwiGLU 后的离群值撑爆 fp8 动态范围</td></tr>
+<tr><td>⑨</td><td><code>fast_math</code></td><td>bool</td><td>配置</td><td>用 <code>__expf</code> / <code>fast_rcp</code> 近似算 SiLU</td></tr>
+</table>
+</div>
+
+<h3>0.5.3 <code>sym_buffer</code> 里装的 —— 真正的数据输入全在这</h3>
+<div class="panel">
+<table>
+<tr><th>字段</th><th>形状</th><th>类型</th><th>作用</th><th>谁产生</th></tr>
+<tr><td><code>buffer.x</code></td><td><code>[m, H]</code></td><td>fp8 / int8</td><td><b>激活</b></td><td>上游 <code>per_token_cast_to_fp8(gran_k=128)</code></td></tr>
+<tr><td><code>buffer.x_sf</code></td><td><code>[m, H/128]</code></td><td>float</td><td>激活 scale（per-token × K128）</td><td>同上</td></tr>
+<tr><td><code>buffer.topk_idx</code></td><td><code>[m, topk]</code></td><td>int64</td><td>每 token 去哪些 expert</td><td><b>router</b></td></tr>
+<tr><td><code>buffer.topk_weights</code></td><td><code>[m, topk]</code></td><td>float</td><td>路由权重（COMBINE 用）</td><td><b>router</b></td></tr>
+<tr><td>ring buffer / L1 pool / combine buffer</td><td>—</td><td>—</td><td>dispatch 与 combine 的中转区</td><td>kernel 自用</td></tr>
+<tr><td><code>handle.buffer_ptrs</code></td><td><code>[8]</code> ptr</td><td>—</td><td><b>8 张卡的对称地址</b>，scatter / pull 跨卡靠它</td><td>初始化时建立</td></tr>
+</table>
+<div class="note ok">
+  <b>为什么数据输入不是独立参数、而全塞在 <code>sym_buffer</code> 里：</b>
+  因为激活、SF、路由信息都要被<b>其它卡远程访问</b>（scatter 写索引、pull 拉数据），
+  必须放在<b>对称内存</b>（8 张卡同一虚拟地址各有一份）上，<code>sym_buffer.map(ptr, rank)</code> 才能直接寻址远端。
+  所以调用前要先 <code>buffer.x.copy_(x_fp8)</code> 这样填进去。
+</div>
+</div>
+
+<!-- ============================================================ -->
 <h2>1. 线程编排（实际 JIT 配置）</h2>
 <div class="panel">
 <table>
