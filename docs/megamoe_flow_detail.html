@@ -178,7 +178,7 @@
 <table>
 <tr><th></th><th><b>w_int4_a_int8</b>（QoQ）</th><th><b>w_mxfp4_a_fp8</b></th></tr>
 <tr><td><b><code>buffer.x</code>（L1 输入激活）</b></td><td><b>int8</b><br><span style="color:var(--dim)">量化：<code>per_token_int8</code>，<code>clamp(-127,127)</code></span></td><td><b>fp8 e4m3</b><br><span style="color:var(--dim)">量化：<code>per_token_cast_to_fp8(gran_k=128)</code></span></td></tr>
-<tr><td><code>buffer.x_sf</code></td><td colspan="2" style="text-align:center">float，<b>per-token × K128（两路相同）</b></td></tr>
+<tr><td><code>buffer.x_sf</code></td><td>float，<b>per-token 整行一个</b>（<code>amax(dim=-1)/127</code>）<br><span style="color:var(--dim)">形状 <code>[m]</code>，H=4096 时每 token <b>1 个</b> scale</span></td><td>float，<b>per-token × 每 K128 一个</b>（<code>amax/448</code>）<br><span style="color:var(--dim)">形状 <code>[m, H/128]</code>，H=4096 时每 token <b>32 个</b></span></td></tr>
 <tr><td><code>topk_idx</code> / <code>topk_weights</code></td><td colspan="2" style="text-align:center"><b>完全相同</b>（与量化格式无关）</td></tr>
 <tr><td>L1 权重解码</td><td>uint4 → int8：shift/mask + <b>减 z</b>（SHIFTXOR）<br><span style="color:var(--dim)">s2、s1 都不在解码里，延到 promote</span></td><td>e2m1 → e4m3：PRMT 查表</td></tr>
 <tr><td>L2 权重 / MMA</td><td><b>默认走 mxfp4 路</b>（L1-int / L2-mxfp4 是已验证组合）<br><span style="color:var(--dim)">L2 也走 int 需 <code>DG_W4A8_INT_L2=1</code>（WIP）</span></td><td>e2m1 → e4m3，WGMMA fp32</td></tr>
@@ -682,7 +682,8 @@ grid_barrier()                                      <span class="c"># 等所有�
 <div class="panel">
 <table>
 <tr><th>对象</th><th>格式</th><th>scale 粒度</th><th>每 K128 promote</th><th>说明</th></tr>
-<tr><td>L1 输入激活 X</td><td>fp8 / int8</td><td><b>per-token × per-K128</b></td><td>—</td><td>随 dispatch 一起搬运（per-128ch float）</td></tr>
+<tr><td>L1 输入激活 X<br><span style="color:var(--dim)">（mxfp4 路）</span></td><td>fp8 e4m3</td><td><b>per-token × per-K128</b><br><span style="color:var(--dim)">[m, H/128]，amax/448</span></td><td>—</td><td>随 dispatch 一起搬运</td></tr>
+<tr><td>L1 输入激活 X<br><span style="color:var(--dim)">（int 路）</span></td><td>int8</td><td><b>per-token 整行一个</b><br><span style="color:#f85149">[m]，amax/127 —— 与 mxfp4 路不同</span></td><td>—</td><td>同上</td></tr>
 <tr><td>L2 输入激活</td><td>fp8 / int8</td><td><b>per-token × per-K64</b></td><td>—</td><td>粒度 = 一个 N block 宽 ⇒ amax 不跨 CTA</td></tr>
 <tr><td>权重 <b>w_int4_a_int8</b>（QoQ）</td><td>uint4 + zero point</td><td>s2 整数[1,127]/K128 + z uint4/K128<br>+ s1 bf16 <b>per-row</b></td><td><b>1 次</b></td><td>s2 组宽 = BLOCK_K，s2·s1 在 promote 一次乘完</td></tr>
 <tr><td>权重 <b>w_mxfp4_a_fp8</b></td><td>e2m1 + e8m0</td><td>per-K32</td><td><b>4 次</b></td><td>← 比 int4 慢 ~8-13% 的根因</td></tr>
