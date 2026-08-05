@@ -181,10 +181,19 @@
 <tr><td><code>buffer.x_sf</code></td><td colspan="2" style="text-align:center">float，<b>per-token × K128（两路相同）</b></td></tr>
 <tr><td><code>topk_idx</code> / <code>topk_weights</code></td><td colspan="2" style="text-align:center"><b>完全相同</b>（与量化格式无关）</td></tr>
 <tr><td>L1 权重解码</td><td>uint4 → int8：shift/mask + <b>减 z</b>（SHIFTXOR）<br><span style="color:var(--dim)">s2、s1 都不在解码里，延到 promote</span></td><td>e2m1 → e4m3：PRMT 查表</td></tr>
+<tr><td>L2 权重 / MMA</td><td><b>默认走 mxfp4 路</b>（L1-int / L2-mxfp4 是已验证组合）<br><span style="color:var(--dim)">L2 也走 int 需 <code>DG_W4A8_INT_L2=1</code>（WIP）</span></td><td>e2m1 → e4m3，WGMMA fp32</td></tr>
 <tr><td>L1 MMA</td><td><b>IGMMA，int32 累加</b>，epilogue 走 I2F</td><td>WGMMA，fp32 累加</td></tr>
-<tr><td>中间激活（L2 输入）</td><td><b>int8</b>，SF = <code>amax/127</code></td><td><b>fp8</b>，SF = <code>amax/448</code></td></tr>
+<tr><td>中间激活（L2 输入）</td><td><b>默认 = fp8</b>，SF = <code>amax/448</code><br><span style="color:#f85149">仅当 <code>DG_W4A8_INT_L2=1</code> 才是 int8（SF=amax/127），该路径代码注明 <b>still WIP</b>，默认关</span></td><td><b>fp8</b>，SF = <code>amax/448</code></td></tr>
 <tr><td>promote 做什么 / 频率</td><td>乘 <b>s2 × s1</b>，<b>每 K128 一次</b><br><span style="color:var(--dim)">s2 组宽 128 恰好对齐 BLOCK_K；s1 是 <b>per-row</b>（bf16 位型，amax/120）</span></td><td>乘 <b>2^(e−127)</b>，<b>每 K32 一次 → 每 K128 四次</b></td></tr>
 </table>
+<div class="note warn">
+  <b>⚠ 对客户讲之前必须分清「默认」与「实验」：</b>
+  <br>· <code>DG_W4A8_INT=1</code> 的<b>默认已验证组合是「L1 走 int4/int8，L2 仍走 mxfp4」</b>；
+  <br>· <code>DG_W4A8_INT_L2=1</code>（int8 中间激活）代码注明 <b>still WIP</b>，默认关闭；
+  <br>· 本文前面 7 点表里的 <code>w_int4_a_int8</code> 数据是在 <b>L1_int + L2_int 全开</b>下测的，
+  引用时要说明开关组合。
+</div>
+
 <div class="note warn">
   <b>两个容易踩的坑：</b>
   <br>· 内核注释里的「weight/act TMA is <b>byte-identical</b> to MXFP4/FP8」指的是<b>搬运布局字节级一致</b>（所以能复用同一条 swapAB-RF 流水），
