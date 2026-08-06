@@ -308,6 +308,38 @@ def transform_mxfp4_weights_for_mega_moe_sm90(
     return (l1_packed_out, l1_scale_tm), (l2_packed_out, l2_scale_tm)
 
 
+def transform_qoq_int4_weights_for_mega_moe_sm90(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    block_n: int = 128,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Prepack the sole supported INT4 format: QoQ + asymmetric zero point.
+
+    Inputs are ``(packed_uint4, coeff_plane_int32)`` from
+    :func:`quantize_to_qoq_int4`. The coefficient bytes are
+    ``[s2, z, s1_bf16]`` for every output row and K128 group.
+    """
+    from ..quantization_mxfp4 import (
+        mxfp4_fuse_packed_with_scale_tile_major,
+        qoq_plane_to_tile_major,
+    )
+    assert block_n in (128, 256)
+    l1_packed, l1_plane = _interleave_l1_weights(l1_weights)
+    l2_packed, l2_plane = l2_weights
+    l1_tm = qoq_plane_to_tile_major(l1_plane, block_n)
+    l2_tm = qoq_plane_to_tile_major(l2_plane, block_n)
+    direct_nibble = os.environ.get("DG_W4A8_INT_DIRECT_NIBBLE", "0") != "0"
+    use_prmt_groups = not direct_nibble
+
+    def fuse(packed, plane_tm):
+        fused = mxfp4_fuse_packed_with_scale_tile_major(
+            packed.contiguous(), plane_tm, block_k=128,
+            use_prmt_groups=use_prmt_groups, use_rf_fragments=True)
+        return fused, plane_tm
+
+    return fuse(l1_packed, l1_tm), fuse(l2_packed, l2_tm)
+
+
 def mxfp4_mega_moe(y: torch.Tensor,
                    l1_weights: Tuple[torch.Tensor, torch.Tensor],
                    l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -318,7 +350,16 @@ def mxfp4_mega_moe(y: torch.Tensor,
                    recipe: Optional[Tuple[int, int, int]] = None,
                    activation: str = 'swiglu',
                    activation_clamp: Optional[float] = None,
-                   fast_math: bool = True):
+                   fast_math: bool = True,
+                   attn_tp_size: int = 1,
+                   attn_tp_group: Optional[dist.ProcessGroup] = None,
+                   broadcast_output: bool = False,
+                   router_input: Optional[torch.Tensor] = None,
+                   router_weight: Optional[torch.Tensor] = None,
+                   router_logits: Optional[torch.Tensor] = None,
+                   router_renormalize: bool = True,
+                   tp_combine_output: Optional[torch.Tensor] = None,
+                   hidden_input: Optional[torch.Tensor] = None):
     """Run the SM90 split MegaMoE kernel with prepacked OCP MXFP4 weights.
 
     Weights come from ``transform_mxfp4_weights_for_mega_moe_sm90``. Values
@@ -335,6 +376,35 @@ def mxfp4_mega_moe(y: torch.Tensor,
     else:
         assert recipe[1] == cached_block_n
 
+    assert attn_tp_size >= 1
+    assert (router_input is None) == (router_weight is None)
+    assert router_logits is None or router_input is None
+    if router_input is not None:
+        assert router_input.dtype == torch.bfloat16 and router_input.is_contiguous()
+        assert router_weight.dtype == torch.bfloat16 and router_weight.is_contiguous()
+        assert router_input.shape == (y.size(0), sym_buffer.hidden)
+        assert router_weight.shape == (sym_buffer.num_experts, sym_buffer.hidden)
+    if router_logits is not None:
+        assert router_logits.dtype == torch.bfloat16 and router_logits.is_contiguous()
+        assert router_logits.shape == (y.size(0), sym_buffer.num_experts)
+    if tp_combine_output is not None:
+        assert attn_tp_size > 1 and y.size(0) % attn_tp_size == 0
+        assert tp_combine_output.dtype == torch.bfloat16
+        assert tp_combine_output.is_contiguous()
+        assert tp_combine_output.shape == (y.size(0) // attn_tp_size, y.size(1))
+    if hidden_input is not None:
+        assert hidden_input.dtype == torch.bfloat16 and hidden_input.is_contiguous()
+        assert hidden_input.shape == y.shape
+    assert sym_buffer.group.size() % attn_tp_size == 0
+    if attn_tp_size > 1:
+        assert attn_tp_group is not None, \
+            "attn_tp_group is required when attn_tp_size > 1"
+        assert attn_tp_group.size() == attn_tp_size
+        # Rank layout is contiguous (DP outer, attention TP inner). This is
+        # the layout used by SGLang DP-attention and by the SM90 kernel's
+        # physical-source mapping.
+        assert sym_buffer.group.rank() % attn_tp_size == attn_tp_group.rank()
+
     _C.mxfp4_mega_moe(
         y,
         l1_weights,
@@ -342,12 +412,19 @@ def mxfp4_mega_moe(y: torch.Tensor,
         cumulative_local_expert_recv_stats,
         l1_global_scales,
         l2_global_scales,
+        router_input,
+        router_weight,
+        router_logits,
+        router_renormalize,
+        tp_combine_output,
+        hidden_input,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs,
         sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
+        attn_tp_size,
         recipe,
         activation,
         activation_clamp,
@@ -355,8 +432,142 @@ def mxfp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_ring_tokens,
     )
 
+    if tp_combine_output is not None:
+        dist.all_gather_into_tensor(y, tp_combine_output, group=attn_tp_group)
+    elif attn_tp_size > 1 and broadcast_output:
+        # Every expert rank combines a TP group's replicated token stream only
+        # onto that group's rank 0. Replicate the completed MoE result back to
+        # the remaining attention-TP ranks for the following attention block.
+        root_global_rank = dist.get_global_rank(attn_tp_group, 0)
+        dist.broadcast(y, src=root_global_rank, group=attn_tp_group)
 
-# W4A8-int entry point: the int4 paths (GPTQ fp32-scale / QServe QoQ / QoQ+zero-point)
-# share the mxfp4 kernel infrastructure and are selected via DG_W4A8_INT* env vars.
-# This alias gives the int4 deployment its properly-named API.
+
+# W4A8 INT4 has one supported format: canonical QoQ+ZP with full INT4 L1/L2
+# and SHIFTXOR decode. DG_W4A8_INT=1 selects it; optional DIRECT_NIBBLE and
+# ZSUB_XOR only change the equivalent decode implementation.
 int4_mega_moe = mxfp4_mega_moe
+
+
+def mxfp4_mega_moe_from_bf16(
+    y: torch.Tensor,
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    sym_buffer: SymmBuffer,
+    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+    l1_global_scales: Optional[torch.Tensor] = None,
+    l2_global_scales: Optional[torch.Tensor] = None,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    activation: str = 'swiglu',
+    activation_clamp: Optional[float] = None,
+    fast_math: bool = True,
+    attn_tp_size: int = 1,
+    attn_tp_group: Optional[dist.ProcessGroup] = None,
+    broadcast_output: bool = False,
+    router_renormalize: bool = True,
+    tp_combine_output: Optional[torch.Tensor] = None,
+    router_logits_buffer: Optional[torch.Tensor] = None,
+):
+    """End-to-end BF16-hidden MegaMoE entry point.
+
+    The timed operation starts from rank-local BF16 hidden states and performs
+    router GEMM, activation quantization, fused TopK/dispatch, expert L1/L2,
+    combine, and the final attention-TP collective. Output is BF16 ``y``.
+    """
+    assert hidden_states.dtype == torch.bfloat16 and hidden_states.is_contiguous()
+    assert router_weight.dtype == torch.bfloat16 and router_weight.is_contiguous()
+    if tp_combine_output is None:
+        assert hidden_states.shape == y.shape
+        local_y = y
+    else:
+        assert attn_tp_size > 1 and attn_tp_group is not None
+        assert tp_combine_output.dtype == torch.bfloat16 and tp_combine_output.is_contiguous()
+        assert tp_combine_output.shape == hidden_states.shape
+        assert y.shape == (hidden_states.size(0) * attn_tp_size, hidden_states.size(1))
+        local_y = tp_combine_output
+    assert router_weight.shape == (sym_buffer.num_experts, sym_buffer.hidden)
+    assert attn_tp_group is not None or attn_tp_size == 1
+
+    def finalize_tp_output():
+        if tp_combine_output is None:
+            return
+        if broadcast_output:
+            # Gather-to-root + broadcast, represented as disjoint token slots
+            # followed by SUM reduction. Produces the same global token layout
+            # as AllGather while exercising the root-combine communication mode.
+            local_m = hidden_states.size(0)
+            tp_rank = attn_tp_group.rank()
+            y.zero_()
+            y[tp_rank * local_m:(tp_rank + 1) * local_m].copy_(local_y)
+            root_global_rank = dist.get_global_rank(attn_tp_group, 0)
+            dist.reduce(y, dst=root_global_rank, group=attn_tp_group)
+            dist.broadcast(y, src=root_global_rank, group=attn_tp_group)
+        else:
+            dist.all_gather_into_tensor(y, local_y, group=attn_tp_group)
+
+    # Router weights are replicated over attention TP ranks; hidden tokens are
+    # rank-local DP shards, so every rank runs the frontend.
+    fuse_qoq_input_quant = os.environ.get("DG_W4A8_INT", "0") != "0"
+    router_logits = None
+    if fuse_qoq_input_quant:
+        if router_logits_buffer is None:
+            router_logits = torch.empty(
+                (hidden_states.size(0), sym_buffer.num_experts),
+                dtype=torch.bfloat16, device=hidden_states.device)
+        else:
+            assert router_logits_buffer.shape == (hidden_states.size(0), sym_buffer.num_experts)
+            assert router_logits_buffer.dtype == torch.bfloat16 and router_logits_buffer.is_contiguous()
+            router_logits = router_logits_buffer
+        if recipe is None:
+            recipe = (128, int(l1_weights[1].size(3)), 128)
+        _C.qoq_bf16_mega_moe(
+            local_y, hidden_states, router_weight, router_logits,
+            sym_buffer.x[:hidden_states.size(0)],
+            sym_buffer.x_sf[:hidden_states.size(0)],
+            sym_buffer.topk_idx[:hidden_states.size(0)],
+            sym_buffer.topk_weights[:hidden_states.size(0)],
+            l1_weights, l2_weights,
+            cumulative_local_expert_recv_stats,
+            l1_global_scales, l2_global_scales, None,
+            sym_buffer.buffer, sym_buffer.handle.buffer_ptrs,
+            sym_buffer.group.rank(), sym_buffer.num_max_tokens_per_rank,
+            sym_buffer.num_experts, sym_buffer.num_topk, attn_tp_size,
+            recipe, activation, activation_clamp, fast_math,
+            sym_buffer.num_ring_tokens)
+        finalize_tp_output()
+        return y
+    else:
+        # TP router weights are replicated while tokens are DP-sharded. Every
+        # physical rank runs the local fused Router+FP8-quant+TopK frontend and
+        # writes directly into the symmetric input views consumed by L1.
+        num_tokens = hidden_states.size(0)
+        for token_begin in range(0, num_tokens, 64):
+            token_end = min(token_begin + 64, num_tokens)
+            _C.mxfp4_router_quant_topk(
+                hidden_states[token_begin:token_end], router_weight,
+                sym_buffer.x[token_begin:token_end],
+                sym_buffer.x_sf[token_begin:token_end],
+                sym_buffer.topk_idx[token_begin:token_end],
+                sym_buffer.topk_weights[token_begin:token_end],
+            )
+
+    mxfp4_mega_moe(
+        local_y, l1_weights, l2_weights, sym_buffer,
+        cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+        l1_global_scales=l1_global_scales,
+        l2_global_scales=l2_global_scales,
+        recipe=recipe,
+        activation=activation,
+        activation_clamp=activation_clamp,
+        fast_math=fast_math,
+        attn_tp_size=attn_tp_size,
+        attn_tp_group=attn_tp_group,
+        broadcast_output=broadcast_output,
+        router_logits=None,
+        router_renormalize=router_renormalize,
+        tp_combine_output=None,
+        hidden_input=None,
+    )
+    finalize_tp_output()
+    return y

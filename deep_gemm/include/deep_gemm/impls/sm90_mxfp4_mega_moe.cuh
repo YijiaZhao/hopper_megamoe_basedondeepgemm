@@ -104,6 +104,12 @@
 #ifndef DG_W4A8_INT_DIRECT_NIBBLE
 #define DG_W4A8_INT_DIRECT_NIBBLE 0
 #endif
+#if DG_W4A8_INT && (!DG_W4A8_INT_L2 || !DG_W4A8_INT_QOQ || \
+                    !DG_W4A8_INT_QOQ_ZP || !DG_W4A8_INT_QOQ_ZP_SHIFTXOR || \
+                    DG_W4A8_INT_PRE || DG_W4A8_INT_SHADOW || \
+                    DG_W4A8_INT_QOQ_ZP_PRELUT)
+#error "INT4 MegaMoE supports only canonical QoQ+ZP+SHIFTXOR with INT4 L1/L2"
+#endif
 #if DG_W4A8_INT_QOQ_ZP_SHIFTXOR && DG_W4A8_INT_QOQ_ZP_PRELUT
 #error "SHIFTXOR replaces PRELUT; the host must enable at most one"
 #endif
@@ -465,6 +471,12 @@ using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
     bool kOneWarpCleanupRequested = false, \
     bool kMXFP4SwapAB = false, \
     bool kOcc2 = false, \
+    uint32_t kAttnTPSize = 1, \
+    bool kFuseRouter = false, \
+    bool kRouterRenormalize = true, \
+    bool kRouterLogitsInput = false, \
+    bool kTPDistributedCombine = false, \
+    bool kFuseInputQuant = false, \
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2, \
     uint32_t L1_SHAPE_K = kHidden, \
     uint32_t L2_SHAPE_N = kHidden, \
@@ -481,6 +493,10 @@ using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
     void* y, \
     int* cumulative_local_expert_recv_stats, \
     const uint32_t num_tokens, \
+    const nv_bfloat16* __restrict__ hidden_input, \
+    const nv_bfloat16* __restrict__ router_input, \
+    const nv_bfloat16* __restrict__ router_weight, \
+    const nv_bfloat16* __restrict__ router_logits_input, \
     const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf, \
@@ -498,6 +514,10 @@ using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
     void* y, \
     int* cumulative_local_expert_recv_stats, \
     const uint32_t num_tokens, \
+    const nv_bfloat16* __restrict__ hidden_input, \
+    const nv_bfloat16* __restrict__ router_input, \
+    const nv_bfloat16* __restrict__ router_weight, \
+    const nv_bfloat16* __restrict__ router_logits_input, \
     const layout::SymBuffer<kNumRanks>& sym_buffer, \
     const cute::TmaDescriptor& tensor_map_l1_acts, \
     const cute::TmaDescriptor& tensor_map_l1_acts_sf, \
@@ -512,7 +532,7 @@ using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
     const float* __restrict__ l2_global_scales
 
 #define DG_SM90_MXFP4_MOE_KERNEL_ARGS \
-    y, cumulative_local_expert_recv_stats, num_tokens, sym_buffer, \
+    y, cumulative_local_expert_recv_stats, num_tokens, hidden_input, router_input, router_weight, router_logits_input, sym_buffer, \
     tensor_map_l1_acts, tensor_map_l1_acts_sf, tensor_map_l1_weights, \
     tensor_map_l1_weights_sf, \
     l1_global_scales, tensor_map_l1_output, tensor_map_l2_acts, \
@@ -527,7 +547,8 @@ using MegaMoELinear2Phase = MegaMoEPhasePolicy<MegaMoEPhaseKind::Linear2>;
     kNumNonEpilogueThreads, kNumEpilogueThreads, kClusterSize, kNumSMs, \
     kNumRanks, kActivationClamp, kFastMath, kDirectL2ScatterRequested, \
     kPhaseProfileRequested, kL2NMajorScheduleRequested, kOneWarpCleanupRequested, kMXFP4SwapAB, \
-    kOcc2, \
+    kOcc2, kAttnTPSize, kFuseRouter, kRouterRenormalize, kRouterLogitsInput, \
+    kTPDistributedCombine, kFuseInputQuant, \
     L1_SHAPE_N, \
     L1_SHAPE_K, L2_SHAPE_N, L2_SHAPE_K, kNumDispatchWarps, \
     kNumMMANonEpilogueWarps, kNumEpilogueWarps, kNumEpilogueWarpgroups, \
@@ -548,6 +569,8 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
                      "Invalid number of GEMM TMA warps (2 or 4 warps expected)");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of math/epilogue threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+    DG_STATIC_ASSERT(kAttnTPSize >= 1 and kNumRanks % kAttnTPSize == 0,
+                     "Attention TP groups must evenly partition the EP ranks");
     DG_STATIC_ASSERT(kClusterSize == 1 or kClusterSize == 2, "Invalid cluster size");
     DG_STATIC_ASSERT(kNumSMs % kClusterSize == 0, "SM count must be divisible by cluster size");
     DG_STATIC_ASSERT(BLOCK_M % 64 == 0,
@@ -566,6 +589,25 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx   = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx   = ptx::get_lane_idx();
+    // Router weights are TP-replicated, but tokens are DP-sharded: every
+    // physical rank is an independent MegaMoE source and combine destination.
+    const bool is_attn_tp_leader = (sym_buffer.rank_idx % kAttnTPSize) == 0;
+    const uint32_t num_source_tokens = num_tokens;
+    const uint32_t attn_tp_rank = sym_buffer.rank_idx % kAttnTPSize;
+    const auto get_combine_destination = [&](const uint32_t src_rank_idx,
+                                             const uint32_t src_token_idx,
+                                             uint32_t& dst_rank_idx,
+                                             uint32_t& dst_token_idx) {
+        if constexpr (kTPDistributedCombine) {
+            const uint32_t tokens_per_tp = num_tokens / kAttnTPSize;
+            const uint32_t owner_tp_rank = src_token_idx / tokens_per_tp;
+            dst_rank_idx = (src_rank_idx / kAttnTPSize) * kAttnTPSize + owner_tp_rank;
+            dst_token_idx = src_token_idx - owner_tp_rank * tokens_per_tp;
+        } else {
+            dst_rank_idx = src_rank_idx;
+            dst_token_idx = src_token_idx;
+        }
+    };
 
     // Prefetch the TMA descriptors used by this split phase.
     if (warp_idx == 0 and cute::elect_one_sync()) {
@@ -1160,14 +1202,162 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
             return;
         }
 
+        // End-to-end QoQ frontend: quantize replicated BF16 hidden states
+        // directly into the leader's symmetric INT8 activation buffer. One
+        // dispatch warp owns one token, computes a whole-row amax/scale, then
+        // writes raw signed-int8 bytes plus the broadcast K128 scale slots.
+        if constexpr (kFuseInputQuant) {
+            DG_STATIC_ASSERT(!kFuseInputQuant || DG_W4A8_INT, "Fused input quantization currently supports canonical QoQ INT8 only");
+            constexpr uint32_t kQuantWarps = kNumSMs * kNumDispatchWarps;
+            const uint32_t quant_warp_idx = sm_idx * kNumDispatchWarps + warp_idx;
+            if (is_attn_tp_leader) {
+                for (uint32_t token_idx = quant_warp_idx;
+                     token_idx < num_tokens;
+                     token_idx += kQuantWarps) {
+                    const auto* src = hidden_input + static_cast<uint64_t>(token_idx) * kHidden;
+                    float amax = 0.0f;
+                    #pragma unroll 1
+                    for (uint32_t k = lane_idx; k < kHidden; k += 32)
+                        amax = fmaxf(amax, fabsf(__bfloat162float(src[k])));
+                    #pragma unroll
+                    for (uint32_t offset = 16; offset > 0; offset >>= 1)
+                        amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, offset));
+                    amax = __shfl_sync(0xffffffff, amax, 0);
+                    const float scale = fmaxf(amax * (1.0f / 127.0f), 1.0e-30f);
+                    const float inv_scale = 1.0f / scale;
+
+                    auto* dst = input_token_buffer.get_data_buffer(token_idx).get_base_ptr<int8_t>();
+                    #pragma unroll 1
+                    for (uint32_t k = lane_idx; k < kHidden; k += 32) {
+                        int q = __float2int_rn(__bfloat162float(src[k]) * inv_scale);
+                        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                        dst[k] = static_cast<int8_t>(q);
+                    }
+                    auto* sf = input_sf_buffer.get_data_buffer(token_idx).get_base_ptr<float>();
+                    for (uint32_t g = lane_idx; g < kHidden / 128; g += 32)
+                        sf[g] = scale;
+                }
+            }
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+        }
+
+        // Fused replicated router. Attention-TP ranks carry identical tokens
+        // and gate weights, so only the TP-group leader computes logits and
+        // top-k. The output tensor is safe scratch until the L2 combine phase;
+        // its first kNumExperts float slots per token hold router logits.
+        if constexpr (kFuseRouter) {
+            DG_STATIC_ASSERT(kHidden >= kNumExperts * 2,
+                             "BF16 output row must fit FP32 router logits scratch");
+            DG_STATIC_ASSERT(kNumTopk <= 32, "Fused router top-k must fit one warp");
+            auto* router_logits_scratch = reinterpret_cast<float*>(y);
+            constexpr uint32_t kRouterWarps = kNumSMs * kNumDispatchWarps;
+            const uint32_t global_warp_idx = sm_idx * kNumDispatchWarps + warp_idx;
+
+            if constexpr (!kRouterLogitsInput) if (is_attn_tp_leader) {
+                for (uint32_t pair_idx = global_warp_idx;
+                     pair_idx < num_tokens * kNumExperts;
+                     pair_idx += kRouterWarps) {
+                    const uint32_t token_idx = pair_idx / kNumExperts;
+                    const uint32_t expert_idx = pair_idx % kNumExperts;
+                    float accum = 0.0f;
+                    const auto* x_row = router_input + static_cast<uint64_t>(token_idx) * kHidden;
+                    const auto* w_row = router_weight + static_cast<uint64_t>(expert_idx) * kHidden;
+                    #pragma unroll 1
+                    for (uint32_t k = lane_idx; k < kHidden; k += 32)
+                        accum = fmaf(__bfloat162float(x_row[k]), __bfloat162float(w_row[k]), accum);
+                    #pragma unroll
+                    for (uint32_t offset = 16; offset > 0; offset >>= 1)
+                        accum += __shfl_down_sync(0xffffffff, accum, offset);
+                    if (lane_idx == 0)
+                        router_logits_scratch[pair_idx] = accum;
+                }
+            }
+
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+
+            // One warp owns one token. Lane 0 performs a deterministic serial
+            // top-k over the small expert dimension; router GEMM dominates the
+            // cost and this avoids another temporary buffer/reduction kernel.
+            if (is_attn_tp_leader) {
+                for (uint32_t token_idx = global_warp_idx;
+                     token_idx < num_tokens;
+                     token_idx += kRouterWarps) {
+                    if (lane_idx == 0) {
+                        float top_values[kNumTopk];
+                        int top_indices[kNumTopk];
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumTopk; ++j) {
+                            top_values[j] = -3.402823466e+38F;
+                            top_indices[j] = -1;
+                        }
+                        const auto* logits_row_fp32 = router_logits_scratch +
+                            static_cast<uint64_t>(token_idx) * kNumExperts;
+                        const auto* logits_row_bf16 = router_logits_input +
+                            static_cast<uint64_t>(token_idx) * kNumExperts;
+                        #pragma unroll 1
+                        for (uint32_t expert_idx = 0; expert_idx < kNumExperts; ++expert_idx) {
+                            const float value = kRouterLogitsInput ?
+                                __bfloat162float(logits_row_bf16[expert_idx]) :
+                                logits_row_fp32[expert_idx];
+                            uint32_t insert = kNumTopk;
+                            #pragma unroll
+                            for (uint32_t j = 0; j < kNumTopk; ++j) {
+                                if (value > top_values[j]) {
+                                    insert = j;
+                                    break;
+                                }
+                            }
+                            if (insert < kNumTopk) {
+                                #pragma unroll
+                                for (uint32_t j = kNumTopk - 1; j > insert; --j) {
+                                    top_values[j] = top_values[j - 1];
+                                    top_indices[j] = top_indices[j - 1];
+                                }
+                                top_values[insert] = value;
+                                top_indices[insert] = static_cast<int>(expert_idx);
+                            }
+                        }
+
+                        float normalizer = 1.0f;
+                        if constexpr (kRouterRenormalize) {
+                            normalizer = 0.0f;
+                            const float max_value = top_values[0];
+                            #pragma unroll
+                            for (uint32_t j = 0; j < kNumTopk; ++j) {
+                                top_values[j] = __expf(top_values[j] - max_value);
+                                normalizer += top_values[j];
+                            }
+                        }
+                        auto* out_idx = input_topk_idx_buffer.get_base_ptr<int64_t>() +
+                            static_cast<uint64_t>(token_idx) * kNumTopk;
+                        auto* out_weight = input_topk_weights_buffer.get_base_ptr<float>() +
+                            static_cast<uint64_t>(token_idx) * kNumTopk;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumTopk; ++j) {
+                            out_idx[j] = static_cast<int64_t>(top_indices[j]);
+                            out_weight[j] = top_values[j] / normalizer;
+                        }
+                    }
+                }
+            }
+
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+        }
+
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
         const auto read_topk_idx = [&](const auto& process) {
             #pragma unroll
             for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
-                 i < num_tokens;
+                 i < num_source_tokens;
                  i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
-                if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
+                if (i + (lane_idx / kNumTopk) < num_source_tokens and lane_idx < kNumActivateLanes) {
                     const int expert_idx = static_cast<int>(
                         __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
                     if (expert_idx >= 0)
@@ -2094,8 +2284,9 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
                             if (m_idx_in_block >= valid_m) break;
 
                             const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
-                            const uint32_t dst_rank_idx = src_metadata.rank_idx;
-                            const uint32_t dst_token_idx = src_metadata.token_idx;
+                            uint32_t dst_rank_idx = 0, dst_token_idx = 0;
+                            get_combine_destination(src_metadata.rank_idx, src_metadata.token_idx,
+                                                    dst_rank_idx, dst_token_idx);
                             const uint32_t dst_topk_idx = src_metadata.topk_idx;
                             auto smem_ptr = smem_cd_l2 + row_in_wg * WG_BLOCK_N + lane_in_row * cols_per_lane;
                             const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
@@ -4044,8 +4235,8 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                             const uint32_t row_group_base = lane_idx - col_idx;
                             if (col_idx == 0) {
                                 const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + row_offset);
-                                dst_rank_idx = src_metadata.rank_idx;
-                                dst_token_idx = src_metadata.token_idx;
+                                get_combine_destination(src_metadata.rank_idx, src_metadata.token_idx,
+                                                        dst_rank_idx, dst_token_idx);
                                 dst_topk_idx = src_metadata.topk_idx;
                             }
                             const uint32_t row_group_mask = 0xfu << row_group_base;
@@ -4167,8 +4358,9 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
                         if (m_idx_in_block >= valid_m) break;
 
                         const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
-                        const uint32_t dst_rank_idx = src_metadata.rank_idx;
-                        const uint32_t dst_token_idx = src_metadata.token_idx;
+                        uint32_t dst_rank_idx = 0, dst_token_idx = 0;
+                        get_combine_destination(src_metadata.rank_idx, src_metadata.token_idx,
+                                                dst_rank_idx, dst_token_idx);
                         const uint32_t dst_topk_idx = src_metadata.topk_idx;
 
                         auto smem_ptr = smem_cd_l2
@@ -4262,11 +4454,20 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
 
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
+        const uint32_t num_combine_tokens = kTPDistributedCombine ?
+            num_tokens / kAttnTPSize : num_source_tokens;
+        const uint32_t source_leader_rank =
+            (sym_buffer.rank_idx / kAttnTPSize) * kAttnTPSize;
+        const auto* combine_topk_idx_base = kTPDistributedCombine ?
+            sym_buffer.map(input_topk_idx_buffer.get_base_ptr<int64_t>(), source_leader_rank) :
+            input_topk_idx_buffer.get_base_ptr<int64_t>();
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
-             token_idx < num_tokens;
+             token_idx < num_combine_tokens;
              token_idx += kNumSMs * kNumEpilogueWarps) {
+            const uint32_t source_token_idx = kTPDistributedCombine ?
+                attn_tp_rank * num_combine_tokens + token_idx : token_idx;
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
-                static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
+                static_cast<int>(__ldg(combine_topk_idx_base + source_token_idx * kNumTopk + lane_idx)) : -1;
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {

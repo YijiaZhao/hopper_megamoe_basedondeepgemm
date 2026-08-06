@@ -227,14 +227,18 @@ def _prepare_model(args: argparse.Namespace, weight_scale: float,
 
 def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
               global_scale_mode: str, routing_seed: int,
-              rank_idx: int, group: dist.ProcessGroup, buffer,
+              rank_idx: int, group: dist.ProcessGroup,
+              attn_tp_group: dist.ProcessGroup, buffer,
               l1_dequant: torch.Tensor, l2_dequant: torch.Tensor,
-              transformed_l1, transformed_l2):
+              transformed_l1, transformed_l2, router_weight):
     hidden = args.hidden
     intermediate_hidden = args.intermediate_hidden
     num_experts = args.num_experts
     num_topk = args.num_topk
     num_ranks = dist.get_world_size(group)
+    attn_dp_rank = rank_idx // args.attn_tp_size
+    attn_tp_rank = rank_idx % args.attn_tp_size
+    num_attn_dp_ranks = num_ranks // args.attn_tp_size
     num_local_experts = num_experts // num_ranks
     num_max_tokens_per_rank = args.num_max_tokens_per_rank or max(32, max(args.batches))
     selected_block_n = (
@@ -253,10 +257,12 @@ def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
             flush=True,
         )
 
-    torch.manual_seed(routing_seed + m_tokens * 1009 + rank_idx * 1000003)
+    torch.manual_seed(routing_seed + m_tokens * 1009 + attn_dp_rank * 1000003)
     x_bf = torch.randn((m_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-    scores = torch.randn((m_tokens, num_experts), dtype=torch.float, device="cuda")
+    scores = x_bf.float() @ router_weight.float().t()
     topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1)
+    if args.router_renormalize:
+        topk_weights = torch.softmax(topk_weights, dim=-1)
     x_fp8, x_sf = per_token_cast_to_fp8(x_bf, use_ue8m0=False, gran_k=128)
 
     l1_global_scales = None
@@ -272,12 +278,17 @@ def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
         raise ValueError(f"unsupported global_scale_mode={global_scale_mode}")
 
     cumulative_stats = torch.zeros(num_local_experts, dtype=torch.int, device="cuda")
-    buffer.x[:m_tokens].copy_(x_fp8)
-    buffer.x_sf[:m_tokens].copy_(x_sf)
-    buffer.topk_idx[:m_tokens].copy_(topk_idx.to(torch.int32))
-    buffer.topk_weights[:m_tokens].copy_(topk_weights.to(torch.float32))
+    if attn_tp_rank == 0:
+        buffer.x[:m_tokens].copy_(x_fp8)
+        buffer.x_sf[:m_tokens].copy_(x_sf)
 
     y_kernel = torch.zeros((m_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    runtime_router_logits = (
+        x_bf @ router_weight.t() if attn_tp_rank == 0 else
+        torch.empty((m_tokens, num_experts), dtype=torch.bfloat16, device="cuda"))
+    tp_combine_output = (
+        torch.empty((m_tokens // args.attn_tp_size, hidden), dtype=torch.bfloat16, device="cuda")
+        if args.tp_combine_allgather else None)
     deep_gemm.mxfp4_mega_moe(
         y_kernel,
         transformed_l1,
@@ -290,6 +301,11 @@ def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
         activation="swiglu",
         activation_clamp=args.activation_clamp,
         fast_math=bool(args.fast_math),
+        attn_tp_size=args.attn_tp_size,
+        attn_tp_group=attn_tp_group,
+        router_logits=runtime_router_logits,
+        router_renormalize=args.router_renormalize,
+        tp_combine_output=tp_combine_output,
     )
     torch.cuda.synchronize()
     dist.barrier(group=group)
@@ -299,17 +315,21 @@ def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
         * x_sf.float().unsqueeze(2)
     ).view(m_tokens, hidden)
 
-    num_global_tokens = m_tokens * num_ranks
-    x_ref = torch.empty(
-        (num_global_tokens, hidden), device="cuda", dtype=torch.float32)
-    topk_idx_global = torch.empty(
-        (num_global_tokens, num_topk), device="cuda", dtype=topk_idx.dtype)
-    topk_weights_global = torch.empty(
-        (num_global_tokens, num_topk), device="cuda", dtype=topk_weights.dtype)
-    dist.all_gather_into_tensor(x_ref, x_ref_local.contiguous(), group=group)
-    dist.all_gather_into_tensor(topk_idx_global, topk_idx.contiguous(), group=group)
+    x_ref_physical = torch.empty(
+        (m_tokens * num_ranks, hidden), device="cuda", dtype=torch.float32)
+    topk_idx_physical = torch.empty(
+        (m_tokens * num_ranks, num_topk), device="cuda", dtype=topk_idx.dtype)
+    topk_weights_physical = torch.empty(
+        (m_tokens * num_ranks, num_topk), device="cuda", dtype=topk_weights.dtype)
+    dist.all_gather_into_tensor(x_ref_physical, x_ref_local.contiguous(), group=group)
+    dist.all_gather_into_tensor(topk_idx_physical, topk_idx.contiguous(), group=group)
     dist.all_gather_into_tensor(
-        topk_weights_global, topk_weights.contiguous(), group=group)
+        topk_weights_physical, topk_weights.contiguous(), group=group)
+    leader_ranks = torch.arange(0, num_ranks, args.attn_tp_size, device="cuda")
+    x_ref = x_ref_physical.view(num_ranks, m_tokens, hidden).index_select(0, leader_ranks).reshape(-1, hidden)
+    topk_idx_global = topk_idx_physical.view(num_ranks, m_tokens, num_topk).index_select(0, leader_ranks).reshape(-1, num_topk)
+    topk_weights_global = topk_weights_physical.view(num_ranks, m_tokens, num_topk).index_select(0, leader_ranks).reshape(-1, num_topk)
+    num_global_tokens = m_tokens * num_attn_dp_ranks
 
     # Each rank computes only the routes owned by its local experts. Route
     # slots are BF16-rounded like the kernel's combine buffer, then reduced
@@ -352,7 +372,7 @@ def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
 
     dist.all_reduce(route_outputs, op=dist.ReduceOp.SUM, group=group)
     y_ref_global = route_outputs.sum(dim=1).to(torch.bfloat16).float()
-    local_token_start = rank_idx * m_tokens
+    local_token_start = attn_dp_rank * m_tokens
     y_ref = y_ref_global[local_token_start:local_token_start + m_tokens]
 
     diff = y_kernel.float() - y_ref
@@ -440,6 +460,15 @@ def _run_case(args: argparse.Namespace, m_tokens: int, weight_scale: float,
 
 def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None:
     rank_idx, _, group = init_dist(local_rank, num_local_ranks)
+    if num_local_ranks % args.attn_tp_size != 0:
+        raise ValueError("num_processes must be divisible by attn_tp_size")
+    attn_tp_group = None
+    for first_rank in range(0, num_local_ranks, args.attn_tp_size):
+        ranks = list(range(first_rank, first_rank + args.attn_tp_size))
+        candidate = dist.new_group(ranks)
+        if rank_idx in ranks:
+            attn_tp_group = candidate
+    assert attn_tp_group is not None
     deep_gemm.set_pdl(os.environ.get("DG_PDL", "0") == "1")
     buffer = None
     try:
@@ -470,6 +499,9 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
             mma_type="fp8xmxfp4",
             activation="swiglu",
         )
+        torch.manual_seed(args.router_seed)
+        router_weight = torch.randn(
+            (args.num_experts, args.hidden), dtype=torch.bfloat16, device="cuda") * 0.05
 
         all_results = []
         for weight_scale in args.weight_scales:
@@ -480,7 +512,7 @@ def _worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> 
                     for m_tokens in args.batches:
                         all_results.append(_run_case(
                             args, m_tokens, weight_scale, global_scale_mode, routing_seed,
-                            rank_idx, group, buffer, *model))
+                            rank_idx, group, attn_tp_group, buffer, *model, router_weight))
             del model
             torch.cuda.empty_cache()
 
@@ -520,10 +552,14 @@ def _parse_args() -> argparse.Namespace:
         help="Override the model-shape layout policy; default selects at prepack time.",
     )
     parser.add_argument("--num-processes", type=int, default=8)
+    parser.add_argument("--attn-tp-size", type=int, default=1)
+    parser.add_argument("--tp-combine-allgather", action="store_true")
     parser.add_argument("--num-max-tokens-per-rank", type=int, default=0)
     parser.add_argument("--activation-clamp", type=float, default=10.0)
     parser.add_argument("--fast-math", type=int, default=1)
     parser.add_argument("--weight-seed", type=int, default=20260703)
+    parser.add_argument("--router-seed", type=int, default=20260805)
+    parser.add_argument("--router-renormalize", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--routing-seeds", nargs="+", type=int, default=[17, 2027])
     parser.add_argument("--weight-scales", nargs="+", type=float, default=[0.05])
     parser.add_argument(
@@ -540,7 +576,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--small-signal-ref-abs-max", type=float, default=1e-4)
     parser.add_argument("--small-signal-abs-max-threshold", type=float, default=1e-4)
     parser.add_argument("--small-signal-abs-mean-threshold", type=float, default=2e-5)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.tp_combine_allgather and any(m % args.attn_tp_size for m in args.batches):
+        parser.error("all batches must be divisible by attn_tp_size for TP all-gather combine")
+    return args
 
 
 if __name__ == "__main__":

@@ -47,6 +47,14 @@ public:
         // (stages/regs/pad) but single grid -- isolates the slim pipeline
         // from the doubled-grid protocol.
         bool occ2_doubled;
+        // Number of contiguous attention-TP ranks. Router weights are
+        // replicated, but every physical rank owns a distinct DP token shard.
+        int attn_tp_size;
+        bool fuse_router;
+        bool router_renormalize;
+        bool router_logits_input_mode;
+        bool tp_distributed_combine;
+        bool fuse_input_quant;
         KernelPhase kernel_phase;
         MegaMoESM90Config config;
 
@@ -54,6 +62,10 @@ public:
         void* y;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
+        const void* hidden_input;
+        const void* router_input;
+        const void* router_weight;
+        const void* router_logits_input;
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Packed E2M1 values and UE4M3 scales share the weight TMA descriptor.
@@ -99,59 +111,22 @@ public:
               args.num_tokens <= rel_lut_smallm_max) ? 1 : 0);
         const int abs_scale256 =
             get_env<int>("DG_MXFP4_ABS_SCALE256", 0) != 0 ? 1 : 0;
-        // W4A8-integer variant: int4 weights + int8 activations through the same
-        // swapAB-RF pipeline. Off by default; DG_W4A8_INT=1 selects it.
+        // INT4 has one canonical format only: QoQ + asymmetric zero point,
+        // full INT4 L1/L2, decoded with SHIFTXOR. Legacy GPTQ/fp32-scale,
+        // hybrid L2, PRE, SHADOW and PRELUT modes have been retired.
         const int w4a8_int = get_env<int>("DG_W4A8_INT", 0) != 0 ? 1 : 0;
-        // L2 int path: int8 intermediate + int4 L2 weights.
-        const int w4a8_int_l2 = get_env<int>("DG_W4A8_INT_L2", 0) != 0 ? 1 : 0;
-        // Prologue-int: pre-decoded int8 weight rows, no in-kernel decode.
-        const int w4a8_int_pre = get_env<int>("DG_W4A8_INT_PRE", 0) != 0 ? 1 : 0;
-        const int w4a8_int_shadow = get_env<int>("DG_W4A8_INT_SHADOW", 0) != 0 ? 1 : 0;
-        const int w4a8_int_qoq = get_env<int>("DG_W4A8_INT_QOQ", 0) != 0 ? 1 : 0;
-        const int w4a8_int_qoq_zp = get_env<int>("DG_W4A8_INT_QOQ_ZP", 0) != 0 ? 1 : 0;
-        // SHIFTXOR (customer-suggested decode variant): shift+mask + per-byte
-        // z-subtract decode with s2 deferred to the fp32 promote. Replaces
-        // PRELUT entirely (mutually exclusive; SHIFTXOR wins when both are
-        // set) and needs no smem table. Same prepack as PRELUT (byte 1 = raw
-        // z). Off under PRE (the prologue bakes (w4-z)*s2 already).
-        const int w4a8_int_qoq_zp_shiftxor =
-            (get_env<int>("DG_W4A8_INT_QOQ_ZP_SHIFTXOR", 0) != 0 and
-             w4a8_int_qoq_zp and w4a8_int_qoq and not w4a8_int_pre) ? 1 : 0;
+        const int w4a8_int_l2 = w4a8_int;
+        const int w4a8_int_pre = 0;
+        const int w4a8_int_shadow = 0;
+        const int w4a8_int_qoq = w4a8_int;
+        const int w4a8_int_qoq_zp = w4a8_int;
+        const int w4a8_int_qoq_zp_shiftxor = w4a8_int;
         const int w4a8_int_direct_nibble =
-            (get_env<int>("DG_W4A8_INT_DIRECT_NIBBLE", 0) != 0 and
-             w4a8_int_qoq_zp_shiftxor) ? 1 : 0;
-        // ZSUB_XOR (LiquidGEMM-style): keep the z-subtract in the uint8 domain
-        // (add 128-z, carry-free) and flip the MSB with one XOR, replacing __vsub4.
+            (w4a8_int and get_env<int>("DG_W4A8_INT_DIRECT_NIBBLE", 0) != 0) ? 1 : 0;
         const int w4a8_int_zsub_xor =
-            (get_env<int>("DG_W4A8_INT_ZSUB_XOR", 0) != 0 and
-             w4a8_int_qoq_zp_shiftxor) ? 1 : 0;
-        // Prestored ZP decode LUT: replaces the per-row arithmetic LUT build
-        // with one LDS.64 from a 4KB smem table. Only meaningful on the
-        // in-kernel QoQ+ZP decode path; PRE mode's prologue dequant never
-        // runs it, so force the define off there (keeps PRE bit-identical).
-        // Keep this gating in sync with the smem_size addition below.
-        const int w4a8_int_qoq_zp_prelut =
-            (get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT", 0) != 0 and
-             w4a8_int_qoq_zp and w4a8_int_qoq and not w4a8_int_pre and
-             not w4a8_int_qoq_zp_shiftxor) ? 1 : 0;
-        // PRELUT_CONST: direct __constant__ LUT fetch, no smem staging (and
-        // no 4KB smem_size addition -- keep in sync with the size code below).
-        // M-gated dispatch (same pattern as occ2): measured H20 wins are the
-        // flash-family M8 (-4.3%) / M32 (-2.4%), ties elsewhere, flash M1
-        // LOSS (+27%) -> the default gate engages only for IH < 3072 at
-        // M in [8, 32]. _MIN_M/_MAX_M env-override; pro-family default is
-        // disabled (min > max).
-        const int prelut_const_min_m = get_env<int>(
-            "DG_W4A8_INT_QOQ_ZP_PRELUT_CONST_MIN_M",
-            args.intermediate_hidden >= 3072 ? 1 : 8);
-        const int prelut_const_max_m = get_env<int>(
-            "DG_W4A8_INT_QOQ_ZP_PRELUT_CONST_MAX_M",
-            args.intermediate_hidden >= 3072 ? 0 : 32);
-        const int w4a8_int_qoq_zp_prelut_const =
-            (w4a8_int_qoq_zp_prelut and
-             get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST", 0) != 0 and
-             args.num_tokens >= prelut_const_min_m and
-             args.num_tokens <= prelut_const_max_m) ? 1 : 0;
+            (w4a8_int and get_env<int>("DG_W4A8_INT_ZSUB_XOR", 0) != 0) ? 1 : 0;
+        const int w4a8_int_qoq_zp_prelut = 0;
+        const int w4a8_int_qoq_zp_prelut_const = 0;
         // Diagnostic-only: compile the comm-barrier timeout printf path in
         // (degrades scheduling; never enable for perf runs).
         const int comm_barrier_printf = get_env<int>("DG_COMM_BARRIER_TIMEOUT_PRINTF", 0) != 0 ? 1 : 0;
@@ -207,6 +182,12 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
         {}
     >);
 }};
@@ -250,7 +231,13 @@ static void __instantiate_kernel() {{
     args.l2_nmajor_schedule ? "true" : "false",
     args.one_warp_cleanup ? "true" : "false",
     args.config.swap_ab ? "true" : "false",
-    args.occ2 ? "true" : "false");
+    args.occ2 ? "true" : "false",
+    args.attn_tp_size,
+    args.fuse_router ? "true" : "false",
+    args.router_renormalize ? "true" : "false",
+    args.router_logits_input_mode ? "true" : "false",
+    args.tp_distributed_combine ? "true" : "false",
+    args.fuse_input_quant ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -258,6 +245,10 @@ static void __instantiate_kernel() {{
             args.y,
             args.cumulative_local_expert_recv_stats,
             args.num_tokens,
+            args.hidden_input,
+            args.router_input,
+            args.router_weight,
+            args.router_logits_input,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
             args.tensor_map_l1_acts_sf,
@@ -283,19 +274,63 @@ static void sm90_mxfp4_mega_moe(
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
     const std::optional<torch::Tensor> l1_global_scales,
     const std::optional<torch::Tensor> l2_global_scales,
+    const std::optional<torch::Tensor> router_input,
+    const std::optional<torch::Tensor> router_weight,
+    const std::optional<torch::Tensor> router_logits,
+    const bool& router_renormalize,
+    const std::optional<torch::Tensor> tp_combine_output,
+    const std::optional<torch::Tensor> hidden_input,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const int& deployment_block_n,
+    const int& attn_tp_size,
     const float& activation_clamp,
     const bool& fast_math
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(attn_tp_size >= 1 and num_ranks % attn_tp_size == 0);
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
+    const bool router_logits_input_mode = router_logits.has_value();
+    const bool fuse_router = router_input.has_value() or router_weight.has_value() or router_logits_input_mode;
+    DG_HOST_ASSERT(router_input.has_value() == router_weight.has_value());
+    DG_HOST_ASSERT(not (router_logits_input_mode and router_input.has_value()));
+    if (router_input.has_value()) {
+        DG_HOST_ASSERT(router_input->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(router_weight->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(router_input->dim() == 2 and router_weight->dim() == 2);
+        DG_HOST_ASSERT(router_input->size(0) == num_tokens and router_input->size(1) == hidden);
+        DG_HOST_ASSERT(router_weight->size(0) == num_experts and router_weight->size(1) == hidden);
+        DG_HOST_ASSERT(router_input->is_contiguous() and router_weight->is_contiguous());
+        DG_HOST_ASSERT(router_input->device() == y.device() and router_weight->device() == y.device());
+    }
+    if (router_logits_input_mode) {
+        DG_HOST_ASSERT(router_logits->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(router_logits->dim() == 2);
+        DG_HOST_ASSERT(router_logits->size(0) == num_tokens and router_logits->size(1) == num_experts);
+        DG_HOST_ASSERT(router_logits->is_contiguous() and router_logits->device() == y.device());
+    }
+    const bool tp_distributed_combine = tp_combine_output.has_value();
+    if (tp_distributed_combine) {
+        DG_HOST_ASSERT(attn_tp_size > 1 and num_tokens % attn_tp_size == 0);
+        DG_HOST_ASSERT(tp_combine_output->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(tp_combine_output->dim() == 2);
+        DG_HOST_ASSERT(tp_combine_output->size(0) == num_tokens / attn_tp_size);
+        DG_HOST_ASSERT(tp_combine_output->size(1) == hidden);
+        DG_HOST_ASSERT(tp_combine_output->is_contiguous() and tp_combine_output->device() == y.device());
+    }
+    const bool fuse_input_quant = hidden_input.has_value();
+    if (fuse_input_quant) {
+        DG_HOST_ASSERT(get_env<int>("DG_W4A8_INT", 0) != 0);
+        DG_HOST_ASSERT(hidden_input->scalar_type() == torch::kBFloat16);
+        DG_HOST_ASSERT(hidden_input->dim() == 2);
+        DG_HOST_ASSERT(hidden_input->size(0) == num_tokens and hidden_input->size(1) == hidden);
+        DG_HOST_ASSERT(hidden_input->is_contiguous() and hidden_input->device() == y.device());
+    }
 
     // Start from the retained FP8 policy, then constrain only the dimensions
     // and resources changed by in-kernel MXFP4 dequantization.
@@ -333,27 +368,12 @@ static void sm90_mxfp4_mega_moe(
     if (deployment_block_n == 128 and not config.swap_ab and num_tokens > 0 and
         num_tokens <= get_env<int>("DG_MXFP4_SWAP_AB_MAX_M", default_swap_ab_max_m))
         config.swap_ab = true;
-    // Prologue-int consumes pre-decoded int8 weight rows; the swapAB RF path
-    // decodes from packed scratch and is incompatible.
-    const bool pre_decoded_b = get_env<int>("DG_W4A8_INT_PRE", 0) != 0;
-    if (pre_decoded_b)
-        config.swap_ab = false;
-    // Prestored ZP decode LUT smem: 32 x 16 uint2 = 4096 bytes staged after
-    // the barrier region. Mirror generate_impl's gating (off under PRE, and
-    // off under SHIFTXOR which replaces PRELUT with a table-free decode).
-    const bool zp_prelut = get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT", 0) != 0 and
-        get_env<int>("DG_W4A8_INT_QOQ_ZP", 0) != 0 and
-        get_env<int>("DG_W4A8_INT_QOQ", 0) != 0 and not pre_decoded_b and
-        get_env<int>("DG_W4A8_INT_QOQ_ZP_SHIFTXOR", 0) == 0;
-    // PRELUT_CONST reads the table straight from __constant__: no smem copy.
-    // MUST mirror generate_impl's M-gate exactly (host smem_size contract).
-    const bool zp_prelut_const = zp_prelut and
-        get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST", 0) != 0 and
-        num_tokens >= get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST_MIN_M",
-                                   intermediate_hidden >= 3072 ? 1 : 8) and
-        num_tokens <= get_env<int>("DG_W4A8_INT_QOQ_ZP_PRELUT_CONST_MAX_M",
-                                   intermediate_hidden >= 3072 ? 0 : 32);
-    const int zp_prelut_smem_size = (zp_prelut and not zp_prelut_const) ? 4096 : 0;
+    // Legacy PRE/PRELUT modes were removed; canonical QoQ always decodes the
+    // packed uint4 stream in-kernel with SHIFTXOR.
+    const bool pre_decoded_b = false;
+    const bool zp_prelut = false;
+    const bool zp_prelut_const = false;
+    const int zp_prelut_smem_size = 0;
     config.num_epilogue_threads = deployment_block_n == 256 ? 256 :
         (config.swap_ab ? 256 : 128);
     const bool compact_frontend = deployment_block_n == 256 or config.swap_ab;
@@ -387,8 +407,9 @@ static void sm90_mxfp4_mega_moe(
     const int rf_reclaim_per_stage = config.swap_ab ? deployment_block_n * 128 : 0;
     // PRE mode frees the packed-B scratch; grant the budget back and request
     // a deeper pipeline (B rows are 2x bytes, more stages hide the TMA).
+    const int default_rf_stages = num_tokens <= 32 ? 4 : 6;
     int requested_stages = config.swap_ab ?
-        get_env<int>("DG_MXFP4_RF_STAGES", 8) :
+        get_env<int>("DG_MXFP4_RF_STAGES", default_rf_stages) :
         (pre_decoded_b ? get_env<int>("DG_W4A8_PRE_STAGES", 6) : (stage5 ? 5 : 4));
     const int packed_scratch_per_stage = pre_decoded_b ? 0 : deployment_block_n * 80;
     while (true) {
@@ -586,11 +607,21 @@ static void sm90_mxfp4_mega_moe(
         .one_warp_cleanup = config.one_warp_cleanup,
         .occ2 = occ2,
         .occ2_doubled = occ2 and get_env<int>("DG_W4A8_INT_SMALLM_OCC2_NO2X", 0) == 0,
+        .attn_tp_size = attn_tp_size,
+        .fuse_router = fuse_router,
+        .router_renormalize = router_renormalize,
+        .router_logits_input_mode = router_logits_input_mode,
+        .tp_distributed_combine = tp_distributed_combine,
+        .fuse_input_quant = fuse_input_quant,
         .kernel_phase = SM90MXFP4MegaMoERuntime::KernelPhase::Linear1,
         .config = config,
-        .y = y.data_ptr(),
+        .y = tp_distributed_combine ? tp_combine_output->data_ptr() : y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,
+        .hidden_input = fuse_input_quant ? hidden_input->data_ptr() : nullptr,
+        .router_input = router_input.has_value() ? router_input->data_ptr() : nullptr,
+        .router_weight = router_weight.has_value() ? router_weight->data_ptr() : nullptr,
+        .router_logits_input = router_logits_input_mode ? router_logits->data_ptr() : nullptr,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
@@ -628,7 +659,15 @@ static void sm90_mxfp4_mega_moe(
                 verified_kernels.insert(handle_key);
             }
         }
+        // Whole-grid PDL is disabled for the persistent MegaMoE phases.
+        // Allowing L1/L2 to start before the predecessor grid retires caused
+        // SM starvation and millisecond slow modes on H20.
+        const bool global_pdl = device_runtime->get_pdl();
+        if (global_pdl)
+            device_runtime->set_pdl(false);
         SM90MXFP4MegaMoERuntime::launch(runtime, split_args);
+        if (global_pdl)
+            device_runtime->set_pdl(true);
     };
 
     launch_with_phase(SM90MXFP4MegaMoERuntime::KernelPhase::Linear1, "sm90_mxfp4_mega_moe_l1_impl");

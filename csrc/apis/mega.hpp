@@ -13,6 +13,10 @@
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_mxfp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
+#include "../mega_frontend.h"
+#include "../router_frontend_kf.h"
+#include "../qoq_router_frontend_kf.h"
 
 namespace deep_gemm::mega {
 
@@ -375,10 +379,17 @@ static void mxfp4_mega_moe(
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const std::optional<torch::Tensor>& l1_global_scales,
     const std::optional<torch::Tensor>& l2_global_scales,
+    const std::optional<torch::Tensor>& router_input,
+    const std::optional<torch::Tensor>& router_weight,
+    const std::optional<torch::Tensor>& router_logits,
+    const bool& router_renormalize,
+    const std::optional<torch::Tensor>& tp_combine_output,
+    const std::optional<torch::Tensor>& hidden_input,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
     const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
+    const int& attn_tp_size,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
@@ -459,6 +470,7 @@ static void mxfp4_mega_moe(
     check_global_scale(l2_global_scales);
 
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(attn_tp_size >= 1 and num_ranks % attn_tp_size == 0);
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
@@ -477,16 +489,135 @@ static void mxfp4_mega_moe(
         l1_weights_sf, l2_weights_sf,
         cumulative_local_expert_recv_stats,
         l1_global_scales, l2_global_scales,
+        router_input, router_weight, router_logits, router_renormalize,
+        tp_combine_output, hidden_input,
         sym_buffer_ptrs,
         rank_idx, num_max_tokens_per_rank,
         num_experts_per_rank,
         num_tokens, num_topk,
         hidden, intermediate_hidden,
         rn,
+        attn_tp_size,
         activation_clamp, fast_math);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
+}
+
+static void qoq_quant_topk(const torch::Tensor& hidden,
+                           const torch::Tensor& router_logits,
+                           const torch::Tensor& x_storage,
+                           const torch::Tensor& x_sf,
+                           const torch::Tensor& topk_idx,
+                           const torch::Tensor& topk_weights) {
+    DG_HOST_ASSERT(hidden.scalar_type() == torch::kBFloat16 and hidden.dim() == 2);
+    DG_HOST_ASSERT(router_logits.scalar_type() == torch::kBFloat16 and router_logits.dim() == 2);
+    DG_HOST_ASSERT(x_storage.numel() == hidden.numel());
+    DG_HOST_ASSERT(x_sf.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
+    DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+    const int m = static_cast<int>(hidden.size(0));
+    const int h = static_cast<int>(hidden.size(1));
+    const int e = static_cast<int>(router_logits.size(1));
+    const int topk = static_cast<int>(topk_idx.size(1));
+    DG_HOST_ASSERT(router_logits.size(0) == m and x_sf.size(0) >= m);
+    DG_HOST_ASSERT(x_sf.size(1) == h / 128);
+    DG_HOST_ASSERT(topk_weights.sizes() == topk_idx.sizes());
+    launch_qoq_quant_topk(hidden.data_ptr(), router_logits.data_ptr(),
+                          x_storage.data_ptr(), x_sf.data_ptr(),
+                          topk_idx.data_ptr(), topk_weights.data_ptr(),
+                          m, h, e, topk,
+                          at::cuda::getCurrentCUDAStream().stream());
+}
+
+static void mxfp4_router_quant_topk(const torch::Tensor& hidden,
+                                      const torch::Tensor& router_weight,
+                                      const torch::Tensor& x_storage,
+                                      const torch::Tensor& x_sf,
+                                      const torch::Tensor& topk_idx,
+                                      const torch::Tensor& topk_weights) {
+    const auto [m, h] = get_shape<2>(hidden);
+    const auto [e, h_] = get_shape<2>(router_weight);
+    DG_HOST_ASSERT(hidden.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(router_weight.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(hidden.is_contiguous() and router_weight.is_contiguous());
+    DG_HOST_ASSERT(h == 4096 and h_ == h and e == 128);
+    DG_HOST_ASSERT(m > 0 and m <= 64);
+    DG_HOST_ASSERT(x_storage.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(x_storage.size(0) >= m and x_storage.size(1) == h);
+    DG_HOST_ASSERT(x_sf.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(x_sf.size(0) >= m and x_sf.size(1) == h / 128);
+    DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
+    DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(topk_idx.size(0) >= m and topk_idx.size(1) == 6);
+    DG_HOST_ASSERT(topk_weights.sizes() == topk_idx.sizes());
+    router_frontend_launcher(
+        hidden.data_ptr(), router_weight.data_ptr(),
+        x_storage.data_ptr(), x_sf.data_ptr(), topk_weights.data_ptr(),
+        topk_idx.data_ptr(), m, at::cuda::getCurrentCUDAStream().stream());
+}
+
+static void qoq_router_quant_topk(const torch::Tensor& hidden,
+                                  const torch::Tensor& router_weight,
+                                  const torch::Tensor& router_logits,
+                                  const torch::Tensor& x_storage,
+                                  const torch::Tensor& x_sf,
+                                  const torch::Tensor& topk_idx,
+                                  const torch::Tensor& topk_weights) {
+    const auto [m, h] = get_shape<2>(hidden);
+    const auto [e, h_] = get_shape<2>(router_weight);
+    DG_HOST_ASSERT(h == h_ and router_logits.size(0) == m and router_logits.size(1) == e);
+    sm90_bf16_gemm(hidden, router_weight, std::nullopt, router_logits,
+                   m, e, h, get_major_type_ab(hidden), get_major_type_ab(router_weight), "nk");
+    qoq_quant_topk(hidden, router_logits, x_storage, x_sf, topk_idx, topk_weights);
+}
+
+static void qoq_fused_router_quant_topk(
+    const torch::Tensor& hidden, const torch::Tensor& router_weight,
+    const torch::Tensor& x_storage, const torch::Tensor& x_sf,
+    const torch::Tensor& topk_idx, const torch::Tensor& topk_weights) {
+    const auto [m, h] = get_shape<2>(hidden);
+    const auto [e, h_] = get_shape<2>(router_weight);
+    DG_HOST_ASSERT(hidden.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(router_weight.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(hidden.is_contiguous() and router_weight.is_contiguous());
+    DG_HOST_ASSERT(h == 4096 and h_ == h and e == 128);
+    DG_HOST_ASSERT(m > 0 and m <= 64);
+    DG_HOST_ASSERT(x_sf.scalar_type() == torch::kFloat32);
+    DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
+    DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+    qoq_router_frontend_launcher(
+        hidden.data_ptr(), router_weight.data_ptr(), x_storage.data_ptr(),
+        x_sf.data_ptr(), topk_weights.data_ptr(), topk_idx.data_ptr(), m,
+        at::cuda::getCurrentCUDAStream().stream());
+}
+
+static void qoq_bf16_mega_moe(
+    const torch::Tensor& y, const torch::Tensor& hidden,
+    const torch::Tensor& router_weight, const torch::Tensor& router_logits,
+    const torch::Tensor& x_storage, const torch::Tensor& x_sf,
+    const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights,
+    const std::optional<torch::Tensor>& stats,
+    const std::optional<torch::Tensor>& l1_global_scales,
+    const std::optional<torch::Tensor>& l2_global_scales,
+    const std::optional<torch::Tensor>& tp_combine_output,
+    const torch::Tensor& sym_buffer, const std::vector<int64_t>& sym_buffer_ptrs,
+    const int& rank_idx, const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk, const int& attn_tp_size,
+    const std::tuple<int,int,int>& recipe, const std::string& activation,
+    const std::optional<float>& activation_clamp, const bool& fast_math,
+    const int& num_ring_tokens) {
+    qoq_fused_router_quant_topk(hidden, router_weight,
+                                x_storage, x_sf, topk_idx, topk_weights);
+    mxfp4_mega_moe(y, l1_weights, l2_weights, stats,
+                    l1_global_scales, l2_global_scales,
+                    std::nullopt, std::nullopt, std::nullopt, true,
+                    tp_combine_output, std::nullopt,
+                    sym_buffer, sym_buffer_ptrs, rank_idx,
+                    num_max_tokens_per_rank, num_experts, num_topk, attn_tp_size,
+                    recipe, activation, activation_clamp, fast_math, num_ring_tokens);
 }
 
 static void register_apis(pybind11::module_& m) {
@@ -498,6 +629,11 @@ static void register_apis(pybind11::module_& m) {
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
     m.def("mxfp4_mega_moe", &mxfp4_mega_moe);
+    m.def("mxfp4_router_quant_topk", &mxfp4_router_quant_topk);
+    m.def("qoq_fused_router_quant_topk", &qoq_fused_router_quant_topk);
+    m.def("qoq_quant_topk", &qoq_quant_topk);
+    m.def("qoq_router_quant_topk", &qoq_router_quant_topk);
+    m.def("qoq_bf16_mega_moe", &qoq_bf16_mega_moe);
 #endif
 }
 

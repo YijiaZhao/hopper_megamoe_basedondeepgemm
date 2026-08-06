@@ -91,7 +91,9 @@ from .mega import (
     get_nvfp4_mega_moe_sm90_weight_layout,
     get_mxfp4_mega_moe_sm90_block_n,
     transform_mxfp4_weights_for_mega_moe_sm90,
+    transform_qoq_int4_weights_for_mega_moe_sm90,
     mxfp4_mega_moe,
+    mxfp4_mega_moe_from_bf16,
     int4_mega_moe,
 )
 

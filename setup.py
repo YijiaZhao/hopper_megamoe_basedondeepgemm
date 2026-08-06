@@ -14,7 +14,7 @@ from setuptools import find_packages
 from setuptools.command.build_py import build_py
 from packaging.version import parse
 from pathlib import Path
-from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
+from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME, BuildExtension
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 from scripts.generate_pyi import generate_pyi_file
 
@@ -32,15 +32,16 @@ if DG_JIT_USE_RUNTIME_API:
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
-sources = ['csrc/python_api.cpp']
+os.environ.setdefault('TORCH_CUDA_ARCH_LIST', '9.0a')
+sources = ['csrc/python_api.cpp', 'csrc/mega_frontend.cu', 'csrc/router_frontend_kf.cu', 'csrc/qoq_router_frontend_kf.cu']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
     f'{CUDA_HOME}/include/cccl',
-    'deep_gemm/include',
-    'third-party/cutlass/include',
-    'third-party/fmt/include',
+    os.path.join(current_dir, 'deep_gemm/include'),
+    os.path.join(current_dir, 'third-party/cutlass/include'),
+    os.path.join(current_dir, 'third-party/fmt/include'),
 ]
-build_libraries = ['cudart', 'nvrtc']
+build_libraries = ['cudart', 'nvrtc', 'cuda']
 build_library_dirs = [f'{CUDA_HOME}/lib64']
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',
@@ -108,7 +109,11 @@ def get_ext_modules():
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
                           library_dirs=build_library_dirs,
-                          extra_compile_args=cxx_flags)]
+                          extra_compile_args={
+                              'cxx': cxx_flags,
+                              'nvcc': ['-O3', '-std=c++17',
+                                       f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}'],
+                          })]
 
 
 class CustomBuildPy(build_py):
@@ -210,5 +215,6 @@ if __name__ == '__main__':
         cmdclass={
             'build_py': CustomBuildPy,
             'bdist_wheel': CachedWheelsCommand,
+            'build_ext': BuildExtension,
         },
     )

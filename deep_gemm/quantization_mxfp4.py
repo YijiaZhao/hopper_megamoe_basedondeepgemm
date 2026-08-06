@@ -318,3 +318,65 @@ if __name__ == "__main__":
     assert torch.equal(back, probe)
     assert not torch.equal(rf, probe)
     print("OK")
+
+
+def quantize_to_qoq_int4(weight: torch.Tensor, group_size: int = 128):
+    """Canonical W4A8 QoQ+ZP weight format.
+
+    Returns Marlin-packed uint4 values and an int32 coefficient plane with
+    bytes ``[s2:u8, z:u8, s1:bf16]`` per output row and K128 group.  This is
+    the only supported INT4 weight format for SM90 MegaMoE.
+    """
+    assert weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    *outer, K = weight.shape
+    assert len(outer) == 2 and K % group_size == 0
+    E, N = outer
+    w = weight.float()
+    s1 = (w.abs().amax(dim=-1, keepdim=True) / 120.0).clamp_min(1e-30)
+    s1 = s1.to(torch.bfloat16).to(torch.float32)
+    w8 = (w / s1).round().clamp(-112, 112)
+    groups = K // group_size
+    w8g = w8.view(E, N, groups, group_size)
+    mn = w8g.amin(dim=-1, keepdim=True)
+    mx = w8g.amax(dim=-1, keepdim=True)
+    s2 = ((mx - mn) / 15.0).ceil().clamp(1, 127)
+    z = (-mn / s2).round().clamp(0, 15)
+    w4 = (w8g / s2 + z).round().clamp(0, 15).view(E, N, K)
+
+    nib = w4.to(torch.uint8).view(E, N, K // 8, 8)
+    packed = (nib[..., 4:8] | (nib[..., 0:4] << 4)).view(E, N, K // 2).contiguous()
+
+    s1_word = (s1.view(torch.int32) & -65536).expand(E, N, groups)
+    plane = (s1_word |
+             (z.squeeze(-1).to(torch.int32) << 8) |
+             s2.squeeze(-1).to(torch.int32)).contiguous()
+    return packed, plane
+
+
+def qoq_plane_to_tile_major(plane: torch.Tensor, block_n: int = 128) -> torch.Tensor:
+    """Convert canonical ``[E,N,K/128]`` int32 QoQ plane to tile-major bytes."""
+    assert plane.dtype == torch.int32 and plane.dim() == 3
+    E, N, Kb = plane.shape
+    assert N % block_n == 0
+    b = plane.contiguous().view(torch.uint8).view(E, N, Kb, 4)
+    return b.view(E, N // block_n, block_n, Kb, 4).permute(0, 1, 3, 2, 4).contiguous()
+
+
+def dequantize_qoq_int4(packed: torch.Tensor, plane: torch.Tensor) -> torch.Tensor:
+    """Reference dequantization for canonical QoQ+ZP weights."""
+    assert packed.dtype == torch.uint8 and plane.dtype == torch.int32
+    E, N, K2 = packed.shape
+    K = K2 * 2
+    groups = plane.size(-1)
+    assert K == groups * 128
+    chunks = packed.view(E, N, K // 8, 4)
+    codes = torch.empty((E, N, K // 8, 8), dtype=torch.uint8, device=packed.device)
+    codes[..., :4] = chunks >> 4
+    codes[..., 4:] = chunks & 0x0f
+    codes = codes.view(E, N, groups, 128).float()
+    u = plane.view(torch.uint8).view(E, N, groups, 4)
+    s2 = u[..., 0].float()
+    z = u[..., 1].float()
+    s1_word = (plane & -65536).contiguous()
+    s1 = s1_word.view(torch.float32)
+    return ((codes - z.unsqueeze(-1)) * s2.unsqueeze(-1) * s1.unsqueeze(-1)).view(E, N, K)
