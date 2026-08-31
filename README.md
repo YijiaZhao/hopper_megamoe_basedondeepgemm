@@ -1,5 +1,7 @@
 # DeepGEMM
 
+> **Customer H20 E384/H3072/I1280/TopK8:** follow the self-contained build, correctness, and benchmark runbook in [`docs/CUSTOMER_QUICKSTART_H20_E384_H3072_I1280_TOPK8.md`](docs/CUSTOMER_QUICKSTART_H20_E384_H3072_I1280_TOPK8.md).
+
 DeepGEMM is a unified, high-performance tensor core kernel library that brings together the key computation primitives of modern large language models — GEMMs (FP8, FP4, BF16), fused MoE with overlapped communication (Mega MoE), MQA scoring for the lightning indexer, HyperConnection (HC), and more — into a single, cohesive CUDA codebase. All kernels are compiled at runtime via a lightweight Just-In-Time (JIT) module, requiring no CUDA compilation during installation.
 
 DeepGEMM leverages some concepts from [CUTLASS](https://github.com/nvidia/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute), but avoids heavy reliance on their templates or algebras. The library is designed for simplicity, with only a limited number of core kernel functions, making it a clean and accessible resource for learning NVIDIA GPU kernel optimization techniques.
