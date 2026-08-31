@@ -147,10 +147,10 @@ def _worker(local_rank, world, args):
             torch.cuda.synchronize()
             elapsed_us = start.elapsed_time(end) * 1000.0 / args.iters
             measured = torch.tensor(elapsed_us, device="cuda", dtype=torch.float64)
-            dist.all_reduce(measured, op=dist.ReduceOp.MAX, group=ep_group)
+            dist.all_reduce(measured, op=dist.ReduceOp.SUM, group=ep_group)
             if rank == 0:
                 print(
-                    f"RESULT global_tokens=8 M_per_tp_group={num_tokens} max_rank_us={measured.item():.3f}",
+                    f"RESULT global_tokens=8 M_per_tp_group={num_tokens} mean_rank_us={measured.item() / world:.3f}",
                     flush=True)
     finally:
         sym_buffer.destroy()
