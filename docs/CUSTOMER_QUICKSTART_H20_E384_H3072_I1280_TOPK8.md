@@ -21,49 +21,91 @@ a26b27a docs: record clean-main customer benchmark verification
 
 Newer `main` commits are acceptable only after rerunning the tests below.
 
-## 2. Required system
+## 2. Required system and tested container
 
 ```text
 GPU: 8 x NVIDIA H20-3e (SM90)
-CUDA toolkit: 13.0
+Host NVIDIA driver: must support CUDA 13.0 containers
+CUDA toolkit: 13.0 (tested: nvcc 13.0.88)
+Python: 3.12.3
 PyTorch: 2.11.0+cu130
-Python: 3.12
+NCCL: 2.28.9
+GCC/G++: 13.3
+Ninja: 1.13
 NCCL-visible topology supporting all 8 GPUs
 ```
 
-The tested environment used the `ds_new` container. PyTorch symmetric memory is
-required by the EP8 MegaMoE implementation.
+PyTorch symmetric memory is required by the EP8 MegaMoE implementation.
 
-## 3. Build
+The exact tested image was:
 
-Ensure the CUTLASS and fmt submodules exist:
+```text
+docker.io/lmsysorg/sglang@sha256:08f2f19ffd2522067dadac51716ddce84b13f1e5f3084e1bbd4cb14122998aa8
+```
+
+The local container name `ds_new` is not portable. Create a container from the
+immutable digest above:
+
+```bash
+export DG_REPO=$PWD
+
+docker pull \
+  docker.io/lmsysorg/sglang@sha256:08f2f19ffd2522067dadac51716ddce84b13f1e5f3084e1bbd4cb14122998aa8
+
+docker run --name deepgemm-h20-customer --gpus all \
+  --network host --shm-size=128g \
+  -v "$DG_REPO:/workspace/hopper_megamoe_basedondeepgemm" \
+  -w /workspace/hopper_megamoe_basedondeepgemm \
+  -d docker.io/lmsysorg/sglang@sha256:08f2f19ffd2522067dadac51716ddce84b13f1e5f3084e1bbd4cb14122998aa8 \
+  sleep infinity
+```
+
+Verify the container:
+
+```bash
+docker exec deepgemm-h20-customer bash -lc '
+  python3 --version
+  python3 -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.nccl.version(), torch.cuda.device_count())"
+  nvcc --version
+  g++ --version | head -1
+'
+```
+
+Expected key values are Python 3.12, PyTorch 2.11+cu130, CUDA 13.0, and eight
+visible H20 GPUs. An equivalent CUDA 13/PyTorch 2.11 image may be used, but the
+full validation suite must then be rerun.
+
+## 3. Build inside the container
+
+Ensure the CUTLASS and fmt submodules exist on the host:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-Then build from the repository root:
+Build inside the container:
 
 ```bash
-export CUDA_HOME=/usr/local/cuda
-export PATH="$CUDA_HOME/bin:$PATH"
-export MAX_JOBS=16
-bash develop.sh
+docker exec deepgemm-h20-customer bash -lc '
+  cd /workspace/hopper_megamoe_basedondeepgemm
+  export CUDA_HOME=/usr/local/cuda
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export MAX_JOBS=16
+  rm -rf build deep_gemm/_C*.so
+  bash develop.sh
+'
 ```
 
 Verify that Python loads this checkout rather than another DeepGEMM install:
 
 ```bash
-python3 - <<'PY'
-import deep_gemm
-print("package:", deep_gemm.__file__)
-print("extension:", deep_gemm._C.__file__)
-print("MXFP4 frontend:", deep_gemm._C.mxfp4_router_quant_topk_split.__doc__)
-print("QoQ frontend:", deep_gemm._C.qoq_router_quant_topk.__doc__)
-PY
+docker exec deepgemm-h20-customer bash -lc '
+  cd /workspace/hopper_megamoe_basedondeepgemm
+  python3 -c "import deep_gemm; print(deep_gemm.__file__); print(deep_gemm._C.__file__); print(deep_gemm._C.mxfp4_router_quant_topk_split.__doc__); print(deep_gemm._C.qoq_router_quant_topk.__doc__)"
+'
 ```
 
-Both printed paths must point inside the current repository.
+Both paths must point inside `/workspace/hopper_megamoe_basedondeepgemm`.
 
 ## 4. Hardware preparation
 
@@ -79,7 +121,14 @@ nvidia-smi --query-gpu=index,name,clocks.current.sm,memory.used,utilization.gpu 
 Use all eight idle GPUs. Do not run MXFP4 and QoQ simultaneously because both
 benchmarks use the same default distributed rendezvous port.
 
-Common environment:
+Enter the container before running the remaining commands:
+
+```bash
+docker exec -it deepgemm-h20-customer bash
+cd /workspace/hopper_megamoe_basedondeepgemm
+```
+
+Common environment inside the container:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
