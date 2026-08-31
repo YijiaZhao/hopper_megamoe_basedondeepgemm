@@ -101,3 +101,59 @@ docker exec ds_new bash -lc '
     --valid-tokens-per-group 4 --warmup 15 --iters 150
 '
 ```
+
+## Clean-main verification — 2026-08-31
+
+A clean copy of local `main@25681fd` was transferred to H20-GPU-08, rebuilt from source in the `ds_new` container, and tested independently of earlier build artifacts.
+
+Configuration:
+
+```text
+8 x H20-3e, clocks requested at 1980 MHz
+TP4 / DP2 / EP8
+E=384, H=3072, I=1280, TopK=8
+BS=1, ISL=4 per DP replica
+Performance routing: balanced, 8 assignments per EP rank
+Correctness frontend: real Router GEMM + quantization + TopK8
+```
+
+Correctness:
+
+| precision | exact | max_abs | cos_min |
+|---|---:|---:|---:|
+| scaled-MXFP4 | 1 | 0 | 0.9999999404 |
+| QoQ INT4 x INT8 | 1 | 0 | 0.9999999404 |
+
+Full E2E, arithmetic mean across eight ranks (`warmup=15`, `iters=150`):
+
+| precision | mean-rank E2E |
+|---|---:|
+| scaled-MXFP4 | 276.089 us |
+| QoQ INT4 x INT8 | 281.006 us |
+
+MegaMoE kernel-only measurements were repeated three times with `warmup=20` and `num_tests=200`. Each value below is the arithmetic mean across eight ranks:
+
+| precision | repeat 1 | repeat 2 | repeat 3 | mean of repeats |
+|---|---:|---:|---:|---:|
+| scaled-MXFP4 | 108.984 us | 125.195 us | 113.564 us | 115.914 us |
+| QoQ INT4 x INT8 | 140.911 us | 107.317 us | 115.829 us | 121.352 us |
+
+The kernel-only numbers show noticeable run-to-run variation; retain all repeats rather than quoting only the best run. The E2E results above are the primary production comparison.
+
+Verification logs on H20-GPU-08:
+
+```text
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_build.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_mxfp4_correctness.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_mxfp4_core.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_mxfp4_core_rep1.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_mxfp4_core_rep2.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_mxfp4_core_rep3.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_mxfp4_e2e.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_int4_correctness.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_int4_core.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_int4_core_rep1.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_int4_core_rep2.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_int4_core_rep3.log
+/raid/kimi/megamoe_opt2_results/verify_main_25681fd_int4_e2e.log
+```
