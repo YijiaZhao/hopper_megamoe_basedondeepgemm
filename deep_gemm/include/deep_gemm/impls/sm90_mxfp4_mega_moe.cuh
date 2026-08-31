@@ -132,6 +132,9 @@
 #ifndef DG_MXFP4_ABS_SCALE256
 #define DG_MXFP4_ABS_SCALE256 0
 #endif
+#ifndef DG_TP_REPLICA_PULL
+#define DG_TP_REPLICA_PULL 0
+#endif
 
 namespace deep_gemm {
 
@@ -1358,8 +1361,11 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
                  i < num_source_tokens;
                  i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
                 if (i + (lane_idx / kNumTopk) < num_source_tokens and lane_idx < kNumActivateLanes) {
+                    const uint32_t route_token_idx = DG_TP_REPLICA_PULL ?
+                        attn_tp_rank * num_source_tokens + i : i;
                     const int expert_idx = static_cast<int>(
-                        __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
+                        __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() +
+                              route_token_idx * kNumTopk + lane_idx));
                     if (expert_idx >= 0)
                         process(i * kNumTopk + lane_idx, expert_idx);
                 }
@@ -1508,12 +1514,27 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
             const uint32_t src_token_idx = src_token_topk_idx / kNumTopk;
             const uint32_t src_topk_idx  = src_token_topk_idx % kNumTopk;
 
+            // With an AllReduce-replicated TP input, route metadata remains
+            // owned by one token-source rank, while activation data may be
+            // pulled from the TP replica aligned with the expert owner.
+            uint32_t activation_rank_idx = current_rank_in_expert_idx;
+            uint32_t activation_token_idx = src_token_idx;
+            if constexpr (DG_TP_REPLICA_PULL and kAttnTPSize > 1) {
+                const uint32_t source_tp_base =
+                    (current_rank_in_expert_idx / kAttnTPSize) * kAttnTPSize;
+                activation_rank_idx = source_tp_base +
+                    (sym_buffer.rank_idx % kAttnTPSize);
+                activation_token_idx =
+                    (current_rank_in_expert_idx % kAttnTPSize) * num_tokens +
+                    src_token_idx;
+            }
+
             // TMA pull token data into SMEM
             if (cute::elect_one_sync()) {
                 ptx::tma_load_1d(
                     pull_buffer.get_base_ptr(),
-                    sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
-                                   current_rank_in_expert_idx),
+                    sym_buffer.map(input_token_buffer.get_data_buffer(activation_token_idx).get_base_ptr(),
+                                   activation_rank_idx),
                     pull_mbarrier, kHidden);
             }
             __syncwarp();
@@ -1522,8 +1543,8 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
             constexpr uint32_t kNumSFFloats = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
             const auto remote_sf_ptr = sym_buffer.map(
-                input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
-                current_rank_in_expert_idx);
+                input_sf_buffer.get_data_buffer(activation_token_idx).get_base_ptr<float>(),
+                activation_rank_idx);
             const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
             const uint32_t sf_pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
             #pragma unroll
@@ -1536,8 +1557,12 @@ sm90_mxfp4_mega_moe_core(DG_SM90_MXFP4_MOE_CORE_ARGS_DECL) {
 
             const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
             if (cute::elect_one_sync()) {
+                const uint32_t route_topk_offset =
+                    (DG_TP_REPLICA_PULL ?
+                        (current_rank_in_expert_idx % kAttnTPSize) * num_tokens * kNumTopk : 0) +
+                    src_token_topk_idx;
                 const auto weight = *sym_buffer.map(
-                    input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+                    input_topk_weights_buffer.get_base_ptr<float>() + route_topk_offset,
                     current_rank_in_expert_idx);
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
@@ -4460,7 +4485,8 @@ for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_bl
             (sym_buffer.rank_idx / kAttnTPSize) * kAttnTPSize;
         const auto* combine_topk_idx_base = kTPDistributedCombine ?
             sym_buffer.map(input_topk_idx_buffer.get_base_ptr<int64_t>(), source_leader_rank) :
-            input_topk_idx_buffer.get_base_ptr<int64_t>();
+            input_topk_idx_buffer.get_base_ptr<int64_t>() +
+                (DG_TP_REPLICA_PULL ? attn_tp_rank * num_tokens * kNumTopk : 0);
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
              token_idx < num_combine_tokens;
              token_idx += kNumSMs * kNumEpilogueWarps) {

@@ -111,6 +111,8 @@ public:
               args.num_tokens <= rel_lut_smallm_max) ? 1 : 0);
         const int abs_scale256 =
             get_env<int>("DG_MXFP4_ABS_SCALE256", 0) != 0 ? 1 : 0;
+        const int tp_replica_pull =
+            get_env<int>("DG_TP_REPLICA_PULL", 0) != 0 ? 1 : 0;
         // INT4 has one canonical format only: QoQ + asymmetric zero point,
         // full INT4 L1/L2, decoded with SHIFTXOR. Legacy GPTQ/fp32-scale,
         // hybrid L2, PRE, SHADOW and PRELUT modes have been retired.
@@ -147,6 +149,7 @@ public:
 #define DG_OCC2_BASELINE_REGS {}
 #define DG_MXFP4_REL_LUT {}
 #define DG_MXFP4_ABS_SCALE256 {}
+#define DG_TP_REPLICA_PULL {}
 #define DG_W4A8_INT {}
 #define DG_W4A8_INT_L2 {}
 #define DG_W4A8_INT_PRE {}
@@ -200,6 +203,7 @@ static void __instantiate_kernel() {{
     occ2_baseline_regs,
     rel_lut,
     abs_scale256,
+    tp_replica_pull,
     w4a8_int,
     w4a8_int_l2,
     w4a8_int_pre,
