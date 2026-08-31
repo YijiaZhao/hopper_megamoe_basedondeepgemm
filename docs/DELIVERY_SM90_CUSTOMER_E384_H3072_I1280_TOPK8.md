@@ -21,6 +21,28 @@ implementation changes that produced the August 27, 2026 result set.
 - Core: `tests/bench_customer_core_balanced.py`
 - Communication: `tests/bench_customer_comm.py`
 
+## Measurement policy
+
+The two validation modes are intentionally different:
+
+- **All performance measurements use forced balanced routing.** The real
+  Router/Quant/TopK frontend is executed and included when it belongs to the
+  timed scope, but its TopK IDs and weights are overwritten with the fixed
+  balanced pattern before MegaMoE dispatch. This gives exactly eight routed
+  assignments per EP rank and removes routing-load variance.
+- **All correctness measurements use the normal, unmodified router output.**
+  Do not overwrite TopK IDs or weights in correctness runs. Correctness compares
+  the TP ReduceScatter path with the AllReduce/reference-token path using the
+  same real Router/Quant/TopK results.
+
+Do not add independently measured components to predict E2E latency. In
+particular, the historical component table and historical E2E table are not an
+additive decomposition because they were collected by separate harnesses/runs,
+use max-rank independently, and include different launch/synchronization and
+frontend boundaries. `core + communication` also omits Router GEMM,
+quantization, TopK, copies, launch gaps, and other timed orchestration overhead.
+Only the directly measured full-E2E number is the E2E result.
+
 ## Historical validated results
 
 - scaled-MXFP4: exact=1, max_abs=0, cos_min=0.9999999404;
@@ -54,7 +76,7 @@ Relevant symbols/files:
 - `csrc/mega_frontend.h`: `launch_mxfp4_quant_topk_from_logits`
 - `csrc/apis/mega.hpp`: `mxfp4_router_quant_topk_split`
 
-Performance policy: report the arithmetic mean across all eight ranks. Correctness uses the real router path, then compares the TP ReduceScatter pipeline against the AllReduce/reference-token pipeline. The deterministic balanced route is applied after the real router frontend so performance has exactly eight assignments per EP rank.
+Performance policy: report the arithmetic mean across all eight ranks. Correctness uses the normal, unmodified real-router output. Performance uses the real frontend where applicable and then replaces its routing metadata with the deterministic balanced pattern, giving exactly eight assignments per EP rank.
 
 Fresh H20-GPU-08 results on 2026-08-31, clocks requested at 1980 MHz:
 
@@ -114,15 +136,15 @@ TP4 / DP2 / EP8
 E=384, H=3072, I=1280, TopK=8
 BS=1, ISL=4 per DP replica
 Performance routing: balanced, 8 assignments per EP rank
-Correctness frontend: real Router GEMM + quantization + TopK8
+Correctness routing: normal real Router GEMM + quantization + TopK8 output (not overwritten)
 ```
 
 Correctness:
 
 | precision | exact | max_abs | cos_min |
 |---|---:|---:|---:|
-| scaled-MXFP4 | 1 | 0 | 0.9999999404 |
-| QoQ INT4 x INT8 | 1 | 0 | 0.9999999404 |
+| scaled-MXFP4 | 1 | 0 | 0.9999998808 |
+| QoQ INT4 x INT8 | 1 | 0 | 0.9999998212 |
 
 Full E2E, arithmetic mean across eight ranks (`warmup=15`, `iters=150`):
 

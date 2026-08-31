@@ -137,6 +137,28 @@ export DG_SM90_MOE_GREEN_OVERLAP=0
 unset DG_SM90_MOE_UNIFIED DG_SM90_MOE_SPLIT_L1_L2
 ```
 
+## Measurement policy
+
+The two validation modes are intentionally different:
+
+- **All performance measurements use forced balanced routing.** The real
+  Router/Quant/TopK frontend is executed and included when it belongs to the
+  timed scope, but its TopK IDs and weights are overwritten with the fixed
+  balanced pattern before MegaMoE dispatch. This gives exactly eight routed
+  assignments per EP rank and removes routing-load variance.
+- **All correctness measurements use the normal, unmodified router output.**
+  Do not overwrite TopK IDs or weights in correctness runs. Correctness compares
+  the TP ReduceScatter path with the AllReduce/reference-token path using the
+  same real Router/Quant/TopK results.
+
+Do not add independently measured components to predict E2E latency. In
+particular, the historical component table and historical E2E table are not an
+additive decomposition because they were collected by separate harnesses/runs,
+use max-rank independently, and include different launch/synchronization and
+frontend boundaries. `core + communication` also omits Router GEMM,
+quantization, TopK, copies, launch gaps, and other timed orchestration overhead.
+Only the directly measured full-E2E number is the E2E result.
+
 ## 5. Test scaled-MXFP4
 
 ```bash
@@ -163,7 +185,7 @@ python3 tests/bench_customer_bs2_tp4_dp2.py \
 Expected correctness:
 
 ```text
-CORRECT mode=scaled-MXFP4 exact=1 max_abs=0 cos_min=0.9999999404
+CORRECT mode=scaled-MXFP4 exact=1 max_abs=0 cos_min=0.9999998808
 ```
 
 ## 6. Test QoQ INT4 x INT8
@@ -191,12 +213,12 @@ python3 tests/bench_customer_bs2_tp4_dp2.py \
 Expected correctness:
 
 ```text
-CORRECT mode=QoQ exact=1 max_abs=0 cos_min=0.9999999404
+CORRECT mode=QoQ exact=1 max_abs=0 cos_min=0.9999998212
 ```
 
 ## 7. What the tests measure
 
-Correctness uses the real BF16 router frontend for both paths. It compares:
+Correctness uses the normal, unmodified real BF16 router output for both paths. It compares:
 
 ```text
 TP4 ReduceScatter -> Router/Quant/TopK8 -> MegaMoE -> TP4 AllGather
@@ -209,8 +231,7 @@ TP4 AllReduce -> corresponding token slice
 -> same Router/Quant/TopK8 -> same MegaMoE -> TP4 AllGather
 ```
 
-The deterministic balanced route is installed after the real frontend so every
-EP rank receives exactly eight assignments.
+The deterministic balanced route is used only by performance benchmarks. It is not installed during correctness testing.
 
 Core timing includes only:
 

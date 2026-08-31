@@ -54,7 +54,8 @@ def worker(local_rank):
             else:
                 deep_gemm._C.mxfp4_router_quant_topk_split(
                     local_x,rw,logits,buf.x[:1],buf.x_sf[:1],buf.topk_idx[:1],buf.topk_weights[:1])
-            buf.topk_idx[:1].copy_(balanced_idx); buf.topk_weights[:1].copy_(balanced_w)
+            # Correctness intentionally consumes the normal router output.
+            # Forced-balanced metadata is reserved for performance benchmarks.
             deep_gemm.mxfp4_mega_moe(local_out,l1,l2,buf,
                 cumulative_local_expert_recv_stats=stats,
                 recipe=(128,128,128),activation_clamp=10.0,
