@@ -5,6 +5,10 @@ import os
 import sys
 
 import torch
+
+# Customer performance measurements are hot-cache, matching the E2E harness.
+# Set before bench_kineto reads it; callers may still override explicitly.
+os.environ.setdefault("DG_BENCH_FLUSH_L2_BYTES", "0")
 import torch.distributed as dist
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
