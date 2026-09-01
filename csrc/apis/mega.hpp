@@ -16,6 +16,7 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../mega_frontend.h"
 #include "../router_frontend_kf.h"
+#include "../router_frontend_topk8_kf.h"
 #include "../qoq_router_frontend_kf.h"
 
 namespace deep_gemm::mega {
@@ -551,7 +552,12 @@ static void mxfp4_router_quant_topk(const torch::Tensor& hidden,
     DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
     DG_HOST_ASSERT(topk_idx.size(0) >= m and topk_weights.sizes() == topk_idx.sizes());
-    if (h == 4096 and e == 128 and topk == 6) {
+    if (h == 3072 and e == 384 and topk == 8 and m == 1) {
+        router_frontend_topk8_launcher(
+            hidden.data_ptr(), router_weight.data_ptr(),
+            x_storage.data_ptr(), x_sf.data_ptr(), topk_weights.data_ptr(),
+            topk_idx.data_ptr(), at::cuda::getCurrentCUDAStream().stream());
+    } else if (h == 4096 and e == 128 and topk == 6) {
         router_frontend_launcher(
             hidden.data_ptr(), router_weight.data_ptr(),
             x_storage.data_ptr(), x_sf.data_ptr(), topk_weights.data_ptr(),

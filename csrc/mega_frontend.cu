@@ -54,6 +54,23 @@ __global__ void qoq_quant_topk_kernel(const __nv_bfloat16* __restrict__ hidden,
                 vals[p] = v; ids[p] = i;
             }
         }
+        const float cutoff = vals[topk - 1];
+        // Match torch.topk(sorted=False) gatherTopK ordering used by the
+        // DeepGEMM router contract: non-cutoff values first in ascending
+        // expert-id order, then cutoff ties in ascending expert-id order.
+        for (int a = 0; a < topk; ++a) {
+            int best = a;
+            for (int b = a + 1; b < topk; ++b) {
+                const int tie_b = vals[b] == cutoff;
+                const int tie_best = vals[best] == cutoff;
+                if (tie_b < tie_best || (tie_b == tie_best && ids[b] < ids[best]))
+                    best = b;
+            }
+            if (best != a) {
+                const float tv = vals[a]; vals[a] = vals[best]; vals[best] = tv;
+                const int ti = ids[a]; ids[a] = ids[best]; ids[best] = ti;
+            }
+        }
         float sum = 0.f, mx = vals[0];
         for (int j = 0; j < topk; ++j) { vals[j] = __expf(vals[j] - mx); sum += vals[j]; }
         for (int j = 0; j < topk; ++j) {
