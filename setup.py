@@ -33,7 +33,7 @@ if DG_JIT_USE_RUNTIME_API:
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
 os.environ.setdefault('TORCH_CUDA_ARCH_LIST', '9.0a')
-sources = ['csrc/python_api.cpp', 'csrc/mega_frontend.cu', 'csrc/router_frontend_kf.cu', 'csrc/router_frontend_topk8_kf.cu', 'csrc/qoq_router_frontend_kf.cu']
+sources = ['csrc/python_api.cpp', 'csrc/mega_frontend.cu', 'csrc/router_frontend_kf.cu', 'csrc/router_frontend_topk8_kf.cu', 'csrc/qoq_router_frontend_kf.cu', 'csrc/router_frontend_tc.cu']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
     f'{CUDA_HOME}/include/cccl',

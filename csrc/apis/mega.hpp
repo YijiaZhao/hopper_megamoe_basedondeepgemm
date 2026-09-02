@@ -18,6 +18,7 @@
 #include "../router_frontend_kf.h"
 #include "../router_frontend_topk8_kf.h"
 #include "../qoq_router_frontend_kf.h"
+#include "../router_frontend_tc.h"
 
 namespace deep_gemm::mega {
 
@@ -552,7 +553,14 @@ static void mxfp4_router_quant_topk(const torch::Tensor& hidden,
     DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
     DG_HOST_ASSERT(topk_idx.size(0) >= m and topk_weights.sizes() == topk_idx.sizes());
-    if (h == 3072 and e == 384 and topk == 8 and m == 1) {
+    // DG_FRONTEND_TC=1 (default): shape-generic tensor-core frontend; 0 = legacy KF/generic path.
+    static const bool use_tc = get_env<int>("DG_FRONTEND_TC", 1) != 0;
+    if (use_tc and router_quant_topk_tc_supported(m, h, e, topk)) {
+        launch_router_quant_topk_tc(
+            hidden.data_ptr(), router_weight.data_ptr(), x_storage.data_ptr(),
+            x_sf.data_ptr(), topk_idx.data_ptr(), topk_weights.data_ptr(),
+            m, h, e, topk, /*mode=*/0, at::cuda::getCurrentCUDAStream().stream());
+    } else if (h == 3072 and e == 384 and topk == 8 and m == 1) {
         router_frontend_topk8_launcher(
             hidden.data_ptr(), router_weight.data_ptr(),
             x_storage.data_ptr(), x_sf.data_ptr(), topk_weights.data_ptr(),
@@ -621,7 +629,13 @@ static void qoq_fused_router_quant_topk(
     DG_HOST_ASSERT(x_sf.scalar_type() == torch::kFloat32);
     DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
     DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
-    if (h == 4096 and e == 128 and topk == 6) {
+    static const bool use_tc = get_env<int>("DG_FRONTEND_TC", 1) != 0;
+    if (use_tc and router_quant_topk_tc_supported(m, h, e, topk)) {
+        launch_router_quant_topk_tc(
+            hidden.data_ptr(), router_weight.data_ptr(), x_storage.data_ptr(),
+            x_sf.data_ptr(), topk_idx.data_ptr(), topk_weights.data_ptr(),
+            m, h, e, topk, /*mode=*/1, at::cuda::getCurrentCUDAStream().stream());
+    } else if (h == 4096 and e == 128 and topk == 6) {
         qoq_router_frontend_launcher(
             hidden.data_ptr(), router_weight.data_ptr(), x_storage.data_ptr(),
             x_sf.data_ptr(), topk_weights.data_ptr(), topk_idx.data_ptr(), m,
