@@ -29,9 +29,15 @@ from deep_gemm.quantization_mxfp4 import (
 )
 from deep_gemm.quantization_mxfp4_fused import quantize_to_mxfp4 as quantize_to_mxfp4_fused
 from deep_gemm.quantization_qoq_fused import quantize_to_qoq
-from deep_gemm.testing.bench import flush_l2_cache
 from deep_gemm.utils import per_token_cast_to_fp8
 from deep_gemm.quantization_qoq_fused import per_token_cast_to_int8
+
+
+def flush_l2_cache():
+    num_bytes = int(os.environ.get("DG_BENCH_FLUSH_L2_BYTES", str(256 * 1024 * 1024)))
+    n = max(0, num_bytes // 4)
+    if n:
+        torch.empty(n, dtype=torch.int32, device="cuda").zero_()
 
 WORLD = 8
 TP = 4
