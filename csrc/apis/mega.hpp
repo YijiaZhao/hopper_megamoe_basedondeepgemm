@@ -555,12 +555,19 @@ static void mxfp4_router_quant_topk(const torch::Tensor& hidden,
     DG_HOST_ASSERT(topk_idx.size(0) >= m and topk_weights.sizes() == topk_idx.sizes());
     // DG_FRONTEND_TC=1 (default): shape-generic tensor-core frontend; 0 = legacy KF/generic path.
     static const bool use_tc = get_env<int>("DG_FRONTEND_TC", 1) != 0;
-    if (use_tc and router_quant_topk_tc_supported(m, h, e, topk)) {
+    // The hand-written M=1 GEMV frontend (H3072/E384/TopK8) is ~3x faster than the
+    // generic tensor-core kernel at M=1 (2.6 vs 8.8 us on H200); keep it first.
+    if (h == 3072 and e == 384 and topk == 8 and m == 1) {
+        router_frontend_topk8_launcher(
+            hidden.data_ptr(), router_weight.data_ptr(),
+            x_storage.data_ptr(), x_sf.data_ptr(), topk_weights.data_ptr(),
+            topk_idx.data_ptr(), at::cuda::getCurrentCUDAStream().stream());
+    } else if (use_tc and router_quant_topk_tc_supported(m, h, e, topk)) {
         launch_router_quant_topk_tc(
             hidden.data_ptr(), router_weight.data_ptr(), x_storage.data_ptr(),
             x_sf.data_ptr(), topk_idx.data_ptr(), topk_weights.data_ptr(),
             m, h, e, topk, /*mode=*/0, at::cuda::getCurrentCUDAStream().stream());
-    } else if (h == 3072 and e == 384 and topk == 8 and m == 1) {
+    } else if (false) {
         router_frontend_topk8_launcher(
             hidden.data_ptr(), router_weight.data_ptr(),
             x_storage.data_ptr(), x_sf.data_ptr(), topk_weights.data_ptr(),
