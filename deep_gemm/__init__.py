@@ -95,6 +95,7 @@ from .mega import (
     mxfp4_mega_moe,
     mxfp4_mega_moe_from_bf16,
     int4_mega_moe,
+    fable_router_quant_topk_frontend,
     mxfp4_mega_moe_split, qoq_mega_moe_split,
     FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe,
     transform_mxfp4_weights_for_mega_moe_fused, transform_qoq_weights_for_mega_moe_fused,

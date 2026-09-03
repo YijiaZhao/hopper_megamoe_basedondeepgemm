@@ -585,3 +585,25 @@ def qoq_mega_moe_split(*args, **kwargs):
     return mxfp4_mega_moe(*args, **kwargs)
 
 from .fused import FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe, transform_mxfp4_weights_for_mega_moe_fused, transform_qoq_weights_for_mega_moe_fused, mxfp4_mega_moe_fused, qoq_mega_moe_fused
+
+
+def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
+                                     sym_buffer, quant: str = "mxfp4"):
+    """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend."""
+    assert quant in ("mxfp4", "qoq")
+    m = hidden.size(0)
+    e = router_weight.size(0)
+    cache = getattr(sym_buffer, "_fable_frontend_cache", None)
+    if cache is None:
+        cache = sym_buffer._fable_frontend_cache = {}
+    workspace = cache.get("workspace")
+    required = 256 + 4 * 64 * e * 4
+    if workspace is None or workspace.numel() < required:
+        workspace = cache["workspace"] = torch.zeros(required, dtype=torch.uint8, device=hidden.device)
+    views = cache.get(m)
+    if views is None:
+        views = cache[m] = (sym_buffer.x[:m], sym_buffer.x_sf[:m],
+                            sym_buffer.topk_idx[:m], sym_buffer.topk_weights[:m])
+    _C.fable_router_quant_topk_frontend(
+        hidden, router_weight, views[0], views[1], views[2], views[3], workspace,
+        0 if quant == "mxfp4" else 1)

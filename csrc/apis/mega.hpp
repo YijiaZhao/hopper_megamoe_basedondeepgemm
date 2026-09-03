@@ -15,6 +15,7 @@
 #include "../jit_kernels/impls/sm90_mxfp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../mega_frontend.h"
+#include "../fable_frontend.h"
 #include "../router_frontend_kf.h"
 #include "../router_frontend_topk8_kf.h"
 #include "../qoq_router_frontend_kf.h"
@@ -734,8 +735,37 @@ static void qoq_bf16_mega_moe(
                     recipe, activation, activation_clamp, fast_math, num_ring_tokens);
 }
 
+// Fable dynamic-M fused frontend: Router WMMA + activation quantization +
+// TopK8 + softmax in one launch. mode 0 = MXFP4/FP8, mode 1 = QoQ/INT8.
+static void fable_router_quant_topk_frontend(
+        const torch::Tensor& hidden, const torch::Tensor& router_weight,
+        const torch::Tensor& x, const torch::Tensor& x_sf,
+        const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
+        const torch::Tensor& workspace, const int& mode) {
+    const auto [m, h] = get_shape<2>(hidden);
+    const auto [e, h_] = get_shape<2>(router_weight);
+    const int topk = static_cast<int>(topk_idx.size(1));
+    DG_HOST_ASSERT(hidden.scalar_type() == torch::kBFloat16 and router_weight.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(hidden.is_contiguous() and router_weight.is_contiguous());
+    DG_HOST_ASSERT(h == h_ and h % 1024 == 0 and e % 16 == 0 and e <= 512 and topk >= 1 and topk <= 8);
+    DG_HOST_ASSERT(m >= 1 and m <= 64);
+    DG_HOST_ASSERT(x.scalar_type() == torch::kFloat8_e4m3fn and x.size(0) >= m and x.size(1) == h);
+    DG_HOST_ASSERT(x_sf.scalar_type() == torch::kFloat32 and x_sf.size(0) >= m and x_sf.size(1) == h / 128);
+    DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64 and topk_idx.size(0) >= m);
+    DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32 and topk_weights.sizes() == topk_idx.sizes());
+    DG_HOST_ASSERT(x.is_contiguous() and x_sf.is_contiguous() and topk_idx.is_contiguous() and topk_weights.is_contiguous());
+    DG_HOST_ASSERT(workspace.nbytes() >= static_cast<size_t>(256 + 4 * m * e * 4));
+    DG_HOST_ASSERT(mode == 0 or mode == 1);
+    launch_router_quant_topk_frontend(
+        hidden.data_ptr(), router_weight.data_ptr(), x.data_ptr(), x_sf.data_ptr(),
+        topk_idx.data_ptr(), topk_weights.data_ptr(), workspace.data_ptr(),
+        static_cast<int>(m), static_cast<int>(h), static_cast<int>(e), topk, mode,
+        at::cuda::getCurrentCUDAStream().stream());
+}
+
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
+    m.def("fable_router_quant_topk_frontend", &fable_router_quant_topk_frontend);
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_ring_limit_for_mega_moe", &get_ring_limit_for_mega_moe);
     m.def("get_legacy_pool_tokens_for_mega_moe", &get_legacy_pool_tokens_for_mega_moe);

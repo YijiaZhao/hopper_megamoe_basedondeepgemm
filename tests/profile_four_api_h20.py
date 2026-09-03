@@ -103,14 +103,8 @@ def prepare_backend(args, rank, local_rows, group):
 
 
 def launch_frontend(quant, x, router_weight, logits, buffer, rows):
-    if quant == "mxfp4":
-        deep_gemm._C.mxfp4_router_quant_topk(
-            x, router_weight, buffer.x[:rows], buffer.x_sf[:rows],
-            buffer.topk_idx[:rows], buffer.topk_weights[:rows])
-    else:
-        deep_gemm._C.qoq_router_quant_topk(
-            x, router_weight, logits, buffer.x[:rows], buffer.x_sf[:rows],
-            buffer.topk_idx[:rows], buffer.topk_weights[:rows])
+    del logits, rows
+    deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=quant)
 
 
 def run_e2e(args, rank, tp_group, group):
