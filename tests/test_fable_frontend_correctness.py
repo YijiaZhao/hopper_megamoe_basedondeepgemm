@@ -16,12 +16,12 @@ def main():
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
-        dist.group.WORLD, 384, 2, 8, 3072, 1280,
+        dist.group.WORLD, 384, 64, 8, 3072, 1280,
         mma_type="fp8xmxfp4", activation="swiglu")
     try:
         torch.manual_seed(20260903 + rank)
         router_weight = (torch.randn(384, 3072, device="cuda", dtype=torch.bfloat16) * 0.02).contiguous()
-        for m in (1, 2):
+        for m in (1, 2, 4, 8, 16, 32, 64):
             x = torch.randn(m, 3072, device="cuda", dtype=torch.bfloat16)
             for quant in ("mxfp4", "qoq"):
                 deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant)
