@@ -1,0 +1,26 @@
+MegaMoE four-API H20 validation
+Date: 2026-09-03
+Host: 10.6.131.8 (H20-GPU-08)
+GPU: 8 x NVIDIA H20-3e
+Container: nvfp4_timeline
+Workspace: /raid/kimi/DeepGEMM_four_api_h20
+Command: bash scripts/run_four_api_h20_validation.sh all
+Exit code: 0
+
+Smoke:
+mxfp4_split finite 2.71875
+qoq_split finite 2.765625
+mxfp4_fused finite 2.703125
+qoq_fused finite 2.765625
+
+Exact quantized-reference correctness:
+RESULT api=mxfp4_mega_moe_split finite=1 max_abs=0.0625 mean_abs=0.0047555622 cos_min=0.9999898076 cos_mean=0.9999959469 norm_ratio=0.9999283552
+RESULT api=qoq_mega_moe_split finite=1 max_abs=0.15625 mean_abs=0.033552093 cos_min=0.9999098182 cos_mean=0.9999209046 norm_ratio=0.9970810413
+RESULT api=mxfp4_mega_moe_fused finite=1 max_abs=0.0625 mean_abs=0.0047725799 cos_min=0.9999899864 cos_mean=0.9999959469 norm_ratio=0.9999219179
+RESULT api=qoq_mega_moe_fused finite=1 max_abs=0.140625 mean_abs=0.028386369 cos_min=0.9999374151 cos_mean=0.9999402761 norm_ratio=0.9999618530
+
+Thresholds:
+cos_min >= 0.99
+0.97 <= norm_ratio <= 1.03
+
+Result: PASS (all four APIs)

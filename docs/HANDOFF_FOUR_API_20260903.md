@@ -251,3 +251,26 @@ not launched automatically.  Run inside the container:
 cd /raid/kimi/DeepGEMM_four_api_h20
 bash scripts/run_four_api_h20_validation.sh all
 ```
+
+## Final H20 Four-API Correctness — 2026-09-03
+
+Executed on `10.6.131.8`, container `nvfp4_timeline`, using all eight H20-3e GPUs:
+
+```bash
+cd /raid/kimi/DeepGEMM_four_api_h20
+bash scripts/run_four_api_h20_validation.sh all
+```
+
+The build, same-process four-API smoke test, and exact quantized-reference test
+all completed with exit code 0.
+
+| API | max abs | mean abs | min cosine | mean cosine | norm ratio |
+|---|---:|---:|---:|---:|---:|
+| `mxfp4_mega_moe_split` | 0.0625 | 0.0047555622 | 0.9999898076 | 0.9999959469 | 0.9999283552 |
+| `qoq_mega_moe_split` | 0.15625 | 0.033552093 | 0.9999098182 | 0.9999209046 | 0.9970810413 |
+| `mxfp4_mega_moe_fused` | 0.0625 | 0.0047725799 | 0.9999899864 | 0.9999959469 | 0.9999219179 |
+| `qoq_mega_moe_fused` | 0.140625 | 0.028386369 | 0.9999374151 | 0.9999402761 | 0.9999618530 |
+
+Acceptance thresholds were `cos_min >= 0.99` and norm ratio in `[0.97, 1.03]`.
+All four APIs passed and produced finite output.  Full captured results are in
+`delivery/four_api_correctness_h20_20260903.txt`.
