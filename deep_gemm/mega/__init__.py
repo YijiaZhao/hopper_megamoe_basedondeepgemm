@@ -571,3 +571,9 @@ def mxfp4_mega_moe_from_bf16(
     )
     finalize_tp_output()
     return y
+
+
+# Explicit four-backend API names
+mxfp4_mega_moe_split = mxfp4_mega_moe
+qoq_mega_moe_split = int4_mega_moe
+from .fused import FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe, transform_mxfp4_weights_for_mega_moe_fused, transform_qoq_weights_for_mega_moe_fused, mxfp4_mega_moe_fused, qoq_mega_moe_fused
