@@ -25,3 +25,9 @@ deep_gemm/*.so
 # Internal dev notes (IPs, machine names) - never ship
 docs/plans/
 docs/W4A8_INT_HANDOFF.md
+
+# NVIDIA profiling artifacts (distributed separately)
+*.nsys-rep
+*.qdrep
+*.qdstrm
+*.sqlite
