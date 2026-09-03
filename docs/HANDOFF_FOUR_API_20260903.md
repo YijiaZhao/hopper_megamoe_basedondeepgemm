@@ -304,3 +304,11 @@ Local organized copy:
 
 All 24 reports passed structural verification.  See
 `delivery/four_api_delivery_summary_20260903.md` for details.
+
+### Target kernels used for timeline summaries
+
+The older handoff documented the overall E2E chain and the Split-vs-Fused
+architecture, but not a single authoritative symbol table.  The authoritative
+target definitions are now recorded in
+`delivery/four_api_delivery_summary_20260903.md` and the generated table is in
+`delivery/four_api_timeline_table_20260903.md`.
