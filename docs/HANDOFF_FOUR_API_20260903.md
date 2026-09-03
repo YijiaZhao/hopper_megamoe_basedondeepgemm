@@ -274,3 +274,33 @@ all completed with exit code 0.
 Acceptance thresholds were `cos_min >= 0.99` and norm ratio in `[0.97, 1.03]`.
 All four APIs passed and produced finite output.  Full captured results are in
 `delivery/four_api_correctness_h20_20260903.txt`.
+
+## Delivery Revalidation and 24 Timelines — 2026-09-03
+
+After repository cleanup, the extension was rebuilt and all four exact-reference
+checks were rerun successfully with the same metrics recorded above.  A fresh
+24-report Nsight Systems matrix was then captured from the unified four-API
+workspace:
+
+```text
+2 precisions (MXFP4, QoQ)
+× 2 backends (Split, Fused)
+× 2 scopes (E2E, MegaMoE-only)
+× 3 global token counts (M2, M8, M16)
+= 24 timelines
+```
+
+Remote reports:
+
+```text
+/raid/kimi/megamoe_opt2_results/four_api_delivery_8cf5472_20260903
+```
+
+Local organized copy:
+
+```text
+/Users/kimiz/Downloads/BYTEDANCE_MEGAMOE_FOUR_API_8cf5472
+```
+
+All 24 reports passed structural verification.  See
+`delivery/four_api_delivery_summary_20260903.md` for details.
