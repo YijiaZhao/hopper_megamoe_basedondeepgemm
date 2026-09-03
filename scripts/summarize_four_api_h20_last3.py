@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List the final three target executions for each H20 timeline."""
+"""List final-three Frontend, complete MegaMoE, and E2E spans per timeline."""
 import argparse
 import csv
 import json
@@ -13,6 +13,22 @@ def fmt(value):
     return "-" if value is None else f"{value:.3f}"
 
 
+def triplet_fields(prefix, values):
+    if values[0] is None:
+        return {
+            f"{prefix}_third_last_us": None,
+            f"{prefix}_second_last_us": None,
+            f"{prefix}_last_us": None,
+            f"{prefix}_median_us": None,
+        }
+    return {
+        f"{prefix}_third_last_us": values[0],
+        f"{prefix}_second_last_us": values[1],
+        f"{prefix}_last_us": values[2],
+        f"{prefix}_median_us": statistics.median(values),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=pathlib.Path)
@@ -22,21 +38,18 @@ def main():
     rows = []
     for report in sorted(args.directory.glob("*.nsys-rep")):
         metadata, final_three = extract_final_three(report, args.device_id)
-        target_values = [call["target_span_us"] for call in final_three]
         frontend_values = [call["frontend_us"] for call in final_three]
         mega_values = [call["mega_span_us"] for call in final_three]
+        target_values = [call["target_span_us"] for call in final_three]
         rows.append(dict(
             scope=metadata["scope"],
             precision=metadata["quant"],
             M=metadata["M"],
             backend=metadata["backend"],
             device_id=args.device_id,
-            mega_third_last_us=mega_values[0],
-            mega_second_last_us=mega_values[1],
-            mega_last_us=mega_values[2],
-            mega_median_us=statistics.median(mega_values),
-            frontend_median_us=None if frontend_values[0] is None else statistics.median(frontend_values),
-            target_median_us=statistics.median(target_values),
+            **triplet_fields("frontend", frontend_values),
+            **triplet_fields("mega", mega_values),
+            **triplet_fields("target", target_values),
             report=metadata["report"],
         ))
 
@@ -57,18 +70,37 @@ def main():
     (args.directory / "TIMELINE_LAST3.json").write_text(json.dumps(rows, indent=2) + "\n")
 
     lines = [
-        f"Device: GPU {args.device_id}; final value: median of the three displayed executions.\n",
-        "| Scope | Precision | M | Backend | Mega -3 | Mega -2 | Mega last | Mega median | Frontend median | Target median |",
-        "|---|---|---:|---|---:|---:|---:|---:|---:|---:|",
+        f"Device: GPU {args.device_id}; each median is taken over the three displayed complete spans.\n",
+        "## E2E timelines",
+        "",
+        "| Precision | M | Backend | FE -3 | FE -2 | FE last | FE med | Mega -3 | Mega -2 | Mega last | Mega med | E2E -3 | E2E -2 | E2E last | E2E med |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for row in rows:
+    for row in (row for row in rows if row["scope"] == "e2e"):
         lines.append(
-            f"| {row['scope'].upper()} | {row['precision'].upper()} | {row['M']} | "
-            f"{row['backend'].upper()} | {fmt(row['mega_third_last_us'])} | "
-            f"{fmt(row['mega_second_last_us'])} | {fmt(row['mega_last_us'])} | "
-            f"**{fmt(row['mega_median_us'])}** | {fmt(row['frontend_median_us'])} | "
-            f"{fmt(row['target_median_us'])} |"
+            f"| {row['precision'].upper()} | {row['M']} | {row['backend'].upper()} | "
+            f"{fmt(row['frontend_third_last_us'])} | {fmt(row['frontend_second_last_us'])} | "
+            f"{fmt(row['frontend_last_us'])} | **{fmt(row['frontend_median_us'])}** | "
+            f"{fmt(row['mega_third_last_us'])} | {fmt(row['mega_second_last_us'])} | "
+            f"{fmt(row['mega_last_us'])} | **{fmt(row['mega_median_us'])}** | "
+            f"{fmt(row['target_third_last_us'])} | {fmt(row['target_second_last_us'])} | "
+            f"{fmt(row['target_last_us'])} | **{fmt(row['target_median_us'])}** |"
         )
+
+    lines.extend([
+        "",
+        "## Mega-only timelines",
+        "",
+        "| Precision | M | Backend | Mega -3 | Mega -2 | Mega last | Mega median |",
+        "|---|---:|---|---:|---:|---:|---:|",
+    ])
+    for row in (row for row in rows if row["scope"] == "mega"):
+        lines.append(
+            f"| {row['precision'].upper()} | {row['M']} | {row['backend'].upper()} | "
+            f"{fmt(row['mega_third_last_us'])} | {fmt(row['mega_second_last_us'])} | "
+            f"{fmt(row['mega_last_us'])} | **{fmt(row['mega_median_us'])}** |"
+        )
+
     text = "\n".join(lines) + "\n"
     (args.directory / "TIMELINE_LAST3.md").write_text(text)
     print(text)
