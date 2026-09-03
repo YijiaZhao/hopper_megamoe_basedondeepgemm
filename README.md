@@ -200,16 +200,17 @@ python3 scripts/summarize_four_api_h20_timelines.py /path/to/reports
 python3 scripts/summarize_four_api_h20_last3.py /path/to/reports
 ```
 
-For every target:
+For every timeline, the delivery number is reported for GPU 0 / rank 0:
 
-1. take the final three executions on each GPU;
-2. take their median per GPU;
-3. take the median across all eight GPUs.
+1. identify the final three complete MegaMoE executions;
+2. measure each complete execution span;
+3. report the median of those three spans.
 
-For Split, `Mega span` is measured from L1 kernel start through L2 kernel end,
+For Split, one complete `Mega span` is measured from its L1 kernel start through
+its corresponding L2 kernel end,
 including the real inter-kernel gap.  `Target span` in E2E is measured from
 Fable frontend start through MegaMoE completion.  It is not a sum of unrelated
-kernel averages.
+kernel statistics and is not aggregated across GPUs.
 
 The final table, raw values, report verification, and SHA256 manifest are kept
 under `delivery/`:
