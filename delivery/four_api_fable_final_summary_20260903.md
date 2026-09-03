@@ -19,7 +19,7 @@ Correctness gates passed for Fable frontend local M=1,2,4,8,16,32,64 and for
 all four explicit MegaMoE APIs against their quantized references.
 
 Performance aggregation: on each GPU take the median of the final three target
-executions, then take the arithmetic mean across eight GPUs. Split MegaMoE is
+executions, then take the median across eight GPUs. Split MegaMoE is
 the span from L1 start through L2 end. E2E target span is Fable frontend start
 through MegaMoE end. L2 flush and TP collectives are excluded.
 

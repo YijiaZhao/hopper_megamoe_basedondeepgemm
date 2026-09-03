@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Summarize the 24 H20 NSYS reports using the agreed target-span metric.
 
-For each GPU: take the final three executions, use their median, then average
-those eight per-GPU medians.  Split MegaMoE is measured from L1 start through
+For each GPU: take the final three executions and use their median, then take
+the median of those eight per-GPU medians.  Split MegaMoE is measured from L1
+start through
 L2 end, including the inter-kernel gap.  E2E target span is frontend start
 through MegaMoE end; TP ReduceScatter/AllGather and L2 eviction are excluded.
 """
@@ -14,10 +15,6 @@ import re
 import sqlite3
 import statistics
 import subprocess
-
-
-def mean(values):
-    return sum(values) / len(values) if values else None
 
 
 def summarize(report):
@@ -101,7 +98,7 @@ def summarize(report):
         })
 
     metrics = {
-        key: None if rank_metrics[0][key] is None else mean([entry[key] for entry in rank_metrics])
+        key: None if rank_metrics[0][key] is None else statistics.median(entry[key] for entry in rank_metrics)
         for key in rank_metrics[0]
     }
     return dict(scope=scope, backend=backend, quant=quant, M=int(m_text), report=report.name, **metrics)
@@ -121,7 +118,7 @@ def main():
     order_backend = {"fused": 0, "split": 1}
     rows.sort(key=lambda r: (order_scope[r["scope"]], order_quant[r["quant"]], r["M"], order_backend[r["backend"]]))
     with open(args.directory / "TIMELINE_TABLE.csv", "w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader(); writer.writerows(rows)
     (args.directory / "TIMELINE_TABLE.json").write_text(json.dumps(rows, indent=2) + "\n")
     print("| Scope | Precision | M | Backend | Frontend | L1 | L2 | Mega span | Target span |")

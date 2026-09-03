@@ -28,16 +28,16 @@ for rep in sorted(base.glob('*.nsys-rep')):
   if fs: front_by_dev.append(fs[-3:])
   mega_by_dev.append(ms[-3:])
  assert len(target_by_dev)==8,(rep,len(target_by_dev))
- means=[sum(v[i] for v in target_by_dev)/8 for i in range(3)]
- final=sum(statistics.median(v) for v in target_by_dev)/8
- front_final=None if not front_by_dev else sum(statistics.median(v) for v in front_by_dev)/8
- mega_final=sum(statistics.median(v) for v in mega_by_dev)/8
+ last_call_medians=[statistics.median(v[i] for v in target_by_dev) for i in range(3)]
+ final=statistics.median(statistics.median(v) for v in target_by_dev)
+ front_final=None if not front_by_dev else statistics.median(statistics.median(v) for v in front_by_dev)
+ mega_final=statistics.median(statistics.median(v) for v in mega_by_dev)
  per_gpu_medians=[statistics.median(v) for v in target_by_dev]
- rows.append(dict(scope=scope,precision=quant,M=int(mtxt),backend=backend,third_last_us=means[0],second_last_us=means[1],last_us=means[2],final_median_us=final,frontend_median_us=front_final,mega_median_us=mega_final,rank_median_min_us=min(per_gpu_medians),rank_median_max_us=max(per_gpu_medians),report=rep.name))
+ rows.append(dict(scope=scope,precision=quant,M=int(mtxt),backend=backend,third_last_median_us=last_call_medians[0],second_last_median_us=last_call_medians[1],last_median_us=last_call_medians[2],final_median_us=final,frontend_median_us=front_final,mega_median_us=mega_final,rank_median_min_us=min(per_gpu_medians),rank_median_max_us=max(per_gpu_medians),report=rep.name))
 order={'e2e':0,'mega':1};qo={'mxfp4':0,'qoq':1};bo={'fused':0,'split':1};rows.sort(key=lambda r:(order[r['scope']],qo[r['precision']],r['M'],bo[r['backend']]))
-with open(base/'TIMELINE_LAST3.csv','w',newline='') as f:w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
+with open(base/'TIMELINE_LAST3.csv','w',newline='') as f:w=csv.DictWriter(f,fieldnames=list(rows[0]),lineterminator='\n');w.writeheader();w.writerows(rows)
 (base/'TIMELINE_LAST3.json').write_text(json.dumps(rows,indent=2)+'\n')
-lines=['| Scope | Precision | M | Backend | -3 mean | -2 mean | Last mean | Final median | Frontend median | Mega median |','|---|---|---:|---|---:|---:|---:|---:|---:|---:|']
+lines=['| Scope | Precision | M | Backend | -3 median | -2 median | Last median | Final median | Frontend median | Mega median |','|---|---|---:|---|---:|---:|---:|---:|---:|---:|']
 fmt=lambda x:'-' if x is None else f'{x:.3f}'
-for r in rows:lines.append(f"| {r['scope'].upper()} | {r['precision'].upper()} | {r['M']} | {r['backend'].upper()} | {fmt(r['third_last_us'])} | {fmt(r['second_last_us'])} | {fmt(r['last_us'])} | **{fmt(r['final_median_us'])}** | {fmt(r['frontend_median_us'])} | {fmt(r['mega_median_us'])} |")
+for r in rows:lines.append(f"| {r['scope'].upper()} | {r['precision'].upper()} | {r['M']} | {r['backend'].upper()} | {fmt(r['third_last_median_us'])} | {fmt(r['second_last_median_us'])} | {fmt(r['last_median_us'])} | **{fmt(r['final_median_us'])}** | {fmt(r['frontend_median_us'])} | {fmt(r['mega_median_us'])} |")
 text='\n'.join(lines)+'\n';(base/'TIMELINE_LAST3.md').write_text(text);print(text)

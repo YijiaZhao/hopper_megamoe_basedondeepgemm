@@ -5,13 +5,13 @@
     "quant": "mxfp4",
     "M": 2,
     "report": "e2e_fused_mxfp4_M2.nsys-rep",
-    "frontend_us": 13.707875,
+    "frontend_us": 13.696,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 116.895125,
-    "target_span_us": 130.970875
+    "mega_span_us": 120.41550000000001,
+    "target_span_us": 134.4945
   },
   {
     "scope": "e2e",
@@ -19,13 +19,13 @@
     "quant": "mxfp4",
     "M": 2,
     "report": "e2e_split_mxfp4_M2.nsys-rep",
-    "frontend_us": 13.672,
+    "frontend_us": 13.664,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 50.44375,
-    "l2_us": 63.771249999999995,
-    "mega_span_us": 115.47525,
-    "target_span_us": 129.227
+    "l1_us": 46.64,
+    "l2_us": 69.711,
+    "mega_span_us": 118.495,
+    "target_span_us": 132.2865
   },
   {
     "scope": "e2e",
@@ -33,13 +33,13 @@
     "quant": "mxfp4",
     "M": 8,
     "report": "e2e_fused_mxfp4_M8.nsys-rep",
-    "frontend_us": 13.672,
+    "frontend_us": 13.632,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 125.138875,
-    "target_span_us": 139.286875
+    "mega_span_us": 137.45499999999998,
+    "target_span_us": 151.8385
   },
   {
     "scope": "e2e",
@@ -47,13 +47,13 @@
     "quant": "mxfp4",
     "M": 8,
     "report": "e2e_split_mxfp4_M8.nsys-rep",
-    "frontend_us": 13.82,
+    "frontend_us": 13.744,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 63.743625,
-    "l2_us": 51.4955,
-    "mega_span_us": 109.77125000000001,
-    "target_span_us": 123.71124999999999
+    "l1_us": 59.9995,
+    "l2_us": 53.5195,
+    "mega_span_us": 110.3195,
+    "target_span_us": 124.2235
   },
   {
     "scope": "e2e",
@@ -61,13 +61,13 @@
     "quant": "mxfp4",
     "M": 16,
     "report": "e2e_fused_mxfp4_M16.nsys-rep",
-    "frontend_us": 13.728,
+    "frontend_us": 13.696,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 125.04325,
-    "target_span_us": 139.147125
+    "mega_span_us": 126.97550000000001,
+    "target_span_us": 141.35899999999998
   },
   {
     "scope": "e2e",
@@ -75,13 +75,13 @@
     "quant": "mxfp4",
     "M": 16,
     "report": "e2e_split_mxfp4_M16.nsys-rep",
-    "frontend_us": 13.676,
+    "frontend_us": 13.68,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 64.66737499999999,
-    "l2_us": 67.383375,
-    "mega_span_us": 137.355,
-    "target_span_us": 151.055
+    "l1_us": 64.3995,
+    "l2_us": 64.4635,
+    "mega_span_us": 137.9195,
+    "target_span_us": 151.8075
   },
   {
     "scope": "e2e",
@@ -89,13 +89,13 @@
     "quant": "qoq",
     "M": 2,
     "report": "e2e_fused_qoq_M2.nsys-rep",
-    "frontend_us": 14.435875000000001,
+    "frontend_us": 14.448,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 94.3235,
-    "target_span_us": 109.087375
+    "mega_span_us": 94.9915,
+    "target_span_us": 109.919
   },
   {
     "scope": "e2e",
@@ -103,13 +103,13 @@
     "quant": "qoq",
     "M": 2,
     "report": "e2e_split_qoq_M2.nsys-rep",
-    "frontend_us": 14.471875,
+    "frontend_us": 14.432,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 45.551875,
-    "l2_us": 53.379625,
-    "mega_span_us": 94.77125,
-    "target_span_us": 109.411125
+    "l1_us": 45.984,
+    "l2_us": 57.6315,
+    "mega_span_us": 95.2795,
+    "target_span_us": 109.8235
   },
   {
     "scope": "e2e",
@@ -117,13 +117,13 @@
     "quant": "qoq",
     "M": 8,
     "report": "e2e_fused_qoq_M8.nsys-rep",
-    "frontend_us": 14.459875,
+    "frontend_us": 14.5115,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 98.29125,
-    "target_span_us": 112.943
+    "mega_span_us": 100.36699999999999,
+    "target_span_us": 114.959
   },
   {
     "scope": "e2e",
@@ -131,13 +131,13 @@
     "quant": "qoq",
     "M": 8,
     "report": "e2e_split_qoq_M8.nsys-rep",
-    "frontend_us": 14.396,
+    "frontend_us": 14.368,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 54.523625,
-    "l2_us": 42.423875,
-    "mega_span_us": 93.571375,
-    "target_span_us": 108.019375
+    "l1_us": 57.1515,
+    "l2_us": 43.28,
+    "mega_span_us": 93.99950000000001,
+    "target_span_us": 108.6075
   },
   {
     "scope": "e2e",
@@ -145,13 +145,13 @@
     "quant": "qoq",
     "M": 16,
     "report": "e2e_fused_qoq_M16.nsys-rep",
-    "frontend_us": 14.4715,
+    "frontend_us": 14.5915,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 138.975,
-    "target_span_us": 153.69875
+    "mega_span_us": 143.151,
+    "target_span_us": 157.98250000000002
   },
   {
     "scope": "e2e",
@@ -159,13 +159,13 @@
     "quant": "qoq",
     "M": 16,
     "report": "e2e_split_qoq_M16.nsys-rep",
-    "frontend_us": 14.543875,
+    "frontend_us": 14.448,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 78.84725,
-    "l2_us": 56.139375,
-    "mega_span_us": 134.70725,
-    "target_span_us": 149.339125
+    "l1_us": 84.19149999999999,
+    "l2_us": 52.8475,
+    "mega_span_us": 140.447,
+    "target_span_us": 154.99099999999999
   },
   {
     "scope": "mega",
@@ -178,8 +178,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 65.9395,
-    "target_span_us": 65.9395
+    "mega_span_us": 66.65549999999999,
+    "target_span_us": 66.65549999999999
   },
   {
     "scope": "mega",
@@ -190,10 +190,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 35.77975,
-    "l2_us": 19.655874999999998,
-    "mega_span_us": 56.119625,
-    "target_span_us": 56.119625
+    "l1_us": 36.016000000000005,
+    "l2_us": 19.28,
+    "mega_span_us": 56.64,
+    "target_span_us": 56.64
   },
   {
     "scope": "mega",
@@ -206,8 +206,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 89.85525,
-    "target_span_us": 89.85525
+    "mega_span_us": 90.15950000000001,
+    "target_span_us": 90.15950000000001
   },
   {
     "scope": "mega",
@@ -218,10 +218,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 99.303375,
-    "l2_us": 34.195499999999996,
-    "mega_span_us": 133.814875,
-    "target_span_us": 133.814875
+    "l1_us": 111.039,
+    "l2_us": 34.079499999999996,
+    "mega_span_us": 145.951,
+    "target_span_us": 145.951
   },
   {
     "scope": "mega",
@@ -234,8 +234,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 125.290875,
-    "target_span_us": 125.290875
+    "mega_span_us": 126.463,
+    "target_span_us": 126.463
   },
   {
     "scope": "mega",
@@ -246,10 +246,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 78.123625,
-    "l2_us": 47.735875,
-    "mega_span_us": 126.23125,
-    "target_span_us": 126.23125
+    "l1_us": 79.615,
+    "l2_us": 47.584,
+    "mega_span_us": 126.975,
+    "target_span_us": 126.975
   },
   {
     "scope": "mega",
@@ -262,8 +262,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 72.299375,
-    "target_span_us": 72.299375
+    "mega_span_us": 73.568,
+    "target_span_us": 73.568
   },
   {
     "scope": "mega",
@@ -274,10 +274,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 79.507375,
-    "l2_us": 18.095750000000002,
-    "mega_span_us": 98.375125,
-    "target_span_us": 98.375125
+    "l1_us": 86.67099999999999,
+    "l2_us": 17.872,
+    "mega_span_us": 105.279,
+    "target_span_us": 105.279
   },
   {
     "scope": "mega",
@@ -290,8 +290,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 92.0475,
-    "target_span_us": 92.0475
+    "mega_span_us": 92.64,
+    "target_span_us": 92.64
   },
   {
     "scope": "mega",
@@ -302,10 +302,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 82.395625,
-    "l2_us": 30.183875,
-    "mega_span_us": 112.635375,
-    "target_span_us": 112.635375
+    "l1_us": 86.19149999999999,
+    "l2_us": 30.048000000000002,
+    "mega_span_us": 116.67099999999999,
+    "target_span_us": 116.67099999999999
   },
   {
     "scope": "mega",
@@ -318,8 +318,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 134.85125,
-    "target_span_us": 134.85125
+    "mega_span_us": 136.8795,
+    "target_span_us": 136.8795
   },
   {
     "scope": "mega",
@@ -330,9 +330,9 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 77.25125,
-    "l2_us": 38.943875,
-    "mega_span_us": 116.867125,
-    "target_span_us": 116.867125
+    "l1_us": 77.74350000000001,
+    "l2_us": 39.056,
+    "mega_span_us": 117.47149999999999,
+    "target_span_us": 117.47149999999999
   }
 ]

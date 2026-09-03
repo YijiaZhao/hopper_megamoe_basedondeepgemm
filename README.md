@@ -204,7 +204,7 @@ For every target:
 
 1. take the final three executions on each GPU;
 2. take their median per GPU;
-3. take the arithmetic mean across all eight GPUs.
+3. take the median across all eight GPUs.
 
 For Split, `Mega span` is measured from L1 kernel start through L2 kernel end,
 including the real inter-kernel gap.  `Target span` in E2E is measured from
