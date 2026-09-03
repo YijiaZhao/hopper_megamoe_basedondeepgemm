@@ -142,9 +142,15 @@ QoQ:   0.003937 < 0.005
 Capture all 24 reports:
 
 ```bash
-OUT=/path/to/output \
-ROOT=$PWD \
-bash scripts/capture_four_api_h20_timelines.sh
+# Run inside an exclusive 8-GPU environment after building the extension.
+# The script refuses a non-empty output directory and checks GPU memory before
+# and after every case.
+OUT=/path/to/output ROOT=$PWD \
+  bash scripts/capture_four_api_h20_timelines.sh
+
+# Replace an existing output set intentionally:
+FORCE=1 OUT=/path/to/output ROOT=$PWD \
+  bash scripts/capture_four_api_h20_timelines.sh
 ```
 
 Matrix:
@@ -189,6 +195,7 @@ the CUDA Graph.
 The table is generated with:
 
 ```bash
+python3 scripts/verify_four_api_h20_timelines.py /path/to/reports
 python3 scripts/summarize_four_api_h20_timelines.py /path/to/reports
 ```
 
