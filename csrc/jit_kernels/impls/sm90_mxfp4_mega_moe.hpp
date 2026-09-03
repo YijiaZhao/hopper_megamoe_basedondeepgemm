@@ -55,6 +55,9 @@ public:
         bool router_logits_input_mode;
         bool tp_distributed_combine;
         bool fuse_input_quant;
+        // Explicit backend selection.  Do not infer QoQ from process-global
+        // environment state: MXFP4 and QoQ must be callable in one process.
+        bool qoq_mode;
         KernelPhase kernel_phase;
         MegaMoESM90Config config;
 
@@ -116,7 +119,7 @@ public:
         // INT4 has one canonical format only: QoQ + asymmetric zero point,
         // full INT4 L1/L2, decoded with SHIFTXOR. Legacy GPTQ/fp32-scale,
         // hybrid L2, PRE, SHADOW and PRELUT modes have been retired.
-        const int w4a8_int = get_env<int>("DG_W4A8_INT", 0) != 0 ? 1 : 0;
+        const int w4a8_int = args.qoq_mode ? 1 : 0;
         const int w4a8_int_l2 = w4a8_int;
         const int w4a8_int_pre = 0;
         const int w4a8_int_shadow = 0;
@@ -292,7 +295,8 @@ static void sm90_mxfp4_mega_moe(
     const int& deployment_block_n,
     const int& attn_tp_size,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& qoq_mode
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     DG_HOST_ASSERT(attn_tp_size >= 1 and num_ranks % attn_tp_size == 0);
@@ -329,7 +333,7 @@ static void sm90_mxfp4_mega_moe(
     }
     const bool fuse_input_quant = hidden_input.has_value();
     if (fuse_input_quant) {
-        DG_HOST_ASSERT(get_env<int>("DG_W4A8_INT", 0) != 0);
+        DG_HOST_ASSERT(qoq_mode);
         DG_HOST_ASSERT(hidden_input->scalar_type() == torch::kBFloat16);
         DG_HOST_ASSERT(hidden_input->dim() == 2);
         DG_HOST_ASSERT(hidden_input->size(0) == num_tokens and hidden_input->size(1) == hidden);
@@ -456,7 +460,8 @@ static void sm90_mxfp4_mega_moe(
     // (-4.7%) but flash M1 regresses (+12%, protocol-bound at 6 active
     // experts) -> M1 only engages for the larger FFN (IH >= 3072).
     const int occ2_min_m_default = intermediate_hidden >= 3072 ? 1 : 2;
-    bool occ2 = ((get_env<int>("DG_W4A8_INT_SMALLM_OCC2", 0) != 0 and get_env<int>("DG_W4A8_INT", 0) != 0) or get_env<int>("DG_MXFP4_OCC2", 0) != 0) and
+    bool occ2 = ((get_env<int>("DG_W4A8_INT_SMALLM_OCC2", 0) != 0 and qoq_mode) or
+                 (get_env<int>("DG_MXFP4_OCC2", 0) != 0 and not qoq_mode)) and
                 not pre_decoded_b and config.swap_ab and
                 num_tokens >= get_env<int>("DG_W4A8_INT_SMALLM_OCC2_MIN_M", occ2_min_m_default) and
                 num_tokens <= get_env<int>("DG_W4A8_INT_SMALLM_OCC2_MAX_M", 8);
@@ -617,6 +622,7 @@ static void sm90_mxfp4_mega_moe(
         .router_logits_input_mode = router_logits_input_mode,
         .tp_distributed_combine = tp_distributed_combine,
         .fuse_input_quant = fuse_input_quant,
+        .qoq_mode = qoq_mode,
         .kernel_phase = SM90MXFP4MegaMoERuntime::KernelPhase::Linear1,
         .config = config,
         .y = tp_distributed_combine ? tp_combine_output->data_ptr() : y.data_ptr(),

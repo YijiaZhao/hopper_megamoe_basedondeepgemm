@@ -277,11 +277,7 @@ def transform_mxfp4_weights_for_mega_moe_sm90(
     l2_packed, l2_scale = l2_weights
     hidden = l1_packed.size(-1) * 2
     intermediate_hidden = l2_packed.size(-1) * 2
-    direct_int4 = (
-        os.environ.get("DG_W4A8_INT", "0") != "0" and
-        os.environ.get("DG_W4A8_INT_DIRECT_NIBBLE", "0") != "0"
-    )
-    use_prmt_groups = not direct_int4
+    use_prmt_groups = True
     if block_n is None:
         block_n = get_mxfp4_mega_moe_sm90_block_n(
             hidden, intermediate_hidden, expected_m_per_rank)
@@ -359,7 +355,8 @@ def mxfp4_mega_moe(y: torch.Tensor,
                    router_logits: Optional[torch.Tensor] = None,
                    router_renormalize: bool = True,
                    tp_combine_output: Optional[torch.Tensor] = None,
-                   hidden_input: Optional[torch.Tensor] = None):
+                   hidden_input: Optional[torch.Tensor] = None,
+                   _cpp_op=None):
     """Run the SM90 split MegaMoE kernel with prepacked OCP MXFP4 weights.
 
     Weights come from ``transform_mxfp4_weights_for_mega_moe_sm90``. Values
@@ -405,7 +402,9 @@ def mxfp4_mega_moe(y: torch.Tensor,
         # physical-source mapping.
         assert sym_buffer.group.rank() % attn_tp_size == attn_tp_group.rank()
 
-    _C.mxfp4_mega_moe(
+    if _cpp_op is None:
+        _cpp_op = _C.mxfp4_mega_moe
+    _cpp_op(
         y,
         l1_weights,
         l2_weights,
@@ -573,7 +572,16 @@ def mxfp4_mega_moe_from_bf16(
     return y
 
 
-# Explicit four-backend API names
-mxfp4_mega_moe_split = mxfp4_mega_moe
-qoq_mega_moe_split = int4_mega_moe
+# Explicit split API names.  Unlike the legacy ``mxfp4_mega_moe`` /
+# ``int4_mega_moe`` aliases, these select their backend directly and therefore
+# do not depend on mutating DG_W4A8_INT between calls.
+def mxfp4_mega_moe_split(*args, **kwargs):
+    kwargs["_cpp_op"] = _C.mxfp4_mega_moe_split
+    return mxfp4_mega_moe(*args, **kwargs)
+
+
+def qoq_mega_moe_split(*args, **kwargs):
+    kwargs["_cpp_op"] = _C.qoq_mega_moe_split
+    return mxfp4_mega_moe(*args, **kwargs)
+
 from .fused import FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe, transform_mxfp4_weights_for_mega_moe_fused, transform_qoq_weights_for_mega_moe_fused, mxfp4_mega_moe_fused, qoq_mega_moe_fused

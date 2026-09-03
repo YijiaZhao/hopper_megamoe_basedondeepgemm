@@ -374,7 +374,8 @@ static void bf16_mega_moe(
 }
 
 
-static void mxfp4_mega_moe(
+static void fp4_mega_moe_split_impl(
+    const bool qoq_mode,
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
@@ -427,8 +428,7 @@ static void mxfp4_mega_moe(
     const int intermediate_hidden = static_cast<int>(l2_weights_sf.size(2)) * 128;
     // Packed rows carry 64 value bytes per K128 block; prologue-int passes
     // pre-decoded int8 rows (128 bytes per K128 block) instead.
-    const int value_bytes_per_k128 =
-        get_env<int>("DG_W4A8_INT_PRE", 0) != 0 ? 128 : 64;
+    constexpr int value_bytes_per_k128 = 64;
     DG_HOST_ASSERT(hidden_storage == (hidden / 128) * value_bytes_per_k128);
     DG_HOST_ASSERT(intermediate_storage == (intermediate_hidden / 128) * value_bytes_per_k128);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
@@ -500,11 +500,62 @@ static void mxfp4_mega_moe(
         hidden, intermediate_hidden,
         rn,
         attn_tp_size,
-        activation_clamp, fast_math);
+        activation_clamp, fast_math, qoq_mode);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
 }
+
+
+#define DG_FP4_SPLIT_API_ARGS \
+    const torch::Tensor& y, \
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple, \
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple, \
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats, \
+    const std::optional<torch::Tensor>& l1_global_scales, \
+    const std::optional<torch::Tensor>& l2_global_scales, \
+    const std::optional<torch::Tensor>& router_input, \
+    const std::optional<torch::Tensor>& router_weight, \
+    const std::optional<torch::Tensor>& router_logits, \
+    const bool& router_renormalize, \
+    const std::optional<torch::Tensor>& tp_combine_output, \
+    const std::optional<torch::Tensor>& hidden_input, \
+    const torch::Tensor& sym_buffer, \
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx, \
+    const int& num_max_tokens_per_rank, \
+    const int& num_experts, const int& num_topk, \
+    const int& attn_tp_size, \
+    const std::tuple<int, int, int>& recipe, \
+    const std::string& activation, \
+    const std::optional<float>& activation_clamp_opt, \
+    const bool& fast_math, \
+    const int& num_ring_tokens
+
+#define DG_FP4_SPLIT_API_FORWARD \
+    y, l1_weights_tuple, l2_weights_tuple, \
+    cumulative_local_expert_recv_stats, l1_global_scales, l2_global_scales, \
+    router_input, router_weight, router_logits, router_renormalize, \
+    tp_combine_output, hidden_input, sym_buffer, sym_buffer_ptrs, rank_idx, \
+    num_max_tokens_per_rank, num_experts, num_topk, attn_tp_size, recipe, \
+    activation, activation_clamp_opt, fast_math, num_ring_tokens
+
+// Legacy entry keeps environment-based selection for compatibility.  The two
+// new names below are deterministic and may be used together in one process.
+static void mxfp4_mega_moe(DG_FP4_SPLIT_API_ARGS) {
+    fp4_mega_moe_split_impl(
+        get_env<int>("DG_W4A8_INT", 0) != 0, DG_FP4_SPLIT_API_FORWARD);
+}
+
+static void mxfp4_mega_moe_split(DG_FP4_SPLIT_API_ARGS) {
+    fp4_mega_moe_split_impl(false, DG_FP4_SPLIT_API_FORWARD);
+}
+
+static void qoq_mega_moe_split(DG_FP4_SPLIT_API_ARGS) {
+    fp4_mega_moe_split_impl(true, DG_FP4_SPLIT_API_FORWARD);
+}
+
+#undef DG_FP4_SPLIT_API_FORWARD
+#undef DG_FP4_SPLIT_API_ARGS
 
 static void qoq_quant_topk(const torch::Tensor& hidden,
                            const torch::Tensor& router_logits,
@@ -692,6 +743,8 @@ static void register_apis(pybind11::module_& m) {
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
     m.def("mxfp4_mega_moe", &mxfp4_mega_moe);
+    m.def("mxfp4_mega_moe_split", &mxfp4_mega_moe_split);
+    m.def("qoq_mega_moe_split", &qoq_mega_moe_split);
     m.def("mxfp4_router_quant_topk", &mxfp4_router_quant_topk);
     m.def("mxfp4_router_quant_topk_split", &mxfp4_router_quant_topk_split);
     m.def("qoq_fused_router_quant_topk", &qoq_fused_router_quant_topk);
