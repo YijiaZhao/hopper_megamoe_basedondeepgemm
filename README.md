@@ -197,6 +197,7 @@ The table is generated with:
 ```bash
 python3 scripts/verify_four_api_h20_timelines.py /path/to/reports
 python3 scripts/summarize_four_api_h20_timelines.py /path/to/reports
+python3 scripts/summarize_four_api_h20_last3.py /path/to/reports
 ```
 
 For every target:
@@ -220,6 +221,9 @@ delivery/four_api_fable_timeline_table_20260903.csv
 delivery/four_api_fable_timeline_table_20260903.json
 delivery/four_api_fable_timeline_verify_20260903.json
 delivery/four_api_fable_timeline_sha256_20260903.txt
+delivery/four_api_fable_timeline_last3_20260903.md
+delivery/four_api_fable_timeline_last3_20260903.csv
+delivery/four_api_fable_timeline_last3_20260903.json
 ```
 
 Raw `.nsys-rep` files are not committed to Git because of their size.  They are
