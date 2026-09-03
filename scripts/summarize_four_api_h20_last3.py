@@ -60,32 +60,32 @@ def main():
         writer.writerows(rows)
     (args.directory / "TIMELINE_LAST3.json").write_text(json.dumps(rows, indent=2) + "\n")
 
+    index = {
+        (row["scope"], row["precision"], row["M"], row["backend"]): row
+        for row in rows
+    }
     lines = [
         f"Device: GPU {args.device_id}; values are medians of the final three complete spans.\n",
-        "## E2E timelines",
-        "",
-        "| Precision | M | Backend | Frontend median | Mega median | E2E median |",
-        "|---|---:|---|---:|---:|---:|",
+        "| Precision | M | FE Fused | FE Split | E2E Mega Fused | E2E Mega Split | E2E Fused | E2E Split | Mega-only Fused | Mega-only Split |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for row in (row for row in rows if row["scope"] == "e2e"):
-        lines.append(
-            f"| {row['precision'].upper()} | {row['M']} | {row['backend'].upper()} | "
-            f"{fmt(row['frontend_median_us'])} | {fmt(row['mega_median_us'])} | "
-            f"**{fmt(row['target_median_us'])}** |"
-        )
-
-    lines.extend([
-        "",
-        "## Mega-only timelines",
-        "",
-        "| Precision | M | Backend | Mega median |",
-        "|---|---:|---|---:|",
-    ])
-    for row in (row for row in rows if row["scope"] == "mega"):
-        lines.append(
-            f"| {row['precision'].upper()} | {row['M']} | {row['backend'].upper()} | "
-            f"**{fmt(row['mega_median_us'])}** |"
-        )
+    for precision in ("mxfp4", "qoq"):
+        for m_value in (2, 8, 16):
+            e2e_fused = index[("e2e", precision, m_value, "fused")]
+            e2e_split = index[("e2e", precision, m_value, "split")]
+            mega_fused = index[("mega", precision, m_value, "fused")]
+            mega_split = index[("mega", precision, m_value, "split")]
+            lines.append(
+                f"| {precision.upper()} | {m_value} | "
+                f"{fmt(e2e_fused['frontend_median_us'])} | "
+                f"{fmt(e2e_split['frontend_median_us'])} | "
+                f"{fmt(e2e_fused['mega_median_us'])} | "
+                f"{fmt(e2e_split['mega_median_us'])} | "
+                f"**{fmt(e2e_fused['target_median_us'])}** | "
+                f"**{fmt(e2e_split['target_median_us'])}** | "
+                f"{fmt(mega_fused['mega_median_us'])} | "
+                f"{fmt(mega_split['mega_median_us'])} |"
+            )
 
     text = "\n".join(lines) + "\n"
     (args.directory / "TIMELINE_LAST3.md").write_text(text)
