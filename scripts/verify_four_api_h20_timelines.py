@@ -48,6 +48,11 @@ def main():
         else:
             checks["l1"] = graph_present("sm90_mxfp4_mega_moe_l1_impl")
             checks["l2"] = graph_present("sm90_mxfp4_mega_moe_l2_impl")
+        legacy_frontend_absent = not any(
+            "qoq_quant_topk_kernel" in name or "mxfp4_quant_topk_kernel" in name
+            for name in kernels
+        )
+        checks["legacy_frontend_absent"] = legacy_frontend_absent
         nccl = [(name, value) for name, value in kernels.items() if "ncclDevKernel" in name]
         nccl_outside_graph = (
             scope != "e2e" or

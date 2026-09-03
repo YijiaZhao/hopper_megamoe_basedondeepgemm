@@ -6,13 +6,13 @@
     "M": 2,
     "device_id": 0,
     "report": "e2e_fused_mxfp4_M2.nsys-rep",
-    "frontend_us": 13.6,
+    "frontend_us": 13.92,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 119.743,
-    "target_span_us": 134.111
+    "mega_span_us": 86.368,
+    "target_span_us": 100.384
   },
   {
     "scope": "e2e",
@@ -24,10 +24,10 @@
     "frontend_us": 13.728,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 82.335,
-    "l2_us": 40.064,
-    "mega_span_us": 123.231,
-    "target_span_us": 137.247
+    "l1_us": 141.536,
+    "l2_us": 39.391,
+    "mega_span_us": 181.311,
+    "target_span_us": 194.911
   },
   {
     "scope": "e2e",
@@ -36,13 +36,13 @@
     "M": 8,
     "device_id": 0,
     "report": "e2e_fused_mxfp4_M8.nsys-rep",
-    "frontend_us": 13.664,
+    "frontend_us": 13.536,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 137.951,
-    "target_span_us": 151.903
+    "mega_span_us": 109.44,
+    "target_span_us": 123.296
   },
   {
     "scope": "e2e",
@@ -51,13 +51,13 @@
     "M": 8,
     "device_id": 0,
     "report": "e2e_split_mxfp4_M8.nsys-rep",
-    "frontend_us": 13.76,
+    "frontend_us": 13.728,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 54.336,
-    "l2_us": 53.408,
-    "mega_span_us": 108.096,
-    "target_span_us": 121.984
+    "l1_us": 60.064,
+    "l2_us": 52.288,
+    "mega_span_us": 122.207,
+    "target_span_us": 135.999
   },
   {
     "scope": "e2e",
@@ -66,13 +66,13 @@
     "M": 16,
     "device_id": 0,
     "report": "e2e_fused_mxfp4_M16.nsys-rep",
-    "frontend_us": 13.824,
+    "frontend_us": 13.44,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 128.511,
-    "target_span_us": 142.559
+    "mega_span_us": 124.704,
+    "target_span_us": 138.432
   },
   {
     "scope": "e2e",
@@ -81,13 +81,13 @@
     "M": 16,
     "device_id": 0,
     "report": "e2e_split_mxfp4_M16.nsys-rep",
-    "frontend_us": 13.792,
+    "frontend_us": 13.728,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 58.719,
-    "l2_us": 73.728,
-    "mega_span_us": 145.375,
-    "target_span_us": 158.975
+    "l1_us": 77.696,
+    "l2_us": 72.544,
+    "mega_span_us": 142.015,
+    "target_span_us": 155.807
   },
   {
     "scope": "e2e",
@@ -96,13 +96,13 @@
     "M": 2,
     "device_id": 0,
     "report": "e2e_fused_qoq_M2.nsys-rep",
-    "frontend_us": 14.432,
+    "frontend_us": 14.112,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 87.072,
-    "target_span_us": 101.536
+    "mega_span_us": 95.328,
+    "target_span_us": 110.112
   },
   {
     "scope": "e2e",
@@ -111,13 +111,13 @@
     "M": 2,
     "device_id": 0,
     "report": "e2e_split_qoq_M2.nsys-rep",
-    "frontend_us": 14.464,
+    "frontend_us": 14.496,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 64.096,
-    "l2_us": 34.656,
-    "mega_span_us": 95.104,
-    "target_span_us": 109.664
+    "l1_us": 60.479,
+    "l2_us": 34.528,
+    "mega_span_us": 96.0,
+    "target_span_us": 110.592
   },
   {
     "scope": "e2e",
@@ -126,13 +126,13 @@
     "M": 8,
     "device_id": 0,
     "report": "e2e_fused_qoq_M8.nsys-rep",
-    "frontend_us": 14.24,
+    "frontend_us": 14.4,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 101.599,
-    "target_span_us": 115.807
+    "mega_span_us": 89.791,
+    "target_span_us": 104.416
   },
   {
     "scope": "e2e",
@@ -141,13 +141,13 @@
     "M": 8,
     "device_id": 0,
     "report": "e2e_split_qoq_M8.nsys-rep",
-    "frontend_us": 14.368,
+    "frontend_us": 14.336,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 58.272,
-    "l2_us": 43.264,
-    "mega_span_us": 98.111,
-    "target_span_us": 112.575
+    "l1_us": 39.392,
+    "l2_us": 46.144,
+    "mega_span_us": 85.952,
+    "target_span_us": 100.384
   },
   {
     "scope": "e2e",
@@ -156,13 +156,13 @@
     "M": 16,
     "device_id": 0,
     "report": "e2e_fused_qoq_M16.nsys-rep",
-    "frontend_us": 14.591,
+    "frontend_us": 14.688,
     "router_us": null,
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 144.191,
-    "target_span_us": 158.751
+    "mega_span_us": 131.296,
+    "target_span_us": 146.752
   },
   {
     "scope": "e2e",
@@ -171,13 +171,13 @@
     "M": 16,
     "device_id": 0,
     "report": "e2e_split_qoq_M16.nsys-rep",
-    "frontend_us": 14.336,
+    "frontend_us": 14.592,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 82.208,
-    "l2_us": 61.215,
-    "mega_span_us": 143.391,
-    "target_span_us": 157.855
+    "l1_us": 84.159,
+    "l2_us": 63.616,
+    "mega_span_us": 138.176,
+    "target_span_us": 152.928
   },
   {
     "scope": "mega",
@@ -191,8 +191,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 65.12,
-    "target_span_us": 65.12
+    "mega_span_us": 67.552,
+    "target_span_us": 67.552
   },
   {
     "scope": "mega",
@@ -204,10 +204,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 31.68,
-    "l2_us": 22.015,
-    "mega_span_us": 53.087,
-    "target_span_us": 53.087
+    "l1_us": 64.352,
+    "l2_us": 19.968,
+    "mega_span_us": 85.312,
+    "target_span_us": 85.312
   },
   {
     "scope": "mega",
@@ -221,8 +221,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 88.191,
-    "target_span_us": 88.191
+    "mega_span_us": 131.584,
+    "target_span_us": 131.584
   },
   {
     "scope": "mega",
@@ -234,10 +234,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 61.248,
-    "l2_us": 34.559,
-    "mega_span_us": 96.607,
-    "target_span_us": 96.607
+    "l1_us": 60.352,
+    "l2_us": 35.136,
+    "mega_span_us": 96.287,
+    "target_span_us": 96.287
   },
   {
     "scope": "mega",
@@ -251,8 +251,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 116.543,
-    "target_span_us": 116.543
+    "mega_span_us": 122.144,
+    "target_span_us": 122.144
   },
   {
     "scope": "mega",
@@ -264,10 +264,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 76.832,
-    "l2_us": 49.152,
-    "mega_span_us": 126.4,
-    "target_span_us": 126.4
+    "l1_us": 71.904,
+    "l2_us": 50.688,
+    "mega_span_us": 122.88,
+    "target_span_us": 122.88
   },
   {
     "scope": "mega",
@@ -281,8 +281,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 73.664,
-    "target_span_us": 73.664
+    "mega_span_us": 67.04,
+    "target_span_us": 67.04
   },
   {
     "scope": "mega",
@@ -294,10 +294,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 88.096,
-    "l2_us": 19.199,
-    "mega_span_us": 107.967,
-    "target_span_us": 107.967
+    "l1_us": 35.392,
+    "l2_us": 19.328,
+    "mega_span_us": 55.744,
+    "target_span_us": 55.744
   },
   {
     "scope": "mega",
@@ -311,8 +311,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 93.824,
-    "target_span_us": 93.824
+    "mega_span_us": 92.928,
+    "target_span_us": 92.928
   },
   {
     "scope": "mega",
@@ -324,10 +324,10 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 90.464,
-    "l2_us": 31.232,
-    "mega_span_us": 122.016,
-    "target_span_us": 122.016
+    "l1_us": 64.608,
+    "l2_us": 31.744,
+    "mega_span_us": 98.208,
+    "target_span_us": 98.208
   },
   {
     "scope": "mega",
@@ -341,8 +341,8 @@
     "quant_us": null,
     "l1_us": null,
     "l2_us": null,
-    "mega_span_us": 140.127,
-    "target_span_us": 140.127
+    "mega_span_us": 123.584,
+    "target_span_us": 123.584
   },
   {
     "scope": "mega",
@@ -354,9 +354,9 @@
     "frontend_us": null,
     "router_us": null,
     "quant_us": null,
-    "l1_us": 73.727,
-    "l2_us": 40.32,
-    "mega_span_us": 114.335,
-    "target_span_us": 114.335
+    "l1_us": 80.64,
+    "l2_us": 38.816,
+    "mega_span_us": 119.872,
+    "target_span_us": 119.872
   }
 ]

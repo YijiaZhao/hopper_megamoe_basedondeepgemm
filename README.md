@@ -41,7 +41,7 @@ used for the final delivery timelines.
 | Architecture | SM90a |
 | GPU memory | 143771 MiB per GPU |
 | SM count | 78 per GPU |
-| Locked SM clock | 1980 MHz |
+| Locked SM clock | 1830 MHz |
 | Python | 3.12 |
 | PyTorch | 2.11.0+cu130 |
 | CUDA toolkit | 13.0 |
@@ -143,8 +143,8 @@ Capture all 24 reports:
 
 ```bash
 # Run inside an exclusive 8-GPU environment after building the extension.
-# The script refuses a non-empty output directory and checks GPU memory before
-# and after every case.
+# The script locks all GPUs to 1830 MHz, records CLOCK_DMON.txt, refuses a
+# non-empty output directory, and waits for GPU memory to clear between cases.
 OUT=/path/to/output ROOT=$PWD \
   bash scripts/capture_four_api_h20_timelines.sh
 

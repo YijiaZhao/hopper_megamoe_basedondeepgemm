@@ -4,240 +4,264 @@
   "results": [
     {
       "file": "e2e_fused_mxfp4_M16.nsys-rep",
-      "size": 2472726,
-      "checks": {
+      "size": 2482016,
+      "expected_graph": {
         "fable_frontend": true,
-        "mega": true
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_fused_mxfp4_M2.nsys-rep",
-      "size": 2320333,
-      "checks": {
+      "size": 2324950,
+      "expected_graph": {
         "fable_frontend": true,
-        "mega": true
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_fused_mxfp4_M8.nsys-rep",
-      "size": 2386113,
-      "checks": {
+      "size": 2390953,
+      "expected_graph": {
         "fable_frontend": true,
-        "mega": true
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_fused_qoq_M16.nsys-rep",
-      "size": 2434687,
-      "checks": {
+      "size": 2440764,
+      "expected_graph": {
         "fable_frontend": true,
-        "mega": true
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_fused_qoq_M2.nsys-rep",
-      "size": 2282040,
-      "checks": {
+      "size": 2289253,
+      "expected_graph": {
         "fable_frontend": true,
-        "mega": true
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_fused_qoq_M8.nsys-rep",
-      "size": 2347343,
-      "checks": {
+      "size": 2354354,
+      "expected_graph": {
         "fable_frontend": true,
-        "mega": true
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_split_mxfp4_M16.nsys-rep",
-      "size": 2467192,
-      "checks": {
+      "size": 2473271,
+      "expected_graph": {
         "fable_frontend": true,
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_split_mxfp4_M2.nsys-rep",
-      "size": 2313105,
-      "checks": {
+      "size": 2318815,
+      "expected_graph": {
         "fable_frontend": true,
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_split_mxfp4_M8.nsys-rep",
-      "size": 2378783,
-      "checks": {
+      "size": 2384754,
+      "expected_graph": {
         "fable_frontend": true,
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_split_qoq_M16.nsys-rep",
-      "size": 2468457,
-      "checks": {
+      "size": 2474315,
+      "expected_graph": {
         "fable_frontend": true,
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_split_qoq_M2.nsys-rep",
-      "size": 2316439,
-      "checks": {
+      "size": 2320144,
+      "expected_graph": {
         "fable_frontend": true,
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "e2e_split_qoq_M8.nsys-rep",
-      "size": 2381993,
-      "checks": {
+      "size": 2388393,
+      "expected_graph": {
         "fable_frontend": true,
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_fused_mxfp4_M16.nsys-rep",
-      "size": 1986737,
-      "checks": {
-        "mega": true
+      "size": 1987662,
+      "expected_graph": {
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_fused_mxfp4_M2.nsys-rep",
-      "size": 1980340,
-      "checks": {
-        "mega": true
+      "size": 1985198,
+      "expected_graph": {
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_fused_mxfp4_M8.nsys-rep",
-      "size": 1985109,
-      "checks": {
-        "mega": true
+      "size": 1988585,
+      "expected_graph": {
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_fused_qoq_M16.nsys-rep",
-      "size": 1946042,
-      "checks": {
-        "mega": true
+      "size": 1948723,
+      "expected_graph": {
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_fused_qoq_M2.nsys-rep",
-      "size": 1939739,
-      "checks": {
-        "mega": true
+      "size": 1945467,
+      "expected_graph": {
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_fused_qoq_M8.nsys-rep",
-      "size": 1947436,
-      "checks": {
-        "mega": true
+      "size": 1949352,
+      "expected_graph": {
+        "mega": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_split_mxfp4_M16.nsys-rep",
-      "size": 1976688,
-      "checks": {
+      "size": 1981943,
+      "expected_graph": {
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_split_mxfp4_M2.nsys-rep",
-      "size": 1971793,
-      "checks": {
+      "size": 1974398,
+      "expected_graph": {
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_split_mxfp4_M8.nsys-rep",
-      "size": 1978391,
-      "checks": {
+      "size": 1980455,
+      "expected_graph": {
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_split_qoq_M16.nsys-rep",
-      "size": 1976758,
-      "checks": {
+      "size": 1979923,
+      "expected_graph": {
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_split_qoq_M2.nsys-rep",
-      "size": 1972284,
-      "checks": {
+      "size": 1976054,
+      "expected_graph": {
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true
     },
     {
       "file": "mega_split_qoq_M8.nsys-rep",
-      "size": 1978551,
-      "checks": {
+      "size": 1980494,
+      "expected_graph": {
         "l1": true,
-        "l2": true
+        "l2": true,
+        "legacy_frontend_absent": true
       },
       "nccl_outside_graph": true,
       "ok": true

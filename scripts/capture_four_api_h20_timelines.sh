@@ -7,6 +7,8 @@ ROOT=${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}
 OUT=${OUT:-$ROOT/artifacts/four_api_h20_nsys}
 FORCE=${FORCE:-0}
 GPU_IDLE_LIMIT_MIB=${GPU_IDLE_LIMIT_MIB:-64}
+GPU_IDLE_RETRIES=${GPU_IDLE_RETRIES:-45}
+LOCK_SM_CLOCK_MHZ=${LOCK_SM_CLOCK_MHZ:-1830}
 
 cd "$ROOT"
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
@@ -23,19 +25,31 @@ for command in nvidia-smi nsys torchrun python3; do
 done
 
 check_idle_gpus() {
-  mapfile -t used < <(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
-  if [ "${#used[@]}" -ne 8 ]; then
-    echo "expected 8 visible GPUs, found ${#used[@]}" >&2
-    return 1
-  fi
-  local i
-  for i in "${!used[@]}"; do
-    if [ "${used[$i]}" -gt "$GPU_IDLE_LIMIT_MIB" ]; then
-      echo "GPU $i is not idle: ${used[$i]} MiB used" >&2
+  local attempt i
+  local -a used
+  for attempt in $(seq 1 "$GPU_IDLE_RETRIES"); do
+    mapfile -t used < <(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+    if [ "${#used[@]}" -ne 8 ]; then
+      echo "expected 8 visible GPUs, found ${#used[@]}" >&2
+      return 1
+    fi
+    for i in "${!used[@]}"; do
+      if [ "${used[$i]}" -gt "$GPU_IDLE_LIMIT_MIB" ]; then break; fi
+    done
+    if [ "$i" -eq 7 ] && [ "${used[$i]}" -le "$GPU_IDLE_LIMIT_MIB" ]; then
+      return 0
+    fi
+    if nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory \
+         --format=csv,noheader,nounits | grep -q .; then
+      echo "another GPU process is active" >&2
       nvidia-smi >&2
       return 1
     fi
+    sleep 1
   done
+  echo "GPU memory did not return to idle" >&2
+  nvidia-smi >&2
+  return 1
 }
 
 if find "$OUT" -maxdepth 1 -name '*.nsys-rep' -print -quit 2>/dev/null | grep -q .; then
@@ -55,6 +69,14 @@ PY
 fi
 mkdir -p "$OUT"
 check_idle_gpus
+nvidia-smi -lgc "$LOCK_SM_CLOCK_MHZ,$LOCK_SM_CLOCK_MHZ"
+nvidia-smi dmon -s c -d 1 > "$OUT/CLOCK_DMON.txt" 2>&1 &
+CLOCK_MONITOR_PID=$!
+stop_clock_monitor() {
+  kill "$CLOCK_MONITOR_PID" 2>/dev/null || true
+  wait "$CLOCK_MONITOR_PID" 2>/dev/null || true
+}
+trap stop_clock_monitor EXIT
 
 COMMON=(--trace=cuda,nvtx --cuda-graph-trace=node --sample=none
         --cpuctxsw=none --force-overwrite=true)
@@ -66,7 +88,6 @@ run_case() {
     torchrun --standalone --nproc_per_node=8 tests/profile_four_api_h20.py \
       --scope "$scope" --backend "$backend" --quant "$quant" \
       --global-tokens "$tokens"
-  sleep 2
   check_idle_gpus
 }
 
@@ -81,10 +102,15 @@ for scope in e2e mega; do
   done
 done
 
+stop_clock_monitor
+trap - EXIT
+awk -v expected="$LOCK_SM_CLOCK_MHZ" '!/^#/ && NF {n++; if ($3 != expected) bad++} END {exit(bad != 0 || n == 0)}' "$OUT/CLOCK_DMON.txt"
+
 find "$OUT" -maxdepth 1 -type f -name '*.nsys-rep' -print0 \
   | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS"
 python3 scripts/verify_four_api_h20_timelines.py "$OUT"
 python3 scripts/summarize_four_api_h20_timelines.py "$OUT" | tee "$OUT/TIMELINE_TABLE.md"
+python3 scripts/summarize_four_api_h20_last3.py "$OUT" >/dev/null
 count=$(find "$OUT" -maxdepth 1 -type f -name '*.nsys-rep' | wc -l)
 echo "TIMELINE_COUNT=$count"
 test "$count" -eq 24
