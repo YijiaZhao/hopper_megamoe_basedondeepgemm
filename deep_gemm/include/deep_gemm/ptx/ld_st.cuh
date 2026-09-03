@@ -160,6 +160,12 @@ CUTLASS_DEVICE void st_shared_bulk(void* smem_ptr, const uint32_t& num_bytes) {
 }
 
 /// Global memory
+CUTLASS_DEVICE uint32_t ld_volatile(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.volatile.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
 CUTLASS_DEVICE uint64_t ld_volatile(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.volatile.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
@@ -183,6 +189,12 @@ CUTLASS_DEVICE void st_relaxed_sys(const uint64_t* ptr, const uint64_t& value) {
 }
 
 /// Atomics
+CUTLASS_DEVICE uint32_t atomic_add(const uint32_t* ptr, const uint32_t& value) {
+    uint32_t ret;
+    asm volatile("atom.global.add.u32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
+    return ret;
+}
+
 CUTLASS_DEVICE uint64_t atomic_add(const uint64_t* ptr, const uint64_t& value) {
     uint64_t ret;
     asm volatile("atom.global.add.u64 %0, [%1], %2;" : "=l"(ret) : "l"(ptr), "l"(value));

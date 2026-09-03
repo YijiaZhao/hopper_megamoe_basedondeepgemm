@@ -535,7 +535,7 @@
         });
         if (thread_idx == 0) stamp_max(9);
 
-        comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+        fused_comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
@@ -573,7 +573,7 @@
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_before_nvl_barrier));
         }
 
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+        fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
@@ -739,7 +739,7 @@
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         cleanup_workspace();
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+        fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
@@ -1921,7 +1921,7 @@
         // ---------------- COMBINE ----------------
         // NVLink barrier first: signals remote ranks that this rank's GEMM
         // outputs (NVLink scatter targets) are fully written.
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
+        fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
                              kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
             workspace, sym_buffer, sm_idx, epilogue_thread_idx,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }

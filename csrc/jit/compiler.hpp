@@ -202,10 +202,13 @@ public:
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
         const auto arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
+        auto cutlass = library_root_path.parent_path() / "third-party/cutlass/include";
+        if (const auto override_path = get_env<std::string>("DG_CUTLASS_INCLUDE_PATH"); not override_path.empty())
+            cutlass = override_path;
+        flags = fmt::format("{} -I{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags, library_include_path.c_str(), cutlass.c_str(), arch);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
@@ -263,6 +266,12 @@ public:
         // Build include directories list
         std::string include_dirs;
         include_dirs += fmt::format("-I{} ", library_include_path.string());
+        {
+            auto cutlass = library_root_path.parent_path() / "third-party/cutlass/include";
+            if (const auto override_path = get_env<std::string>("DG_CUTLASS_INCLUDE_PATH"); not override_path.empty())
+                cutlass = override_path;
+            include_dirs += fmt::format("-I{} ", cutlass.string());
+        }
         include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
 
         // Add PCH support for version 12.8 and above
