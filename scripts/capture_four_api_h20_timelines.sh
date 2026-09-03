@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=${ROOT:-/raid/kimi/DeepGEMM_four_api_h20}
-OUT=${OUT:-/raid/kimi/megamoe_opt2_results/four_api_delivery_8cf5472_20260903}
+OUT=${OUT:-/raid/kimi/megamoe_opt2_results/four_api_fable_final24_20260903}
 mkdir -p "$OUT"
 cd "$ROOT"
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}

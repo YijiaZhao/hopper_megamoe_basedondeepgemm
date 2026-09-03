@@ -275,40 +275,26 @@ Acceptance thresholds were `cos_min >= 0.99` and norm ratio in `[0.97, 1.03]`.
 All four APIs passed and produced finite output.  Full captured results are in
 `delivery/four_api_correctness_h20_20260903.txt`.
 
-## Delivery Revalidation and 24 Timelines — 2026-09-03
 
-After repository cleanup, the extension was rebuilt and all four exact-reference
-checks were rerun successfully with the same metrics recorded above.  A fresh
-24-report Nsight Systems matrix was then captured from the unified four-API
-workspace:
+## Fable Frontend Delivery Requirement — 2026-09-03
 
-```text
-2 precisions (MXFP4, QoQ)
-× 2 backends (Split, Fused)
-× 2 scopes (E2E, MegaMoE-only)
-× 3 global token counts (M2, M8, M16)
-= 24 timelines
-```
-
-Remote reports:
+All E2E Split and Fused timelines must use the same H20-validated Fable
+dynamic-M fused frontend:
 
 ```text
-/raid/kimi/megamoe_opt2_results/four_api_delivery_8cf5472_20260903
+Router WMMA + activation quantization (FP8 or INT8) + TopK8 + Softmax
 ```
 
-Local organized copy:
+Authoritative entry point:
 
 ```text
-/Users/kimiz/Downloads/BYTEDANCE_MEGAMOE_FOUR_API_8cf5472
+deep_gemm.fable_router_quant_topk_frontend
 ```
 
-All 24 reports passed structural verification.  See
-`delivery/four_api_delivery_summary_20260903.md` for details.
+Do not use the legacy GEMV, tensor-core generic, or BF16-GEMM-plus-quant
+frontends for the final 24-report delivery.  On 8 x H20-3e, the Fable
+frontend correctness gate passes for local M=1,2,4,8,16,32,64; measured
+frontend latency is roughly 13-15 us through M32 and about 18 us at M64.
 
-### Target kernels used for timeline summaries
-
-The older handoff documented the overall E2E chain and the Split-vs-Fused
-architecture, but not a single authoritative symbol table.  The authoritative
-target definitions are now recorded in
-`delivery/four_api_delivery_summary_20260903.md` and the generated table is in
-`delivery/four_api_timeline_table_20260903.md`.
+The previous non-Fable E2E timeline tables are superseded and intentionally
+removed.

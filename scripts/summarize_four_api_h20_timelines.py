@@ -42,24 +42,10 @@ def summarize(report):
 
     rank_metrics = []
     for _, events in sorted(per_device.items()):
-        if quant == "mxfp4":
-            frontend_calls = [
-                dict(start=e[1], end=e[2], router_us=None, quant_us=None)
-                for e in events
-                if e[0] in ("router_kernel", "router_quant_topk_kernel")
-            ]
-        else:
-            routers = [e for e in events if "sm90_bf16_gemm_impl" in e[0]]
-            quantizers = [e for e in events if "qoq_quant_topk_kernel" in e[0]]
-            count = min(len(routers), len(quantizers))
-            frontend_calls = [
-                dict(
-                    start=router[1], end=quantizer[2],
-                    router_us=(router[2] - router[1]) / 1e3,
-                    quant_us=(quantizer[2] - quantizer[1]) / 1e3,
-                )
-                for router, quantizer in zip(routers[-count:], quantizers[-count:])
-            ]
+        frontend_calls = [
+            dict(start=e[1], end=e[2], router_us=None, quant_us=None)
+            for e in events if e[0] == "router_quant_topk_kernel"
+        ]
 
         if backend == "fused":
             target = f"sm90_{quant}_mega_moe_h20_fused_impl"
