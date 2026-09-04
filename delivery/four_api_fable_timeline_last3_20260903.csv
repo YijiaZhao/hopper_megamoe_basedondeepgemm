@@ -11,7 +11,7 @@ e2e,qoq,8,fused,0,14.432,95.456,110.144,e2e_fused_qoq_M8.nsys-rep
 e2e,qoq,8,split,0,14.432,84.352,98.88,e2e_split_qoq_M8.nsys-rep
 e2e,qoq,16,fused,0,14.72,138.784,153.504,e2e_fused_qoq_M16.nsys-rep
 e2e,qoq,16,split,0,14.4,125.12,139.968,e2e_split_qoq_M16.nsys-rep
-mega,mxfp4,2,fused,0,,107.808,107.808,mega_fused_mxfp4_M2.nsys-rep
+mega,mxfp4,2,fused,0,,62.432,62.432,mega_fused_mxfp4_M2.nsys-rep
 mega,mxfp4,2,split,0,,57.152,57.152,mega_split_mxfp4_M2.nsys-rep
 mega,mxfp4,8,fused,0,,87.584,87.584,mega_fused_mxfp4_M8.nsys-rep
 mega,mxfp4,8,split,0,,105.088,105.088,mega_split_mxfp4_M8.nsys-rep

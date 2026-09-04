@@ -138,8 +138,8 @@
     "backend": "fused",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 107.808,
-    "target_median_us": 107.808,
+    "mega_median_us": 62.432,
+    "target_median_us": 62.432,
     "report": "mega_fused_mxfp4_M2.nsys-rep"
   },
   {

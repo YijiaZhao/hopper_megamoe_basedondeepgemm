@@ -14,7 +14,7 @@ Device: GPU 0; metric: median of final three target executions.
 | E2E | QOQ | 8 | SPLIT | 14.432 | 45.888 | 44.544 | 84.352 | 98.880 |
 | E2E | QOQ | 16 | FUSED | 14.720 | - | - | 138.784 | 153.504 |
 | E2E | QOQ | 16 | SPLIT | 14.400 | 59.808 | 61.728 | 125.120 | 139.968 |
-| MEGA | MXFP4 | 2 | FUSED | - | - | - | 107.808 | 107.808 |
+| MEGA | MXFP4 | 2 | FUSED | - | - | - | 62.432 | 62.432 |
 | MEGA | MXFP4 | 2 | SPLIT | - | 35.936 | 20.576 | 57.152 | 57.152 |
 | MEGA | MXFP4 | 8 | FUSED | - | - | - | 87.584 | 87.584 |
 | MEGA | MXFP4 | 8 | SPLIT | - | 68.352 | 35.776 | 105.088 | 105.088 |
