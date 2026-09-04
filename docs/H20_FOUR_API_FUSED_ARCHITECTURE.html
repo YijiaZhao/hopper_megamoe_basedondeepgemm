@@ -85,6 +85,14 @@
   .lane { border-radius: 15px; border: 1px solid var(--line); background: rgba(255,255,255,.025); padding: 18px; }
   .lane.split { border-top: 4px solid var(--orange); }
   .lane.fused { border-top: 4px solid var(--purple); }
+
+  .compare-table { width: 100%; border-collapse: collapse; margin-top: 18px; overflow: hidden; border-radius: 12px; }
+  .compare-table th, .compare-table td { border: 1px solid var(--line); padding: 11px 13px; vertical-align: top; text-align: left; }
+  .compare-table th { background: #172941; color: #dce9ff; }
+  .compare-table td:first-child { color: var(--muted); width: 19%; font-weight: 700; }
+  .compare-table td:nth-child(2) { background: rgba(255,180,94,.035); }
+  .compare-table td:nth-child(3) { background: rgba(179,140,255,.035); }
+  .one-line { margin-top: 16px; border: 1px solid rgba(67,217,209,.45); background: rgba(67,217,209,.06); border-radius: 12px; padding: 14px 16px; }
   .mini-flow { display: flex; align-items: center; gap: 7px; overflow-x: auto; margin: 14px 0; }
   .mini { white-space: nowrap; padding: 10px 12px; border-radius: 9px; background: #182a42; border: 1px solid var(--line); }
   .mini.kernel { border-color: var(--orange); }
@@ -231,6 +239,23 @@
         </ul>
       </div>
     </div>
+    <table class="compare-table">
+      <thead><tr><th>维度</th><th>Split</th><th>Fused</th></tr></thead>
+      <tbody>
+        <tr><td>Python API</td><td><code>*_mega_moe_split</code></td><td><code>*_mega_moe_fused</code></td></tr>
+        <tr><td>CUDA kernel 数</td><td>2 个：L1 + L2</td><td>1 个：Dispatch + L1 + L2 + Combine</td></tr>
+        <tr><td>目标 symbol</td><td><code>sm90_mxfp4_mega_moe_l1_impl</code><br><code>sm90_mxfp4_mega_moe_l2_impl</code></td><td><code>sm90_{mxfp4|qoq}_mega_moe_h20_fused_impl</code></td></tr>
+        <tr><td>Workspace</td><td>Split ring buffer，按 ring phase 循环复用</td><td>独立 Fused full-pool layout，按 expert/token pool 分配</td></tr>
+        <tr><td>L1→L2 依赖</td><td>跨 kernel；L1 写 ring，L2 kernel 再消费</td><td>同 kernel 内用 arrival counter、mask 和 mbarrier 发布 ready</td></tr>
+        <tr><td>调度生命周期</td><td>L1 scheduler 结束后，再进入 L2 scheduler</td><td>一个 scheduler 在 L1 warmup 后交错领取 L1/L2 task</td></tr>
+        <tr><td>中间 activation</td><td>量化后写 global/symmetric-memory ring buffer</td><td>量化后写 global/symmetric-memory full pool；不会永久留在寄存器</td></tr>
+        <tr><td>Frontend</td><td>独立 <code>router_quant_topk_kernel</code></td><td>同样独立；不属于 Mega Fused kernel</td></tr>
+        <tr><td>NSYS 计时</td><td>L1 start → L2 end，包含 kernel gap</td><td>单个 fused kernel start → end</td></tr>
+        <tr><td>主要优势</td><td>模块简单、阶段独立、ring workspace 较紧凑</td><td>减少一次 launch，允许设备端 L1/L2 交错和 cleanup/combine overlap</td></tr>
+        <tr><td>主要代价</td><td>存在 L1→L2 launch boundary</td><td>状态机、寄存器、SMEM 和跨 rank barrier 更复杂，可能出现等待抖动</td></tr>
+      </tbody>
+    </table>
+    <div class="one-line"><b>一句话：</b>Split = “两个 kernel 通过 ring buffer 串联”；Fused = “一个 persistent kernel 通过设备端 scheduler 和 barrier 管理整个 MegaMoE”。两者都会把量化中间 activation 写入显存。</div>
   </section>
 
   <section>
