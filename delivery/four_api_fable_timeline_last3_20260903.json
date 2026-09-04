@@ -5,9 +5,9 @@
     "M": 2,
     "backend": "fused",
     "device_id": 0,
-    "frontend_median_us": 13.92,
-    "mega_median_us": 86.368,
-    "target_median_us": 100.384,
+    "frontend_median_us": 13.76,
+    "mega_median_us": 86.624,
+    "target_median_us": 100.64,
     "report": "e2e_fused_mxfp4_M2.nsys-rep"
   },
   {
@@ -16,9 +16,9 @@
     "M": 2,
     "backend": "split",
     "device_id": 0,
-    "frontend_median_us": 13.728,
-    "mega_median_us": 181.311,
-    "target_median_us": 194.911,
+    "frontend_median_us": 13.856,
+    "mega_median_us": 107.52,
+    "target_median_us": 121.44,
     "report": "e2e_split_mxfp4_M2.nsys-rep"
   },
   {
@@ -27,9 +27,9 @@
     "M": 8,
     "backend": "fused",
     "device_id": 0,
-    "frontend_median_us": 13.536,
-    "mega_median_us": 109.44,
-    "target_median_us": 123.296,
+    "frontend_median_us": 13.632,
+    "mega_median_us": 91.52,
+    "target_median_us": 105.44,
     "report": "e2e_fused_mxfp4_M8.nsys-rep"
   },
   {
@@ -38,9 +38,9 @@
     "M": 8,
     "backend": "split",
     "device_id": 0,
-    "frontend_median_us": 13.728,
-    "mega_median_us": 122.207,
-    "target_median_us": 135.999,
+    "frontend_median_us": 13.792,
+    "mega_median_us": 125.568,
+    "target_median_us": 139.424,
     "report": "e2e_split_mxfp4_M8.nsys-rep"
   },
   {
@@ -49,9 +49,9 @@
     "M": 16,
     "backend": "fused",
     "device_id": 0,
-    "frontend_median_us": 13.44,
-    "mega_median_us": 124.704,
-    "target_median_us": 138.432,
+    "frontend_median_us": 13.696,
+    "mega_median_us": 133.024,
+    "target_median_us": 147.008,
     "report": "e2e_fused_mxfp4_M16.nsys-rep"
   },
   {
@@ -60,9 +60,9 @@
     "M": 16,
     "backend": "split",
     "device_id": 0,
-    "frontend_median_us": 13.728,
-    "mega_median_us": 142.015,
-    "target_median_us": 155.807,
+    "frontend_median_us": 13.856,
+    "mega_median_us": 147.424,
+    "target_median_us": 161.088,
     "report": "e2e_split_mxfp4_M16.nsys-rep"
   },
   {
@@ -71,9 +71,9 @@
     "M": 2,
     "backend": "fused",
     "device_id": 0,
-    "frontend_median_us": 14.112,
-    "mega_median_us": 95.328,
-    "target_median_us": 110.112,
+    "frontend_median_us": 14.272,
+    "mega_median_us": 92.896,
+    "target_median_us": 107.584,
     "report": "e2e_fused_qoq_M2.nsys-rep"
   },
   {
@@ -82,9 +82,9 @@
     "M": 2,
     "backend": "split",
     "device_id": 0,
-    "frontend_median_us": 14.496,
-    "mega_median_us": 96.0,
-    "target_median_us": 110.592,
+    "frontend_median_us": 14.4,
+    "mega_median_us": 87.04,
+    "target_median_us": 101.632,
     "report": "e2e_split_qoq_M2.nsys-rep"
   },
   {
@@ -93,9 +93,9 @@
     "M": 8,
     "backend": "fused",
     "device_id": 0,
-    "frontend_median_us": 14.4,
-    "mega_median_us": 89.791,
-    "target_median_us": 104.416,
+    "frontend_median_us": 14.432,
+    "mega_median_us": 95.456,
+    "target_median_us": 110.144,
     "report": "e2e_fused_qoq_M8.nsys-rep"
   },
   {
@@ -104,9 +104,9 @@
     "M": 8,
     "backend": "split",
     "device_id": 0,
-    "frontend_median_us": 14.336,
-    "mega_median_us": 85.952,
-    "target_median_us": 100.384,
+    "frontend_median_us": 14.432,
+    "mega_median_us": 84.352,
+    "target_median_us": 98.88,
     "report": "e2e_split_qoq_M8.nsys-rep"
   },
   {
@@ -115,9 +115,9 @@
     "M": 16,
     "backend": "fused",
     "device_id": 0,
-    "frontend_median_us": 14.688,
-    "mega_median_us": 131.296,
-    "target_median_us": 146.752,
+    "frontend_median_us": 14.72,
+    "mega_median_us": 138.784,
+    "target_median_us": 153.504,
     "report": "e2e_fused_qoq_M16.nsys-rep"
   },
   {
@@ -126,9 +126,9 @@
     "M": 16,
     "backend": "split",
     "device_id": 0,
-    "frontend_median_us": 14.592,
-    "mega_median_us": 138.176,
-    "target_median_us": 152.928,
+    "frontend_median_us": 14.4,
+    "mega_median_us": 125.12,
+    "target_median_us": 139.968,
     "report": "e2e_split_qoq_M16.nsys-rep"
   },
   {
@@ -138,8 +138,8 @@
     "backend": "fused",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 67.552,
-    "target_median_us": 67.552,
+    "mega_median_us": 107.808,
+    "target_median_us": 107.808,
     "report": "mega_fused_mxfp4_M2.nsys-rep"
   },
   {
@@ -149,8 +149,8 @@
     "backend": "split",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 85.312,
-    "target_median_us": 85.312,
+    "mega_median_us": 57.152,
+    "target_median_us": 57.152,
     "report": "mega_split_mxfp4_M2.nsys-rep"
   },
   {
@@ -160,8 +160,8 @@
     "backend": "fused",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 131.584,
-    "target_median_us": 131.584,
+    "mega_median_us": 87.584,
+    "target_median_us": 87.584,
     "report": "mega_fused_mxfp4_M8.nsys-rep"
   },
   {
@@ -171,8 +171,8 @@
     "backend": "split",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 96.287,
-    "target_median_us": 96.287,
+    "mega_median_us": 105.088,
+    "target_median_us": 105.088,
     "report": "mega_split_mxfp4_M8.nsys-rep"
   },
   {
@@ -182,8 +182,8 @@
     "backend": "fused",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 122.144,
-    "target_median_us": 122.144,
+    "mega_median_us": 115.232,
+    "target_median_us": 115.232,
     "report": "mega_fused_mxfp4_M16.nsys-rep"
   },
   {
@@ -193,8 +193,8 @@
     "backend": "split",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 122.88,
-    "target_median_us": 122.88,
+    "mega_median_us": 128.416,
+    "target_median_us": 128.416,
     "report": "mega_split_mxfp4_M16.nsys-rep"
   },
   {
@@ -204,8 +204,8 @@
     "backend": "fused",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 67.04,
-    "target_median_us": 67.04,
+    "mega_median_us": 64.192,
+    "target_median_us": 64.192,
     "report": "mega_fused_qoq_M2.nsys-rep"
   },
   {
@@ -215,8 +215,8 @@
     "backend": "split",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 55.744,
-    "target_median_us": 55.744,
+    "mega_median_us": 50.4,
+    "target_median_us": 50.4,
     "report": "mega_split_qoq_M2.nsys-rep"
   },
   {
@@ -226,8 +226,8 @@
     "backend": "fused",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 92.928,
-    "target_median_us": 92.928,
+    "mega_median_us": 92.608,
+    "target_median_us": 92.608,
     "report": "mega_fused_qoq_M8.nsys-rep"
   },
   {
@@ -237,8 +237,8 @@
     "backend": "split",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 98.208,
-    "target_median_us": 98.208,
+    "mega_median_us": 81.76,
+    "target_median_us": 81.76,
     "report": "mega_split_qoq_M8.nsys-rep"
   },
   {
@@ -248,8 +248,8 @@
     "backend": "fused",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 123.584,
-    "target_median_us": 123.584,
+    "mega_median_us": 123.712,
+    "target_median_us": 123.712,
     "report": "mega_fused_qoq_M16.nsys-rep"
   },
   {
@@ -259,8 +259,8 @@
     "backend": "split",
     "device_id": 0,
     "frontend_median_us": null,
-    "mega_median_us": 119.872,
-    "target_median_us": 119.872,
+    "mega_median_us": 114.112,
+    "target_median_us": 114.112,
     "report": "mega_split_qoq_M16.nsys-rep"
   }
 ]

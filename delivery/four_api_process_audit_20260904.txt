@@ -1,0 +1,13 @@
+H20 final 24-timeline process audit
+Date: 2026-09-04
+Host: 10.6.131.7
+Sampling cadence: 250 ms
+Observed GPU process samples: 2532
+Non-four_api_build process violations: 0
+Clock samples: 4968
+Clock samples not equal to 1830 MHz: 0
+Other GPU-capable containers paused during capture:
+- claudec
+- cudagym
+- wenpengw_aic_cpumodel
+- mega_moe_box_07
