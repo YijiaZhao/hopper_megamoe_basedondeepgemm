@@ -99,7 +99,7 @@ by `scripts/capture_four_api_h20_timelines_host.sh` on the host.
 
 ```bash
 git clone --recursive \
-  --branch delivery/four-api-fable-h20-20260903 \
+  --branch main \
   https://github.com/YijiaZhao/hopper_megamoe_basedondeepgemm.git
 cd hopper_megamoe_basedondeepgemm
 

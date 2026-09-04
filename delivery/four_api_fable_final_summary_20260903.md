@@ -6,7 +6,7 @@ Date: 2026-09-04
 - GPU: 8 x NVIDIA H20-3e
 - SM clock: explicitly locked at `1830 MHz` (`4968/4968` monitor samples; 250 ms process audit: 0 violations)
 - Container: `four_api_build`
-- GitHub branch: `delivery/four-api-fable-h20-20260903`
+- GitHub branch: `main`
 - Workspace: `/raid/kimi/DeepGEMM_four_api_fable_h20_git`
 - Reports: `/raid/kimi/megamoe_opt2_results/four_api_fable_final24_gpu07_exclusive_v2_locked1830_20260904`
 - Local copy: `/Users/kimiz/Downloads/BYTEDANCE_MEGAMOE/FINAL24_EXCLUSIVE_LOCKED1830_20260904`

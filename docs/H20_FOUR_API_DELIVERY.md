@@ -93,7 +93,7 @@ docker exec -it four_api_build bash
 
 cd /raid/kimi
 git clone --recursive \
-  --branch delivery/four-api-fable-h20-20260903 \
+  --branch main \
   https://github.com/YijiaZhao/hopper_megamoe_basedondeepgemm.git \
   DeepGEMM_four_api_fable_h20_git
 
