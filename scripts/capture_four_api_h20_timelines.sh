@@ -9,6 +9,7 @@ FORCE=${FORCE:-0}
 GPU_IDLE_LIMIT_MIB=${GPU_IDLE_LIMIT_MIB:-64}
 GPU_IDLE_RETRIES=${GPU_IDLE_RETRIES:-45}
 LOCK_SM_CLOCK_MHZ=${LOCK_SM_CLOCK_MHZ:-1830}
+CLOCK_LOCK_MODE=${CLOCK_LOCK_MODE:-verify}
 
 cd "$ROOT"
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
@@ -69,7 +70,24 @@ PY
 fi
 mkdir -p "$OUT"
 check_idle_gpus
-nvidia-smi -lgc "$LOCK_SM_CLOCK_MHZ,$LOCK_SM_CLOCK_MHZ"
+case "$CLOCK_LOCK_MODE" in
+  set) nvidia-smi -lgc "$LOCK_SM_CLOCK_MHZ,$LOCK_SM_CLOCK_MHZ" ;;
+  verify) ;;
+  *) echo "CLOCK_LOCK_MODE must be set or verify" >&2; exit 2 ;;
+esac
+mapfile -t locked_clocks < <(
+  nvidia-smi --query-gpu=clocks.current.sm --format=csv,noheader,nounits
+)
+if [ "${#locked_clocks[@]}" -ne 8 ]; then
+  echo "expected eight clock readings" >&2
+  exit 2
+fi
+for clock in "${locked_clocks[@]}"; do
+  if [ "$clock" -ne "$LOCK_SM_CLOCK_MHZ" ]; then
+    echo "GPU clock is not locked at $LOCK_SM_CLOCK_MHZ MHz; lock it on the host first" >&2
+    exit 3
+  fi
+done
 nvidia-smi dmon -s c -d 1 > "$OUT/CLOCK_DMON.txt" 2>&1 &
 CLOCK_MONITOR_PID=$!
 stop_clock_monitor() {

@@ -62,6 +62,9 @@ Attention DP: 2 for E2E timelines
 Global M:     2, 8, 16
 ```
 
+For a clean-machine Docker setup and end-to-end reproduction procedure, see
+[`docs/H20_FOUR_API_DELIVERY.md`](docs/H20_FOUR_API_DELIVERY.md).
+
 ## Clone and build
 
 ```bash
@@ -139,20 +142,30 @@ QoQ:   0.003937 < 0.005
 
 ## Nsight Systems timeline matrix
 
-Capture all 24 reports:
+Capture all 24 reports with the recommended host-side wrapper:
 
 ```bash
-# Run inside an exclusive 8-GPU environment after building the extension.
-# The script locks all GPUs to 1830 MHz, records CLOCK_DMON.txt, refuses a
-# non-empty output directory, and waits for GPU memory to clear between cases.
-OUT=/path/to/output ROOT=$PWD \
-  bash scripts/capture_four_api_h20_timelines.sh
-
-# Replace an existing output set intentionally:
-FORCE=1 OUT=/path/to/output ROOT=$PWD \
-  bash scripts/capture_four_api_h20_timelines.sh
+# Run on the host from the repository path. The wrapper locks all eight GPUs
+# to 1830 MHz and launches the collector in the validated Docker container.
+CONTAINER=four_api_build \
+ROOT=$PWD \
+OUT=/path/to/empty/output \
+LOCK_SM_CLOCK_MHZ=1830 \
+bash scripts/capture_four_api_h20_timelines_host.sh
 ```
 
+To invoke the inner collector directly, first lock clocks on the host, then run
+inside the container:
+
+```bash
+# Host:
+nvidia-smi -lgc 1830,1830
+
+# Container:
+OUT=/path/to/empty/output ROOT=$PWD \
+LOCK_SM_CLOCK_MHZ=1830 CLOCK_LOCK_MODE=verify \
+bash scripts/capture_four_api_h20_timelines.sh
+```
 Matrix:
 
 ```text
@@ -272,6 +285,8 @@ tests/test_fable_frontend_correctness.py
 tests/test_four_api_smoke.py
 tests/test_four_api_correctness.py
 tests/profile_four_api_h20.py
+scripts/capture_four_api_h20_timelines_host.sh
+scripts/capture_four_api_h20_timelines.sh
 ```
 
 ## License
