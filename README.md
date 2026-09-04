@@ -212,6 +212,30 @@ including the real inter-kernel gap.  `Target span` in E2E is measured from
 Fable frontend start through MegaMoE completion.  It is not a sum of unrelated
 kernel statistics and is not aggregated across GPUs.
 
+## Final locked-clock performance results
+
+The following values were captured on `10.6.131.7` with all eight H20 GPUs
+explicitly locked at **1830 MHz**. All values are microseconds and are the
+GPU 0 / rank 0 median of the final three complete spans.
+
+| Precision | M | FE Fused | FE Split | E2E Mega Fused | E2E Mega Split | E2E Fused | E2E Split | Mega-only Fused | Mega-only Split |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | 13.920 | 13.728 | 86.368 | 181.311 | **100.384** | **194.911** | 67.552 | 85.312 |
+| MXFP4 | 8 | 13.536 | 13.728 | 109.440 | 122.207 | **123.296** | **135.999** | 131.584 | 96.287 |
+| MXFP4 | 16 | 13.440 | 13.728 | 124.704 | 142.015 | **138.432** | **155.807** | 122.144 | 122.880 |
+| QoQ | 2 | 14.112 | 14.496 | 95.328 | 96.000 | **110.112** | **110.592** | 67.040 | 55.744 |
+| QoQ | 8 | 14.400 | 14.336 | 89.791 | 85.952 | **104.416** | **100.384** | 92.928 | 98.208 |
+| QoQ | 16 | 14.688 | 14.592 | 131.296 | 138.176 | **146.752** | **152.928** | 123.584 | 119.872 |
+
+Validation summary:
+
+```text
+24/24 NSYS reports structurally valid
+5056/5056 clock samples at 1830 MHz
+qoq_quant_topk_kernel calls: 0
+E2E reports using router_quant_topk_kernel: 12/12
+```
+
 The final table, raw values, report verification, and SHA256 manifest are kept
 under `delivery/`:
 
