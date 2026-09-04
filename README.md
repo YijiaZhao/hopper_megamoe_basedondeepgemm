@@ -65,6 +65,36 @@ Global M:     2, 8, 16
 For a clean-machine Docker setup and end-to-end reproduction procedure, see
 [`docs/H20_FOUR_API_DELIVERY.md`](docs/H20_FOUR_API_DELIVERY.md).
 
+### Clean-host Docker quick start
+
+The validated image is pinned by digest:
+
+```text
+docker.io/lmsysorg/sglang@sha256:687efca081e85f4e3126456ff389b1af515fc08a604de4c61f947f531963aba7
+```
+
+Create the validated container on an 8-GPU H20 host:
+
+```bash
+docker pull \
+  docker.io/lmsysorg/sglang@sha256:687efca081e85f4e3126456ff389b1af515fc08a604de4c61f947f531963aba7
+
+docker run -d \
+  --name four_api_build \
+  --gpus all \
+  --network host \
+  --ipc host \
+  --shm-size 64g \
+  -v /raid:/raid \
+  -w /raid/kimi \
+  docker.io/lmsysorg/sglang@sha256:687efca081e85f4e3126456ff389b1af515fc08a604de4c61f947f531963aba7 \
+  sleep infinity
+```
+
+The commands in the next sections run inside this container unless explicitly
+marked as host-side. The container is not privileged, so GPU clocks are locked
+by `scripts/capture_four_api_h20_timelines_host.sh` on the host.
+
 ## Clone and build
 
 ```bash
