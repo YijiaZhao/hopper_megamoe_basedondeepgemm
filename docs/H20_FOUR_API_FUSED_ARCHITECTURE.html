@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>H20 MegaMoE Fused Architecture</title>
+<style>
+  :root {
+    --bg: #08111f;
+    --panel: #101d30;
+    --panel-2: #14243a;
+    --line: #2d4566;
+    --text: #e9f1ff;
+    --muted: #9fb2cc;
+    --cyan: #43d9d1;
+    --blue: #69a7ff;
+    --purple: #b38cff;
+    --orange: #ffb45e;
+    --green: #70dc8f;
+    --red: #ff7b86;
+    --yellow: #f0dc69;
+    --shadow: 0 16px 44px rgba(0,0,0,.27);
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    color: var(--text);
+    background:
+      radial-gradient(circle at 10% 0%, rgba(67,217,209,.10), transparent 30%),
+      radial-gradient(circle at 95% 15%, rgba(179,140,255,.10), transparent 28%),
+      var(--bg);
+    font: 15px/1.58 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .page { width: min(1440px, calc(100% - 40px)); margin: 0 auto; padding: 42px 0 70px; }
+  h1, h2, h3, p { margin-top: 0; }
+  h1 { font-size: clamp(30px, 4vw, 52px); line-height: 1.08; letter-spacing: -.03em; margin-bottom: 12px; }
+  h2 { font-size: 24px; margin-bottom: 18px; }
+  h3 { font-size: 16px; margin-bottom: 8px; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  code { color: #d7e7ff; }
+  .muted { color: var(--muted); }
+  .hero {
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 30px;
+    background: linear-gradient(135deg, rgba(20,36,58,.96), rgba(11,22,39,.94));
+    box-shadow: var(--shadow);
+    margin-bottom: 28px;
+  }
+  .hero-grid { display: grid; grid-template-columns: 1.35fr .65fr; gap: 24px; align-items: center; }
+  .badge { display: inline-flex; padding: 5px 10px; border-radius: 999px; border: 1px solid #315c71; color: var(--cyan); background: rgba(67,217,209,.08); margin-bottom: 14px; font-size: 12px; font-weight: 700; letter-spacing: .08em; }
+  .hero-note { border-left: 4px solid var(--cyan); padding: 14px 18px; background: rgba(67,217,209,.07); border-radius: 8px; }
+  .metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .metric { background: rgba(255,255,255,.035); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .metric b { display: block; font-size: 21px; color: var(--cyan); }
+  section { margin-top: 28px; border: 1px solid var(--line); background: rgba(16,29,48,.82); border-radius: 18px; padding: 24px; box-shadow: var(--shadow); }
+  .section-head { display: flex; justify-content: space-between; gap: 18px; align-items: baseline; margin-bottom: 18px; }
+  .section-head p { margin: 0; color: var(--muted); }
+  .pipeline { display: flex; align-items: stretch; gap: 10px; overflow-x: auto; padding: 8px 3px 16px; }
+  .node {
+    min-width: 180px;
+    flex: 1;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    border-radius: 14px;
+    padding: 16px;
+    position: relative;
+  }
+  .node strong { display: block; margin-bottom: 7px; }
+  .node small { display: block; color: var(--muted); }
+  .node.cyan { border-color: rgba(67,217,209,.65); }
+  .node.blue { border-color: rgba(105,167,255,.65); }
+  .node.purple { border-color: rgba(179,140,255,.65); }
+  .node.orange { border-color: rgba(255,180,94,.65); }
+  .arrow { min-width: 30px; display: grid; place-items: center; color: var(--cyan); font-size: 26px; font-weight: 800; }
+  .kernel-boundary { border: 2px solid var(--purple); border-radius: 18px; padding: 14px; background: rgba(179,140,255,.045); min-width: 860px; flex: 5; }
+  .kernel-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; color: #d8c8ff; }
+  .inner-flow { display: grid; grid-template-columns: repeat(5, minmax(145px, 1fr)); gap: 8px; }
+  .inner { border: 1px solid rgba(179,140,255,.35); border-radius: 11px; padding: 12px; background: rgba(255,255,255,.035); }
+  .inner b { display: block; margin-bottom: 5px; }
+  .inner span { color: var(--muted); font-size: 12px; }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .lane { border-radius: 15px; border: 1px solid var(--line); background: rgba(255,255,255,.025); padding: 18px; }
+  .lane.split { border-top: 4px solid var(--orange); }
+  .lane.fused { border-top: 4px solid var(--purple); }
+  .mini-flow { display: flex; align-items: center; gap: 7px; overflow-x: auto; margin: 14px 0; }
+  .mini { white-space: nowrap; padding: 10px 12px; border-radius: 9px; background: #182a42; border: 1px solid var(--line); }
+  .mini.kernel { border-color: var(--orange); }
+  .mini.fkernel { border-color: var(--purple); }
+  ul.clean { padding-left: 19px; margin-bottom: 0; }
+  ul.clean li { margin: 7px 0; }
+  .role-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .role { border: 1px solid var(--line); border-radius: 13px; padding: 15px; background: rgba(255,255,255,.025); }
+  .role:nth-child(1) { border-top: 3px solid var(--cyan); }
+  .role:nth-child(2) { border-top: 3px solid var(--blue); }
+  .role:nth-child(3) { border-top: 3px solid var(--purple); }
+  .role:nth-child(4) { border-top: 3px solid var(--orange); }
+  .role p { color: var(--muted); margin: 0; font-size: 13px; }
+  .buffer-flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 9px; }
+  .buffer { min-height: 106px; border: 1px dashed #426286; border-radius: 12px; padding: 13px; background: #0d1a2b; }
+  .buffer b { color: var(--blue); }
+  .timeline-wrap { overflow-x: auto; }
+  .timeline { min-width: 980px; display: grid; grid-template-columns: 85px repeat(9, 1fr); gap: 5px; align-items: center; }
+  .tlabel { color: var(--muted); font-weight: 700; }
+  .slot { height: 38px; border-radius: 7px; display: grid; place-items: center; color: #07101b; font-weight: 800; font-size: 12px; }
+  .l1 { background: var(--blue); }
+  .l2 { background: var(--purple); }
+  .disp { background: var(--cyan); }
+  .comb { background: var(--orange); }
+  .empty { background: rgba(255,255,255,.025); border: 1px dashed rgba(255,255,255,.08); }
+  .callouts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .callout { border-radius: 13px; padding: 16px; border: 1px solid var(--line); }
+  .callout.good { background: rgba(112,220,143,.07); border-color: rgba(112,220,143,.45); }
+  .callout.warn { background: rgba(255,180,94,.07); border-color: rgba(255,180,94,.45); }
+  .callout.bad { background: rgba(255,123,134,.07); border-color: rgba(255,123,134,.45); }
+  .quant { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .quant-card { padding: 16px; border-radius: 13px; border: 1px solid var(--line); background: #0d1a2b; }
+  .quant-card b { color: var(--yellow); }
+  footer { color: var(--muted); text-align: center; margin-top: 28px; font-size: 12px; }
+  @media (max-width: 950px) {
+    .hero-grid, .compare, .quant { grid-template-columns: 1fr; }
+    .role-grid { grid-template-columns: repeat(2,1fr); }
+    .buffer-flow { grid-template-columns: repeat(2,1fr); }
+    .callouts { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 600px) {
+    .page { width: min(100% - 20px, 1440px); padding-top: 18px; }
+    .hero, section { padding: 17px; border-radius: 14px; }
+    .metrics, .role-grid, .buffer-flow { grid-template-columns: 1fr; }
+  }
+  @media print {
+    body { background: white; color: #111; }
+    .page { width: 100%; padding: 0; }
+    .hero, section { box-shadow: none; break-inside: avoid; background: white; border-color: #aaa; }
+    .muted, .node small, .role p, .section-head p { color: #444; }
+  }
+</style>
+</head>
+<body>
+<main class="page">
+  <header class="hero">
+    <div class="hero-grid">
+      <div>
+        <div class="badge">H20 · SM90A · EP8 · TOPK8</div>
+        <h1>MegaMoE Fused 架构图</h1>
+        <p class="muted">单个 persistent CUDA kernel 内融合 Dispatch、Linear1、SwiGLU、中间量化、Linear2 与 Combine。</p>
+        <div class="hero-note">
+          <b>核心结论：</b>这是<strong>控制流、通信和调度融合</strong>，不是把整个 MLP 中间张量永久保存在寄存器或 Shared Memory。
+        </div>
+      </div>
+      <div class="metrics">
+        <div class="metric"><b>1</b><span>Fused Mega kernel</span></div>
+        <div class="metric"><b>78</b><span>Persistent CTAs / H20 SMs</span></div>
+        <div class="metric"><b>8</b><span>EP ranks</span></div>
+        <div class="metric"><b>2</b><span>Quant modes: MXFP4 / QoQ</span></div>
+      </div>
+    </div>
+  </header>
+
+  <section>
+    <div class="section-head">
+      <h2>1. E2E 边界：Frontend 没有塞进 Mega kernel</h2>
+      <p>CUDA Graph 中仍然是两个节点</p>
+    </div>
+    <div class="pipeline">
+      <div class="node cyan">
+        <strong>BF16 Hidden</strong>
+        <small>[local M, H=3072]</small>
+      </div>
+      <div class="arrow">→</div>
+      <div class="node cyan">
+        <strong>Fable Frontend</strong>
+        <small><code>router_quant_topk_kernel</code></small>
+        <small>Router WMMA + activation quant + TopK8 + softmax</small>
+      </div>
+      <div class="arrow">→</div>
+      <div class="node blue">
+        <strong>FusedSymmBuffer</strong>
+        <small>x / x_sf / topk_idx / topk_weights</small>
+      </div>
+      <div class="arrow">→</div>
+      <div class="kernel-boundary">
+        <div class="kernel-title">
+          <b>单个 Fused MegaMoE kernel</b>
+          <code>sm90_{mxfp4|qoq}_mega_moe_h20_fused_impl</code>
+        </div>
+        <div class="inner-flow">
+          <div class="inner"><b>Dispatch</b><span>expert count<br>remote route</span></div>
+          <div class="inner"><b>Linear1</b><span>Gate + Up<br>WGMMA</span></div>
+          <div class="inner"><b>SwiGLU</b><span>TopK weight<br>intermediate quant</span></div>
+          <div class="inner"><b>Linear2</b><span>Down projection<br>WGMMA</span></div>
+          <div class="inner"><b>Combine</b><span>NVLink pull<br>TopK reduce</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>2. Split 与 Fused 的真正区别</h2>
+      <p>不是数学公式改变，而是执行生命周期改变</p>
+    </div>
+    <div class="compare">
+      <div class="lane split">
+        <h3>Split backend</h3>
+        <div class="mini-flow">
+          <div class="mini">Frontend</div><div>→</div>
+          <div class="mini kernel">L1 kernel</div><div>→</div>
+          <div class="mini kernel">L2 kernel</div>
+        </div>
+        <ul class="clean">
+          <li>L1 与 L2 是两个独立 persistent kernel。</li>
+          <li>中间 activation 通过 ring buffer 传递。</li>
+          <li>L1 退出后由 host 启动 L2，存在 launch boundary 和 gap。</li>
+          <li>L1/L2 各自拥有独立 scheduler 生命周期。</li>
+        </ul>
+      </div>
+      <div class="lane fused">
+        <h3>Fused backend</h3>
+        <div class="mini-flow">
+          <div class="mini">Frontend</div><div>→</div>
+          <div class="mini fkernel">Dispatch + L1 + L2 + Combine</div>
+        </div>
+        <ul class="clean">
+          <li>一个 kernel 持续占据 78 个 SM。</li>
+          <li>使用 full-pool workspace，不复用 Split ring-buffer ABI。</li>
+          <li>L1/L2 依赖由设备端 counter、mask 和 mbarrier 表达。</li>
+          <li>完成少量 L1 warmup wave 后，可交错领取 L1/L2 task。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>3. 单个 CTA 内的角色分工</h2>
+      <p>同一 kernel 内采用 producer / consumer 流水线</p>
+    </div>
+    <div class="role-grid">
+      <div class="role">
+        <h3>Dispatch warps</h3>
+        <p>读取 TopK，统计 expert token，发布远端路由，执行 grid/NVLink barrier，并拉取远端 token。</p>
+      </div>
+      <div class="role">
+        <h3>TMA A loader</h3>
+        <p>Linear1 加载 routed input；Linear2 加载量化中间 activation，并等待对应数据 ready。</p>
+      </div>
+      <div class="role">
+        <h3>TMA B loader</h3>
+        <p>根据动态 task 加载 W1/W2 及量化 metadata。预取的是后续 tile，不是完整模型常驻 L2。</p>
+      </div>
+      <div class="role">
+        <h3>Math + epilogue</h3>
+        <p>执行 WGMMA；L1 epilogue 做 SwiGLU/量化，L2 epilogue 写 Combine buffer，最后完成 TopK 聚合。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>4. FusedSymmBuffer 数据布局</h2>
+      <p>中间 activation 仍写 global/symmetric memory</p>
+    </div>
+    <div class="buffer-flow">
+      <div class="buffer"><b>Registered input</b><br><code>x</code><br><code>x_sf</code><br><code>topk_idx</code><br><code>topk_weights</code></div>
+      <div class="buffer"><b>L1 token pool</b><br>远端 token pull 后的量化输入与 scale</div>
+      <div class="buffer"><b>L2 activation pool</b><br>SwiGLU 后的量化中间 activation 与 scale</div>
+      <div class="buffer"><b>Combine buffer</b><br>每个 token、每个 TopK slot 的 BF16 L2 输出</div>
+      <div class="buffer"><b>Control metadata</b><br>expert counts<br>arrival mask<br>barrier signals<br>source metadata</div>
+    </div>
+    <p class="muted" style="margin-top:14px;margin-bottom:0">
+      L1 与 L2 可能由不同 CTA/SM 执行，因此中间结果不能全部留在寄存器；Fused 消除的是 kernel 边界，而不是完整的 global-memory 中间写回。
+    </p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>5. L1 / L2 设备端交错调度</h2>
+      <p>先建立 L1 ready，再穿插 L2 task</p>
+    </div>
+    <div class="timeline-wrap">
+      <div class="timeline">
+        <div class="tlabel">时间 →</div><div class="empty"></div><div class="empty"></div><div class="empty"></div><div class="empty"></div><div class="empty"></div><div class="empty"></div><div class="empty"></div><div class="empty"></div><div class="empty"></div>
+        <div class="tlabel">Dispatch</div><div class="slot disp">Route</div><div class="slot disp">Count</div><div class="slot disp">NVL</div><div class="slot disp">Pull</div><div class="empty"></div><div class="empty"></div><div class="empty"></div><div class="slot comb">Cleanup</div><div class="empty"></div>
+        <div class="tlabel">SM group A</div><div class="empty"></div><div class="slot l1">L1 e0</div><div class="slot l1">L1 e1</div><div class="slot l2">L2 e0</div><div class="slot l1">L1 e2</div><div class="slot l2">L2 e1</div><div class="slot l2">L2 e2</div><div class="empty"></div><div class="slot comb">Combine</div>
+        <div class="tlabel">SM group B</div><div class="empty"></div><div class="slot l1">L1 e0</div><div class="slot l1">L1 e1</div><div class="slot l1">L1 e2</div><div class="slot l2">L2 e0</div><div class="slot l2">L2 e1</div><div class="slot l1">L1 e3</div><div class="slot l2">L2 e2</div><div class="slot comb">Combine</div>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:14px;margin-bottom:0">
+      Scheduler task 携带 phase、expert、M/N block、pool offset 和 valid-M。某个 M block 的 L1 数据 ready 后，L2 loader 才消费对应中间 activation。
+    </p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>6. 两种量化模式共用一套融合骨架</h2>
+      <p>通信与调度相同，decode / accumulator 路径不同</p>
+    </div>
+    <div class="quant">
+      <div class="quant-card">
+        <h3>MXFP4 Fused</h3>
+        <p><b>FP8 activation × MXFP4 weight</b></p>
+        <p class="muted">使用 MXFP4 relative scale、tile-major scale layout 和 fused FP4 decode。</p>
+        <code>sm90_mxfp4_mega_moe_h20_fused_impl</code>
+      </div>
+      <div class="quant-card">
+        <h3>QoQ Fused</h3>
+        <p><b>INT8 activation × INT4 weight</b></p>
+        <p class="muted">使用 QoQ scale/zero-point metadata 与整数累加路径。</p>
+        <code>sm90_qoq_mega_moe_h20_fused_impl</code>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>7. 收益、代价与边界</h2>
+    </div>
+    <div class="callouts">
+      <div class="callout good">
+        <h3>收益</h3>
+        <ul class="clean">
+          <li>消除 L1→L2 的第二次 kernel launch。</li>
+          <li>设备端交错 L1/L2，减少阶段间空洞。</li>
+          <li>Dispatch、计算、Combine 共享 persistent 生命周期。</li>
+          <li>Workspace cleanup 可与尾部 Combine 重叠。</li>
+        </ul>
+      </div>
+      <div class="callout warn">
+        <h3>代价</h3>
+        <ul class="clean">
+          <li>寄存器、SMEM、barrier 和状态机更复杂。</li>
+          <li>full-pool workspace 通常比 ring buffer 更大。</li>
+          <li>单 kernel duration 包含跨 rank 等待。</li>
+          <li>小 M 对 rank arrival skew 特别敏感。</li>
+        </ul>
+      </div>
+      <div class="callout bad">
+        <h3>不要误解</h3>
+        <ul class="clean">
+          <li>Frontend 仍是独立 kernel。</li>
+          <li>中间 activation 仍写 global memory。</li>
+          <li>tile prefetch 不等于完整模型权重驻留 L2。</li>
+          <li>Fused 不保证所有 M 都比 Split 快。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    H20 MegaMoE Four-API delivery · Generated from the implementation in
+    <code>sm90_fp4_mega_moe_h20_fused_body.inl</code>, <code>mega_moe_fused.cuh</code>, and <code>mega_fused.hpp</code>.
+  </footer>
+</main>
+</body>
+</html>

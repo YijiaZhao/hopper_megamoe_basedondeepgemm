@@ -65,6 +65,8 @@ Global M:     2, 8, 16
 For a clean-machine Docker setup and end-to-end reproduction procedure, see
 [`docs/H20_FOUR_API_DELIVERY.md`](docs/H20_FOUR_API_DELIVERY.md).
 
+Architecture diagram: [`docs/H20_FOUR_API_FUSED_ARCHITECTURE.html`](docs/H20_FOUR_API_FUSED_ARCHITECTURE.html).
+
 ### Clean-host Docker quick start
 
 The validated image is pinned by digest:

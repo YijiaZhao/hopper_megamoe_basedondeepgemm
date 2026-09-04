@@ -5,6 +5,12 @@ Updated: 2026-09-04
 This is the standalone environment, build, correctness, profiling, and result
 reproduction guide for the H20 Four-API delivery.
 
+Interactive architecture diagram:
+
+```text
+docs/H20_FOUR_API_FUSED_ARCHITECTURE.html
+```
+
 ## 1. Validated configuration
 
 | Item | Validated value |
