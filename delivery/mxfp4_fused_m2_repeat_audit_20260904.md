@@ -14,5 +14,6 @@ complete fused-kernel spans.
 | **Median across timelines** | **62.432** |
 
 The customer performance table therefore reports `62.432 us` for this point.
-The original 24-matrix raw report remains in the NSYS package for auditability;
-the three repeat reports are distributed in the supplemental local package.
+The canonical 24-report customer package replaces the slow-mode report with
+Repeat 2, renamed to `mega_fused_mxfp4_M2.nsys-rep`. The other repeat files were
+removed from the customer package so that it contains exactly 24 timelines.

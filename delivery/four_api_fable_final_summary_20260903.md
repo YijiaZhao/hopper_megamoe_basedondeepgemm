@@ -8,8 +8,8 @@ Date: 2026-09-04
 - Container: `four_api_build`
 - GitHub branch: `main`
 - Workspace: `/raid/kimi/DeepGEMM_four_api_fable_h20_git`
-- Reports: `/raid/kimi/megamoe_opt2_results/four_api_fable_final24_gpu07_exclusive_v2_locked1830_20260904`
-- Local copy: `/Users/kimiz/Downloads/BYTEDANCE_MEGAMOE/FINAL24_EXCLUSIVE_LOCKED1830_20260904`
+- Reports: `/raid/kimi/megamoe_opt2_results/FINAL24_CUSTOMER_20260904`
+- Local copy: `/Users/kimiz/Downloads/BYTEDANCE_MEGAMOE`
 
 All 24 reports were captured from an empty output directory on an otherwise
 idle 8-GPU host. Every E2E report uses the same Fable dynamic-M frontend for

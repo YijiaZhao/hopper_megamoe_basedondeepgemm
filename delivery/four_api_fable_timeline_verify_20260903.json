@@ -152,7 +152,7 @@
     },
     {
       "file": "mega_fused_mxfp4_M2.nsys-rep",
-      "size": 1989957,
+      "size": 1989133,
       "expected_graph": {
         "mega": true,
         "legacy_frontend_absent": true
