@@ -35,6 +35,8 @@ public:
         bool half_tile_tasks;
         bool split_k_l1;
         bool l2_half_row_tasks;
+        bool split_k_l2;
+        bool nvl_fast_epilogue;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -78,7 +80,9 @@ public:
             "        /* kDenseWeightTiles */ {},\n"
             "        /* kHalfTileTasksRequested */ {},\n"
             "        /* kSplitKL1Requested */ {},\n"
-            "        /* kL2HalfRowTasksRequested */ {}",
+            "        /* kL2HalfRowTasksRequested */ {},\n"
+            "        /* kSplitKL2Requested */ {},\n"
+            "        /* kNvlFastEpilogueRequested */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -91,7 +95,9 @@ public:
             args.dense_weight_tiles ? "true" : "false",
             args.half_tile_tasks ? "true" : "false",
             args.split_k_l1 ? "true" : "false",
-            args.l2_half_row_tasks ? "true" : "false");
+            args.l2_half_row_tasks ? "true" : "false",
+            args.split_k_l2 ? "true" : "false",
+            args.nvl_fast_epilogue ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -245,6 +251,22 @@ static void sm90_fp4_h20_fused_mega_moe(
     const bool l2_half_row_tasks = mxfp4 && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && plan.use_interleaved_scheduler && dense_weight_tiles &&
         get_env<int>("DG_FP4_L2_HALFROW", 0) != 0;
+    // L2 split-K tasks (kernel `kSplitKL2`): the same last-partial-wave split for
+    // the L2 tasks (M=16: 192 L2 tasks = 2.46 waves on 78 SMs, the 36 stragglers of
+    // the last wave run as 72 K-range halves; M=8: 96 tasks, 18 stragglers). K
+    // halves are whole 2-K128-block stages: half 0 = K-blocks [0, 4), half 1 =
+    // [4, 10); half 0 publishes, half 1 (claimed one index later) finishes. Scratch
+    // slots are separate from the L1 ones (same 8 KB per slot, workspace +6 MB).
+    // Exclusive with L2 half-row tasks. DG_FP4_SPLITK_L2 (default 1) disables.
+    const bool split_k_l2 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
+        !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
+        dense_weight_tiles && get_env<int>("DG_FP4_SPLITK_L2", 1) != 0;
+    // Fast NVLink-barrier epilogue (kernel `kNvlFastEpilogue`, needs the
+    // distributed expert bcast so the first barrier has a prologue grid sync):
+    // the two barriers with an epilogue (before dispatch pull, before combine)
+    // replace their second grid-wide sync with one SM0-written completion word.
+    // DG_FP4_NVL_FAST_EPI (default 1) disables.
+    const bool nvl_fast_epilogue = get_env<int>("DG_FP4_NVL_FAST_EPI", 1) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;
@@ -321,6 +343,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         .half_tile_tasks = half_tile_tasks,
         .split_k_l1 = split_k_l1,
         .l2_half_row_tasks = l2_half_row_tasks,
+        .split_k_l2 = split_k_l2,
+        .nvl_fast_epilogue = nvl_fast_epilogue,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,

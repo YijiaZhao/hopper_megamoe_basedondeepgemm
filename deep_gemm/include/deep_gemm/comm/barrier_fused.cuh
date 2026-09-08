@@ -40,8 +40,29 @@ CUTLASS_DEVICE void nvlink_barrier(const fused_layout::Workspace& workspace,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
                                    const bool& sync_prologue = true,
-                                   const bool& sync_epilogue = true) {
+                                   const bool& sync_epilogue = true,
+                                   // Fast epilogue (requires prologue + epilogue): instead of a
+                                   // second grid-wide sync (78 CTAs atomically arrive on one word
+                                   // and spin), SM0 publishes completion by storing
+                                   // `done_base + done_ordinal` (release.gpu) to the NVLink done
+                                   // count after its cross-rank wait, and every other CTA's
+                                   // thread 0 spins on that word (acquire.gpu) -> same completion
+                                   // condition ("SM0 observed all ranks' signals"), one writer.
+                                   // `done_base` is the done count snapshotted by every thread of
+                                   // every CTA at kernel start, BEFORE the kernel-start
+                                   // __syncthreads that precedes the first barrier's prologue grid
+                                   // sync; SM0 only writes the word after that prologue completes
+                                   // (all CTAs arrived => all snapshots taken), and the previous
+                                   // launch's writes are ordered by the kernel boundary, so all
+                                   // CTAs hold the same base. `done_ordinal` is the fixed 1-based
+                                   // ordinal of this barrier within the launch (the call sites
+                                   // execute in a fixed order on every rank; the existing
+                                   // counter/phase scheme already requires that).
+                                   const bool& fast_epilogue = false,
+                                   const uint32_t& done_base = 0,
+                                   const uint32_t& done_ordinal = 0) {
     DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+    DG_DEVICE_ASSERT(!fast_epilogue || (sync_prologue && sync_epilogue));
 
     // Grid sync before NVLink signaling
     if (sync_prologue)
@@ -76,7 +97,22 @@ CUTLASS_DEVICE void nvlink_barrier(const fused_layout::Workspace& workspace,
 #endif
                 }
             }
+            // Fast epilogue: publish completion to the other CTAs of this rank
+            if (fast_epilogue && thread_idx == 0)
+                ptx::st_rel_gpu(workspace.get_nvl_done_count_ptr(), done_base + done_ordinal);
         }
+    }
+
+    if (fast_epilogue) {
+        // Non-SM0 CTAs: wait for SM0's completion word; SM0 falls through (it has
+        // already observed all ranks). No timeout here: SM0's own wait traps first.
+        if (sm_idx != 0 && thread_idx == 0) {
+            const auto done_ptr = workspace.get_nvl_done_count_ptr();
+            while (static_cast<int32_t>(ptx::ld_acq(done_ptr) - done_base) <
+                   static_cast<int32_t>(done_ordinal)) {}
+        }
+        sync_scope();
+        return;
     }
 
     // Grid sync after NVLink completion

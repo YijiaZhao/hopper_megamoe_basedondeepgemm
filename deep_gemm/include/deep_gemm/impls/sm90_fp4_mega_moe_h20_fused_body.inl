@@ -178,6 +178,26 @@
         BLOCK_N == 256 && kNumEpilogueWarpgroups == 2;
     // N extent of one scheduled L2 task (L1 tasks use TASK_BLOCK_N).
     constexpr uint32_t TASK_BLOCK_N_L2 = kL2HalfRowTasks ? BLOCK_N / 2 : TASK_BLOCK_N;
+    // L2 split-K tasks (kSplitKL2; host env DG_FP4_SPLITK_L2): the L2 (expert,
+    // n_block) tasks of the last partial L2 wave (`num_l2_tasks % kNumSMs`
+    // stragglers; M=8: 18 of 96, M=16: 36 of 192) are each scheduled as two
+    // adjacent task indices covering whole 2-K128-block stages: K half 0 =
+    // K-blocks [0, 4) (2 stages, PUBLISHER), K half 1 = [4, 10) (3 stages,
+    // FINISHER, claimed one index later), so the finisher's flag wait is ~free.
+    // Same protocol/scratch format as kSplitKL1 (separate L2 slot index space);
+    // the L2 epilogue (BF16 x scale, NVLink scatter) runs on the finisher only.
+    // Each half's TMA producer waits only for the L1 bits of its own K-blocks.
+    constexpr bool kSplitKL2 =
+        kSplitKL2Requested && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
+        !kHalfTileTasks && !kL2HalfRowTasks && kUseInterleavedScheduler &&
+        kDenseWeightTiles && BLOCK_N == 256;
+    constexpr uint32_t kNumL2KSplits = kSplitKL2 ? fused_layout::kSM90SplitKL1NumKSplits : 1u;
+    // Fast NVLink-barrier epilogue (kNvlFastEpilogue; host env DG_FP4_NVL_FAST_EPI):
+    // see fused_comm::nvlink_barrier. Needs the first barrier (before dispatch
+    // pull) to have a prologue grid sync, i.e. kDistributedExpertBcast, so that
+    // SM0's first write of the done word is ordered after every CTA's kernel-start
+    // snapshot of it.
+    constexpr bool kNvlFastEpilogue = kNvlFastEpilogueRequested && kDistributedExpertBcast;
     constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / TASK_BLOCK_N;
     constexpr uint32_t kNumRoutedL2BlockNs = L2_SHAPE_N / TASK_BLOCK_N_L2;
     using interleaved_scheduler_t = fused_sched::InterleavedMegaMoEScheduler<
@@ -188,7 +208,8 @@
         kNumL1KSplits, fused_layout::kSM90SplitKL1MaxPoolBlocks,
         math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
         /* phase-specific task N: L1 256-row tasks, L2 TASK_BLOCK_N_L2-row tasks */
-        kNumRoutedL1BlockNs, kNumRoutedL2BlockNs>;
+        kNumRoutedL1BlockNs, kNumRoutedL2BlockNs,
+        kNumL2KSplits>;
     constexpr bool kSplitMDecodedWeightReuse =
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
     constexpr uint32_t WG_BLOCK_M =
@@ -259,6 +280,13 @@
                       ((L1_SHAPE_K / BLOCK_K) % (kNumL1KSplits * kKBlocksPerStage)) == 0 &&
                       L1_SHAPE_N / TASK_BLOCK_N == fused_layout::kSM90SplitKL1NumL1BlockNs),
                      "Split-K L1: RF decode, 2 K-blocks per stage, K halves of whole stages, 10 L1 N-blocks");
+    DG_STATIC_ASSERT(!kSplitKL2 ||
+                     (kRFDecode && kKBlocksPerStage == 2 && kNumEpilogueWarpgroups == 2 &&
+                      ((L2_SHAPE_K / BLOCK_K) % kKBlocksPerStage) == 0 &&
+                      (L2_SHAPE_K / BLOCK_K) >= 2 * kKBlocksPerStage &&
+                      L2_SHAPE_N / TASK_BLOCK_N_L2 == fused_layout::kSM90SplitKL2NumL2BlockNs &&
+                      L2_WG_BLOCK_N == WG_BLOCK_N),
+                     "Split-K L2: RF decode, 2 K-blocks per stage, >= 2 whole stages, 12 L2 N-blocks, full-row L2 tasks");
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -532,6 +560,12 @@
         }
         cutlass::arch::fence_barrier_init();
     }
+    // Fast NVLink-barrier epilogue: every thread snapshots the done count BEFORE
+    // the kernel-start __syncthreads (see fused_comm::nvlink_barrier for why this
+    // is race-free: SM0's first write of the word this launch is ordered after the
+    // first barrier's prologue grid sync, which every CTA reaches after this sync).
+    const uint32_t nvl_done_base = kNvlFastEpilogue ?
+        ptx::ld_volatile(workspace.get_nvl_done_count_ptr()) : 0u;
     __syncthreads();
     if (thread_idx == 0) stamp_max(12);
 
@@ -605,22 +639,40 @@
         }
     };
 
+    // K-block count of K split `k_split_idx` (of `num_k_splits` in {1, 2}) of a task
+    // with `total_k_blocks` K-blocks: half 0 is the lower whole-stage half (floor to
+    // kKBlocksPerStage; L1 24 -> 12, L2 10 -> 4), half 1 the rest (12 / 6). The
+    // task consumers derive the first absolute K-block as total - count for half 1.
+    const auto get_split_k_num_blocks = [](const uint32_t& total_k_blocks,
+                                           const uint32_t& k_split_idx,
+                                           const uint32_t& num_k_splits) -> uint32_t {
+        if (num_k_splits == 1u)
+            return total_k_blocks;
+        const uint32_t half_0 = ((total_k_blocks / 2u) / kKBlocksPerStage) * kKBlocksPerStage;
+        return k_split_idx == 0u ? half_0 : total_k_blocks - half_0;
+    };
     const auto invoke_interleaved_task = [&](const task_info_t& task_info,
                                               auto&& func) {
-        // Split-K L1 tasks cover (L1 K-blocks / num_k_splits) blocks starting at
-        // k_split_idx * that count; L2 tasks are never split.
+        // Split-K tasks (L1 tail: kSplitKL1, L2 tail: kSplitKL2) cover the K-block
+        // range of their K split; every other task covers the whole K.
         if (task_info.block_phase == fused_sched::BlockPhase::Linear1) {
             const uint32_t num_k_splits = kSplitKL1 ? task_info.get_num_k_splits() : 1u;
+            const uint32_t k_split_idx = kSplitKL1 ? task_info.get_k_split_idx() : 0u;
             func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear1>{},
-                 task_info.local_expert_idx, (L1_SHAPE_K / BLOCK_K) / num_k_splits,
+                 task_info.local_expert_idx,
+                 get_split_k_num_blocks(L1_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits),
                  task_info.m_block_idx, task_info.n_block_idx,
                  task_info.pool_block_idx, task_info.valid_m,
-                 kSplitKL1 ? task_info.get_k_split_idx() : 0u, num_k_splits);
+                 k_split_idx, num_k_splits);
         } else {
+            const uint32_t num_k_splits = kSplitKL2 ? task_info.get_num_k_splits() : 1u;
+            const uint32_t k_split_idx = kSplitKL2 ? task_info.get_k_split_idx() : 0u;
             func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear2>{},
-                 task_info.local_expert_idx, L2_SHAPE_K / BLOCK_K,
+                 task_info.local_expert_idx,
+                 get_split_k_num_blocks(L2_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits),
                  task_info.m_block_idx, task_info.n_block_idx,
-                 task_info.pool_block_idx, task_info.valid_m, 0u, 1u);
+                 task_info.pool_block_idx, task_info.valid_m,
+                 k_split_idx, num_k_splits);
         }
     };
 
@@ -653,8 +705,9 @@
                     *workspace.get_l1_task_count_ptr() = 0;
                     *workspace.get_l2_task_count_ptr() = 0;
                 }
-                if constexpr (kSplitKL1) {
-                    for (uint32_t i = thread_idx; i < fused_layout::kSM90SplitKL1NumSlots; i += kNumDispatchThreads)
+                if constexpr (kSplitKL1 || kSplitKL2) {
+                    // L1 and L2 flag slots are contiguous (L1 first)
+                    for (uint32_t i = thread_idx; i < fused_layout::kSM90SplitKNumSlots; i += kNumDispatchThreads)
                         *workspace.get_splitk_l1_flag_ptr(0, i) = 0;
                 }
             }
@@ -789,7 +842,8 @@
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            kDistributedExpertBcast, true);
+            kDistributedExpertBcast, true,
+            /* fast epilogue: barrier #1 of the launch */ kNvlFastEpilogue, nvl_done_base, 1u);
         if (thread_idx == 0) {
             stamp_max(1);
             if (sm_idx == 0) {
@@ -979,8 +1033,10 @@
                                      const uint32_t& num_k_splits) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
-            // First absolute K-block of this task (split-K L1 halves start mid-K)
-            const uint32_t k_block_begin = k_split_idx * num_k_blocks;
+            // First absolute K-block of this task (split-K K half 1 starts mid-K; the
+            // halves may differ in size, so half 1 starts at total - its own count)
+            const uint32_t k_block_begin = k_split_idx == 0u ? 0u :
+                (kBlockIsL2 ? L2_SHAPE_K / BLOCK_K : L1_SHAPE_K / BLOCK_K) - num_k_blocks;
             const auto tensor_map_a_ptr = kBlockIsL2 ?
                 &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = kBlockIsL2 ?
@@ -1042,12 +1098,12 @@
 
                 if constexpr (kBlockIsL2) {
                     if (has_valid_m) {
-                        // Bits of the L1 N-blocks feeding K-blocks
-                        // [k_block_idx, k_block_idx + kKBlocksPerStage).
+                        // Bits of the L1 N-blocks feeding absolute K-blocks
+                        // [k_block_begin + k_block_idx, + kKBlocksPerStage).
                         constexpr uint32_t kBitsPerStage = kKBlocksPerStage * kNumL1BlocksPerL2KBlock;
                         DG_STATIC_ASSERT(kBitsPerStage < 64, "Stage readiness mask overflow");
                         const uint64_t need = ((1ull << kBitsPerStage) - 1ull)
-                                              << (k_block_idx * kNumL1BlocksPerL2KBlock);
+                                              << ((k_block_begin + k_block_idx) * kNumL1BlocksPerL2KBlock);
                         if ((l1_ready_mask & need) != need) {
                             const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
                             do {
@@ -1130,7 +1186,8 @@
                                      const uint32_t& num_k_splits) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
-            const uint32_t k_block_begin = k_split_idx * num_k_blocks;
+            const uint32_t k_block_begin = k_split_idx == 0u ? 0u :
+                (kBlockIsL2 ? L2_SHAPE_K / BLOCK_K : L1_SHAPE_K / BLOCK_K) - num_k_blocks;
             const auto tensor_map_b_ptr = kBlockIsL2 ?
                 &tensor_map_l2_weights : &tensor_map_l1_weights;
             constexpr uint32_t shape_n = kBlockIsL2 ? L2_SHAPE_N : L1_SHAPE_N;
@@ -2165,17 +2222,31 @@
             // wait is short and deadlock-free), resets it for the next launch, adds
             // the partner's slot and runs the normal epilogue + notify.
             // valid_m == 0 tasks skipped this on both halves (flag untouched).
-            if constexpr (kSplitKL1 && !kBlockIsL2) {
+            // Split-K L2 (kSplitKL2) uses the identical protocol on the L2 tail tasks
+            // (own slot/flag index space): the L2 accumulator is also two 64-row
+            // weight halves x 8 tokens per thread, the finisher runs the L2 epilogue
+            // (BF16 x scale, NVLink scatter). Deadlock-free for the same reason: the
+            // publisher (index i) only waits on L1-ready bits, the finisher (i + 1)
+            // only on the publisher; by induction on the claim order every earlier
+            // task completes.
+            if constexpr ((kSplitKL1 && !kBlockIsL2) || (kSplitKL2 && kBlockIsL2)) {
                 if (num_k_splits > 1) {
                     constexpr uint32_t kNumPartialElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
-                    // (Guarded on kSplitKL1: this discarded branch is not template-dependent.)
-                    DG_STATIC_ASSERT(!kSplitKL1 || kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
+                    // (Guarded: this discarded branch is not template-dependent.)
+                    DG_STATIC_ASSERT(!(kSplitKL1 || kSplitKL2) ||
+                                     kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
                                      fused_layout::kSM90SplitKL1PartialBytes,
                                      "Split-K partial slot size mismatch");
                     DG_STATIC_ASSERT(fused_layout::kSM90SplitKL1NumKSplits == 2,
                                      "Split-K handshake assumes one publisher and one finisher half");
-                    float* slot = workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx);
-                    uint32_t* flag = workspace.get_splitk_l1_flag_ptr(pool_block_idx, n_block_idx);
+                    DG_STATIC_ASSERT(!kBlockIsL2 || kWGHalves == kSwapABWeightHalves,
+                                     "Split-K L2 expects both weight halves per WG");
+                    float* slot = kBlockIsL2 ?
+                        workspace.get_splitk_l2_scratch_ptr(pool_block_idx, n_block_idx) :
+                        workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx);
+                    uint32_t* flag = kBlockIsL2 ?
+                        workspace.get_splitk_l2_flag_ptr(pool_block_idx, n_block_idx) :
+                        workspace.get_splitk_l1_flag_ptr(pool_block_idx, n_block_idx);
                     if (k_split_idx == 0) {
                         #pragma unroll
                         for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
@@ -2760,8 +2831,10 @@
         fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
                              kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
             workspace, sym_buffer, sm_idx, epilogue_thread_idx,
-            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
-        );
+            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); },
+            true, true,
+            /* fast epilogue: barrier #2 of the launch (#3 = after cleanup, no epilogue) */
+            kNvlFastEpilogue, nvl_done_base, 2u);
         if (epilogue_thread_idx == 0) stamp_max(6);
 
         // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that

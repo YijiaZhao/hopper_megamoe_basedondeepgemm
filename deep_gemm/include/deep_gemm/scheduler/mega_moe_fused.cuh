@@ -329,7 +329,11 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kMaxSplitKPoolBlocks = 0xffffffffu,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
-          uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N>
+          uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
+          // L2 split-K: same tail rule for the L2 tasks of the last partial L2 wave
+          // (`num_l2_tasks % kNumSMs` highest L2 task indices), each claimed as
+          // kNumL2KSplits adjacent K-range task indices. Same fit conditions.
+          uint32_t kNumL2KSplits = 1>
 struct InterleavedMegaMoEScheduler {
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using task_info_t = TaskInfo;
@@ -351,6 +355,8 @@ struct InterleavedMegaMoEScheduler {
     // exceeds the L2 count; `get_num_l1_warmup_waves` accounts for the surplus
     // through its per-M-block task difference term.
     DG_STATIC_ASSERT(kNumL1KSplits >= 1 && kNumL1KSplits <= 255, "Invalid L1 K-split count");
+    DG_STATIC_ASSERT(kNumL2KSplits >= 1 && kNumL2KSplits <= 255, "Invalid L2 K-split count");
+    DG_STATIC_ASSERT(L2_SHAPE_K <= 0xffffu, "L2 K extent must fit the TaskInfo shape_k field");
     DG_STATIC_ASSERT(L1_SHAPE_K <= 0xffffu, "L1 K extent must fit the TaskInfo shape_k field");
 
     const fused_layout::Workspace& workspace;
@@ -369,6 +375,10 @@ struct InterleavedMegaMoEScheduler {
     // `num_l1_split_base` on are the K splits of the tail tasks.
     uint32_t num_l1_split_base = 0;
     uint32_t num_total_l1_task_indices = 0;
+    // L2 counterpart: effective split factor, first split L2 task, total indices
+    uint32_t num_l2_k_splits = 1;
+    uint32_t num_l2_split_base = 0;
+    uint32_t num_total_l2_task_indices = 0;
 
     CUTLASS_DEVICE
     InterleavedMegaMoEScheduler(
@@ -444,6 +454,19 @@ struct InterleavedMegaMoEScheduler {
             min_l1_warmup_waves += kNumSplitKExtraWarmupWaves;
         num_l1_warmup_waves =
             cute::min(min_l1_warmup_waves, num_total_l1_waves);
+
+        // L2 split-K tail (same rule as L1; no warm-up interaction: L2 indices are
+        // only claimed after the L1 warm-up, and the split halves are adjacent
+        // indices so the finisher is always claimed after its publisher).
+        const uint32_t num_l2_full_tasks = num_total_m_blocks * kNumL2BlockNs;
+        const uint32_t num_l2_tail_tasks = num_l2_full_tasks % kNumSMs;
+        const bool split_l2_tail = kNumL2KSplits > 1 &&
+            num_total_m_blocks <= kMaxSplitKPoolBlocks &&
+            num_l2_tail_tasks > 0 && num_l2_tail_tasks * kNumL2KSplits <= kNumSMs;
+        num_l2_k_splits = split_l2_tail ? kNumL2KSplits : 1u;
+        num_l2_split_base = split_l2_tail ? num_l2_full_tasks - num_l2_tail_tasks : num_l2_full_tasks;
+        num_total_l2_task_indices =
+            num_l2_split_base + (num_l2_full_tasks - num_l2_split_base) * num_l2_k_splits;
     }
 
     // Number of L1 task indices covering the first `num_full_tasks` L1 tasks
@@ -533,15 +556,21 @@ struct InterleavedMegaMoEScheduler {
 
             const uint32_t task_idx =
                 get_next_task_idx(workspace.get_l2_task_count_ptr());
-            if (task_idx >= num_total_m_blocks * kNumL2BlockNs)
+            if (task_idx >= num_total_l2_task_indices)
                 break;
 
             if (num_l1_warmup_waves != kNumL1WavesDone)
                 num_l1_warmup_waves = 1;
 
+            // Split-K tail: index = base + (full_idx - base) * splits + k_split
+            const bool is_l2_split = task_idx >= num_l2_split_base;
+            const uint32_t l2_tail_idx = is_l2_split ? task_idx - num_l2_split_base : 0u;
             auto task_info = create_task(
-                BlockPhase::Linear2, task_idx, kNumL2BlockNs,
-                L2_SHAPE_N, L2_SHAPE_K);
+                BlockPhase::Linear2,
+                is_l2_split ? num_l2_split_base + l2_tail_idx / num_l2_k_splits : task_idx,
+                kNumL2BlockNs, L2_SHAPE_N, L2_SHAPE_K);
+            if (is_l2_split)
+                task_info.set_k_split(l2_tail_idx % num_l2_k_splits, num_l2_k_splits);
             const uint32_t num_required_l1_tasks =
                 get_num_l1_task_indices((task_info.pool_block_idx + 1) * kNumL1BlockNs);
             while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) <

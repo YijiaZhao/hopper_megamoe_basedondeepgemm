@@ -454,7 +454,15 @@ template <
     // 64 rows over the full K, no cross-WG reduction) on the BM8 MXFP4 RF swapAB
     // path; see `kL2HalfRowTasks` in the body. Ignored by every other tier.
     // Env DG_FP4_L2_HALFROW (default 0: measured slower on H20, see the body).
-    bool kL2HalfRowTasksRequested = false
+    bool kL2HalfRowTasksRequested = false,
+    // Host-selected L2 split-K tasks (the L2 tasks of the last partial L2 wave run
+    // as two K ranges on two SMs, same cross-CTA fp32 reduction as kSplitKL1) on
+    // the BM8 MXFP4 RF swapAB path; see `kSplitKL2` in the body. Env DG_FP4_SPLITK_L2.
+    bool kSplitKL2Requested = false,
+    // Host-selected fast NVLink-barrier epilogue (SM0 publishes completion through
+    // one word instead of a second grid-wide sync); see `kNvlFastEpilogue` in the
+    // body. Env DG_FP4_NVL_FAST_EPI.
+    bool kNvlFastEpilogueRequested = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

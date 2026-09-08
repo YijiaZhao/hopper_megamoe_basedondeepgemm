@@ -41,8 +41,18 @@ static constexpr uint32_t kSM90SplitKL1NumKSplits = 2;
 static constexpr uint32_t kSM90SplitKL1PartialBytes = 256u * 8u * 4u;
 static constexpr uint32_t kSM90SplitKL1NumSlots =
     kSM90SplitKL1MaxPoolBlocks * kSM90SplitKL1NumL1BlockNs;
+// L2 split-K (`kSplitKL2` in the kernel body; host env DG_FP4_SPLITK_L2): the same
+// protocol for the L2 (expert, n_block) tasks of the last partial L2 wave. The L2
+// accumulator is also 256 hidden rows x 8 tokens (same slot size); the L2 slots
+// live in their own index space (pool_block x 12 BN256 L2 N-blocks) after the L1
+// slots, so the L1 and L2 handshakes of one pool block never share a slot.
+static constexpr uint32_t kSM90SplitKL2NumL2BlockNs = 12;
+static constexpr uint32_t kSM90SplitKL2NumSlots =
+    kSM90SplitKL1MaxPoolBlocks * kSM90SplitKL2NumL2BlockNs;
+// Total (L1 + L2) split-K slots: flags and fp32 partial scratch are sized by this.
+static constexpr uint32_t kSM90SplitKNumSlots = kSM90SplitKL1NumSlots + kSM90SplitKL2NumSlots;
 static constexpr uint64_t kSM90SplitKL1ScratchBytes =
-    static_cast<uint64_t>(kSM90SplitKL1NumSlots) * kSM90SplitKL1PartialBytes;  // 5 MB
+    static_cast<uint64_t>(kSM90SplitKNumSlots) * kSM90SplitKL1PartialBytes;  // 11 MB (L1 5 MB + L2 6 MB)
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -118,8 +128,8 @@ struct Workspace {
         // L2 block arrival mask
         num_bytes += num_max_pool_blocks * sizeof(uint64_t);
 
-        // Split-K L1 ready flags (padded to keep `uint64_t` alignment)
-        num_bytes += math::align<uint64_t>(kSM90SplitKL1NumSlots * sizeof(uint32_t), 8);
+        // Split-K L1 + L2 ready flags (padded to keep `uint64_t` alignment)
+        num_bytes += math::align<uint64_t>(kSM90SplitKNumSlots * sizeof(uint32_t), 8);
 
         // Dispatch pulling source token-topk
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
@@ -127,7 +137,7 @@ struct Workspace {
         // Combine push source indices
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
-        // Split-K L1 fp32 partial-sum scratch (128 B aligned start)
+        // Split-K L1 + L2 fp32 partial-sum scratch (128 B aligned start)
         num_bytes = math::align<uint64_t>(num_bytes, 128);
         num_bytes += kSM90SplitKL1ScratchBytes;
 
@@ -147,7 +157,9 @@ struct Workspace {
     // [20..27]: 2 x `int` NVLink barrier signals (phase 0 and 1)
     // [28..31]: `uint32_t` L1 schedule task counter
     // [32..35]: `uint32_t` L2 schedule task counter
-    // [36..127]: padding to isolate hot schedule and expert counters
+    // [36..39]: `uint32_t` NVLink barrier completion count (fast epilogue; SM0-written,
+    //           never reset: read at kernel start by every CTA as the launch base)
+    // [40..127]: padding to isolate hot schedule and expert counters
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
     template <uint32_t kIndex = 0>
@@ -179,6 +191,11 @@ struct Workspace {
     }
 
     CUTLASS_DEVICE
+    uint32_t* get_nvl_done_count_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 36u);
+    }
+
+    CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
         return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
     }
@@ -207,11 +224,19 @@ struct Workspace {
         return reinterpret_cast<uint64_t*>(base) + pool_block_idx;
     }
 
-    // Split-K L1: ready flag per (pool_block, n_block) (K half 0 -> K half 1)
+    // Split-K L1: ready flag per (pool_block, n_block) (K half 0 -> K half 1).
+    // Flag slot index space: [0, kSM90SplitKL1NumSlots) L1, then kSM90SplitKL2NumSlots L2.
     CUTLASS_DEVICE
     uint32_t* get_splitk_l1_flag_ptr(const uint32_t& pool_block_idx = 0, const uint32_t& n_block_idx = 0) const {
         const auto base = get_l2_arrival_mask_ptr(num_max_pool_blocks);
         return reinterpret_cast<uint32_t*>(base) + pool_block_idx * kSM90SplitKL1NumL1BlockNs + n_block_idx;
+    }
+
+    // Split-K L2: ready flag per (pool_block, L2 n_block), after the L1 flags
+    CUTLASS_DEVICE
+    uint32_t* get_splitk_l2_flag_ptr(const uint32_t& pool_block_idx = 0, const uint32_t& n_block_idx = 0) const {
+        return get_splitk_l1_flag_ptr(0, 0) + kSM90SplitKL1NumSlots +
+            pool_block_idx * kSM90SplitKL2NumL2BlockNs + n_block_idx;
     }
 
     // For dispatch pulling
@@ -219,7 +244,7 @@ struct Workspace {
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
         const auto base = get_splitk_l1_flag_ptr(0, 0) +
-            math::align<uint64_t>(kSM90SplitKL1NumSlots * sizeof(uint32_t), 8) / sizeof(uint32_t);
+            math::align<uint64_t>(kSM90SplitKNumSlots * sizeof(uint32_t), 8) / sizeof(uint32_t);
         return reinterpret_cast<uint32_t*>(base) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;
@@ -242,6 +267,15 @@ struct Workspace {
         return reinterpret_cast<float*>(base +
             static_cast<uint64_t>(pool_block_idx * kSM90SplitKL1NumL1BlockNs + n_block_idx) *
                 kSM90SplitKL1PartialBytes);
+    }
+
+    // Split-K L2: fp32 partial scratch slot (pool_block, L2 n_block), after the L1 slots
+    CUTLASS_DEVICE
+    float* get_splitk_l2_scratch_ptr(const uint32_t& pool_block_idx, const uint32_t& n_block_idx) const {
+        return get_splitk_l1_scratch_ptr(0, 0) +
+            (static_cast<uint64_t>(kSM90SplitKL1NumSlots) +
+             pool_block_idx * kSM90SplitKL2NumL2BlockNs + n_block_idx) *
+                (kSM90SplitKL1PartialBytes / sizeof(float));
     }
 };
 
