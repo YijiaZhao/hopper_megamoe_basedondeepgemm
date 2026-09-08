@@ -42,6 +42,9 @@ REPORT = [
     (6, "after combine NVLink barrier"),
     (7, "combine end (kernel end)"),
 ]
+# SM0-only accumulators (per launch after reset): 13 = entry->after NVLink barrier#1,
+# 16 = time spent inside NVLink barrier#1 (includes cross-rank launch skew).
+ACCUM = [(13, "SM0: entry->after barrier1"), (16, "SM0: barrier1 wait incl. skew")]
 
 
 def reset(stamps):
@@ -128,7 +131,9 @@ def main():
             if i >= args.warmup:
                 s = stamps.cpu().tolist()
                 t0 = s[0]
-                rows.append({slot: (s[slot] - t0) / 1000.0 for slot, _ in REPORT})
+                row = {slot: (s[slot] - t0) / 1000.0 for slot, _ in REPORT}
+                row.update({slot: s[slot] / 1000.0 for slot, _ in ACCUM})
+                rows.append(row)
                 wall.append(start.elapsed_time(end) * 1000.0)
         dist.barrier(group=group)
 
@@ -143,6 +148,9 @@ def main():
             for slot, name in REPORT:
                 print(f"{slot:>4} {name:<32} {med[slot]:>9.2f} {mn[slot]:>9.2f} {mx[slot]:>9.2f} {med[slot]-prev:>9.2f}")
                 prev = med[slot]
+            for slot, name in ACCUM:
+                v = [r[slot] for r in rows]
+                print(f"{slot:>4} {name:<32} {statistics.median(v):>9.2f} {min(v):>9.2f} {max(v):>9.2f}")
             print(f"CUDA-event wall (us): median {statistics.median(wall):.2f}  "
                   f"min {min(wall):.2f}  max {max(wall):.2f}")
     finally:
