@@ -32,6 +32,7 @@ public:
         bool distributed_expert_bcast;
         bool qoq;
         bool dense_weight_tiles;
+        bool half_tile_tasks;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -72,7 +73,8 @@ public:
             "        /* kSwapPipelineDecode */ {},\n"
             "        /* kDistributedExpertBcast */ {},\n"
             "        /* kQoQ */ {},\n"
-            "        /* kDenseWeightTiles */ {}",
+            "        /* kDenseWeightTiles */ {},\n"
+            "        /* kHalfTileTasksRequested */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -82,7 +84,8 @@ public:
             args.swap_pipeline_decode ? "true" : "false",
             args.distributed_expert_bcast ? "true" : "false",
             args.qoq ? "true" : "false",
-            args.dense_weight_tiles ? "true" : "false");
+            args.dense_weight_tiles ? "true" : "false",
+            args.half_tile_tasks ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -193,11 +196,18 @@ static void sm90_fp4_h20_fused_mega_moe(
     // QoQ W4A8 is implemented for the swapAB tiers only (<= 64 tokens per rank).
     DG_HOST_ASSERT(!qoq || plan.swap_ab);
 
-    // Half-tile tasks (kernel `kHalfTileTasks`, gate fused_layout::kSM90FusedHalfTileTasks):
-    // the BM8 MXFP4 RF swapAB tier schedules 128-row tasks, so the L1 output store
-    // box and the L2 activation-scale granularity follow the 128-row task N.
+    // Half-tile tasks (kernel `kHalfTileTasks`, master gate
+    // fused_layout::kSM90FusedHalfTileTasks): the BM8 MXFP4 RF swapAB tier
+    // schedules 128-row tasks (intra-CTA K-split), so the L1 output store box and
+    // the L2 activation-scale granularity follow the 128-row task N.
+    // H20 A/B (2026-09-09): wins only when the L1 tasks fit one wave (M=2 global
+    // tokens: 51 -> 44.5 us); at M=8/16 the per-K-block RF loop cost does not halve
+    // with the task, so it loses (65 -> 68.6, 90 -> 101 us). Default OFF; the token
+    // count per rank cannot tell M=2 from M=8 (both 1 token/rank), so this is an
+    // explicit knob rather than a tier rule.
     const bool half_tile_tasks = fused_layout::kSM90FusedHalfTileTasks &&
-        mxfp4 && plan.swap_ab && config.block_m == 8;
+        mxfp4 && plan.swap_ab && config.block_m == 8 &&
+        get_env<int>("DG_FP4_HALF_TILE", 0) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;
@@ -271,6 +281,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // one 1D bulk copy per stage instead of a TMA-issue-bound 2D box.
         // NVFP4 keeps the row-major fused layout + 2D TMA.
         .dense_weight_tiles = dense_weight_tiles,
+        .half_tile_tasks = half_tile_tasks,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,

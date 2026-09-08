@@ -120,8 +120,15 @@
     // smem and WG0 alone runs the epilogue (64 SwiGLU columns for L1, 128 BF16
     // columns for L2). Weight tile layout (256 x 80 B) is unchanged; the B loader
     // fetches the two 10 KB sub-tiles of a stage with two bulk copies.
+    // H20 probe (2026-09-09, 8 ranks, 78 SMs): the per-WG K-loop costs ~740 ns per
+    // K128 block whatever the grouping (RF decode 349 + RS-WGMMA issue/drain ~390),
+    // so a half task is ~9.9 us instead of ~16 us and 160 tasks quantise onto 78
+    // SMs as badly as 80 do: M=2 (single wave) kernel end 51 -> 44.5 us, but M=8
+    // 65 -> 68.6 and M=16 90 -> 101-103 us. The host therefore keeps it OFF by
+    // default (DG_FP4_HALF_TILE=1 enables it).
     constexpr bool kHalfTileTasks =
-        fused_layout::kSM90FusedHalfTileTasks && kSwapABRequested && kMXFP4 && BLOCK_M == 8;
+        fused_layout::kSM90FusedHalfTileTasks && kHalfTileTasksRequested &&
+        kSwapABRequested && kMXFP4 && BLOCK_M == 8;
     // N extent of one scheduled task (== the weight tile N unless half-tile tasks).
     constexpr uint32_t TASK_BLOCK_N = kHalfTileTasks ? BLOCK_N / 2 : BLOCK_N;
     using interleaved_scheduler_t = fused_sched::InterleavedMegaMoEScheduler<

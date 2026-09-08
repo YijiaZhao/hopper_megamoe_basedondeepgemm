@@ -440,7 +440,11 @@ template <
     // the B loader streams one 1D bulk copy (BLOCK_N*80 B) per stage from
     // `l{1,2}_weights_ptr` instead of the 2D TMA box (H20: 2D box is
     // TMA-issue bound, ~0.4us/stage; 1D bulk ~0.18us/stage at 7 in flight).
-    bool kDenseWeightTiles = false
+    bool kDenseWeightTiles = false,
+    // Host-selected half-tile tasks (128-row tasks + intra-CTA K-split) on the
+    // BM8 MXFP4 RF swapAB path; see `kHalfTileTasks` in the body. Ignored by
+    // every other tier.
+    bool kHalfTileTasksRequested = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
