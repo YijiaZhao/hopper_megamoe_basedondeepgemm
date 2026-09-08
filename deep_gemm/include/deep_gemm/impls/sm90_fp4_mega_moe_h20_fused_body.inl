@@ -1275,6 +1275,17 @@
                             if constexpr (!kBlockIsL2)
                                 kstage_add(17, kt_a - kt_b);
                             decode_stage_rf(next_stage, fnext);
+                            // PROBE EXPERIMENT (timing only): decode a second time into a
+                            // dummy buffer to test whether slot 18 is compute/LDS bound.
+                            if (kstage_probe_on || (phase_stamps != nullptr && sm_idx != 0)) {
+                                uint32_t fdummy[2][4][4];
+                                decode_stage_rf(next_stage, fdummy);
+                                #pragma unroll
+                                for (uint32_t h = 0; h < 2; ++ h)
+                                    #pragma unroll
+                                    for (uint32_t k = 0; k < 4; ++ k)
+                                        asm volatile("" :: "r"(fdummy[h][k][0]), "r"(fdummy[h][k][3]));
+                            }
                             kt_b = clock64();
                             kstage_add(18, kt_b - kt_a);
                         }
