@@ -2090,12 +2090,13 @@
             if constexpr (kSplitKL1 && !kBlockIsL2) {
                 if (num_k_splits > 1) {
                     constexpr uint32_t kNumPartialElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
-                    DG_STATIC_ASSERT(kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
+                    // (Guarded on kSplitKL1: this discarded branch is not template-dependent.)
+                    DG_STATIC_ASSERT(!kSplitKL1 || kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
                                      fused_layout::kSM90SplitKL1PartialBytes,
                                      "Split-K partial slot size mismatch");
                     DG_STATIC_ASSERT(fused_layout::kSM90SplitKL1NumKSplits == 2,
                                      "Split-K handshake reads the single partner slot (k_split_idx ^ 1)");
-                    DG_STATIC_ASSERT(SMEM_CD_OUTPUT_BASE_SIZE >= SMEM_CD_L1_SIZE + 4u,
+                    DG_STATIC_ASSERT(!kSplitKL1 || SMEM_CD_OUTPUT_BASE_SIZE >= SMEM_CD_L1_SIZE + 4u,
                                      "Split-K role broadcast word must not overlap the L1 CD tile");
                     auto* smem_splitk_role = reinterpret_cast<uint32_t*>(
                         reinterpret_cast<uint8_t*>(smem_cd_base) + SMEM_CD_OUTPUT_BASE_SIZE - 4u);
