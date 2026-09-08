@@ -1076,9 +1076,19 @@
             // decoder's, so the result is bit-exact vs the SS path. The four
             // steps share one commit group, so each has its own fragment array;
             // registers are only reused after `warpgroup_wait<0>`.
+            // Stage-level probe (SM0 / thread 0 only; phase_stamps slots 17..22, SM cycles):
+            //   17 full-barrier wait | 18 RF decode+LUT | 19 wgmma issue->drain
+            //   21 #L1 stages | 22 head-to-head stage total (excl. last stage of a task)
+            const bool kstage_probe_on =
+                (phase_stamps != nullptr) && (sm_idx == 0) && (epilogue_thread_idx == 0);
+            unsigned long long kstage_t_prev = 0;
+            const auto kstage_add = [&](const uint32_t slot, const unsigned long long& v) {
+                if (kstage_probe_on) atomicAdd(phase_stamps + slot, v);
+            };
             const auto issue_swap_ab_half_rf = [&]<typename SwapRS, uint32_t kSwapAccum>(
                     float (&swap_accum)[kSwapAccum], const uint32_t& half) {
                 DG_STATIC_ASSERT(BLOCK_K / SwapRS::K == 4, "Expects 4 K32 steps per K128");
+                const unsigned long long kt_a = clock64();
                 const auto* packed_rows =
                     reinterpret_cast<const uint8_t*>(smem_packed_b[stage_idx]);
                 const uint32_t row_0 = wg_n_idx + half * 64u + r_0;
@@ -1115,6 +1125,8 @@
                     for (uint32_t i = 0; i < 4; ++ i)
                         ptx::warpgroup_fence_operand(reinterpret_cast<float&>(frag[k][i]));
                 }
+                const unsigned long long kt_b = clock64();
+                kstage_add(18, kt_b - kt_a);
                 ptx::warpgroup_arrive();
                 #pragma unroll
                 for (uint32_t k = 0; k < 4; ++ k) {
@@ -1127,6 +1139,7 @@
                 for (uint32_t i = 0; i < kSwapAccum; ++ i)
                     ptx::warpgroup_fence_operand(swap_accum[i]);
                 ptx::warpgroup_wait<0>();
+                kstage_add(19, clock64() - kt_b);
             };
 
             // Software-pipelined swapAB main loop (kSwapPipelineDecode): the WGMMAs
@@ -1231,7 +1244,15 @@
             for (uint32_t k_block_idx = 0;
                  k_block_idx < num_k_blocks;
                  advance_pipeline(k_block_idx)) {
+                const unsigned long long kt_head = clock64();
                 full_barriers[stage_idx]->wait(phase);
+                if constexpr (!kBlockIsL2) {
+                    kstage_add(17, clock64() - kt_head);
+                    kstage_add(21, 1ull);
+                    if (k_block_idx > 0)
+                        kstage_add(22, kt_head - kstage_t_prev);
+                    kstage_t_prev = kt_head;
+                }
                 if constexpr (kUseInterleavedScheduler) {
                     if (k_block_idx == 0)
                         interleaved_scheduler.release_task_info(lane_idx);

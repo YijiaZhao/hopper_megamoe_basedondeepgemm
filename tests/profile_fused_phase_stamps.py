@@ -45,6 +45,10 @@ REPORT = [
 # SM0-only accumulators (per launch after reset): 13 = entry->after NVLink barrier#1,
 # 16 = time spent inside NVLink barrier#1 (includes cross-rank launch skew).
 ACCUM = [(13, "SM0: entry->after barrier1"), (16, "SM0: barrier1 wait incl. skew")]
+# K-loop stage probe (SM0 thread0, SM cycles @1830MHz): per-stage ns = cycles / count / 1.83
+STAGE = [(17, "L1 stage: full-barrier wait"), (18, "L1 stage: RF decode+LUT"),
+         (19, "L1 stage: wgmma issue->drain"), (22, "L1 stage: head-to-head total")]
+SM_GHZ = 1.83
 
 
 def reset(stamps):
@@ -133,6 +137,9 @@ def main():
                 t0 = s[0]
                 row = {slot: (s[slot] - t0) / 1000.0 for slot, _ in REPORT}
                 row.update({slot: s[slot] / 1000.0 for slot, _ in ACCUM})
+                n_st = max(s[21], 1)
+                row.update({slot: s[slot] / n_st / SM_GHZ for slot, _ in STAGE})
+                row[21] = s[21]
                 rows.append(row)
                 wall.append(start.elapsed_time(end) * 1000.0)
         dist.barrier(group=group)
@@ -151,6 +158,11 @@ def main():
             for slot, name in ACCUM:
                 v = [r[slot] for r in rows]
                 print(f"{slot:>4} {name:<32} {statistics.median(v):>9.2f} {min(v):>9.2f} {max(v):>9.2f}")
+            n_st = statistics.median(r[21] for r in rows)
+            print(f"--- K-loop stage probe (SM0 thread0), {n_st:.0f} L1 stages/launch, ns per stage ---")
+            for slot, name in STAGE:
+                v = [r[slot] for r in rows]
+                print(f"{slot:>4} {name:<32} {statistics.median(v):>9.1f} {min(v):>9.1f} {max(v):>9.1f}")
             print(f"CUDA-event wall (us): median {statistics.median(wall):.2f}  "
                   f"min {min(wall):.2f}  max {max(wall):.2f}")
     finally:
