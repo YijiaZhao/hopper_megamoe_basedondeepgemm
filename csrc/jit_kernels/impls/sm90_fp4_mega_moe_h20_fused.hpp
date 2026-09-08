@@ -212,7 +212,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         mxfp4 && plan.swap_ab && config.block_m == 8 &&
         get_env<int>("DG_FP4_HALF_TILE", 0) != 0;
     // L1 split-K tasks (kernel `kSplitKL1`): the BM8 MXFP4 RF swapAB tier claims
-    // each L1 (expert, n_block) task as two K halves on two SMs (cross-CTA fp32
+    // the L1 tasks of the last partial L1 wave as two K halves on two SMs (cross-CTA fp32
     // reduction through fused_layout::Workspace scratch, 5 MB, bounded to
     // kSM90SplitKL1MaxPoolBlocks pool blocks; larger launches fall back in-kernel).
     // The per-WG math shape is unchanged, so unlike half-tile tasks the per-task

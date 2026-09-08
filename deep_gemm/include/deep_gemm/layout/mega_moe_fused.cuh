@@ -26,8 +26,8 @@ static constexpr bool kSM90FusedHalfTileTasks = DG_FUSED_HALF_TILE_TASKS != 0;
 
 // SM90 fused MXFP4 BM8 (RF swapAB, 2 K128 blocks per stage): L1 split-K tasks
 // (`kSplitKL1` in the kernel body; host env DG_FP4_SPLITK_L1, default ON for that
-// tier). Each L1 (expert, n_block) task is claimed as two K halves that run on two
-// SMs; K half 0 publishes its fp32 partial sums through a workspace scratch slot
+// tier). The L1 (expert, n_block) tasks of the last partial L1 wave are claimed as
+// two K halves that run on two SMs; K half 0 publishes its fp32 partial sums through a workspace scratch slot
 // indexed by (pool_block, n_block) and releases a per-(pool_block, n_block) flag
 // that K half 1 acquires before running the epilogue.
 // The scratch is bounded: the scheduler only splits when the launch's total pool

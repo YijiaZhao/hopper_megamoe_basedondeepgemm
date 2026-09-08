@@ -133,10 +133,13 @@
     constexpr uint32_t TASK_BLOCK_N = kHalfTileTasks ? BLOCK_N / 2 : BLOCK_N;
     // L1 split-K tasks (kSplitKL1; host env DG_FP4_SPLITK_L1, default ON for the BM8
     // MXFP4 RF swapAB tier == the 2-K-block-per-stage path; every other tier is
-    // untouched). Each L1 (expert, n_block) task is scheduled as two adjacent task
-    // indices k_half = 0/1 covering K-blocks [12*k_half, 12*k_half + 12) (6 stages),
-    // so the two halves run concurrently on two SMs and a task takes ~half as long
-    // (80 L1 tasks on 78 SMs no longer cost two full task lengths). The per-WG math
+    // untouched). The L1 (expert, n_block) tasks of the last partial L1 wave (the
+    // `num_l1_tasks % kNumSMs` stragglers; M=8: 2 of 80, M=16: 4 of 160) are each
+    // scheduled as two adjacent task indices k_half = 0/1 covering K-blocks
+    // [12*k_half, 12*k_half + 12) (6 stages), so the two halves run concurrently
+    // on two SMs and the straggler wave takes ~half a task length. Splitting every
+    // task instead was measured neutral (H20 09-09: 3 waves of ~11.3 us halves ==
+    // 2 waves of ~17 us tasks; ~3.8 us fixed cost per task). The per-WG math
     // shape is identical to the unsplit path; `final_accum` already carries the
     // per-K-block activation SF at promote time, so the two partials are directly
     // summable. Reduction (before the L1 epilogue): half 0 publishes its partial to

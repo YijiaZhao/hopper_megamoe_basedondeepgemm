@@ -317,11 +317,14 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumSMs, uint32_t kNumRanks,
-          // L1 split-K: every L1 (pool_block, n_block) task is claimed as
-          // `kNumL1KSplits` K-range tasks (adjacent task indices, so the halves
-          // run concurrently on different SMs) whenever the launch's pool block
+          // L1 split-K: the L1 tasks of the last, partial L1 wave (the
+          // `num_l1_tasks % kNumSMs` highest task indices, i.e. the stragglers
+          // that would otherwise serialise a whole extra task length) are each
+          // claimed as `kNumL1KSplits` K-range tasks (adjacent task indices, so
+          // the halves run concurrently on different SMs). Splitting is only
+          // applied when all the halves fit one wave and the launch's pool block
           // count fits the partial-sum scratch (`kMaxSplitKPoolBlocks`);
-          // otherwise the launch falls back to unsplit tasks.
+          // otherwise the launch runs unsplit tasks.
           uint32_t kNumL1KSplits = 1,
           uint32_t kMaxSplitKPoolBlocks = 0xffffffffu,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
@@ -333,7 +336,9 @@ struct InterleavedMegaMoEScheduler {
 
     static constexpr uint32_t kNumScheduleStages = 2;
     static constexpr uint32_t kNumL1WavesDone = 0xffffffffu;
-    static constexpr uint32_t kNumSplitKExtraWarmupWaves = 2;
+    // The split tail adds < 1 wave of L1 task indices; one extra L1-first wave
+    // keeps them ahead of the L2 claims (extra L1 waves are deadlock-free).
+    static constexpr uint32_t kNumSplitKExtraWarmupWaves = 1;
 
     DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid L1 shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid L2 shape");
@@ -360,6 +365,10 @@ struct InterleavedMegaMoEScheduler {
     uint32_t num_l1_warmup_waves = 0;
     // Effective L1 K-split factor for this launch (1 or kNumL1KSplits)
     uint32_t num_l1_k_splits = 1;
+    // L1 task indices [0, num_l1_split_base) are unsplit tasks; indices from
+    // `num_l1_split_base` on are the K splits of the tail tasks.
+    uint32_t num_l1_split_base = 0;
+    uint32_t num_total_l1_task_indices = 0;
 
     CUTLASS_DEVICE
     InterleavedMegaMoEScheduler(
@@ -413,30 +422,35 @@ struct InterleavedMegaMoEScheduler {
         __syncwarp();
 
         num_total_m_blocks = get_pool_block_offset(kNumExpertsPerRank);
-        num_l1_k_splits = (kNumL1KSplits > 1 && num_total_m_blocks <= kMaxSplitKPoolBlocks) ?
-            kNumL1KSplits : 1u;
-        const uint32_t num_total_l1_tasks = get_num_total_l1_tasks();
+        const uint32_t num_l1_full_tasks = num_total_m_blocks * kNumL1BlockNs;
+        const uint32_t num_l1_tail_tasks = num_l1_full_tasks % kNumSMs;
+        // Split only when the tail's splits fit one wave (otherwise they would
+        // form another full wave and merely add per-task fixed cost).
+        const bool split_tail = kNumL1KSplits > 1 &&
+            num_total_m_blocks <= kMaxSplitKPoolBlocks &&
+            num_l1_tail_tasks > 0 && num_l1_tail_tasks * kNumL1KSplits <= kNumSMs;
+        num_l1_k_splits = split_tail ? kNumL1KSplits : 1u;
+        num_l1_split_base = split_tail ? num_l1_full_tasks - num_l1_tail_tasks : num_l1_full_tasks;
+        num_total_l1_task_indices =
+            num_l1_split_base + (num_l1_full_tasks - num_l1_split_base) * num_l1_k_splits;
         const uint32_t num_total_l1_waves =
-            math::ceil_div(num_total_l1_tasks, kNumSMs);
+            math::ceil_div(num_total_l1_task_indices, kNumSMs);
         uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
-            num_total_m_blocks, kNumSMs, kNumL1BlockNs * num_l1_k_splits, kNumL2BlockNs);
-        // Split-K: the K halves are short, so let the L1 warm-up absorb the
-        // leftover half-tasks of the last (partial) L1 wave instead of queueing
-        // them behind an L2 task on the alternating schedule (M=8: 160 half tasks
-        // on 78 SMs -> 3 warm-up waves claim them all). Extra L1-first waves are
-        // always deadlock-free (L1 tasks never wait on L2 progress).
-        if (num_l1_k_splits > 1)
+            num_total_m_blocks, kNumSMs, kNumL1BlockNs, kNumL2BlockNs);
+        // Split-K tail: claim the (short) halves in the L1 warm-up rather than
+        // behind an L2 task on the alternating schedule (M=16: 156 + 8 indices
+        // on 78 SMs -> 3 warm-up waves claim them all).
+        if (split_tail)
             min_l1_warmup_waves += kNumSplitKExtraWarmupWaves;
         num_l1_warmup_waves =
             cute::min(min_l1_warmup_waves, num_total_l1_waves);
     }
 
-    CUTLASS_DEVICE uint32_t get_num_l1_tasks_per_m_block() const {
-        return kNumL1BlockNs * num_l1_k_splits;
-    }
-
-    CUTLASS_DEVICE uint32_t get_num_total_l1_tasks() const {
-        return num_total_m_blocks * get_num_l1_tasks_per_m_block();
+    // Number of L1 task indices covering the first `num_full_tasks` L1 tasks
+    CUTLASS_DEVICE uint32_t get_num_l1_task_indices(const uint32_t& num_full_tasks) const {
+        return num_full_tasks <= num_l1_split_base ?
+            num_full_tasks :
+            num_l1_split_base + (num_full_tasks - num_l1_split_base) * num_l1_k_splits;
     }
 
     CUTLASS_DEVICE task_info_t create_task(
@@ -500,15 +514,20 @@ struct InterleavedMegaMoEScheduler {
                 -- num_l1_warmup_waves;
                 const uint32_t task_idx =
                     get_next_task_idx(workspace.get_l1_task_count_ptr());
-                if (task_idx >= get_num_total_l1_tasks()) {
+                if (task_idx >= num_total_l1_task_indices) {
                     num_l1_warmup_waves = kNumL1WavesDone;
                     continue;
                 }
-                // Split-K: task index = ((pool * kNumL1BlockNs + n) * splits + k_split)
+                // Split-K tail: index = base + (full_idx - base) * splits + k_split
+                if (task_idx < num_l1_split_base)
+                    return create_task(
+                        BlockPhase::Linear1, task_idx, kNumL1BlockNs,
+                        L1_SHAPE_N, L1_SHAPE_K);
+                const uint32_t tail_idx = task_idx - num_l1_split_base;
                 auto task_info = create_task(
-                    BlockPhase::Linear1, task_idx / num_l1_k_splits, kNumL1BlockNs,
-                    L1_SHAPE_N, L1_SHAPE_K);
-                task_info.set_k_split(task_idx % num_l1_k_splits, num_l1_k_splits);
+                    BlockPhase::Linear1, num_l1_split_base + tail_idx / num_l1_k_splits,
+                    kNumL1BlockNs, L1_SHAPE_N, L1_SHAPE_K);
+                task_info.set_k_split(tail_idx % num_l1_k_splits, num_l1_k_splits);
                 return task_info;
             }
 
@@ -524,7 +543,7 @@ struct InterleavedMegaMoEScheduler {
                 BlockPhase::Linear2, task_idx, kNumL2BlockNs,
                 L2_SHAPE_N, L2_SHAPE_K);
             const uint32_t num_required_l1_tasks =
-                (task_info.pool_block_idx + 1) * get_num_l1_tasks_per_m_block();
+                get_num_l1_task_indices((task_info.pool_block_idx + 1) * kNumL1BlockNs);
             while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) <
                    num_required_l1_tasks) {}
             return task_info;
