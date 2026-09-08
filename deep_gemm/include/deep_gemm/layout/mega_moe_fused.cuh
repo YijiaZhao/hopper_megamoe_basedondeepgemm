@@ -13,6 +13,14 @@ static constexpr int kMaxCandidateBlockM = 192;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 384;
 static constexpr int kSM90InterleavedSchedulerSMEMBytes = 96;
+// SM90 fused MXFP4 BM8 (RF swapAB, 2 K128 blocks per stage): schedule HALF-tile
+// tasks (128 of the 256 packed weight rows per task, intra-CTA K-split between the
+// two math WGs). Compile-time gate shared by host (TMA boxes / SF granularity) and
+// device; set -DDG_FUSED_HALF_TILE_TASKS=0 to recover the full-tile behaviour.
+#ifndef DG_FUSED_HALF_TILE_TASKS
+#define DG_FUSED_HALF_TILE_TASKS 1
+#endif
+static constexpr bool kSM90FusedHalfTileTasks = DG_FUSED_HALF_TILE_TASKS != 0;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>

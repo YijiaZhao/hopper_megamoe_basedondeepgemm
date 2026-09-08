@@ -193,8 +193,14 @@ static void sm90_fp4_h20_fused_mega_moe(
     // QoQ W4A8 is implemented for the swapAB tiers only (<= 64 tokens per rank).
     DG_HOST_ASSERT(!qoq || plan.swap_ab);
 
+    // Half-tile tasks (kernel `kHalfTileTasks`, gate fused_layout::kSM90FusedHalfTileTasks):
+    // the BM8 MXFP4 RF swapAB tier schedules 128-row tasks, so the L1 output store
+    // box and the L2 activation-scale granularity follow the 128-row task N.
+    const bool half_tile_tasks = fused_layout::kSM90FusedHalfTileTasks &&
+        mxfp4 && plan.swap_ab && config.block_m == 8;
+    const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
-    const int l2_scale_gran_k = config.block_n / 2;
+    const int l2_scale_gran_k = task_block_n / 2;
     const auto tensor_map_l1_acts = make_tma_2d_desc(
         l1_acts, hidden, config.num_max_pool_tokens,
         KernelConfig::kBlockK, config.block_m,
@@ -209,7 +215,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         kSM90NVFP4BStoragePerKBlock, config.block_n,
         static_cast<int>(l1_weights.stride(-2)), 0);
 
-    const int l1_output_store_block_n = config.block_n / 2;
+    const int l1_output_store_block_n = task_block_n / 2;
     const auto tensor_map_l1_output = make_tma_2d_desc(
         l2_acts, intermediate_hidden, config.num_max_pool_tokens,
         l1_output_store_block_n, config.block_m,
