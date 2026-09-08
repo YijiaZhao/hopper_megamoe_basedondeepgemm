@@ -457,11 +457,12 @@ template <
     bool kL2HalfRowTasksRequested = false,
     // Host-selected L2 split-K tasks (the L2 tasks of the last partial L2 wave run
     // as two K ranges on two SMs, same cross-CTA fp32 reduction as kSplitKL1) on
-    // the BM8 MXFP4 RF swapAB path; see `kSplitKL2` in the body. Env DG_FP4_SPLITK_L2.
+    // the BM8 MXFP4 RF swapAB path; see `kSplitKL2` in the body. Env DG_FP4_SPLITK_L2
+    // (default 0: measured neutral/slower on H20, see the host).
     bool kSplitKL2Requested = false,
     // Host-selected fast NVLink-barrier epilogue (SM0 publishes completion through
     // one word instead of a second grid-wide sync); see `kNvlFastEpilogue` in the
-    // body. Env DG_FP4_NVL_FAST_EPI.
+    // body. Env DG_FP4_NVL_FAST_EPI (default 0: within noise on H20, see the host).
     bool kNvlFastEpilogueRequested = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void

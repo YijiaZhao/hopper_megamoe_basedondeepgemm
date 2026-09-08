@@ -251,22 +251,32 @@ static void sm90_fp4_h20_fused_mega_moe(
     const bool l2_half_row_tasks = mxfp4 && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && plan.use_interleaved_scheduler && dense_weight_tiles &&
         get_env<int>("DG_FP4_L2_HALFROW", 0) != 0;
-    // L2 split-K tasks (kernel `kSplitKL2`): the same last-partial-wave split for
-    // the L2 tasks (M=16: 192 L2 tasks = 2.46 waves on 78 SMs, the 36 stragglers of
-    // the last wave run as 72 K-range halves; M=8: 96 tasks, 18 stragglers). K
-    // halves are whole 2-K128-block stages: half 0 = K-blocks [0, 4), half 1 =
-    // [4, 10); half 0 publishes, half 1 (claimed one index later) finishes. Scratch
-    // slots are separate from the L1 ones (same 8 KB per slot, workspace +6 MB).
-    // Exclusive with L2 half-row tasks. DG_FP4_SPLITK_L2 (default 1) disables.
+    // L2 split-K tasks (kernel `kSplitKL2`): the L2 tasks of the last L2 claim
+    // batch (the batch that runs after the last L1 wave: (num_l2 - first batch)
+    // % 78, M=8: 22 of 96, M=2: all 24; M=16: 44 -> 88 halves do not fit, unsplit)
+    // run as two K-range halves (K-blocks [0, 4) publisher / [4, 10) finisher) with
+    // the kSplitKL1 protocol on separate scratch slots (workspace +6 MB).
+    // H20 A/B (2026-09-09, 3 interleaved reps, rank-0 stamps): NO gain. The L2 tail
+    // (last L2 - last L1) is a dependency-latency chain after the last L1 notify
+    // (poll + TMA + last stage + epilogue + NVLink scatter, ~5 us at M=8) plus, at
+    // M=16, two full L2 waves gated on the last L1 wave (122 tasks / 78 SMs), and
+    // a 2-way K split shortens neither: M=8 tail 4.7 vs 4.9 us (kernel end 63.9 vs
+    // 64.4), M=16 11.6 vs 10.7 (88.9 vs 87.3), M=2 7.8 vs 6.6 (50.8 vs 48.2).
+    // Default OFF; DG_FP4_SPLITK_L2=1 enables (numerics verified: T=2/8/16/128/512
+    // + QoQ pass). Exclusive with L2 half-row tasks.
     const bool split_k_l2 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
-        dense_weight_tiles && get_env<int>("DG_FP4_SPLITK_L2", 1) != 0;
+        dense_weight_tiles && get_env<int>("DG_FP4_SPLITK_L2", 0) != 0;
     // Fast NVLink-barrier epilogue (kernel `kNvlFastEpilogue`, needs the
     // distributed expert bcast so the first barrier has a prologue grid sync):
     // the two barriers with an epilogue (before dispatch pull, before combine)
     // replace their second grid-wide sync with one SM0-written completion word.
-    // DG_FP4_NVL_FAST_EPI (default 1) disables.
-    const bool nvl_fast_epilogue = get_env<int>("DG_FP4_NVL_FAST_EPI", 1) != 0;
+    // H20 A/B (2026-09-09, 3 interleaved reps): within noise (the epilogue grid
+    // sync is cheap when SM0 arrives last: combine-barrier segment 5.8 vs 6.3 us at
+    // M=8, 5.5 vs 4.8 at M=16; kernel end M=8 64.0 vs 64.4, M=16 87.3 vs 87.3,
+    // M=2 47.3 vs 48.2). Default OFF; DG_FP4_NVL_FAST_EPI=1 enables (numerics
+    // verified: T=2/8/16/128/512 + QoQ pass).
+    const bool nvl_fast_epilogue = get_env<int>("DG_FP4_NVL_FAST_EPI", 0) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;
