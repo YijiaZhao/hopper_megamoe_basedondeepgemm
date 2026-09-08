@@ -1100,7 +1100,7 @@
                     DG_STATIC_ASSERT(BLOCK_K / SwapRS::K == 4, "Expects 4 K32 steps per K128");
                     constexpr uint32_t kSwapAccum = SwapRS::kNumAccum;
                     float swap_accum[2][kSwapAccum];
-                    uint32_t frag[2][4][4];
+                    uint32_t frag[2][2][4][4];  // [buffer][half][k32 step][a0..a3]
 
                     const auto fence_accum = [&]() {
                         #pragma unroll
@@ -1203,33 +1203,60 @@
                         }
                     };
 
-                    for (uint32_t k_block_idx = 0;
-                         k_block_idx < num_k_blocks;
-                         advance_pipeline(k_block_idx)) {
+                    // Software pipeline: the 8 WGMMAs of stage k are issued
+                    // asynchronously; while the tensor cores run, the math warps wait
+                    // for stage k+1's full barrier (the loader runs kNumStages ahead)
+                    // and decode its fragments into the other frag buffer. Only then
+                    // is stage k drained, promoted and released. Frag buffer `fcur`
+                    // stays live (fenced) until the drain, so its registers cannot be
+                    // reused by the k+1 decode while the RS WGMMAs read them.
+                    // Probe: 17 = exposed k+1 barrier wait, 18 = k+1 decode (overlapped
+                    // with k's WGMMAs), 19 = exposed drain after the decode.
+                    if (num_k_blocks > 0) {
                         const unsigned long long kt_head = clock64();
                         full_barriers[stage_idx]->wait(phase);
-                        if constexpr (!kBlockIsL2) {
+                        if constexpr (!kBlockIsL2)
                             kstage_add(17, clock64() - kt_head);
+                        if constexpr (kUseInterleavedScheduler)
+                            interleaved_scheduler.release_task_info(lane_idx);
+                        decode_stage_rf(stage_idx, frag[0]);
+                    }
+                    const auto stage_step = [&](uint32_t& k_block_idx,
+                                                uint32_t (&fcur)[2][4][4],
+                                                uint32_t (&fnext)[2][4][4]) {
+                        const unsigned long long kt_head = clock64();
+                        const uint32_t cur_stage = stage_idx;
+                        if constexpr (!kBlockIsL2) {
                             kstage_add(21, 1ull);
                             if (k_block_idx > 0)
                                 kstage_add(22, kt_head - kstage_t_prev);
                             kstage_t_prev = kt_head;
                         }
-                        if constexpr (kUseInterleavedScheduler) {
-                            if (k_block_idx == 0)
-                                interleaved_scheduler.release_task_info(lane_idx);
+                        issue_stage_rf(cur_stage, fcur);
+                        unsigned long long kt_b = clock64();
+                        if (k_block_idx + 1 < num_k_blocks) {
+                            const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
+                            const uint32_t next_phase = phase ^ (next_stage == 0);
+                            full_barriers[next_stage]->wait(next_phase);
+                            const unsigned long long kt_a = clock64();
+                            if constexpr (!kBlockIsL2)
+                                kstage_add(17, kt_a - kt_b);
+                            decode_stage_rf(next_stage, fnext);
+                            kt_b = clock64();
+                            kstage_add(18, kt_b - kt_a);
                         }
-                        const unsigned long long kt_a = clock64();
-                        decode_stage_rf(stage_idx, frag);
-                        const unsigned long long kt_b = clock64();
-                        kstage_add(18, kt_b - kt_a);
-                        issue_stage_rf(stage_idx, frag);
                         fence_accum();
                         ptx::warpgroup_wait<0>();
-                        fence_frag(frag);
+                        fence_frag(fcur);
                         kstage_add(19, clock64() - kt_b);
-                        promote_stage_rf(stage_idx);
-                        arrive_empty_barrier(stage_idx);
+                        promote_stage_rf(cur_stage);
+                        arrive_empty_barrier(cur_stage);
+                        advance_pipeline(k_block_idx);
+                    };
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;) {
+                        stage_step(k_block_idx, frag[0], frag[1]);
+                        if (k_block_idx < num_k_blocks)
+                            stage_step(k_block_idx, frag[1], frag[0]);
                     }
                 };
                 if constexpr (BLOCK_M == 8) {
