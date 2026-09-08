@@ -103,7 +103,11 @@ select_sm90_nvfp4_h200_fused(
         bool single_active_dispatch_warp;
     } tuning {};
 
-    const int bm8_stages = std::clamp(get_env<int>("DG_FP4_BM8_STAGES", 7), 4, 7);
+    // BM8 (MXFP4 RF swapAB) runs kKBlocksPerStage == 2: each pipeline stage
+    // carries two K128 blocks (2 KB A + 40 KB packed B + 2 SFA slots), so 4
+    // stages (= 8 K-blocks in flight, 173 KB) is the smem-capacity default;
+    // the kernel static-asserts 2..4 for this mode.
+    const int bm8_stages = std::clamp(get_env<int>("DG_FP4_BM8_STAGES", 4), 2, 4);
     if (input.num_tokens <= 1)
         tuning = {8, 256, 24, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};

@@ -8,7 +8,9 @@
     DG_STATIC_ASSERT(BLOCK_M == 8 || BLOCK_M == 16 ||
                      BLOCK_M == 24 || BLOCK_M == 64 || BLOCK_M == 128,
                      "H200 fused kernel requires BM8/BM16/BM24/BM64/BM128");
-    DG_STATIC_ASSERT((BLOCK_M == 8 && kNumStages >= 4 && kNumStages <= 7) ||
+    // BM8: 4..7 stages of one K128 block, or 2..4 stages of two K128 blocks
+    // (kKBlocksPerStage, checked precisely below once kRFDecode is known).
+    DG_STATIC_ASSERT((BLOCK_M == 8 && kNumStages >= 2 && kNumStages <= 7) ||
                      ((BLOCK_M == 16 || BLOCK_M == 24) && kNumStages == 3) ||
                      (BLOCK_M == 64 && kNumStages == 3) ||
                      (BLOCK_M == 128 && kNumStages == 6),
@@ -150,6 +152,23 @@
     constexpr bool kRFDecode = kSwapABRequested && kMXFP4;
     DG_STATIC_ASSERT(!(kRFDecode && kSwapPipelineDecode),
                      "RF decode is only implemented for the serial swapAB main loop");
+    // K128 blocks per pipeline stage. The tiny-M (BM8) RF swapAB path carries TWO
+    // consecutive K128 blocks per stage: H20 probes put the fixed per-stage
+    // skeleton (mbarrier check + wgmma drain + arrive/loop) at ~540 ns of a
+    // ~740 ns stage, so halving the stage count per task halves that cost.
+    // Every other path keeps one K128 block per stage.
+    constexpr uint32_t kKBlocksPerStage = (kRFDecode && BLOCK_M == 8) ? 2u : 1u;
+    DG_STATIC_ASSERT(BLOCK_M != 8 ||
+                     (kKBlocksPerStage == 2 ? (kNumStages >= 2 && kNumStages <= 4)
+                                            : (kNumStages >= 4 && kNumStages <= 7)),
+                     "BM8 pipeline depth: 4..7 (1 K-block/stage) or 2..4 (2 K-blocks/stage)");
+    // Loaders and math step `kKBlocksPerStage` K-blocks per stage without a tail
+    // stage; both GEMM K extents must be multiples (L1 3072/128 = 24, L2 1280/128 = 10).
+    DG_STATIC_ASSERT((L1_SHAPE_K / BLOCK_K) % kKBlocksPerStage == 0 &&
+                     (L2_SHAPE_K / BLOCK_K) % kKBlocksPerStage == 0,
+                     "K-block count must be a multiple of kKBlocksPerStage (no tail stage)");
+    DG_STATIC_ASSERT(kKBlocksPerStage == 1 || !kSplitMDecodedWeightReuse,
+                     "Multi-K-block stages are not implemented for the BM128 split-M path");
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -179,7 +198,13 @@
     // Lane l reads entry i at [i*32 + l], so a warp's 32 gathers always hit 32
     // distinct 8 B slots of one 256 B row -> bank-conflict-free regardless of i.
     constexpr uint32_t SMEM_RF_LUT_REP_SIZE = 0u;  // replicated LUT measured: no gain (bank conflicts not the limiter)
-    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
+    // One BM x K128 FP8 A tile (128 B-swizzled rows). With two K-blocks per stage
+    // the tiles sit back to back; each is 1 KB (BM8) so the 1024 B swizzle
+    // period and the WGMMA descriptor base alignment are preserved.
+    constexpr uint32_t SMEM_A_SIZE_PER_KBLOCK = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
+    constexpr uint32_t SMEM_A_SIZE_PER_STAGE = kKBlocksPerStage * SMEM_A_SIZE_PER_KBLOCK;
+    DG_STATIC_ASSERT(kKBlocksPerStage == 1 || SMEM_A_SIZE_PER_KBLOCK % 1024 == 0,
+                     "Per-K-block A tiles must keep the 1024 B swizzle period");
     // RF decode feeds WGMMA A straight from registers; no decoded-B tile.
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE =
         kRFDecode ? 0u : LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
@@ -194,27 +219,35 @@
     constexpr uint32_t kNumDecodedBStages =
         kDoubleBufferDecodedB ? 2u : kNumStages;
     constexpr uint32_t B_LOAD_BYTES_PER_ROW = 80u;
-    constexpr uint32_t SMEM_PACKED_B_SIZE_PER_STAGE =
+    constexpr uint32_t SMEM_PACKED_B_SIZE_PER_KBLOCK =
         LOAD_BLOCK_N * B_LOAD_BYTES_PER_ROW * sizeof(b_dtype_t);
+    constexpr uint32_t SMEM_PACKED_B_SIZE_PER_STAGE =
+        kKBlocksPerStage * SMEM_PACKED_B_SIZE_PER_KBLOCK;
     // Dense weight tiles: one (BLOCK_N x 80 B) tile == exactly one packed-B stage,
     // fetched with a single `cp.async.bulk` (needs 16 B size/address alignment).
     DG_STATIC_ASSERT(!kDenseWeightTiles || (kMXFP4 || kQoQ),
                      "Dense weight tiles are only packed by the MXFP4/QoQ hosts");
     DG_STATIC_ASSERT(SMEM_PACKED_B_SIZE_PER_STAGE % 16 == 0, "Bulk copy size must be 16 B aligned");
-    DG_STATIC_ASSERT(SMEM_PACKED_B_SIZE_PER_STAGE == BLOCK_N * 80u, "Unexpected packed-B stage size");
+    DG_STATIC_ASSERT(SMEM_PACKED_B_SIZE_PER_KBLOCK == BLOCK_N * 80u, "Unexpected packed-B K-block size");
     // Host packer tile height (rows); a BLOCK_N < 256 kernel tile is a contiguous
     // BLOCK_N*80 B slice of the 256*80 B packed tile.
     constexpr uint32_t kPackedTileN = 256u;
     constexpr uint32_t kPackedTileBytes = kPackedTileN * B_LOAD_BYTES_PER_ROW;
     DG_STATIC_ASSERT(kPackedTileN % BLOCK_N == 0, "Kernel BLOCK_N must divide the packed tile height");
     constexpr uint32_t kSubTilesPerPacked = kPackedTileN / BLOCK_N;
+    // Two K-blocks per stage are fetched with ONE bulk copy, which needs the
+    // consecutive k tiles of an (expert, n_block) to be contiguous: dense layout
+    // with the kernel tile == the packed tile (BN256).
+    DG_STATIC_ASSERT(kKBlocksPerStage == 1 || (kDenseWeightTiles && kSubTilesPerPacked == 1),
+                     "Multi-K-block stages need contiguous dense BN256 weight tiles");
     // L1 and L2 each consume one per-128 activation scale per row and K tile.
     constexpr uint32_t kL2SFAHalfStride =
         math::constexpr_align<uint32_t>(BLOCK_M * sizeof(float), 128u) / sizeof(float);
     constexpr uint32_t kNumL2SFAGroups =
         kSplitMDecodedWeightReuse ? 2u : 1u;
+    // One kL2SFAHalfStride slot per (K-block, SF group).
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
-        kNumL2SFAGroups * kL2SFAHalfStride * sizeof(float);
+        kKBlocksPerStage * kNumL2SFAGroups * kL2SFAHalfStride * sizeof(float);
     // CD output: max of L1 FP8 (BLOCK_M * (BLOCK_N/2) * 1 byte * num_wg) and
     // L2 BF16 (BLOCK_M * BLOCK_N * 2 bytes * num_wg).
     constexpr uint32_t SMEM_CD_L1_SIZE =
@@ -315,6 +348,11 @@
         kInterleavedSchedulerSMEMBytes;
     DG_STATIC_ASSERT(!kUseInterleavedScheduler || kInterleavedSMEMEnd <= 232448,
                      "Interleaved scheduler exceeds the SM90 shared-memory capacity");
+    // The BM8 hosts launch with the full 232448 B; the 2-K-block layout must fit
+    // regardless of the scheduler variant (4 x (2048 + 40960 + 256) = 173056 B of
+    // stages plus the fixed regions and barriers).
+    DG_STATIC_ASSERT(kKBlocksPerStage == 1 || kInterleavedSMEMEnd <= 232448,
+                     "2-K-block pipeline exceeds the SM90 shared-memory capacity");
 
     // =====================================================================
     // Initialization
@@ -391,7 +429,7 @@
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
-        ++ k_block_idx;
+        k_block_idx += kKBlocksPerStage;
         stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
         phase ^= stage_idx == 0;
     };
@@ -817,7 +855,8 @@
                 if constexpr (kPrefetchWeightKBlocks > 0) {
                     if (cute::elect_one_sync()) {
                         constexpr uint32_t shape_n = kBlockIsL2 ? L2_SHAPE_N : L1_SHAPE_N;
-                        const uint32_t k_end = cute::min(num_k_blocks, kNumStages + kPrefetchWeightKBlocks);
+                        constexpr uint32_t kInFlightKBlocks = kNumStages * kKBlocksPerStage;
+                        const uint32_t k_end = cute::min(num_k_blocks, kInFlightKBlocks + kPrefetchWeightKBlocks);
                         if constexpr (kDenseWeightTiles) {
                             // Dense tiles: k-blocks of one (expert, n_block) are
                             // contiguous, so prefetch whole 20 KB tiles in 1D.
@@ -828,15 +867,15 @@
                                                       n_block_idx / kSubTilesPerPacked;
                             const auto* tiles = weights_base +
                                 static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * kPackedTileBytes +
-                                (n_block_idx % kSubTilesPerPacked) * SMEM_PACKED_B_SIZE_PER_STAGE;
-                            for (uint32_t kb = kNumStages; kb < k_end; ++ kb)
+                                (n_block_idx % kSubTilesPerPacked) * SMEM_PACKED_B_SIZE_PER_KBLOCK;
+                            for (uint32_t kb = kInFlightKBlocks; kb < k_end; ++ kb)
                                 ptx::tma_prefetch_1d(tiles + static_cast<size_t>(kb) * kPackedTileBytes,
-                                                     SMEM_PACKED_B_SIZE_PER_STAGE);
+                                                     SMEM_PACKED_B_SIZE_PER_KBLOCK);
                         } else {
                             const auto tensor_map_b_ptr = kBlockIsL2 ?
                                 &tensor_map_l2_weights : &tensor_map_l1_weights;
                             const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
-                            for (uint32_t kb = kNumStages; kb < k_end; ++ kb)
+                            for (uint32_t kb = kInFlightKBlocks; kb < k_end; ++ kb)
                                 cute::SM90_TMA_LOAD_2D::PREFETCH::copy(
                                     tensor_map_b_ptr, kb * B_LOAD_BYTES_PER_ROW, n_idx);
                         }
@@ -861,18 +900,27 @@
                         const uint32_t m_idx = pool_block_idx * BLOCK_M;
                         const uint32_t k_idx = k_block_idx * BLOCK_K;
 
-                        // TMA load A
-                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
-                            tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
-                            k_idx, m_idx, 1);
-
                         if constexpr (!kBlockIsL2 || !kSplitMDecodedWeightReuse) {
-                            tma::copy<BLOCK_M, 1, 0, float>(
-                                tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                                m_idx, k_block_idx, 1);
+                            // One A tile + one SFA row per K-block of the stage,
+                            // a single expect-tx for the whole stage.
+                            #pragma unroll
+                            for (uint32_t kb = 0; kb < kKBlocksPerStage; ++ kb) {
+                                tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                                    tensor_map_a_ptr, full_barriers[stage_idx],
+                                    smem_a[stage_idx] + kb * SMEM_A_SIZE_PER_KBLOCK / sizeof(a_dtype_t),
+                                    k_idx + kb * BLOCK_K, m_idx, 1);
+                                tma::copy<BLOCK_M, 1, 0, float>(
+                                    tensor_map_sfa_ptr, full_barriers[stage_idx],
+                                    smem_sfa[stage_idx] + kb * kL2SFAHalfStride,
+                                    m_idx, k_block_idx + kb, 1);
+                            }
                             full_barriers[stage_idx]->arrive_and_expect_tx(
-                                SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(float));
+                                SMEM_A_SIZE_PER_STAGE + kKBlocksPerStage * BLOCK_M * sizeof(float));
                         } else {
+                            // TMA load A
+                            tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                                tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
+                                k_idx, m_idx, 1);
                             // BN128 L1 produces per-64 activation scales. L2
                             // consumes both scale groups for each BK128 tile.
                             tma::copy<BLOCK_M, 1, 0, float>(
@@ -921,7 +969,7 @@
                                           n_block_idx / kSubTilesPerPacked;
                 dense_tiles = reinterpret_cast<const uint8_t*>(kBlockIsL2 ? l2_weights_ptr : l1_weights_ptr) +
                     static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * kPackedTileBytes +
-                    (n_block_idx % kSubTilesPerPacked) * SMEM_PACKED_B_SIZE_PER_STAGE;
+                    (n_block_idx % kSubTilesPerPacked) * SMEM_PACKED_B_SIZE_PER_KBLOCK;
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -929,8 +977,9 @@
 
                 if (cute::elect_one_sync()) {
                     if constexpr (kDenseWeightTiles) {
-                        // One 1D bulk copy per stage (20 KB for BN256); the
-                        // decoders still see 80 B rows at row * 80.
+                        // One 1D bulk copy per stage (20 KB per K-block for BN256;
+                        // 40 KB when kKBlocksPerStage == 2, tiles k, k+1 are adjacent
+                        // in the dense layout); decoders see 80 B rows at row * 80.
                         ptx::tma_load_1d(smem_packed_b[stage_idx],
                                     dense_tiles + static_cast<size_t>(k_block_idx) * kPackedTileBytes,
                                     full_barriers[stage_idx], SMEM_PACKED_B_SIZE_PER_STAGE);
@@ -1084,6 +1133,8 @@
             // Stage-level probe (SM0 / thread 0 only; phase_stamps slots 17..22, SM cycles):
             //   17 full-barrier wait | 18 RF decode+LUT (both halves) | 19 wgmma arrive->drain
             //   21 #L1 stages | 22 head-to-head stage total (excl. last stage of a task)
+            //   (kKBlocksPerStage == 2: all per *2-K128-block* stage; 18 = both decodes,
+            //    19 = wait<1> + wait<0> drains; 21 counts 2-block stages, 12/L1 task)
             const bool kstage_probe_on =
                 (phase_stamps != nullptr) && (sm_idx == 0) && (epilogue_thread_idx == 0);
             unsigned long long kstage_t_prev = 0;
@@ -1132,15 +1183,21 @@
                     using SwapRS = typename mma::sm90::FP8MMARSSelector<N_SWAP>::type;
                     DG_STATIC_ASSERT(BLOCK_K / SwapRS::K == 4, "Expects 4 K32 steps per K128");
                     constexpr uint32_t kSwapAccum = SwapRS::kNumAccum;
-                    float swap_accum[2][kSwapAccum];
+                    // One accumulator set per K-block of a stage: the two K128 blocks
+                    // carry different per-token activation scales, so they are promoted
+                    // separately (the RS WGMMAs of both run concurrently).
+                    float swap_accum[kKBlocksPerStage][2][kSwapAccum];
                     uint32_t frag[2][2][4][4];  // [buffer][half][k32 step][a0..a3]
 
                     const auto fence_accum = [&]() {
                         #pragma unroll
-                        for (uint32_t h = 0; h < 2; ++ h) {
+                        for (uint32_t kb = 0; kb < kKBlocksPerStage; ++ kb) {
                             #pragma unroll
-                            for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                ptx::warpgroup_fence_operand(swap_accum[h][i]);
+                            for (uint32_t h = 0; h < 2; ++ h) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    ptx::warpgroup_fence_operand(swap_accum[kb][h][i]);
+                            }
                         }
                     };
                     const auto fence_frag = [&](uint32_t (&f)[2][4][4]) {
@@ -1154,11 +1211,13 @@
                             }
                         }
                     };
-                    // Decode both 64-row halves of `stage` into `f` (this thread's
-                    // A fragments for the 4 K32 steps x 2 halves).
-                    const auto decode_stage_rf = [&](const uint32_t& stage, uint32_t (&f)[2][4][4]) {
+                    // Decode both 64-row halves of K-block `kb` of `stage` into `f` (this
+                    // thread's A fragments for the 4 K32 steps x 2 halves).
+                    const auto decode_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
+                                                     uint32_t (&f)[2][4][4]) {
                         const auto* packed_rows =
-                            reinterpret_cast<const uint8_t*>(smem_packed_b[stage]);
+                            reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) +
+                            kb * SMEM_PACKED_B_SIZE_PER_KBLOCK;
                         uint4 w[2][2];
                         uint32_t sw[2][2];
                         #pragma unroll
@@ -1198,8 +1257,11 @@
                             }
                         }
                     };
-                    // One commit group: 4 K32 steps into acc[0] with f[0], then into acc[1] with f[1].
-                    const auto issue_stage_rf = [&](const uint32_t& stage, uint32_t (&f)[2][4][4]) {
+                    // One commit group for K-block `kb` of `stage`: 4 K32 steps into
+                    // acc[0] with f[0], then into acc[1] with f[1]. The B (activation)
+                    // descriptor addresses the kb-th 1 KB swizzled A tile of the stage.
+                    const auto issue_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
+                                                    uint32_t (&f)[2][4][4], float (&acc)[2][kSwapAccum]) {
                         fence_accum();
                         fence_frag(f);
                         ptx::warpgroup_arrive();
@@ -1208,13 +1270,17 @@
                             #pragma unroll
                             for (uint32_t k = 0; k < 4; ++ k) {
                                 auto desc_b = mma::sm90::make_smem_desc(
-                                    smem_a[stage] + k * SwapRS::K, 1);
-                                SwapRS::wgmma(f[h][k], desc_b, swap_accum[h], k > 0);
+                                    smem_a[stage] + kb * (SMEM_A_SIZE_PER_KBLOCK / sizeof(a_dtype_t)) +
+                                    k * SwapRS::K, 1);
+                                SwapRS::wgmma(f[h][k], desc_b, acc[h], k > 0);
                             }
                         }
                         ptx::warpgroup_commit_batch();
                     };
-                    const auto promote_stage_rf = [&](const uint32_t& stage) {
+                    // Promote K-block `kb` of `stage` with its per-token K128 activation SF.
+                    const auto promote_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
+                                                      const float (&acc)[2][kSwapAccum]) {
+                        const float* sfa = smem_sfa[stage] + kb * kL2SFAHalfStride;
                         #pragma unroll
                         for (uint32_t half = 0; half < 2; ++ half) {
                             #pragma unroll
@@ -1223,19 +1289,20 @@
                                 const uint32_t token_0 = i * 8 + col_idx * 2;
                                 const uint32_t token_1 = token_0 + 1;
                                 if (token_0 < valid_m) {
-                                    const float scale_0 = ptx::ld_shared(smem_sfa[stage] + token_0);
-                                    final_accum[accum_offset + 0] += scale_0 * swap_accum[half][i * 4 + 0];
-                                    final_accum[accum_offset + 2] += scale_0 * swap_accum[half][i * 4 + 2];
+                                    const float scale_0 = ptx::ld_shared(sfa + token_0);
+                                    final_accum[accum_offset + 0] += scale_0 * acc[half][i * 4 + 0];
+                                    final_accum[accum_offset + 2] += scale_0 * acc[half][i * 4 + 2];
                                 }
                                 if (token_1 < valid_m) {
-                                    const float scale_1 = ptx::ld_shared(smem_sfa[stage] + token_1);
-                                    final_accum[accum_offset + 1] += scale_1 * swap_accum[half][i * 4 + 1];
-                                    final_accum[accum_offset + 3] += scale_1 * swap_accum[half][i * 4 + 3];
+                                    const float scale_1 = ptx::ld_shared(sfa + token_1);
+                                    final_accum[accum_offset + 1] += scale_1 * acc[half][i * 4 + 1];
+                                    final_accum[accum_offset + 3] += scale_1 * acc[half][i * 4 + 3];
                                 }
                             }
                         }
                     };
 
+                    if constexpr (kKBlocksPerStage == 1) {
                     // Software pipeline: the 8 WGMMAs of stage k are issued
                     // asynchronously; while the tensor cores run, the math warps wait
                     // for stage k+1's full barrier (the loader runs kNumStages ahead)
@@ -1252,7 +1319,7 @@
                             kstage_add(17, clock64() - kt_head);
                         if constexpr (kUseInterleavedScheduler)
                             interleaved_scheduler.release_task_info(lane_idx);
-                        decode_stage_rf(stage_idx, frag[0]);
+                        decode_stage_rf(stage_idx, 0, frag[0]);
                     }
                     const auto stage_step = [&](uint32_t& k_block_idx,
                                                 uint32_t (&fcur)[2][4][4],
@@ -1266,7 +1333,7 @@
                             kstage_t_prev = kt_head;
                         }
                         if ((kexp & 2u) == 0u)
-                            issue_stage_rf(cur_stage, fcur);
+                            issue_stage_rf(cur_stage, 0, fcur, swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         if (k_block_idx + 1 < num_k_blocks) {
                             const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
@@ -1282,7 +1349,7 @@
                             if constexpr (!kBlockIsL2)
                                 kstage_add(17, kt_a - kt_b);
                             if ((kexp & 1u) == 0u)
-                                decode_stage_rf(next_stage, fnext);
+                                decode_stage_rf(next_stage, 0, fnext);
                             kt_b = clock64();
                             kstage_add(18, kt_b - kt_a);
                         }
@@ -1291,7 +1358,7 @@
                         fence_frag(fcur);
                         kstage_add(19, clock64() - kt_b);
                         if ((kexp & 8u) == 0u)
-                            promote_stage_rf(cur_stage);
+                            promote_stage_rf(cur_stage, 0, swap_accum[0]);
                         arrive_empty_barrier(cur_stage);
                         advance_pipeline(k_block_idx);
                     };
@@ -1299,6 +1366,80 @@
                         stage_step(k_block_idx, frag[0], frag[1]);
                         if (k_block_idx < num_k_blocks)
                             stage_step(k_block_idx, frag[1], frag[0]);
+                    }
+                    } else {
+                    // Two K128 blocks per stage, one commit group each, frag buffers at
+                    // K-block granularity (frag[0] always holds block 0, frag[1] block 1):
+                    //   issue(blk0 -> acc0); decode blk1 -> frag[1]; issue(blk1 -> acc1);
+                    //   wait<1> (blk0 group done, frag[0] free);
+                    //   wait stage k+1 full; decode its blk0 -> frag[0] (overlaps blk1 WGMMAs);
+                    //   wait<0>; promote acc0 (SFA slot 0) + acc1 (SFA slot 1); release stage.
+                    // Probe (per 2-block stage): 17 = exposed k+1 barrier wait, 18 = both
+                    // decodes (blk1 of k + blk0 of k+1), 19 = exposed drains (wait<1> +
+                    // wait<0>), 21 = stage count, 22 = head-to-head stage total.
+                    if (num_k_blocks > 0) {
+                        const unsigned long long kt_head = clock64();
+                        full_barriers[stage_idx]->wait(phase);
+                        if constexpr (!kBlockIsL2)
+                            kstage_add(17, clock64() - kt_head);
+                        if constexpr (kUseInterleavedScheduler)
+                            interleaved_scheduler.release_task_info(lane_idx);
+                        decode_stage_rf(stage_idx, 0, frag[0]);
+                    }
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;) {
+                        const unsigned long long kt_head = clock64();
+                        const uint32_t cur_stage = stage_idx;
+                        if constexpr (!kBlockIsL2) {
+                            kstage_add(21, 1ull);
+                            if (k_block_idx > 0)
+                                kstage_add(22, kt_head - kstage_t_prev);
+                            kstage_t_prev = kt_head;
+                        }
+                        if ((kexp & 2u) == 0u)
+                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
+                        unsigned long long kt_b = clock64();
+                        if ((kexp & 1u) == 0u)
+                            decode_stage_rf(cur_stage, 1, frag[1]);
+                        unsigned long long kt_a = clock64();
+                        kstage_add(18, kt_a - kt_b);
+                        if ((kexp & 2u) == 0u)
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1]);
+                        // Block 0's group was issued before the block-1 decode; retire it
+                        // so frag[0] can take the next stage's block 0.
+                        fence_accum();
+                        ptx::warpgroup_wait<1>();
+                        fence_frag(frag[0]);
+                        kt_b = clock64();
+                        kstage_add(19, kt_b - kt_a);
+                        if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
+                            const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
+                            const uint32_t next_phase = phase ^ (next_stage == 0);
+                            if ((kexp & 4u) == 0u) {
+                                if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                    if constexpr (!kBlockIsL2)
+                                        kstage_add(23, 1ull);
+                                    full_barriers[next_stage]->wait(next_phase);
+                                }
+                            }
+                            kt_a = clock64();
+                            if constexpr (!kBlockIsL2)
+                                kstage_add(17, kt_a - kt_b);
+                            if ((kexp & 1u) == 0u)
+                                decode_stage_rf(next_stage, 0, frag[0]);
+                            kt_b = clock64();
+                            kstage_add(18, kt_b - kt_a);
+                        }
+                        fence_accum();
+                        ptx::warpgroup_wait<0>();
+                        fence_frag(frag[1]);
+                        kstage_add(19, clock64() - kt_b);
+                        if ((kexp & 8u) == 0u) {
+                            promote_stage_rf(cur_stage, 0, swap_accum[0]);
+                            promote_stage_rf(cur_stage, 1, swap_accum[1]);
+                        }
+                        arrive_empty_barrier(cur_stage);
+                        advance_pipeline(k_block_idx);
+                    }
                     }
                 };
                 if constexpr (BLOCK_M == 8) {

@@ -46,7 +46,9 @@ REPORT = [
 # 16 = time spent inside NVLink barrier#1 (includes cross-rank launch skew).
 ACCUM = [(13, "SM0: entry->after barrier1"), (16, "SM0: barrier1 wait incl. skew")]
 # K-loop stage probe (SM0 thread0, SM cycles @1830MHz): per-stage ns = cycles / count / 1.83
-STAGE = [(17, "L1 stage: exposed k+1 full wait"), (18, "L1 stage: k+1 RF decode+LUT"),
+# BM8 MXFP4 (kKBlocksPerStage == 2): one "stage" = two K128 blocks (12 stages per L1
+# task); 18 = both decodes of the stage, 19 = wait<1> + wait<0> drains.
+STAGE = [(17, "L1 stage: exposed k+1 full wait"), (18, "L1 stage: RF decode+LUT"),
          (19, "L1 stage: exposed wgmma drain"), (22, "L1 stage: head-to-head total")]
 SM_GHZ = 1.83
 
