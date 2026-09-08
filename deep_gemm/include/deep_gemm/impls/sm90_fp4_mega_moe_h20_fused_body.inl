@@ -181,6 +181,19 @@
     DG_STATIC_ASSERT(kSplitMDecodedWeightReuse ||
                      WG_L1_OUT_BLOCK_N < kL2ActsSFGranK,
                      "split-N warpgroups must share one L2 activation scale");
+    // L1 -> L2 data dependency is per block: L1 N-block `n` (gate/up
+    // interleaved) publishes L1-output columns [n * L1_OUT_BLOCK_N, +L1_OUT_BLOCK_N)
+    // plus the matching per-token activation scales, which is exactly what L2
+    // K-block `n / kNumL1BlocksPerL2KBlock` consumes. The L2 A-loader waits per
+    // K-block on the readiness bits of only those L1 N-blocks.
+    constexpr uint32_t kNumL2KBlocks = L2_SHAPE_K / BLOCK_K;
+    constexpr uint32_t kNumL1BlocksPerL2KBlock = BLOCK_K / L1_OUT_BLOCK_N;
+    DG_STATIC_ASSERT(BLOCK_K % L1_OUT_BLOCK_N == 0 &&
+                     kNumRoutedL1BlockNs == kNumL2KBlocks * kNumL1BlocksPerL2KBlock &&
+                     kNumRoutedL1BlockNs <= 64,
+                     "L1 output N-blocks must tile the L2 K dimension exactly");
+    DG_STATIC_ASSERT(L1_OUT_BLOCK_N % kL2ActsSFGranK == 0,
+                     "L2 activation scale groups must not straddle L1 output blocks");
 
     // =====================================================================
     // Shared memory layout
@@ -885,15 +898,31 @@
                 if constexpr (!kBlockIsL2) {
                     const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                     while (ptx::ld_acq(ptr) != valid_m) {}
-                } else {
-                    const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                    const uint64_t expected = (kNumRoutedL1BlockNs >= 64)
-                        ? ~0ull : ((1ull << kNumRoutedL1BlockNs) - 1ull);
-                    while (ptx::ld_acq_gpu(ptr) != expected) {}
                 }
+                // L2: no up-front wait for all L1 N-blocks; each stage below
+                // waits only for the L1 blocks that produced its K-block(s).
             }
+            // Cached snapshot of the L1 readiness mask (L2 tasks only).
+            uint64_t l1_ready_mask = 0;
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
+
+                if constexpr (kBlockIsL2) {
+                    if (has_valid_m) {
+                        // Bits of the L1 N-blocks feeding K-blocks
+                        // [k_block_idx, k_block_idx + kKBlocksPerStage).
+                        constexpr uint32_t kBitsPerStage = kKBlocksPerStage * kNumL1BlocksPerL2KBlock;
+                        DG_STATIC_ASSERT(kBitsPerStage < 64, "Stage readiness mask overflow");
+                        const uint64_t need = ((1ull << kBitsPerStage) - 1ull)
+                                              << (k_block_idx * kNumL1BlocksPerL2KBlock);
+                        if ((l1_ready_mask & need) != need) {
+                            const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
+                            do {
+                                l1_ready_mask = ptx::ld_acq_gpu(ptr);
+                            } while ((l1_ready_mask & need) != need);
+                        }
+                    }
+                }
 
                 if (cute::elect_one_sync()) {
                     if (has_valid_m) {
@@ -1156,7 +1185,8 @@
                     " mbarrier.test_wait.parity.shared::cta.b64 P, [%1], %2;\n"
                     " selp.u32 %0, 1, 0, P;\n}"
                     : "=r"(ready)
-                    : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(parity));
+                    : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(parity)
+                    : "memory");
                 return ready != 0;
             };
 
