@@ -1235,7 +1235,8 @@
                 (phase_stamps != nullptr) && (sm_idx == 0) && (epilogue_thread_idx == 0);
             unsigned long long kstage_t_prev = 0;
             // Timing-only experiments (numerics invalid), bitmask in phase_stamps[24]:
-            // 1 skip decode | 2 skip wgmma issue | 4 skip k+1 barrier check | 8 skip promote.
+            // 1 skip decode | 2 skip wgmma issue | 4 skip k+1 barrier check | 8 skip promote
+            // | 16 broadcast packed-row loads | 32 constant LUT (no gather).
             const uint32_t kexp = (phase_stamps != nullptr) ?
                 static_cast<uint32_t>(phase_stamps[24]) : 0u;
             const auto kstage_add = [&](const uint32_t slot, const unsigned long long& v) {
@@ -1337,12 +1338,15 @@
                         uint32_t sw[2][2];
                         #pragma unroll
                         for (uint32_t h = 0; h < 2; ++ h) {
-                            const uint32_t row_0 = wg_n_idx + h * 64u + r_0;
-                            const uint32_t row_1 = row_0 + 8u;
+                            // PROBE_EXP bit 16 (timing only): every lane reads the same 16 B
+                            // (broadcast) to isolate the cost/latency of the packed-row loads.
+                            const uint32_t row_0 = (kexp & 16u) ? (wg_n_idx + h * 64u) : (wg_n_idx + h * 64u + r_0);
+                            const uint32_t row_1 = (kexp & 16u) ? row_0 : (row_0 + 8u);
+                            const uint32_t col_b = (kexp & 16u) ? 0u : col_idx * 16u;
                             w[h][0] = *reinterpret_cast<const uint4*>(
-                                packed_rows + row_0 * 80u + col_idx * 16u);
+                                packed_rows + row_0 * 80u + col_b);
                             w[h][1] = *reinterpret_cast<const uint4*>(
-                                packed_rows + row_1 * 80u + col_idx * 16u);
+                                packed_rows + row_1 * 80u + col_b);
                             sw[h][0] = *reinterpret_cast<const uint32_t*>(packed_rows + row_0 * 80u + 64u);
                             sw[h][1] = *reinterpret_cast<const uint32_t*>(packed_rows + row_1 * 80u + 64u);
                         }
@@ -1352,20 +1356,10 @@
                             #pragma unroll
                             for (uint32_t r = 0; r < 2; ++ r) {
                                 #pragma unroll
-                                for (uint32_t k = 0; k < 4; ++ k) {
-                                    // kE2M1AndE8M0RelToFp8Lut rows s = 4..15 are byte-wise linear in s
-                                    // (each +1 in s adds 8 to every E4M3 byte = x2); rows 0..3 hold
-                                    // flush/subnormal magnitudes and stay on the SMEM table. This
-                                    // removes the dependent LUT gather from the common decode path.
-                                    const uint32_t sidx = (sw[h][r] >> (k * 8u)) & 0x7fu;
-                                    const uint32_t sm4 = sidx - 4u;
-                                    if (kMXFP4 && sm4 < 12u) {
-                                        lut[h][r][k] = make_uint2(sm4 * 0x08080800u + 0x14100800u,
-                                                                  sm4 * 0x08080808u + 0x24201c18u);
-                                    } else {
-                                        lut[h][r][k] = smem_nvfp4_lut[sidx];
-                                    }
-                                }
+                                for (uint32_t k = 0; k < 4; ++ k)
+                                    // PROBE_EXP bit 32 (timing only): constant LUT, no smem gather.
+                                    lut[h][r][k] = (kexp & 32u) ? make_uint2(0x3c3c3c3cu ^ sw[h][r], 0x3c3c3c3cu)
+                                                                : smem_nvfp4_lut[(sw[h][r] >> (k * 8u)) & 0x7fu];
                             }
                         }
                         #pragma unroll
