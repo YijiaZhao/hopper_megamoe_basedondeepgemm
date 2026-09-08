@@ -175,6 +175,10 @@
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumActiveDispatchWarps, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_NVFP4_LUT_SIZE =
         math::constexpr_align<uint32_t>(128u * sizeof(uint2), kSharedMemoryAlignment);
+    // RF decode: per-lane replicated LUT (128 entries x 32 lanes x 8 B = 32 KB).
+    // Lane l reads entry i at [i*32 + l], so a warp's 32 gathers always hit 32
+    // distinct 8 B slots of one 256 B row -> bank-conflict-free regardless of i.
+    constexpr uint32_t SMEM_RF_LUT_REP_SIZE = kRFDecode ? 128u * 32u * sizeof(uint2) : 0u;
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     // RF decode feeds WGMMA A straight from registers; no decoded-B tile.
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE =
@@ -234,7 +238,8 @@
         SMEM_CD_OUTPUT_UNALIGNED_SIZE, kSharedMemoryAlignment);
 
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
-        SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_NVFP4_LUT_SIZE + SMEM_CD_SIZE +
+        SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_NVFP4_LUT_SIZE + SMEM_RF_LUT_REP_SIZE +
+        SMEM_CD_SIZE +
         kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_PACKED_B_SIZE_PER_STAGE) +
         kNumDecodedBStages * SMEM_B_SIZE_PER_STAGE;
 
@@ -246,8 +251,11 @@
     auto smem_nvfp4_lut = reinterpret_cast<uint2*>(math::advance_ptr<uint8_t>(
         smem_buffer, SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE));
 
+    auto smem_rf_lut = reinterpret_cast<uint2*>(math::advance_ptr<uint8_t>(
+        smem_buffer, SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_NVFP4_LUT_SIZE));
     auto smem_gemm_base = math::advance_ptr(
-        smem_buffer, SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_NVFP4_LUT_SIZE);
+        smem_buffer, SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_NVFP4_LUT_SIZE +
+                     SMEM_RF_LUT_REP_SIZE);
 
     auto smem_cd_base = smem_gemm_base;
     // CD output is shared by L1 (FP8) and L2 (BF16); reinterpret-cast as needed.
@@ -316,6 +324,13 @@
             kMXFP4 ?
                 reinterpret_cast<const uint4*>(deep_gemm::nvfp4::kE2M1AndE8M0RelToFp8Lut)[thread_idx] :
                 reinterpret_cast<const uint4*>(deep_gemm::nvfp4::kE2M1AndUe4m3ToFp8Lut)[thread_idx];
+    }
+    if constexpr (kRFDecode) {
+        const uint2* lut_src = kMXFP4 ?
+            reinterpret_cast<const uint2*>(deep_gemm::nvfp4::kE2M1AndE8M0RelToFp8Lut) :
+            reinterpret_cast<const uint2*>(deep_gemm::nvfp4::kE2M1AndUe4m3ToFp8Lut);
+        for (uint32_t i = thread_idx; i < 128u * 32u; i += blockDim.x)
+            smem_rf_lut[i] = lut_src[i >> 5];
     }
 
     if (warp_idx == 0) {
@@ -1160,7 +1175,7 @@
                             for (uint32_t r = 0; r < 2; ++ r) {
                                 #pragma unroll
                                 for (uint32_t k = 0; k < 4; ++ k)
-                                    lut[h][r][k] = smem_nvfp4_lut[(sw[h][r] >> (k * 8u)) & 0x7fu];
+                                    lut[h][r][k] = smem_rf_lut[(((sw[h][r] >> (k * 8u)) & 0x7fu) << 5) + lane_idx];
                             }
                         }
                         #pragma unroll
