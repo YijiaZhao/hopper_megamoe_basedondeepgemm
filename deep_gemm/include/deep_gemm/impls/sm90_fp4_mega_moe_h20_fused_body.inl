@@ -1290,7 +1290,12 @@
                     // and are promoted with their own SF row.
                     constexpr uint32_t kSFGroups = (kBlockIsL2 && kL2ActsSFGranK == 64u) ? 2u : 1u;
                     constexpr uint32_t kK32PerSFGroup = 4u / kSFGroups;
-                    float swap_accum[kNumAccKBlocks][kSFGroups][2][kSwapAccum];
+                    // Two accumulator chains per (SF group, half): K32 steps alternate
+                    // between them so the 4 dependent RS-WGMMAs of a K128 block become
+                    // two independent 2-deep chains (tensor-core latency exposed once
+                    // less per block); the chains are summed at promote time.
+                    constexpr uint32_t kAccChains = 2u;
+                    float swap_accum[kNumAccKBlocks][kSFGroups][2][kAccChains][kSwapAccum];
                     uint32_t frag[2][2][4][4];  // [buffer][half][k32 step][a0..a3]
 
                     const auto fence_accum = [&]() {
@@ -1301,8 +1306,11 @@
                                 #pragma unroll
                                 for (uint32_t h = 0; h < 2; ++ h) {
                                     #pragma unroll
-                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                        ptx::warpgroup_fence_operand(swap_accum[kb][g][h][i]);
+                                    for (uint32_t c = 0; c < kAccChains; ++ c) {
+                                        #pragma unroll
+                                        for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                            ptx::warpgroup_fence_operand(swap_accum[kb][g][h][c][i]);
+                                    }
                                 }
                             }
                         }
@@ -1369,7 +1377,7 @@
                     // descriptor addresses the kb-th 1 KB swizzled A tile of the stage.
                     const auto issue_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
                                                     uint32_t (&f)[2][4][4],
-                                                    float (&acc)[kSFGroups][2][kSwapAccum]) {
+                                                    float (&acc)[kSFGroups][2][kAccChains][kSwapAccum]) {
                         fence_accum();
                         fence_frag(f);
                         ptx::warpgroup_arrive();
@@ -1380,15 +1388,16 @@
                                 auto desc_b = mma::sm90::make_smem_desc(
                                     smem_a[stage] + kb * (SMEM_A_SIZE_PER_KBLOCK / sizeof(a_dtype_t)) +
                                     k * SwapRS::K, 1);
-                                SwapRS::wgmma(f[h][k], desc_b, acc[k / kK32PerSFGroup][h],
-                                              (k % kK32PerSFGroup) > 0);
+                                SwapRS::wgmma(f[h][k], desc_b,
+                                              acc[k / kK32PerSFGroup][h][(k % kK32PerSFGroup) % kAccChains],
+                                              ((k % kK32PerSFGroup) / kAccChains) > 0);
                             }
                         }
                         ptx::warpgroup_commit_batch();
                     };
                     // Promote K-block `kb` of `stage` with its per-token K128 activation SF.
                     const auto promote_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                      const float (&acc)[kSFGroups][2][kSwapAccum]) {
+                                                      const float (&acc)[kSFGroups][2][kAccChains][kSwapAccum]) {
                         #pragma unroll
                         for (uint32_t g = 0; g < kSFGroups; ++ g) {
                         const float* sfa = smem_sfa[stage] + (kb * kNumL2SFAGroups + g) * kL2SFAHalfStride;
@@ -1399,15 +1408,22 @@
                                 const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
                                 const uint32_t token_0 = i * 8 + col_idx * 2;
                                 const uint32_t token_1 = token_0 + 1;
+                                const auto acc_sum = [&](const uint32_t& j) -> float {
+                                    float v = acc[g][half][0][j];
+                                    #pragma unroll
+                                    for (uint32_t c = 1; c < kAccChains; ++ c)
+                                        v += acc[g][half][c][j];
+                                    return v;
+                                };
                                 if (token_0 < valid_m) {
                                     const float scale_0 = ptx::ld_shared(sfa + token_0);
-                                    final_accum[accum_offset + 0] += scale_0 * acc[g][half][i * 4 + 0];
-                                    final_accum[accum_offset + 2] += scale_0 * acc[g][half][i * 4 + 2];
+                                    final_accum[accum_offset + 0] += scale_0 * acc_sum(i * 4 + 0);
+                                    final_accum[accum_offset + 2] += scale_0 * acc_sum(i * 4 + 2);
                                 }
                                 if (token_1 < valid_m) {
                                     const float scale_1 = ptx::ld_shared(sfa + token_1);
-                                    final_accum[accum_offset + 1] += scale_1 * acc[g][half][i * 4 + 1];
-                                    final_accum[accum_offset + 3] += scale_1 * acc[g][half][i * 4 + 3];
+                                    final_accum[accum_offset + 1] += scale_1 * acc_sum(i * 4 + 1);
+                                    final_accum[accum_offset + 3] += scale_1 * acc_sum(i * 4 + 3);
                                 }
                             }
                         }
