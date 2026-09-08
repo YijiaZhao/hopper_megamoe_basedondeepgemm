@@ -216,7 +216,10 @@ static void sm90_fp4_h20_fused_mega_moe(
     // reduction through fused_layout::Workspace scratch, 5 MB, bounded to
     // kSM90SplitKL1MaxPoolBlocks pool blocks; larger launches fall back in-kernel).
     // The per-WG math shape is unchanged, so unlike half-tile tasks the per-task
-    // latency really halves. Default ON for that tier; DG_FP4_SPLITK_L1=0 disables.
+    // latency really halves. H20 A/B (2026-09-09, phase stamps, kernel end us,
+    // ON vs same-day OFF): M=2 47.4-48.9 vs 50.7; M=8 62.8-64.9 vs 65.3; M=16
+    // 86.7-88.6 vs 89.2 (L1 phase -4.5 / -12 us at M=8 / 16, partly given back to
+    // a longer L2 tail). Default ON for that tier; DG_FP4_SPLITK_L1=0 disables.
     // Exclusive with half-tile tasks. No effect on TMA boxes / SF granularity.
     const bool split_k_l1 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && plan.use_interleaved_scheduler &&
