@@ -47,7 +47,13 @@ def qoq_meta_to_tile_major(s2: torch.Tensor, z: torch.Tensor, block_n: int = 256
 
 def qoq_fuse_packed_with_meta_tile_major(packed: torch.Tensor, meta_tm: torch.Tensor,
                                          block_k: int = QOQ_GROUP_SIZE) -> torch.Tensor:
-    """Pack each BK128 row as ``64B codes + [s2, z] + 14B zero`` (80-byte rows)."""
+    """Pack each BK128 row as ``64B codes + [s2, z] + 14B zero`` (80-byte rows).
+
+    Byte order is dense tile-major ``(E, n_blocks, k_blocks, block_n, 80)`` (one
+    contiguous 20480 B chunk per BN256 weight tile, loaded by the fused kernel
+    with a single 1D bulk copy per stage); the returned shape is the nominal
+    ``(E, N, k_blocks * 80)``. See ``mxfp4_fuse_packed_with_scale_tile_major``.
+    """
     E, N, K_half = packed.shape
     E_s, n_blocks, k_blocks, block_n, two = meta_tm.shape
     assert E == E_s and N == n_blocks * block_n and K_half == k_blocks * (block_k // 2) and two == 2
@@ -55,7 +61,8 @@ def qoq_fuse_packed_with_meta_tile_major(packed: torch.Tensor, meta_tm: torch.Te
     fused = torch.zeros((E, n_blocks, k_blocks, block_n, QOQ_FUSED_ROW_BYTES), dtype=torch.uint8, device=packed.device)
     fused[..., :block_k // 2] = packed_tile
     fused[..., block_k // 2:block_k // 2 + 2] = meta_tm
-    return fused.permute(0, 1, 3, 2, 4).reshape(E, N, k_blocks * QOQ_FUSED_ROW_BYTES).contiguous()
+    # Dense tile-major byte order (no permute back to row-major); nominal shape only.
+    return fused.reshape(E, N, k_blocks * QOQ_FUSED_ROW_BYTES)
 
 
 def dequantize_qoq_to_fp32(packed: torch.Tensor, s2: torch.Tensor, z: torch.Tensor, s1: torch.Tensor,

@@ -192,6 +192,12 @@
     constexpr uint32_t B_LOAD_BYTES_PER_ROW = 80u;
     constexpr uint32_t SMEM_PACKED_B_SIZE_PER_STAGE =
         LOAD_BLOCK_N * B_LOAD_BYTES_PER_ROW * sizeof(b_dtype_t);
+    // Dense weight tiles: one (BLOCK_N x 80 B) tile == exactly one packed-B stage,
+    // fetched with a single `cp.async.bulk` (needs 16 B size/address alignment).
+    DG_STATIC_ASSERT(!kDenseWeightTiles || (kMXFP4 || kQoQ),
+                     "Dense weight tiles are only packed by the MXFP4/QoQ hosts");
+    DG_STATIC_ASSERT(SMEM_PACKED_B_SIZE_PER_STAGE % 16 == 0, "Bulk copy size must be 16 B aligned");
+    DG_STATIC_ASSERT(SMEM_PACKED_B_SIZE_PER_STAGE == BLOCK_N * 80u, "Unexpected packed-B stage size");
     // L1 and L2 each consume one per-128 activation scale per row and K tile.
     constexpr uint32_t kL2SFAHalfStride =
         math::constexpr_align<uint32_t>(BLOCK_M * sizeof(float), 128u) / sizeof(float);
@@ -789,14 +795,28 @@
             if (has_valid_m) {
                 if constexpr (kPrefetchWeightKBlocks > 0) {
                     if (cute::elect_one_sync()) {
-                        const auto tensor_map_b_ptr = kBlockIsL2 ?
-                            &tensor_map_l2_weights : &tensor_map_l1_weights;
                         constexpr uint32_t shape_n = kBlockIsL2 ? L2_SHAPE_N : L1_SHAPE_N;
-                        const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                         const uint32_t k_end = cute::min(num_k_blocks, kNumStages + kPrefetchWeightKBlocks);
-                        for (uint32_t kb = kNumStages; kb < k_end; ++ kb)
-                            cute::SM90_TMA_LOAD_2D::PREFETCH::copy(
-                                tensor_map_b_ptr, kb * B_LOAD_BYTES_PER_ROW, n_idx);
+                        if constexpr (kDenseWeightTiles) {
+                            // Dense tiles: k-blocks of one (expert, n_block) are
+                            // contiguous, so prefetch whole 20 KB tiles in 1D.
+                            constexpr uint32_t shape_k = kBlockIsL2 ? L2_SHAPE_K : L1_SHAPE_K;
+                            const auto* weights_base = reinterpret_cast<const uint8_t*>(
+                                kBlockIsL2 ? l2_weights_ptr : l1_weights_ptr);
+                            const uint32_t tile_row = local_expert_idx * (shape_n / BLOCK_N) + n_block_idx;
+                            const auto* tiles = weights_base +
+                                static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * SMEM_PACKED_B_SIZE_PER_STAGE;
+                            for (uint32_t kb = kNumStages; kb < k_end; ++ kb)
+                                ptx::tma_prefetch_1d(tiles + static_cast<size_t>(kb) * SMEM_PACKED_B_SIZE_PER_STAGE,
+                                                SMEM_PACKED_B_SIZE_PER_STAGE);
+                        } else {
+                            const auto tensor_map_b_ptr = kBlockIsL2 ?
+                                &tensor_map_l2_weights : &tensor_map_l1_weights;
+                            const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
+                            for (uint32_t kb = kNumStages; kb < k_end; ++ kb)
+                                cute::SM90_TMA_LOAD_2D::PREFETCH::copy(
+                                    tensor_map_b_ptr, kb * B_LOAD_BYTES_PER_ROW, n_idx);
+                        }
                     }
                     __syncwarp();
                 }
@@ -868,19 +888,36 @@
             const auto tensor_map_b_ptr = kBlockIsL2 ?
                 &tensor_map_l2_weights : &tensor_map_l1_weights;
             constexpr uint32_t shape_n = kBlockIsL2 ? L2_SHAPE_N : L1_SHAPE_N;
+            constexpr uint32_t shape_k = kBlockIsL2 ? L2_SHAPE_K : L1_SHAPE_K;
+            // Dense tiles (MXFP4/QoQ): tile (expert, n_block, k_block) lives at
+            // ((expert * n_blocks + n_block) * k_blocks + k_block) * (BLOCK_N * 80 B).
+            const uint8_t* dense_tiles = nullptr;
+            if constexpr (kDenseWeightTiles) {
+                const uint32_t tile_row = local_expert_idx * (shape_n / BLOCK_N) + n_block_idx;
+                dense_tiles = reinterpret_cast<const uint8_t*>(kBlockIsL2 ? l2_weights_ptr : l1_weights_ptr) +
+                    static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * SMEM_PACKED_B_SIZE_PER_STAGE;
+            }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
 
-                const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
-                // NVFP4 fused B+scale layout stores 64B packed FP4 + 8B
-                // UE4M3 scale + 8B zero padding per BK128 row.
-                const uint32_t k_idx = k_block_idx * B_LOAD_BYTES_PER_ROW;
                 if (cute::elect_one_sync()) {
-                    tma::copy<B_LOAD_BYTES_PER_ROW, LOAD_BLOCK_N, 0, b_dtype_t>(
-                        tensor_map_b_ptr, full_barriers[stage_idx],
-                        smem_packed_b[stage_idx],
-                        k_idx, n_idx, 1);
+                    if constexpr (kDenseWeightTiles) {
+                        // One 1D bulk copy per stage (20 KB for BN256); the
+                        // decoders still see 80 B rows at row * 80.
+                        ptx::tma_load_1d(smem_packed_b[stage_idx],
+                                    dense_tiles + static_cast<size_t>(k_block_idx) * SMEM_PACKED_B_SIZE_PER_STAGE,
+                                    full_barriers[stage_idx], SMEM_PACKED_B_SIZE_PER_STAGE);
+                    } else {
+                        const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
+                        // NVFP4 fused B+scale layout stores 64B packed FP4 + 8B
+                        // UE4M3 scale + 8B zero padding per BK128 row.
+                        const uint32_t k_idx = k_block_idx * B_LOAD_BYTES_PER_ROW;
+                        tma::copy<B_LOAD_BYTES_PER_ROW, LOAD_BLOCK_N, 0, b_dtype_t>(
+                            tensor_map_b_ptr, full_barriers[stage_idx],
+                            smem_packed_b[stage_idx],
+                            k_idx, n_idx, 1);
+                    }
                     full_barriers[stage_idx]->arrive_and_expect_tx(
                         SMEM_PACKED_B_SIZE_PER_STAGE);
                 }

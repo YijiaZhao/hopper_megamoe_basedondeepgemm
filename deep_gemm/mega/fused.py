@@ -54,17 +54,24 @@ def _fused_word_transpose(fused):
     rows[...,:64]=_mxfp4_word_transpose(rows[...,:64].contiguous())
     return rows.view(e,n,k).contiguous()
 
+# Fused weights are dense tile-major bytes (E, N/256, K/128, 256, 80) under a nominal
+# (E, N, K/128*80) shape; the helpers above only ever permute bytes *within* an 80 B
+# row (viewing the tensor as (e, n, k//80, 80) is layout-agnostic), and `_interleave`
+# runs on the pre-fuse packed/scale tensors, so the dense order is preserved.
+def _check_fused_dense(f, block_n=256):
+    e,n,k=f.shape; assert f.is_contiguous() and n%block_n==0 and k%80==0, f.shape; return f
+
 def transform_mxfp4_weights_for_mega_moe_fused(l1,l2):
     from ..quantization_mxfp4_fused import mxfp4_row_reference_exponent,mxfp4_scale_to_relative_index,mxfp4_scale_to_tile_major,mxfp4_fuse_packed_with_scale_tile_major
     p1,s1=l1; p2,s2=l2; p1,s1=_interleave(p1),_interleave(s1)
     def prep(p,s):
-        er=mxfp4_row_reference_exponent(s); idx=mxfp4_scale_to_relative_index(s,er); tm=mxfp4_scale_to_tile_major(idx,block_n=256,block_k=128); f=_fused_word_transpose(_braid(_mxfp4_rf_fragment_order(mxfp4_fuse_packed_with_scale_tile_major(p,tm,block_k=128)))); return f,tm,torch.exp2(er.float()).contiguous()
+        er=mxfp4_row_reference_exponent(s); idx=mxfp4_scale_to_relative_index(s,er); tm=mxfp4_scale_to_tile_major(idx,block_n=256,block_k=128); f=_check_fused_dense(_fused_word_transpose(_braid(_mxfp4_rf_fragment_order(mxfp4_fuse_packed_with_scale_tile_major(p,tm,block_k=128))))); return f,tm,torch.exp2(er.float()).contiguous()
     return prep(p1,s1),prep(p2,s2)
 
 def transform_qoq_weights_for_mega_moe_fused(l1,l2):
     from ..quantization_qoq_fused import qoq_meta_to_tile_major,qoq_fuse_packed_with_meta_tile_major
     def prep(p,s2,z,s1):
-        tm=qoq_meta_to_tile_major(s2,z,block_n=256); return qoq_fuse_packed_with_meta_tile_major(p.contiguous(),tm),tm,s1.float().contiguous()
+        tm=qoq_meta_to_tile_major(s2,z,block_n=256); return _check_fused_dense(qoq_fuse_packed_with_meta_tile_major(p.contiguous(),tm)),tm,s1.float().contiguous()
     p,s2,z,s1=l1; return prep(_interleave(p),_interleave(s2),_interleave(z),_interleave(s1.unsqueeze(-1)).squeeze(-1)),prep(*l2)
 
 class FusedSymmBuffer:

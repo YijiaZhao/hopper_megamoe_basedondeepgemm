@@ -435,7 +435,12 @@ template <
     uint32_t kPrefetchWeightKBlocks = 0,
     bool kSwapPipelineDecode = true,
     bool kDistributedExpertBcast = true,
-    bool kQoQ = false
+    bool kQoQ = false,
+    // Weights stored as dense (E, N/BLOCK_N, K/BLOCK_K, BLOCK_N, 80 B) tiles:
+    // the B loader streams one 1D bulk copy (BLOCK_N*80 B) per stage from
+    // `l{1,2}_weights_ptr` instead of the 2D TMA box (H20: 2D box is
+    // TMA-issue bound, ~0.4us/stage; 1D bulk ~0.18us/stage at 7 in flight).
+    bool kDenseWeightTiles = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
@@ -450,6 +455,9 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
+        // Raw fused weight bytes; only read when kDenseWeightTiles (MXFP4/QoQ).
+        const void* __restrict__ l1_weights_ptr,
+        const void* __restrict__ l2_weights_ptr,
         // NVFP4: optional per-expert scale [E].
         // MXFP4: required per-(expert, weight row) scale [E, N] = 2^e_ref * global.
         const float* __restrict__ l1_global_scales,

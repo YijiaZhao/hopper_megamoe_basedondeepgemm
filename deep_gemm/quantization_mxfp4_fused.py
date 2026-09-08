@@ -98,8 +98,16 @@ def mxfp4_fuse_packed_with_scale_tile_major(
 ) -> torch.Tensor:
     """Pack each BK128 row as ``64B FP4 + 4B relative E8M0 index + 12B zero``.
 
-    Same 80-byte row stride as the NVFP4 fused layout so the TMA descriptors and
-    shared-memory staging are unchanged; only the scale bytes differ.
+    Same 80-byte rows as the NVFP4 fused layout, but the *byte order* is dense
+    tile-major: ``(E, n_blocks, k_blocks, block_n, 80)`` contiguous, so every
+    ``(expert, n_block, k_block)`` weight tile is one contiguous
+    ``block_n * 80`` byte chunk (20480 B for BN256). The fused H20 kernel
+    streams each stage with a single 1D bulk copy (``cp.async.bulk``) instead of
+    a 2D TMA box, which is TMA-issue-rate bound on H20. The returned tensor keeps
+    the nominal ``(E, N, k_blocks * 80)`` shape so callers/validation are
+    unchanged; only row-wise (80 B chunk) post-processing may be applied to it
+    (see ``deep_gemm.mega.fused``), never anything that assumes row ``n`` lives
+    at byte offset ``n * k_blocks * 80``.
     """
     assert packed.dtype == torch.uint8 and scale_tile_major.dtype == torch.uint8
     assert packed.dim() == 3 and scale_tile_major.dim() == 5
@@ -119,11 +127,17 @@ def mxfp4_fuse_packed_with_scale_tile_major(
     )
     fused[..., :scale_offset] = packed_tile
     fused[..., scale_offset:scale_offset + groups_per_k_block] = scale_tile_major
-    return (
-        fused.permute(0, 1, 3, 2, 4)
-        .reshape(E, N, k_blocks * MXFP4_FUSED_ROW_BYTES)
-        .contiguous()
-    )
+    # Dense tile-major byte order (no permute back to row-major); nominal shape only.
+    out = fused.reshape(E, N, k_blocks * MXFP4_FUSED_ROW_BYTES)
+    assert out.is_contiguous() and out.data_ptr() == fused.data_ptr()
+    return out
+
+
+def fused_dense_tile_view(fused: torch.Tensor, block_n: int = 256,
+                          row_bytes: int = MXFP4_FUSED_ROW_BYTES) -> torch.Tensor:
+    """View a dense tile-major fused tensor as ``(E, n_blocks, k_blocks, block_n, row_bytes)``."""
+    E, N, KB = fused.shape
+    return fused.view(E, N // block_n, KB // row_bytes, block_n, row_bytes)
 
 
 def unpack_fp4_values(packed: torch.Tensor) -> torch.Tensor:

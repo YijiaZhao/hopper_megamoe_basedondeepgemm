@@ -31,6 +31,7 @@ public:
         bool swap_pipeline_decode;
         bool distributed_expert_bcast;
         bool qoq;
+        bool dense_weight_tiles;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -44,6 +45,8 @@ public:
         CUtensorMap tensor_map_l2_acts;
         CUtensorMap tensor_map_l2_acts_sf;
         CUtensorMap tensor_map_l2_weights;
+        const void* l1_weights_ptr;
+        const void* l2_weights_ptr;
         const float* l1_global_scales;
         const float* l2_global_scales;
         unsigned long long* phase_stamps;
@@ -68,7 +71,8 @@ public:
             "        /* kPrefetchWeightKBlocks */ {},\n"
             "        /* kSwapPipelineDecode */ {},\n"
             "        /* kDistributedExpertBcast */ {},\n"
-            "        /* kQoQ */ {}",
+            "        /* kQoQ */ {},\n"
+            "        /* kDenseWeightTiles */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -77,7 +81,8 @@ public:
             args.prefetch_weight_k_blocks,
             args.swap_pipeline_decode ? "true" : "false",
             args.distributed_expert_bcast ? "true" : "false",
-            args.qoq ? "true" : "false");
+            args.qoq ? "true" : "false",
+            args.dense_weight_tiles ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -127,6 +132,8 @@ static void __instantiate_kernel() {{
             args.tensor_map_l2_acts,
             args.tensor_map_l2_acts_sf,
             args.tensor_map_l2_weights,
+            args.l1_weights_ptr,
+            args.l2_weights_ptr,
             args.l1_global_scales,
             args.l2_global_scales,
             args.phase_stamps));
@@ -171,6 +178,18 @@ static void sm90_fp4_h20_fused_mega_moe(
                     config.block_m == 128));
     DG_HOST_ASSERT(config.block_n == 128 || config.block_n == 256);
     DG_HOST_ASSERT(plan.swap_ab == (num_tokens <= 64));
+    // MXFP4/QoQ fused weights are packed as dense BN256 x BK128 tiles (80 B rows)
+    // and loaded with one 1D bulk copy per stage; the tile shape is baked in by
+    // the host packer, so the kernel tile must match.
+    const bool dense_weight_tiles = mxfp4 || qoq;
+    if (dense_weight_tiles) {
+        DG_HOST_ASSERT(config.block_n == 256);
+        DG_HOST_ASSERT(l1_weights.is_contiguous() && l2_weights.is_contiguous());
+        DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(l1_weights.data_ptr()) % 16 == 0);
+        DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(l2_weights.data_ptr()) % 16 == 0);
+        DG_HOST_ASSERT(l1_weights.size(2) == (hidden / KernelConfig::kBlockK) * kSM90NVFP4BStoragePerKBlock);
+        DG_HOST_ASSERT(l2_weights.size(2) == (intermediate_hidden / KernelConfig::kBlockK) * kSM90NVFP4BStoragePerKBlock);
+    }
     // QoQ W4A8 is implemented for the swapAB tiers only (<= 64 tokens per rank).
     DG_HOST_ASSERT(!qoq || plan.swap_ab);
 
@@ -241,6 +260,11 @@ static void sm90_fp4_h20_fused_mega_moe(
         // SMs removes ~10us of SM0-serial sys-scope atomics (M=2: 62->52us).
         .distributed_expert_bcast = get_env<int>("DG_FP4_DIST_BCAST", 1) != 0,
         .qoq = qoq,
+        // MXFP4/QoQ hosts pack dense (E, N/256, K/128, 256, 80 B) weight tiles
+        // (deep_gemm/quantization_{mxfp4,qoq}_fused.py); the B loader then does
+        // one 1D bulk copy per stage instead of a TMA-issue-bound 2D box.
+        // NVFP4 keeps the row-major fused layout + 2D TMA.
+        .dense_weight_tiles = dense_weight_tiles,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -253,6 +277,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         .tensor_map_l2_acts = tensor_map_l2_acts,
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
+        .l1_weights_ptr = l1_weights.data_ptr(),
+        .l2_weights_ptr = l2_weights.data_ptr(),
         .l1_global_scales = l1_global_scales_ptr,
         .l2_global_scales = l2_global_scales_ptr,
         .phase_stamps = phase_stamps.has_value() ?

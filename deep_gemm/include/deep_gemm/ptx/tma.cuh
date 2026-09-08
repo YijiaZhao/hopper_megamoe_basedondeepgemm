@@ -76,6 +76,13 @@ CUTLASS_DEVICE void tma_load_1d(
         : "memory");
 }
 
+// Warm L2 with `num_bytes` (multiple of 16) starting at `src_ptr` (16 B aligned).
+// 1D analogue of `SM90_TMA_LOAD_2D::PREFETCH`; no smem, no barrier.
+CUTLASS_DEVICE void tma_prefetch_1d(const void* src_ptr, const uint32_t& num_bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::
+                 "l"(src_ptr), "r"(num_bytes) : "memory");
+}
+
 CUTLASS_DEVICE void tma_store_1d(
     const void* dst_ptr, const void* src_ptr, const uint32_t& num_bytes,
     const cute::TMA::CacheHintSm90& hint = cute::TMA::CacheHintSm90::EVICT_NORMAL) {
