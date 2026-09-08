@@ -233,10 +233,18 @@ static void sm90_fp4_h20_fused_mega_moe(
     // no reduction), so the per-WG per-stage work and the L2 task latency halve.
     // Targets the post-split-K critical tail (L2 tasks quantising on 78 SMs).
     // L1 tasks / TMA boxes / SF granularity are untouched. Exclusive with
-    // half-tile tasks. Default ON for that tier; DG_FP4_L2_HALFROW=0 disables.
+    // half-tile tasks.
+    // H20 A/B (2026-09-09, 8 ranks, phase stamps, back-to-back ON vs OFF): the L2
+    // task does NOT get shorter with half the rows per WG (per-task probe 6.5 us
+    // both ways: the RF stage chain is latency-bound, as the half-tile experiment
+    // already found per K-block), so doubling the task count doubles the L2 tail
+    // (M16 last L2 - last L1: 26 vs 10.6 us) and the ON build also slows the L1
+    // task (29 vs 22.7 us; one ON cubin spills, STACK 56). Kernel end M8 73.3-73.9
+    // vs 62.9-63.8, M16 115.8-116.0 vs 87.1-99.9. Default OFF; DG_FP4_L2_HALFROW=1
+    // enables it (numerics verified: T=2/8/16/128/512 + QoQ pass).
     const bool l2_half_row_tasks = mxfp4 && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && plan.use_interleaved_scheduler && dense_weight_tiles &&
-        get_env<int>("DG_FP4_L2_HALFROW", 1) != 0;
+        get_env<int>("DG_FP4_L2_HALFROW", 0) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;

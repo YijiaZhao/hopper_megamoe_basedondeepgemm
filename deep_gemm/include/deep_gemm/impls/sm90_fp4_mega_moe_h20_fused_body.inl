@@ -152,10 +152,10 @@
         kSplitKL1Requested && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
         !kHalfTileTasks && kUseInterleavedScheduler && kDenseWeightTiles && BLOCK_N == 256;
     constexpr uint32_t kNumL1KSplits = kSplitKL1 ? fused_layout::kSM90SplitKL1NumKSplits : 1u;
-    // L2 half-row tasks (kL2HalfRowTasks; host env DG_FP4_L2_HALFROW, default ON for
-    // the BM8 MXFP4 RF swapAB tier == the 2-K-block-per-stage path with dense BN256
-    // tiles and the interleaved scheduler; exclusive with kHalfTileTasks; every
-    // other tier is untouched). After L1 split-K the L2 tasks are the critical tail
+    // L2 half-row tasks (kL2HalfRowTasks; host env DG_FP4_L2_HALFROW, default OFF;
+    // only the BM8 MXFP4 RF swapAB tier == the 2-K-block-per-stage path with dense
+    // BN256 tiles and the interleaved scheduler can enable it; exclusive with
+    // kHalfTileTasks; every other tier is untouched). After L1 split-K the L2 tasks are the critical tail
     // (192 tasks of ~6.5 us quantise badly on 78 SMs: M16 last L2 - last L1 = 11 us).
     // An L2 task covers 128 rows (one 10 KB half of a packed weight tile, the BN128
     // sub-tile addressing of the dense-tile work) instead of 256, and the two math
@@ -166,6 +166,12 @@
     // task takes ~half the time; the L2 task count doubles (12 -> 24 per M block).
     // L1 tasks are unchanged (256 rows, 10 per M block); the L1 -> L2 K-block
     // dependency is unchanged (the L2 task N does not affect its K mapping).
+    // H20 probe (2026-09-09): the premise does not hold. The per-WG stage cost is a
+    // latency chain (smem load -> LUT -> decode -> RS WGMMA -> drain -> promote), so
+    // an L2 task still takes ~6.5 us with 64 rows per WG (same as with 128) and the
+    // doubled task count doubles the L2 tail; the ON build also slowed the L1 task
+    // (29 vs 22.7 us, register spills). Kept as an OFF-by-default knob (numerics
+    // verified); see the host for the numbers.
     constexpr bool kL2HalfRowTasks =
         kL2HalfRowTasksRequested && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
         !kHalfTileTasks && kUseInterleavedScheduler && kDenseWeightTiles &&

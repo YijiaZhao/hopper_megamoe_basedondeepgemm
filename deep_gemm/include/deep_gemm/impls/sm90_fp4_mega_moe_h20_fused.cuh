@@ -453,7 +453,7 @@ template <
     // Host-selected L2 half-row tasks (128-row L2 tasks, the two math WGs each own
     // 64 rows over the full K, no cross-WG reduction) on the BM8 MXFP4 RF swapAB
     // path; see `kL2HalfRowTasks` in the body. Ignored by every other tier.
-    // Env DG_FP4_L2_HALFROW (default 1).
+    // Env DG_FP4_L2_HALFROW (default 0: measured slower on H20, see the body).
     bool kL2HalfRowTasksRequested = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
