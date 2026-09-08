@@ -60,9 +60,10 @@ def main():
     args = ap.parse_args()
     args.backend = "fused"
 
-    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
     rank = dist.get_rank()
-    torch.cuda.set_device(rank)
     group = dist.new_group(list(range(P.WORLD)))
 
     active_rows = P.local_tokens(args.global_tokens, rank)
