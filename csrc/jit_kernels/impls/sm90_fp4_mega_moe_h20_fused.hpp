@@ -226,13 +226,19 @@ static void sm90_fp4_h20_fused_mega_moe(
         .mxfp4 = mxfp4,
         // Env knob (default 8): number of BK128 weight rows per task prefetched
         // into L2 cache while waiting for activations; 0 disables.
-        .prefetch_weight_k_blocks = get_env<int>("DG_FP4_PREFETCH_KBLOCKS", 8),
-        // Experimental knobs, default OFF: measured no gain on H200 at tiny M
-        // (2026-09-02 A/B). Kept for re-evaluation.
+        // H20 A/B (2026-09-09, phase stamps): prefetching 8 K-blocks per task is
+        // ~neutral at M<=8 but pollutes L2 / steals HBM at M=16 (-6us L1 phase
+        // when disabled), so default it off from 16 tokens up.
+        .prefetch_weight_k_blocks = get_env<int>("DG_FP4_PREFETCH_KBLOCKS",
+                                                 num_tokens >= 16 ? 0 : 8),
+        // DG_FP4_SWAP_PIPE stays OFF (no gain on H200 09-02 nor H20 09-09).
+        // DG_FP4_DIST_BCAST defaults ON since the H20 09-09 A/B.
         //   DG_FP4_SWAP_PIPE=1   overlap decode(k+1) with WGMMA(k) in swapAB tiles
         //   DG_FP4_DIST_BCAST=1  spread the dispatch expert-count broadcast over all SMs
         .swap_pipeline_decode = !qoq && get_env<int>("DG_FP4_SWAP_PIPE", 0) != 0,
-        .distributed_expert_bcast = get_env<int>("DG_FP4_DIST_BCAST", 0) != 0,
+        // H20 A/B (2026-09-09): spreading the expert-count broadcast over all
+        // SMs removes ~10us of SM0-serial sys-scope atomics (M=2: 62->52us).
+        .distributed_expert_bcast = get_env<int>("DG_FP4_DIST_BCAST", 1) != 0,
         .qoq = qoq,
         .config = config,
         .y = y.data_ptr(),
