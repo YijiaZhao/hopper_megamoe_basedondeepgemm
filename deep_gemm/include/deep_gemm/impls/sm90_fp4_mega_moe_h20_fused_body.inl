@@ -139,11 +139,11 @@
     // (80 L1 tasks on 78 SMs no longer cost two full task lengths). The per-WG math
     // shape is identical to the unsplit path; `final_accum` already carries the
     // per-K-block activation SF at promote time, so the two partials are directly
-    // summable. Reduction (before the L1 epilogue): both halves write their partial
-    // to a global scratch slot [k_half] (fused_layout::Workspace, 8 KB per half) and
-    // bump a per-(pool_block, n_block) counter; the FIRST arriver skips the
-    // epilogue (no L1-ready notify), the LAST adds the partner's slot and runs the
-    // normal epilogue + notify. The scheduler only splits when the launch's pool
+    // summable. Reduction (before the L1 epilogue): half 0 publishes its partial to
+    // a global scratch slot (fused_layout::Workspace, 8 KB) and releases a
+    // per-(pool_block, n_block) flag, skipping the epilogue (no L1-ready notify);
+    // half 1 acquires the flag, adds the slot and runs the normal epilogue +
+    // notify. The scheduler only splits when the launch's pool
     // block count fits the scratch (kSM90SplitKL1MaxPoolBlocks); L2 is unchanged.
     constexpr bool kSplitKL1 =
         kSplitKL1Requested && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
@@ -607,7 +607,7 @@
                 }
                 if constexpr (kSplitKL1) {
                     for (uint32_t i = thread_idx; i < fused_layout::kSM90SplitKL1NumSlots; i += kNumDispatchThreads)
-                        *workspace.get_splitk_l1_counter_ptr(0, i) = 0;
+                        *workspace.get_splitk_l1_flag_ptr(0, i) = 0;
                 }
             }
         } else {
@@ -2078,15 +2078,18 @@
             }
 
             // Split-K L1 (kSplitKL1): cross-CTA reduction of the two K halves of this
-            // (pool_block, n_block). Both halves publish their promoted partials to
-            // their own scratch slot ([element][256 threads] floats, coalesced), fence,
-            // and bump the arrival counter once per CTA. Parity of the old value picks
-            // the role: FIRST leaves (no epilogue, no L1-ready notify; every CTA-wide
-            // barrier of this task has been passed by all 256 threads), LAST acquires,
-            // adds the partner's slot and runs the normal epilogue. valid_m == 0 tasks
-            // skipped the handshake above on both halves, so the counter stays even.
-            // The role broadcast uses the last word of the CD output region, which an
-            // L1 task never touches (its FP8 tile is 1 KB of the 4 KB BF16-sized region).
+            // (pool_block, n_block). Roles are fixed by the K half so no counter
+            // round-trip sits on the critical path: half 0 (PUBLISHER) stores its
+            // promoted partials to the scratch slot ([element][256 threads] floats,
+            // coalesced), one thread releases the ready flag after the CTA barrier
+            // (bar.sync + release.gpu is cumulative over the other threads' stores,
+            // as in CUTLASS's split-K semaphore) and the CTA moves on: no epilogue,
+            // no L1-ready notify (every CTA-wide barrier of the task was passed by
+            // all 256 threads). Half 1 (FINISHER) acquires the flag (its publisher
+            // was claimed one index earlier and never waits on L2 progress, so the
+            // wait is short and deadlock-free), resets it for the next launch, adds
+            // the partner's slot and runs the normal epilogue + notify.
+            // valid_m == 0 tasks skipped this on both halves (flag untouched).
             if constexpr (kSplitKL1 && !kBlockIsL2) {
                 if (num_k_splits > 1) {
                     constexpr uint32_t kNumPartialElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
@@ -2095,35 +2098,30 @@
                                      fused_layout::kSM90SplitKL1PartialBytes,
                                      "Split-K partial slot size mismatch");
                     DG_STATIC_ASSERT(fused_layout::kSM90SplitKL1NumKSplits == 2,
-                                     "Split-K handshake reads the single partner slot (k_split_idx ^ 1)");
-                    DG_STATIC_ASSERT(!kSplitKL1 || SMEM_CD_OUTPUT_BASE_SIZE >= SMEM_CD_L1_SIZE + 4u,
-                                     "Split-K role broadcast word must not overlap the L1 CD tile");
-                    auto* smem_splitk_role = reinterpret_cast<uint32_t*>(
-                        reinterpret_cast<uint8_t*>(smem_cd_base) + SMEM_CD_OUTPUT_BASE_SIZE - 4u);
-                    float* my_slot = workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx, k_split_idx);
-                    #pragma unroll
-                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                                     "Split-K handshake assumes one publisher and one finisher half");
+                    float* slot = workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx);
+                    uint32_t* flag = workspace.get_splitk_l1_flag_ptr(pool_block_idx, n_block_idx);
+                    if (k_split_idx == 0) {
                         #pragma unroll
-                        for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                        for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
                             #pragma unroll
-                            for (uint32_t j = 0; j < 4; ++ j)
-                                __stcg(my_slot + ((h * kSwapABTokenChunks + i) * 4 + j) * kNumEpilogueThreads + epilogue_thread_idx,
-                                       final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j]);
+                            for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                                #pragma unroll
+                                for (uint32_t j = 0; j < 4; ++ j)
+                                    __stcg(slot + ((h * kSwapABTokenChunks + i) * 4 + j) * kNumEpilogueThreads + epilogue_thread_idx,
+                                           final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j]);
+                            }
                         }
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        if (epilogue_thread_idx == 0)
+                            ptx::red_add_rel(flag, 1u);
+                        return;  // PUBLISHER: the finisher CTA completes this task
                     }
-                    __threadfence();
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     if (epilogue_thread_idx == 0) {
-                        *smem_splitk_role = ptx::atomic_add_rel(
-                            workspace.get_splitk_l1_counter_ptr(pool_block_idx, n_block_idx), 1u);
+                        while (ptx::ld_acq(flag) == 0u) {}
+                        *flag = 0u;
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    const uint32_t arrival = *smem_splitk_role;
-                    if ((arrival & 1u) == 0u)
-                        return;  // FIRST half: the partner CTA finishes this task
-                    __threadfence();
-                    const float* other_slot = workspace.get_splitk_l1_scratch_ptr(
-                        pool_block_idx, n_block_idx, k_split_idx ^ 1u);
                     #pragma unroll
                     for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
                         #pragma unroll
@@ -2131,7 +2129,7 @@
                             #pragma unroll
                             for (uint32_t j = 0; j < 4; ++ j)
                                 final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j] +=
-                                    __ldcg(other_slot + ((h * kSwapABTokenChunks + i) * 4 + j) * kNumEpilogueThreads + epilogue_thread_idx);
+                                    __ldcg(slot + ((h * kSwapABTokenChunks + i) * 4 + j) * kNumEpilogueThreads + epilogue_thread_idx);
                         }
                     }
                 }

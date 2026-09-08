@@ -333,6 +333,7 @@ struct InterleavedMegaMoEScheduler {
 
     static constexpr uint32_t kNumScheduleStages = 2;
     static constexpr uint32_t kNumL1WavesDone = 0xffffffffu;
+    static constexpr uint32_t kNumSplitKExtraWarmupWaves = 2;
 
     DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid L1 shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid L2 shape");
@@ -417,8 +418,15 @@ struct InterleavedMegaMoEScheduler {
         const uint32_t num_total_l1_tasks = get_num_total_l1_tasks();
         const uint32_t num_total_l1_waves =
             math::ceil_div(num_total_l1_tasks, kNumSMs);
-        const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
+        uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
             num_total_m_blocks, kNumSMs, kNumL1BlockNs * num_l1_k_splits, kNumL2BlockNs);
+        // Split-K: the K halves are short, so let the L1 warm-up absorb the
+        // leftover half-tasks of the last (partial) L1 wave instead of queueing
+        // them behind an L2 task on the alternating schedule (M=8: 160 half tasks
+        // on 78 SMs -> 3 warm-up waves claim them all). Extra L1-first waves are
+        // always deadlock-free (L1 tasks never wait on L2 progress).
+        if (num_l1_k_splits > 1)
+            min_l1_warmup_waves += kNumSplitKExtraWarmupWaves;
         num_l1_warmup_waves =
             cute::min(min_l1_warmup_waves, num_total_l1_waves);
     }

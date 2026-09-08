@@ -27,8 +27,9 @@ static constexpr bool kSM90FusedHalfTileTasks = DG_FUSED_HALF_TILE_TASKS != 0;
 // SM90 fused MXFP4 BM8 (RF swapAB, 2 K128 blocks per stage): L1 split-K tasks
 // (`kSplitKL1` in the kernel body; host env DG_FP4_SPLITK_L1, default ON for that
 // tier). Each L1 (expert, n_block) task is claimed as two K halves that run on two
-// SMs; the halves exchange fp32 partial sums through a workspace scratch indexed
-// by (pool_block, n_block, k_half) and a per-(pool_block, n_block) arrival counter.
+// SMs; K half 0 publishes its fp32 partial sums through a workspace scratch slot
+// indexed by (pool_block, n_block) and releases a per-(pool_block, n_block) flag
+// that K half 1 acquires before running the epilogue.
 // The scratch is bounded: the scheduler only splits when the launch's total pool
 // block count is <= kSM90SplitKL1MaxPoolBlocks (M<=16 per rank fits easily; larger
 // launches silently fall back to unsplit tasks). Sizes below are fixed by the
@@ -41,7 +42,7 @@ static constexpr uint32_t kSM90SplitKL1PartialBytes = 256u * 8u * 4u;
 static constexpr uint32_t kSM90SplitKL1NumSlots =
     kSM90SplitKL1MaxPoolBlocks * kSM90SplitKL1NumL1BlockNs;
 static constexpr uint64_t kSM90SplitKL1ScratchBytes =
-    static_cast<uint64_t>(kSM90SplitKL1NumSlots) * kSM90SplitKL1NumKSplits * kSM90SplitKL1PartialBytes;  // 10 MB
+    static_cast<uint64_t>(kSM90SplitKL1NumSlots) * kSM90SplitKL1PartialBytes;  // 5 MB
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -117,7 +118,7 @@ struct Workspace {
         // L2 block arrival mask
         num_bytes += num_max_pool_blocks * sizeof(uint64_t);
 
-        // Split-K L1 arrival counters (padded to keep `uint64_t` alignment)
+        // Split-K L1 ready flags (padded to keep `uint64_t` alignment)
         num_bytes += math::align<uint64_t>(kSM90SplitKL1NumSlots * sizeof(uint32_t), 8);
 
         // Dispatch pulling source token-topk
@@ -206,9 +207,9 @@ struct Workspace {
         return reinterpret_cast<uint64_t*>(base) + pool_block_idx;
     }
 
-    // Split-K L1: arrival counter per (pool_block, n_block); two increments per use
+    // Split-K L1: ready flag per (pool_block, n_block) (K half 0 -> K half 1)
     CUTLASS_DEVICE
-    uint32_t* get_splitk_l1_counter_ptr(const uint32_t& pool_block_idx = 0, const uint32_t& n_block_idx = 0) const {
+    uint32_t* get_splitk_l1_flag_ptr(const uint32_t& pool_block_idx = 0, const uint32_t& n_block_idx = 0) const {
         const auto base = get_l2_arrival_mask_ptr(num_max_pool_blocks);
         return reinterpret_cast<uint32_t*>(base) + pool_block_idx * kSM90SplitKL1NumL1BlockNs + n_block_idx;
     }
@@ -217,7 +218,7 @@ struct Workspace {
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
-        const auto base = get_splitk_l1_counter_ptr(0, 0) +
+        const auto base = get_splitk_l1_flag_ptr(0, 0) +
             math::align<uint64_t>(kSM90SplitKL1NumSlots * sizeof(uint32_t), 8) / sizeof(uint32_t);
         return reinterpret_cast<uint32_t*>(base) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
@@ -231,17 +232,16 @@ struct Workspace {
         return base + pool_token_idx;
     }
 
-    // Split-K L1: fp32 partial scratch [(pool_block, n_block)][k_half][kSM90SplitKL1PartialBytes]
+    // Split-K L1: fp32 partial scratch [(pool_block, n_block)][kSM90SplitKL1PartialBytes]
     CUTLASS_DEVICE
-    float* get_splitk_l1_scratch_ptr(const uint32_t& pool_block_idx, const uint32_t& n_block_idx,
-                                     const uint32_t& k_split_idx) const {
+    float* get_splitk_l1_scratch_ptr(const uint32_t& pool_block_idx, const uint32_t& n_block_idx) const {
         const auto end = reinterpret_cast<uint8_t*>(get_token_src_metadata_ptr(num_max_pool_tokens));
         const auto base = reinterpret_cast<uint8_t*>(
             math::align<uint64_t>(reinterpret_cast<uint64_t>(end) - reinterpret_cast<uint64_t>(this->base), 128) +
             reinterpret_cast<uint64_t>(this->base));
         return reinterpret_cast<float*>(base +
-            (static_cast<uint64_t>(pool_block_idx * kSM90SplitKL1NumL1BlockNs + n_block_idx) *
-                 kSM90SplitKL1NumKSplits + k_split_idx) * kSM90SplitKL1PartialBytes);
+            static_cast<uint64_t>(pool_block_idx * kSM90SplitKL1NumL1BlockNs + n_block_idx) *
+                kSM90SplitKL1PartialBytes);
     }
 };
 
