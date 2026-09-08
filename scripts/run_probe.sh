@@ -16,7 +16,7 @@ export DG_BENCH_FLUSH_L2_BYTES=${DG_BENCH_FLUSH_L2_BYTES:-268435456}
 unset DG_W4A8_INT DG_W4A8_INT_PRE DG_W4A8_INT_SHADOW
 nvidia-smi -L | head -1
 for M in "$@"; do
-  log="probe_${QUANT}_m${M}.log"
+  log="probe_${QUANT}_m${M}${LOG_TAG:-}.log"
   torchrun --standalone --nproc_per_node=8 tests/profile_fused_phase_stamps.py \
     --quant "$QUANT" --global-tokens "$M" --iters 20 > "$log" 2>&1
   echo "PROBE_EXIT=$?" >> "$log"
