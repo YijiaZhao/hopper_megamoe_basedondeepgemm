@@ -178,7 +178,7 @@
     // RF decode: per-lane replicated LUT (128 entries x 32 lanes x 8 B = 32 KB).
     // Lane l reads entry i at [i*32 + l], so a warp's 32 gathers always hit 32
     // distinct 8 B slots of one 256 B row -> bank-conflict-free regardless of i.
-    constexpr uint32_t SMEM_RF_LUT_REP_SIZE = kRFDecode ? 128u * 32u * sizeof(uint2) : 0u;
+    constexpr uint32_t SMEM_RF_LUT_REP_SIZE = 0u;  // replicated LUT measured: no gain (bank conflicts not the limiter)
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     // RF decode feeds WGMMA A straight from registers; no decoded-B tile.
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE =
@@ -1087,6 +1087,10 @@
             const bool kstage_probe_on =
                 (phase_stamps != nullptr) && (sm_idx == 0) && (epilogue_thread_idx == 0);
             unsigned long long kstage_t_prev = 0;
+            // Timing-only experiments (numerics invalid): phase_stamps[24] = 1 skip decode,
+            // 2 skip wgmma issue, 3 skip both. 0 / no stamps = normal execution.
+            const uint32_t kexp = (phase_stamps != nullptr) ?
+                static_cast<uint32_t>(phase_stamps[24]) : 0u;
             const auto kstage_add = [&](const uint32_t slot, const unsigned long long& v) {
                 if (kstage_probe_on) atomicAdd(phase_stamps + slot, v);
             };
@@ -1175,7 +1179,7 @@
                             for (uint32_t r = 0; r < 2; ++ r) {
                                 #pragma unroll
                                 for (uint32_t k = 0; k < 4; ++ k)
-                                    lut[h][r][k] = smem_rf_lut[(((sw[h][r] >> (k * 8u)) & 0x7fu) << 5) + lane_idx];
+                                    lut[h][r][k] = smem_nvfp4_lut[(sw[h][r] >> (k * 8u)) & 0x7fu];
                             }
                         }
                         #pragma unroll
@@ -1261,7 +1265,8 @@
                                 kstage_add(22, kt_head - kstage_t_prev);
                             kstage_t_prev = kt_head;
                         }
-                        issue_stage_rf(cur_stage, fcur);
+                        if ((kexp & 2u) == 0u)
+                            issue_stage_rf(cur_stage, fcur);
                         unsigned long long kt_b = clock64();
                         if (k_block_idx + 1 < num_k_blocks) {
                             const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
@@ -1274,18 +1279,8 @@
                             const unsigned long long kt_a = clock64();
                             if constexpr (!kBlockIsL2)
                                 kstage_add(17, kt_a - kt_b);
-                            decode_stage_rf(next_stage, fnext);
-                            // PROBE EXPERIMENT (timing only): decode a second time into a
-                            // dummy buffer to test whether slot 18 is compute/LDS bound.
-                            if (kstage_probe_on || (phase_stamps != nullptr && sm_idx != 0)) {
-                                uint32_t fdummy[2][4][4];
-                                decode_stage_rf(next_stage, fdummy);
-                                #pragma unroll
-                                for (uint32_t h = 0; h < 2; ++ h)
-                                    #pragma unroll
-                                    for (uint32_t k = 0; k < 4; ++ k)
-                                        asm volatile("" :: "r"(fdummy[h][k][0]), "r"(fdummy[h][k][3]));
-                            }
+                            if ((kexp & 1u) == 0u)
+                                decode_stage_rf(next_stage, fnext);
                             kt_b = clock64();
                             kstage_add(18, kt_b - kt_a);
                         }

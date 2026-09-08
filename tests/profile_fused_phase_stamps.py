@@ -51,10 +51,14 @@ STAGE = [(17, "L1 stage: exposed k+1 full wait"), (18, "L1 stage: k+1 RF decode+
 SM_GHZ = 1.83
 
 
+PROBE_EXP = int(os.environ.get("PROBE_EXP", "0"))  # 1 skip decode, 2 skip wgmma, 3 both (timing only)
+
+
 def reset(stamps):
     stamps.zero_()
     for s in MIN_SLOTS:
         stamps[s] = INT64_MAX
+    stamps[24] = PROBE_EXP
 
 
 def main():
@@ -149,7 +153,7 @@ def main():
             med = {slot: statistics.median(r[slot] for r in rows) for slot, _ in REPORT}
             mn = {slot: min(r[slot] for r in rows) for slot, _ in REPORT}
             mx = {slot: max(r[slot] for r in rows) for slot, _ in REPORT}
-            print(f"\n=== fused {args.quant} M={args.global_tokens} rank0 phase stamps "
+            print(f"\n=== fused {args.quant} M={args.global_tokens} rank0 phase stamps PROBE_EXP={PROBE_EXP} "
                   f"(us from kernel entry, median of {args.iters}; graph={not args.no_graph}) ===")
             print(f"{'slot':>4} {'phase':<32} {'median':>9} {'min':>9} {'max':>9} {'delta':>9}")
             prev = 0.0
