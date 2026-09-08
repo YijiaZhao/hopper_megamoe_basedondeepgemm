@@ -1220,13 +1220,13 @@
                                 interleaved_scheduler.release_task_info(lane_idx);
                         }
                         const unsigned long long kt_a = clock64();
-                        decode_stage_rf(stage_idx, frag[0]);
+                        decode_stage_rf(stage_idx, frag);
                         const unsigned long long kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
-                        issue_stage_rf(stage_idx, frag[0]);
+                        issue_stage_rf(stage_idx, frag);
                         fence_accum();
                         ptx::warpgroup_wait<0>();
-                        fence_frag(frag[0]);
+                        fence_frag(frag);
                         kstage_add(19, clock64() - kt_b);
                         promote_stage_rf(stage_idx);
                         arrive_empty_barrier(stage_idx);
