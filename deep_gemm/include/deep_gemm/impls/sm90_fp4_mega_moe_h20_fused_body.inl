@@ -848,67 +848,50 @@
                 const uint32_t src_topk_idx  = src_token_topk_idx % kNumTopk;
 
                 // TMA pull token data into SMEM
-                // Direct remote -> local pull by the whole warp in ONE NVLink round trip:
-                // the token row (kHidden FP8 bytes), its per-128 SFs and the top-k weight
-                // are loaded concurrently and stored into the local L1 pool. Replaces the
-                // former chain (remote TMA -> smem -> mbarrier -> local TMA store -> store
-                // wait, plus a serialised weight load) that cost ~6-7 us per token and
-                // gated every first-wave L1 task.
+                if (cute::elect_one_sync()) {
+                    ptx::tma_load_1d(
+                        pull_buffer.get_base_ptr(),
+                        sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
+                                       current_rank_in_expert_idx),
+                        pull_mbarrier, kHidden);
+                }
+                __syncwarp();
+
+                // Copy SF: per-128 K floats, written linearly (no UTCCP transpose).
                 constexpr uint32_t kNumSFFloats = kHidden / 128;
                 DG_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
-                DG_STATIC_ASSERT(kHidden % 16 == 0, "Token row must be uint4-aligned");
-                constexpr uint32_t kNumTokUint4 = kHidden / 16;
-                constexpr uint32_t kNumTokUint4PerLane = math::constexpr_ceil_div(kNumTokUint4, 32u);
-                constexpr uint32_t kNumSFPerLane = math::constexpr_ceil_div(kNumSFFloats, 32u);
-                const uint32_t pool_token_idx =
-                    expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
-                const auto* remote_tok = reinterpret_cast<const uint4*>(sym_buffer.map(
-                    input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(),
-                    current_rank_in_expert_idx));
                 const auto remote_sf_ptr = sym_buffer.map(
                     input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
                     current_rank_in_expert_idx);
                 const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
-                auto* local_tok = reinterpret_cast<uint4*>(
-                    l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr());
-                uint4 tok_v[kNumTokUint4PerLane];
+                const uint32_t pool_token_idx =
+                    expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
                 #pragma unroll
-                for (uint32_t i = 0; i < kNumTokUint4PerLane; ++ i) {
-                    const uint32_t j = i * 32 + lane_idx;
-                    if (j < kNumTokUint4) tok_v[i] = remote_tok[j];
-                }
-                float sf_v[kNumSFPerLane];
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumSFPerLane; ++ i) {
-                    const uint32_t j = i * 32 + lane_idx;
-                    if (j < kNumSFFloats) sf_v[i] = remote_sf_ptr[j];
-                }
-                float weight = 0.0f;
-                if (lane_idx == 0)
-                    weight = *sym_buffer.map(
-                        input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                        current_rank_in_expert_idx);
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumTokUint4PerLane; ++ i) {
-                    const uint32_t j = i * 32 + lane_idx;
-                    if (j < kNumTokUint4) local_tok[j] = tok_v[i];
-                }
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumSFPerLane; ++ i) {
+                for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
                     if (j < kNumSFFloats)
-                        local_sf_ptr[j * kNumPaddedSFPoolTokens + pool_token_idx] = sf_v[i];
+                        local_sf_ptr[j * kNumPaddedSFPoolTokens + pool_token_idx] = remote_sf_ptr[j];
                 }
-                if (lane_idx == 0) {
+                __syncwarp();
+
+                if (cute::elect_one_sync()) {
+                    const auto weight = *sym_buffer.map(
+                        input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+                        current_rank_in_expert_idx);
                     *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
+
+                    ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
+                    ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
+
+                    ptx::tma_store_1d(
+                        l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr(),
+                        pull_buffer.get_base_ptr(), pull_buffer.get_num_bytes());
+
                     *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                         {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
-                }
-                // The L1 activation loader reads the pool through TMA (async proxy): order
-                // our generic-proxy stores before the release arrival signal.
-                asm volatile("fence.proxy.async.global;" ::: "memory");
-                __syncwarp();
-                if (cute::elect_one_sync()) {
+
+                    cute::tma_store_arrive();
+                    ptx::tma_store_wait<0>();
                     ptx::red_add_rel(
                         workspace.get_l1_arrival_count_ptr(
                             expert_pool_block_offset + token_idx_in_expert / BLOCK_M),
