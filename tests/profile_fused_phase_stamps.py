@@ -76,7 +76,7 @@ def main():
     kernel = (deep_gemm_fused_kernel(args.quant))
     weights = prepare_weights(args, rank, local_experts)
 
-    stamps = torch.zeros(16, dtype=torch.int64, device="cuda")
+    stamps = torch.zeros(32, dtype=torch.int64, device="cuda")
     try:
         torch.manual_seed(17000 + rank * 1000003 + args.global_tokens)
         x = torch.randn(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
