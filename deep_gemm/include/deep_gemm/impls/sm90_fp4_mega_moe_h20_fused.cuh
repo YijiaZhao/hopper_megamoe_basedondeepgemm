@@ -58,6 +58,21 @@ __device__ __forceinline__ uint2 dequant_mode2_nibble_word(
 // swapAB tiers decode one uint4 per row straight into registers. The SMEM
 // tile decoders below gather (q0.x, q1.x, q2.x, q3.x) for K[0..16) and
 // (q0.y, q1.y, q2.y, q3.y) for K[16..32) so the decoded tile is unchanged.
+// RF-ordered MXFP4 rows are additionally word-transposed on the host
+// (`_fused_word_transpose`): 16-byte chunk c holds word c of K32 groups 0..3,
+// so the RS loader fetches all four K32 steps of thread `lane % 4 == c` with a
+// single uint4. The SS tile decoders load the whole 64-byte row anyway, so
+// they undo the transpose in registers (pure renaming after unrolling): after
+// this, `quads[g]` holds words c = 0..3 of K32 group g, i.e. word (g, c) is
+// read from byte offset c*16 + g*4.
+__device__ __forceinline__ void transpose_rf_quads(uint4 (&quads)[4]) {
+    const uint4 t0 = quads[0], t1 = quads[1], t2 = quads[2], t3 = quads[3];
+    quads[0] = make_uint4(t0.x, t1.x, t2.x, t3.x);
+    quads[1] = make_uint4(t0.y, t1.y, t2.y, t3.y);
+    quads[2] = make_uint4(t0.z, t1.z, t2.z, t3.z);
+    quads[3] = make_uint4(t0.w, t1.w, t2.w, t3.w);
+}
+
 template <bool kRFOrder>
 __device__ __forceinline__ void store_decoded_quad(
         uint8_t* __restrict__ fp8_dst,
@@ -146,6 +161,8 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_mode2_nibble(
 #pragma unroll
     for (int i = 0; i < 4; ++i)
         fp4_quads[i] = fp4_src[i];
+    if constexpr (kPer32Scale)
+        transpose_rf_quads(fp4_quads);
     const uint2 scale_words =
         *reinterpret_cast<const uint2*>(row_ptr + 64);
     dequant_mode2_nibble_row_regs<kQuadILP, kPer32Scale>(
@@ -175,7 +192,17 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_mode2_nibble_split_m(
 
     #pragma unroll
     for (uint32_t quad_i = 0; quad_i < 2; ++ quad_i) {
-        const uint4 q = fp4_src[quad_i];
+        uint4 q;
+        if constexpr (kPer32Scale) {
+            // Word-transposed RF row: word c of K32 group g lives at byte
+            // c*16 + g*4, so gather the four words of this half's group.
+            const uint32_t g = k_half_idx * 2u + quad_i;
+            const uint32_t* __restrict__ words =
+                reinterpret_cast<const uint32_t*>(row_ptr + g * 4u);
+            q = make_uint4(words[0], words[4], words[8], words[12]);
+        } else {
+            q = fp4_src[quad_i];
+        }
         const uint32_t scale_i0 = quad_i * 2u;
         const uint32_t scale_i1 = scale_i0 + 1u;
         uint2 lut0, lut1;
@@ -342,6 +369,8 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_braided_lut_window(
 #pragma unroll
     for (int i = 0; i < 4; ++i)
         fp4_quads[i] = fp4_src[i];
+    if constexpr (kPer32Scale)
+        transpose_rf_quads(fp4_quads);
 
     const uint2 scale_words = *reinterpret_cast<const uint2*>(row_ptr + 64);
     const uint2 lut0 = lut_smem[scale_words.x & 0x7fu];
