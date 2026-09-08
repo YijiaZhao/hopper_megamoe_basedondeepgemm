@@ -62,6 +62,9 @@ struct alignas(16) TaskInfo {
     uint32_t pool_block_idx;
     uint32_t valid_m;
     uint32_t shape_n;
+    // bits [0, 16): K extent of the whole GEMM; bits [16, 24): K-split index;
+    // bits [24, 32): number of K splits of this task (1 == unsplit). Consumers
+    // derive their K-block range from `get_k_split_idx()` / `get_num_k_splits()`.
     uint32_t shape_k;
 
     CUTLASS_HOST_DEVICE
@@ -80,11 +83,18 @@ struct alignas(16) TaskInfo {
         local_expert_idx(local_expert_idx),
         m_block_idx(m_block_idx), n_block_idx(n_block_idx),
         pool_block_idx(pool_block_idx), valid_m(valid_m),
-        shape_n(shape_n), shape_k(shape_k) {}
+        shape_n(shape_n), shape_k(shape_k | (1u << 24)) {}
 
     CUTLASS_HOST_DEVICE bool is_valid() const {
         return block_phase != BlockPhase::None;
     }
+
+    CUTLASS_HOST_DEVICE void set_k_split(const uint32_t& k_split_idx, const uint32_t& num_k_splits) {
+        shape_k = (shape_k & 0xffffu) | (k_split_idx << 16) | (num_k_splits << 24);
+    }
+    CUTLASS_HOST_DEVICE uint32_t get_shape_k() const { return shape_k & 0xffffu; }
+    CUTLASS_HOST_DEVICE uint32_t get_k_split_idx() const { return (shape_k >> 16) & 0xffu; }
+    CUTLASS_HOST_DEVICE uint32_t get_num_k_splits() const { return shape_k >> 24; }
 };
 
 DG_STATIC_ASSERT(sizeof(TaskInfo) == 32, "Invalid task payload layout");
@@ -307,6 +317,13 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumSMs, uint32_t kNumRanks,
+          // L1 split-K: every L1 (pool_block, n_block) task is claimed as
+          // `kNumL1KSplits` K-range tasks (adjacent task indices, so the halves
+          // run concurrently on different SMs) whenever the launch's pool block
+          // count fits the partial-sum scratch (`kMaxSplitKPoolBlocks`);
+          // otherwise the launch falls back to unsplit tasks.
+          uint32_t kNumL1KSplits = 1,
+          uint32_t kMaxSplitKPoolBlocks = 0xffffffffu,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N>
@@ -324,6 +341,11 @@ struct InterleavedMegaMoEScheduler {
     DG_STATIC_ASSERT(kNumL1BlockNs <= 64, "L1 readiness mask is too small");
     DG_STATIC_ASSERT(kNumL2BlockNs >= kNumL1BlockNs,
                      "Alternating scheduler requires at least as many L2 tasks as L1 tasks");
+    // With split-K the L1 task count per M block (kNumL1BlockNs * kNumL1KSplits)
+    // exceeds the L2 count; `get_num_l1_warmup_waves` accounts for the surplus
+    // through its per-M-block task difference term.
+    DG_STATIC_ASSERT(kNumL1KSplits >= 1 && kNumL1KSplits <= 255, "Invalid L1 K-split count");
+    DG_STATIC_ASSERT(L1_SHAPE_K <= 0xffffu, "L1 K extent must fit the TaskInfo shape_k field");
 
     const fused_layout::Workspace& workspace;
     Barrier* task_info_full_barriers;
@@ -335,6 +357,8 @@ struct InterleavedMegaMoEScheduler {
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
     uint32_t num_total_m_blocks = 0;
     uint32_t num_l1_warmup_waves = 0;
+    // Effective L1 K-split factor for this launch (1 or kNumL1KSplits)
+    uint32_t num_l1_k_splits = 1;
 
     CUTLASS_DEVICE
     InterleavedMegaMoEScheduler(
@@ -388,13 +412,23 @@ struct InterleavedMegaMoEScheduler {
         __syncwarp();
 
         num_total_m_blocks = get_pool_block_offset(kNumExpertsPerRank);
-        const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1BlockNs;
+        num_l1_k_splits = (kNumL1KSplits > 1 && num_total_m_blocks <= kMaxSplitKPoolBlocks) ?
+            kNumL1KSplits : 1u;
+        const uint32_t num_total_l1_tasks = get_num_total_l1_tasks();
         const uint32_t num_total_l1_waves =
             math::ceil_div(num_total_l1_tasks, kNumSMs);
         const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
-            num_total_m_blocks, kNumSMs, kNumL1BlockNs, kNumL2BlockNs);
+            num_total_m_blocks, kNumSMs, kNumL1BlockNs * num_l1_k_splits, kNumL2BlockNs);
         num_l1_warmup_waves =
             cute::min(min_l1_warmup_waves, num_total_l1_waves);
+    }
+
+    CUTLASS_DEVICE uint32_t get_num_l1_tasks_per_m_block() const {
+        return kNumL1BlockNs * num_l1_k_splits;
+    }
+
+    CUTLASS_DEVICE uint32_t get_num_total_l1_tasks() const {
+        return num_total_m_blocks * get_num_l1_tasks_per_m_block();
     }
 
     CUTLASS_DEVICE task_info_t create_task(
@@ -458,13 +492,16 @@ struct InterleavedMegaMoEScheduler {
                 -- num_l1_warmup_waves;
                 const uint32_t task_idx =
                     get_next_task_idx(workspace.get_l1_task_count_ptr());
-                if (task_idx >= num_total_m_blocks * kNumL1BlockNs) {
+                if (task_idx >= get_num_total_l1_tasks()) {
                     num_l1_warmup_waves = kNumL1WavesDone;
                     continue;
                 }
-                return create_task(
-                    BlockPhase::Linear1, task_idx, kNumL1BlockNs,
+                // Split-K: task index = ((pool * kNumL1BlockNs + n) * splits + k_split)
+                auto task_info = create_task(
+                    BlockPhase::Linear1, task_idx / num_l1_k_splits, kNumL1BlockNs,
                     L1_SHAPE_N, L1_SHAPE_K);
+                task_info.set_k_split(task_idx % num_l1_k_splits, num_l1_k_splits);
+                return task_info;
             }
 
             const uint32_t task_idx =
@@ -479,7 +516,7 @@ struct InterleavedMegaMoEScheduler {
                 BlockPhase::Linear2, task_idx, kNumL2BlockNs,
                 L2_SHAPE_N, L2_SHAPE_K);
             const uint32_t num_required_l1_tasks =
-                (task_info.pool_block_idx + 1) * kNumL1BlockNs;
+                (task_info.pool_block_idx + 1) * get_num_l1_tasks_per_m_block();
             while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) <
                    num_required_l1_tasks) {}
             return task_info;

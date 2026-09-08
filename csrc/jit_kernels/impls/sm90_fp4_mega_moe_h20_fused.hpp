@@ -33,6 +33,7 @@ public:
         bool qoq;
         bool dense_weight_tiles;
         bool half_tile_tasks;
+        bool split_k_l1;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -74,7 +75,8 @@ public:
             "        /* kDistributedExpertBcast */ {},\n"
             "        /* kQoQ */ {},\n"
             "        /* kDenseWeightTiles */ {},\n"
-            "        /* kHalfTileTasksRequested */ {}",
+            "        /* kHalfTileTasksRequested */ {},\n"
+            "        /* kSplitKL1Requested */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -85,7 +87,8 @@ public:
             args.distributed_expert_bcast ? "true" : "false",
             args.qoq ? "true" : "false",
             args.dense_weight_tiles ? "true" : "false",
-            args.half_tile_tasks ? "true" : "false");
+            args.half_tile_tasks ? "true" : "false",
+            args.split_k_l1 ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -208,6 +211,16 @@ static void sm90_fp4_h20_fused_mega_moe(
     const bool half_tile_tasks = fused_layout::kSM90FusedHalfTileTasks &&
         mxfp4 && plan.swap_ab && config.block_m == 8 &&
         get_env<int>("DG_FP4_HALF_TILE", 0) != 0;
+    // L1 split-K tasks (kernel `kSplitKL1`): the BM8 MXFP4 RF swapAB tier claims
+    // each L1 (expert, n_block) task as two K halves on two SMs (cross-CTA fp32
+    // reduction through fused_layout::Workspace scratch, 10 MB, bounded to
+    // kSM90SplitKL1MaxPoolBlocks pool blocks; larger launches fall back in-kernel).
+    // The per-WG math shape is unchanged, so unlike half-tile tasks the per-task
+    // latency really halves. Default ON for that tier; DG_FP4_SPLITK_L1=0 disables.
+    // Exclusive with half-tile tasks. No effect on TMA boxes / SF granularity.
+    const bool split_k_l1 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
+        !half_tile_tasks && plan.use_interleaved_scheduler &&
+        get_env<int>("DG_FP4_SPLITK_L1", 1) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;
@@ -282,6 +295,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // NVFP4 keeps the row-major fused layout + 2D TMA.
         .dense_weight_tiles = dense_weight_tiles,
         .half_tile_tasks = half_tile_tasks,
+        .split_k_l1 = split_k_l1,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,

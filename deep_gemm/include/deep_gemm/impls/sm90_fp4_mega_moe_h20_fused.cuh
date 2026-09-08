@@ -444,7 +444,12 @@ template <
     // Host-selected half-tile tasks (128-row tasks + intra-CTA K-split) on the
     // BM8 MXFP4 RF swapAB path; see `kHalfTileTasks` in the body. Ignored by
     // every other tier.
-    bool kHalfTileTasksRequested = false
+    bool kHalfTileTasksRequested = false,
+    // Host-selected L1 split-K tasks (two K halves of one (expert, n_block) task
+    // on two SMs, cross-CTA fp32 reduction through the workspace) on the BM8
+    // MXFP4 RF swapAB path; see `kSplitKL1` in the body. Ignored by every other
+    // tier. Env DG_FP4_SPLITK_L1 (default 1).
+    bool kSplitKL1Requested = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

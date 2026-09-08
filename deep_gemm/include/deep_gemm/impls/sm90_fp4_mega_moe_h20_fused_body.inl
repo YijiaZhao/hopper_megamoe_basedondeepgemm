@@ -131,11 +131,30 @@
         kSwapABRequested && kMXFP4 && BLOCK_M == 8;
     // N extent of one scheduled task (== the weight tile N unless half-tile tasks).
     constexpr uint32_t TASK_BLOCK_N = kHalfTileTasks ? BLOCK_N / 2 : BLOCK_N;
+    // L1 split-K tasks (kSplitKL1; host env DG_FP4_SPLITK_L1, default ON for the BM8
+    // MXFP4 RF swapAB tier == the 2-K-block-per-stage path; every other tier is
+    // untouched). Each L1 (expert, n_block) task is scheduled as two adjacent task
+    // indices k_half = 0/1 covering K-blocks [12*k_half, 12*k_half + 12) (6 stages),
+    // so the two halves run concurrently on two SMs and a task takes ~half as long
+    // (80 L1 tasks on 78 SMs no longer cost two full task lengths). The per-WG math
+    // shape is identical to the unsplit path; `final_accum` already carries the
+    // per-K-block activation SF at promote time, so the two partials are directly
+    // summable. Reduction (before the L1 epilogue): both halves write their partial
+    // to a global scratch slot [k_half] (fused_layout::Workspace, 8 KB per half) and
+    // bump a per-(pool_block, n_block) counter; the FIRST arriver skips the
+    // epilogue (no L1-ready notify), the LAST adds the partner's slot and runs the
+    // normal epilogue + notify. The scheduler only splits when the launch's pool
+    // block count fits the scratch (kSM90SplitKL1MaxPoolBlocks); L2 is unchanged.
+    constexpr bool kSplitKL1 =
+        kSplitKL1Requested && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
+        !kHalfTileTasks && kUseInterleavedScheduler && kDenseWeightTiles && BLOCK_N == 256;
+    constexpr uint32_t kNumL1KSplits = kSplitKL1 ? fused_layout::kSM90SplitKL1NumKSplits : 1u;
     using interleaved_scheduler_t = fused_sched::InterleavedMegaMoEScheduler<
         BLOCK_M, TASK_BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
-        kNumExpertsPerRank, kNumSMs, kNumRanks>;
+        kNumExpertsPerRank, kNumSMs, kNumRanks,
+        kNumL1KSplits, fused_layout::kSM90SplitKL1MaxPoolBlocks>;
     constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / TASK_BLOCK_N;
     constexpr bool kSplitMDecodedWeightReuse =
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
@@ -195,6 +214,11 @@
                      (kRFDecode && kKBlocksPerStage == 2 && kNumEpilogueWarpgroups == 2 &&
                       BLOCK_N == 256 && kDenseWeightTiles),
                      "Half-tile tasks: RF decode, 2 K-blocks per stage (one per WG), dense BN256 tiles");
+    DG_STATIC_ASSERT(!kSplitKL1 ||
+                     (kRFDecode && kKBlocksPerStage == 2 && kNumEpilogueWarpgroups == 2 &&
+                      ((L1_SHAPE_K / BLOCK_K) % (kNumL1KSplits * kKBlocksPerStage)) == 0 &&
+                      L1_SHAPE_N / TASK_BLOCK_N == fused_layout::kSM90SplitKL1NumL1BlockNs),
+                     "Split-K L1: RF decode, 2 K-blocks per stage, K halves of whole stages, 10 L1 N-blocks");
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -523,28 +547,32 @@
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear1>{},
                      local_expert_idx, L1_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>());
+                     scheduler.template get_valid_m<false>(), 0u, 1u);
             } else {
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear2>{},
                      local_expert_idx, L2_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>());
+                     scheduler.template get_valid_m<false>(), 0u, 1u);
             }
         }
     };
 
     const auto invoke_interleaved_task = [&](const task_info_t& task_info,
                                               auto&& func) {
+        // Split-K L1 tasks cover (L1 K-blocks / num_k_splits) blocks starting at
+        // k_split_idx * that count; L2 tasks are never split.
         if (task_info.block_phase == fused_sched::BlockPhase::Linear1) {
+            const uint32_t num_k_splits = kSplitKL1 ? task_info.get_num_k_splits() : 1u;
             func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear1>{},
-                 task_info.local_expert_idx, L1_SHAPE_K / BLOCK_K,
+                 task_info.local_expert_idx, (L1_SHAPE_K / BLOCK_K) / num_k_splits,
                  task_info.m_block_idx, task_info.n_block_idx,
-                 task_info.pool_block_idx, task_info.valid_m);
+                 task_info.pool_block_idx, task_info.valid_m,
+                 kSplitKL1 ? task_info.get_k_split_idx() : 0u, num_k_splits);
         } else {
             func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear2>{},
                  task_info.local_expert_idx, L2_SHAPE_K / BLOCK_K,
                  task_info.m_block_idx, task_info.n_block_idx,
-                 task_info.pool_block_idx, task_info.valid_m);
+                 task_info.pool_block_idx, task_info.valid_m, 0u, 1u);
         }
     };
 
@@ -576,6 +604,10 @@
                 if (thread_idx == 0) {
                     *workspace.get_l1_task_count_ptr() = 0;
                     *workspace.get_l2_task_count_ptr() = 0;
+                }
+                if constexpr (kSplitKL1) {
+                    for (uint32_t i = thread_idx; i < fused_layout::kSM90SplitKL1NumSlots; i += kNumDispatchThreads)
+                        *workspace.get_splitk_l1_counter_ptr(0, i) = 0;
                 }
             }
         } else {
@@ -889,9 +921,13 @@
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx,
                                      const uint32_t& pool_block_idx,
-                                     const uint32_t& valid_m) {
+                                     const uint32_t& valid_m,
+                                     const uint32_t& k_split_idx,
+                                     const uint32_t& num_k_splits) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
+            // First absolute K-block of this task (split-K L1 halves start mid-K)
+            const uint32_t k_block_begin = k_split_idx * num_k_blocks;
             const auto tensor_map_a_ptr = kBlockIsL2 ?
                 &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = kBlockIsL2 ?
@@ -922,7 +958,7 @@
                                 static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * kPackedTileBytes +
                                 (n_block_idx % kSubTilesPerPacked) * SMEM_PACKED_B_SIZE_PER_KBLOCK;
                             for (uint32_t kb = kInFlightKBlocks; kb < k_end; ++ kb)
-                                ptx::tma_prefetch_1d(tiles + static_cast<size_t>(kb) * kPackedTileBytes,
+                                ptx::tma_prefetch_1d(tiles + static_cast<size_t>(k_block_begin + kb) * kPackedTileBytes,
                                                      SMEM_PACKED_B_SIZE_PER_KBLOCK);
                         } else {
                             const auto tensor_map_b_ptr = kBlockIsL2 ?
@@ -930,7 +966,7 @@
                             const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                             for (uint32_t kb = kInFlightKBlocks; kb < k_end; ++ kb)
                                 cute::SM90_TMA_LOAD_2D::PREFETCH::copy(
-                                    tensor_map_b_ptr, kb * B_LOAD_BYTES_PER_ROW, n_idx);
+                                    tensor_map_b_ptr, (k_block_begin + kb) * B_LOAD_BYTES_PER_ROW, n_idx);
                         }
                     }
                     __syncwarp();
@@ -967,7 +1003,7 @@
                 if (cute::elect_one_sync()) {
                     if (has_valid_m) {
                         const uint32_t m_idx = pool_block_idx * BLOCK_M;
-                        const uint32_t k_idx = k_block_idx * BLOCK_K;
+                        const uint32_t k_idx = (k_block_begin + k_block_idx) * BLOCK_K;
 
                         if constexpr (!kBlockIsL2 || !kSplitMDecodedWeightReuse) {
                             // One A tile + one SFA row per K-block of the stage,
@@ -989,7 +1025,7 @@
                                     tma::copy<BLOCK_M, 1, 0, float>(
                                         tensor_map_sfa_ptr, full_barriers[stage_idx],
                                         smem_sfa[stage_idx] + (kb * kNumL2SFAGroups + g) * kL2SFAHalfStride,
-                                        m_idx, (k_block_idx + kb) * kSFRowsPerKBlock + g, 1);
+                                        m_idx, (k_block_begin + k_block_idx + kb) * kSFRowsPerKBlock + g, 1);
                                 }
                             }
                             full_barriers[stage_idx]->arrive_and_expect_tx(
@@ -1004,11 +1040,11 @@
                             // consumes both scale groups for each BK128 tile.
                             tma::copy<BLOCK_M, 1, 0, float>(
                                 tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                                m_idx, k_block_idx * 2, 1);
+                                m_idx, (k_block_begin + k_block_idx) * 2, 1);
                             tma::copy<BLOCK_M, 1, 0, float>(
                                 tensor_map_sfa_ptr, full_barriers[stage_idx],
                                 smem_sfa[stage_idx] + kL2SFAHalfStride,
-                                m_idx, k_block_idx * 2 + 1, 1);
+                                m_idx, (k_block_begin + k_block_idx) * 2 + 1, 1);
                             full_barriers[stage_idx]->arrive_and_expect_tx(
                                 SMEM_A_SIZE_PER_STAGE + 2 * BLOCK_M * sizeof(float));
                         }
@@ -1032,9 +1068,12 @@
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx,
                                      const uint32_t& pool_block_idx,
-                                     const uint32_t& valid_m) {
+                                     const uint32_t& valid_m,
+                                     const uint32_t& k_split_idx,
+                                     const uint32_t& num_k_splits) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
+            const uint32_t k_block_begin = k_split_idx * num_k_blocks;
             const auto tensor_map_b_ptr = kBlockIsL2 ?
                 &tensor_map_l2_weights : &tensor_map_l1_weights;
             constexpr uint32_t shape_n = kBlockIsL2 ? L2_SHAPE_N : L1_SHAPE_N;
@@ -1061,7 +1100,7 @@
                         // in the dense layout); decoders see 80 B rows at row * 80.
                         if constexpr (kKBlocksPerStage == 1 || kSubTilesPerPacked == 1) {
                             ptx::tma_load_1d(smem_packed_b[stage_idx],
-                                        dense_tiles + static_cast<size_t>(k_block_idx) * kPackedTileBytes,
+                                        dense_tiles + static_cast<size_t>(k_block_begin + k_block_idx) * kPackedTileBytes,
                                         full_barriers[stage_idx], SMEM_PACKED_B_SIZE_PER_STAGE);
                         } else {
                             // Half-tile tasks: the stage's K-blocks are 10 KB sub-tiles one
@@ -1071,7 +1110,7 @@
                                 ptx::tma_load_1d(
                                     reinterpret_cast<uint8_t*>(smem_packed_b[stage_idx]) +
                                         kb * SMEM_PACKED_B_SIZE_PER_KBLOCK,
-                                    dense_tiles + static_cast<size_t>(k_block_idx + kb) * kPackedTileBytes,
+                                    dense_tiles + static_cast<size_t>(k_block_begin + k_block_idx + kb) * kPackedTileBytes,
                                     full_barriers[stage_idx], SMEM_PACKED_B_SIZE_PER_KBLOCK);
                             }
                         }
@@ -1079,7 +1118,7 @@
                         const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                         // NVFP4 fused B+scale layout stores 64B packed FP4 + 8B
                         // UE4M3 scale + 8B zero padding per BK128 row.
-                        const uint32_t k_idx = k_block_idx * B_LOAD_BYTES_PER_ROW;
+                        const uint32_t k_idx = (k_block_begin + k_block_idx) * B_LOAD_BYTES_PER_ROW;
                         tma::copy<B_LOAD_BYTES_PER_ROW, LOAD_BLOCK_N, 0, b_dtype_t>(
                             tensor_map_b_ptr, full_barriers[stage_idx],
                             smem_packed_b[stage_idx],
@@ -1140,7 +1179,9 @@
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx,
                                      const uint32_t& pool_block_idx,
-                                     const uint32_t& valid_m) {
+                                     const uint32_t& valid_m,
+                                     const uint32_t& k_split_idx,
+                                     const uint32_t& num_k_splits) {
             const uint32_t m_idx = pool_block_idx * BLOCK_M;
             // Half-tile tasks: both WGs work on the task's 128 rows (K-split), so
             // the per-WG N offsets are zero and only WG0 owns the epilogue.
@@ -1230,7 +1271,8 @@
             //   17 full-barrier wait | 18 RF decode+LUT (both halves) | 19 wgmma arrive->drain
             //   21 #L1 stages | 22 head-to-head stage total (excl. last stage of a task)
             //   (kKBlocksPerStage == 2: all per *2-K128-block* stage; 18 = both decodes,
-            //    19 = wait<1> + wait<0> drains; 21 counts 2-block stages, 12/L1 task)
+            //    19 = wait<1> + wait<0> drains; 21 counts 2-block stages, 12/L1 task,
+            //    or 6 per L1 K-half task when kSplitKL1 is active)
             const bool kstage_probe_on =
                 (phase_stamps != nullptr) && (sm_idx == 0) && (epilogue_thread_idx == 0);
             unsigned long long kstage_t_prev = 0;
@@ -2035,6 +2077,65 @@
                 }
             }
 
+            // Split-K L1 (kSplitKL1): cross-CTA reduction of the two K halves of this
+            // (pool_block, n_block). Both halves publish their promoted partials to
+            // their own scratch slot ([element][256 threads] floats, coalesced), fence,
+            // and bump the arrival counter once per CTA. Parity of the old value picks
+            // the role: FIRST leaves (no epilogue, no L1-ready notify; every CTA-wide
+            // barrier of this task has been passed by all 256 threads), LAST acquires,
+            // adds the partner's slot and runs the normal epilogue. valid_m == 0 tasks
+            // skipped the handshake above on both halves, so the counter stays even.
+            // The role broadcast uses the last word of the CD output region, which an
+            // L1 task never touches (its FP8 tile is 1 KB of the 4 KB BF16-sized region).
+            if constexpr (kSplitKL1 && !kBlockIsL2) {
+                if (num_k_splits > 1) {
+                    constexpr uint32_t kNumPartialElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
+                    DG_STATIC_ASSERT(kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
+                                     fused_layout::kSM90SplitKL1PartialBytes,
+                                     "Split-K partial slot size mismatch");
+                    DG_STATIC_ASSERT(fused_layout::kSM90SplitKL1NumKSplits == 2,
+                                     "Split-K handshake reads the single partner slot (k_split_idx ^ 1)");
+                    DG_STATIC_ASSERT(SMEM_CD_OUTPUT_BASE_SIZE >= SMEM_CD_L1_SIZE + 4u,
+                                     "Split-K role broadcast word must not overlap the L1 CD tile");
+                    auto* smem_splitk_role = reinterpret_cast<uint32_t*>(
+                        reinterpret_cast<uint8_t*>(smem_cd_base) + SMEM_CD_OUTPUT_BASE_SIZE - 4u);
+                    float* my_slot = workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx, k_split_idx);
+                    #pragma unroll
+                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 4; ++ j)
+                                __stcg(my_slot + ((h * kSwapABTokenChunks + i) * 4 + j) * kNumEpilogueThreads + epilogue_thread_idx,
+                                       final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j]);
+                        }
+                    }
+                    __threadfence();
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (epilogue_thread_idx == 0) {
+                        *smem_splitk_role = ptx::atomic_add_rel(
+                            workspace.get_splitk_l1_counter_ptr(pool_block_idx, n_block_idx), 1u);
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    const uint32_t arrival = *smem_splitk_role;
+                    if ((arrival & 1u) == 0u)
+                        return;  // FIRST half: the partner CTA finishes this task
+                    __threadfence();
+                    const float* other_slot = workspace.get_splitk_l1_scratch_ptr(
+                        pool_block_idx, n_block_idx, k_split_idx ^ 1u);
+                    #pragma unroll
+                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 4; ++ j)
+                                final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j] +=
+                                    __ldcg(other_slot + ((h * kSwapABTokenChunks + i) * 4 + j) * kNumEpilogueThreads + epilogue_thread_idx);
+                        }
+                    }
+                }
+            }
+
             if constexpr (!kBlockIsL2) {
                 const float l1_global_scale = (kPerRowEpilogueScale || l1_global_scales == nullptr) ?
                     1.0f : __ldg(l1_global_scales + local_expert_idx);
@@ -2542,12 +2643,15 @@
                                        const uint32_t& num_k_blocks,
                                        const uint32_t& m_block_idx, const uint32_t& n_block_idx,
                                        const uint32_t& pool_block_idx,
-                                       const uint32_t& valid_m) {
+                                       const uint32_t& valid_m,
+                                       const uint32_t& k_split_idx,
+                                       const uint32_t& num_k_splits) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
             if (epilogue_thread_idx == 0) stamp_min(3);
             run_math_task_impl(block_phase, local_expert_idx, num_k_blocks,
-                               m_block_idx, n_block_idx, pool_block_idx, valid_m);
+                               m_block_idx, n_block_idx, pool_block_idx, valid_m,
+                               k_split_idx, num_k_splits);
             if (epilogue_thread_idx == 0) stamp_max(kBlockIsL2 ? 5 : 4);
         };
         if constexpr (kUseInterleavedScheduler)
