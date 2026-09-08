@@ -2640,6 +2640,7 @@
                 }
             }
         };
+        unsigned long long ktask_prev_end = 0ull;
         const auto run_math_task = [&](const auto& block_phase,
                                        const uint32_t& local_expert_idx,
                                        const uint32_t& num_k_blocks,
@@ -2651,10 +2652,27 @@
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
             if (epilogue_thread_idx == 0) stamp_min(3);
+            // Per-task probe (SM0 thread0, SM cycles): 25/27 = L1 task time / count,
+            // 26/28 = L2 task time / count, 29 = gap between consecutive tasks.
+            const bool ktask_probe_on =
+                (phase_stamps != nullptr) && (sm_idx == 0) && (epilogue_thread_idx == 0);
+            unsigned long long kt_task0 = 0;
+            if (ktask_probe_on) {
+                kt_task0 = clock64();
+                if (ktask_prev_end != 0ull) atomicAdd(phase_stamps + 29, kt_task0 - ktask_prev_end);
+            }
             run_math_task_impl(block_phase, local_expert_idx, num_k_blocks,
                                m_block_idx, n_block_idx, pool_block_idx, valid_m,
                                k_split_idx, num_k_splits);
             if (epilogue_thread_idx == 0) stamp_max(kBlockIsL2 ? 5 : 4);
+            if (ktask_probe_on) {
+                const unsigned long long kt_task1 = clock64();
+                if (valid_m > 0) {
+                    atomicAdd(phase_stamps + (kBlockIsL2 ? 26 : 25), kt_task1 - kt_task0);
+                    atomicAdd(phase_stamps + (kBlockIsL2 ? 28 : 27), 1ull);
+                }
+                ktask_prev_end = kt_task1;
+            }
         };
         if constexpr (kUseInterleavedScheduler)
             for_each_published_block(run_math_task);

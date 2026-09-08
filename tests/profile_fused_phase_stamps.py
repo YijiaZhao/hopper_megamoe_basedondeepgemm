@@ -130,6 +130,7 @@ def main():
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         rows = []
+        raw_rows = []
         wall = []
         for i in range(args.warmup + args.iters):
             reset(stamps)
@@ -142,6 +143,7 @@ def main():
             torch.cuda.synchronize()
             if i >= args.warmup:
                 s = stamps.cpu().tolist()
+                raw_rows.append(list(s))
                 t0 = s[0]
                 row = {slot: (s[slot] - t0) / 1000.0 for slot, _ in REPORT}
                 row.update({slot: s[slot] / 1000.0 for slot, _ in ACCUM})
@@ -175,6 +177,14 @@ def main():
             for slot, name in STAGE:
                 v = [r[slot] for r in rows]
                 print(f"{slot:>4} {name:<32} {statistics.median(v):>9.1f} {min(v):>9.1f} {max(v):>9.1f}")
+            # per-task probe: slots 25/27 L1, 26/28 L2, 29 inter-task gap (cycles @1.83GHz)
+            def _task_us(sl, cnt):
+                return [ (sr[sl] / max(sr[cnt], 1) / SM_GHZ / 1000.0) for sr in raw_rows ]
+            l1t = _task_us(25, 27); l2t = _task_us(26, 28)
+            gap = [ (sr[29] / max(sr[27] + sr[28] - 1, 1) / SM_GHZ / 1000.0) for sr in raw_rows ]
+            print(f"--- per-task probe (SM0 thread0), us per task: L1 {statistics.median(l1t):.2f} "
+                  f"({statistics.median(sr[27] for sr in raw_rows):.0f} tasks)  L2 {statistics.median(l2t):.2f} "
+                  f"({statistics.median(sr[28] for sr in raw_rows):.0f} tasks)  inter-task gap {statistics.median(gap):.2f} ---")
             v = [r[23] for r in rows]
             print(f"  23 {'k+1 tile NOT ready at wait (%)':<32} {statistics.median(v):>9.1f} {min(v):>9.1f} {max(v):>9.1f}")
             print(f"CUDA-event wall (us): median {statistics.median(wall):.2f}  "
