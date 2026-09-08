@@ -455,11 +455,20 @@ struct InterleavedMegaMoEScheduler {
         num_l1_warmup_waves =
             cute::min(min_l1_warmup_waves, num_total_l1_waves);
 
-        // L2 split-K tail (same rule as L1; no warm-up interaction: L2 indices are
-        // only claimed after the L1 warm-up, and the split halves are adjacent
-        // indices so the finisher is always claimed after its publisher).
+        // L2 split-K tail. L2 indices are claimed in batches: the producers that
+        // run out of L1 indices in the last L1 wave (kNumSMs - L1 indices % kNumSMs
+        // of them) take the first batch, then ~kNumSMs per batch as SMs free up
+        // (the tasks of a batch are dependency-gated on the same L1 wave, so they
+        // finish together). The last batch, (num_l2 - first_batch) % kNumSMs tasks
+        // (H20 M=8: 22 of 96, not 96 % 78 = 18; M=16: 44 -> 88 halves do not fit,
+        // unsplit), is the L2 tail that runs after the last L1 wave; only it is
+        // split, and only if its halves fit one wave. The halves are adjacent
+        // indices so the finisher is always claimed after its publisher.
         const uint32_t num_l2_full_tasks = num_total_m_blocks * kNumL2BlockNs;
-        const uint32_t num_l2_tail_tasks = num_l2_full_tasks % kNumSMs;
+        const uint32_t num_l1_last_wave = num_total_l1_task_indices % kNumSMs;
+        const uint32_t num_l2_first_batch = num_l1_last_wave == 0 ? 0u : kNumSMs - num_l1_last_wave;
+        const uint32_t num_l2_tail_tasks = num_l2_full_tasks <= num_l2_first_batch ?
+            num_l2_full_tasks : (num_l2_full_tasks - num_l2_first_batch) % kNumSMs;
         const bool split_l2_tail = kNumL2KSplits > 1 &&
             num_total_m_blocks <= kMaxSplitKPoolBlocks &&
             num_l2_tail_tasks > 0 && num_l2_tail_tasks * kNumL2KSplits <= kNumSMs;

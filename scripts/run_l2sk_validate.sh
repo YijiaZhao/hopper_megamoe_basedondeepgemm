@@ -31,16 +31,18 @@ run_corr() {  # $1 = item tag, $2.. = env assignments
   echo "EXIT=$?" >> "$LOG"
 }
 
-if [ "$MODE" = corr ] || [ "$MODE" = all ]; then
+if [ "$MODE" = corr ] || [ "$MODE" = all ] || [ "$MODE" = corrA ]; then
   : > "$LOG"
   run_corr A DG_FP4_NVL_FAST_EPI=0 DG_FP4_SPLITK_L2=1
-  run_corr B DG_FP4_SPLITK_L2=0 DG_FP4_NVL_FAST_EPI=1
+  [ "$MODE" = corrA ] || run_corr B DG_FP4_SPLITK_L2=0 DG_FP4_NVL_FAST_EPI=1
   echo ALL_CORR_DONE >> "$LOG"
 fi
 
 if [ "$MODE" = perf ] || [ "$MODE" = all ]; then
-  for rep in 1 2; do
-    DG_FP4_NVL_FAST_EPI=0 DG_FP4_SPLITK_L2=1 LOG_TAG=_l2skA$rep bash scripts/run_probe.sh mxfp4 2 8 16 > /dev/null 2>&1
+  # Round-robin over configs to cancel session drift: OFF / A / B / AB, 3 reps.
+  for rep in 1 2 3; do
+    DG_FP4_SPLITK_L2=0 DG_FP4_NVL_FAST_EPI=0 LOG_TAG=_l2skOFF$rep bash scripts/run_probe.sh mxfp4 2 8 16 > /dev/null 2>&1
+    DG_FP4_SPLITK_L2=1 DG_FP4_NVL_FAST_EPI=0 LOG_TAG=_l2skA$rep bash scripts/run_probe.sh mxfp4 2 8 16 > /dev/null 2>&1
     DG_FP4_SPLITK_L2=0 DG_FP4_NVL_FAST_EPI=1 LOG_TAG=_l2skB$rep bash scripts/run_probe.sh mxfp4 2 8 16 > /dev/null 2>&1
     DG_FP4_SPLITK_L2=1 DG_FP4_NVL_FAST_EPI=1 LOG_TAG=_l2skAB$rep bash scripts/run_probe.sh mxfp4 2 8 16 > /dev/null 2>&1
   done
