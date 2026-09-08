@@ -1237,6 +1237,19 @@
                         if (k_block_idx + 1 < num_k_blocks) {
                             const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
                             const uint32_t next_phase = phase ^ (next_stage == 0);
+                            if (kstage_probe_on) {
+                                // Non-blocking readiness check: was the k+1 tile already landed?
+                                uint32_t ready = 0;
+                                asm volatile(
+                                    "{\n .reg .pred P;\n"
+                                    " mbarrier.test_wait.parity.shared::cta.b64 P, [%1], %2;\n"
+                                    " selp.u32 %0, 1, 0, P;\n}"
+                                    : "=r"(ready)
+                                    : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(full_barriers[next_stage]))),
+                                      "r"(next_phase));
+                                if constexpr (!kBlockIsL2)
+                                    if (!ready) kstage_add(23, 1ull);
+                            }
                             full_barriers[next_stage]->wait(next_phase);
                             const unsigned long long kt_a = clock64();
                             if constexpr (!kBlockIsL2)

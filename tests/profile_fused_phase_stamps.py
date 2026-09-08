@@ -46,8 +46,8 @@ REPORT = [
 # 16 = time spent inside NVLink barrier#1 (includes cross-rank launch skew).
 ACCUM = [(13, "SM0: entry->after barrier1"), (16, "SM0: barrier1 wait incl. skew")]
 # K-loop stage probe (SM0 thread0, SM cycles @1830MHz): per-stage ns = cycles / count / 1.83
-STAGE = [(17, "L1 stage: full-barrier wait"), (18, "L1 stage: RF decode+LUT"),
-         (19, "L1 stage: wgmma issue->drain"), (22, "L1 stage: head-to-head total")]
+STAGE = [(17, "L1 stage: exposed k+1 full wait"), (18, "L1 stage: k+1 RF decode+LUT"),
+         (19, "L1 stage: exposed wgmma drain"), (22, "L1 stage: head-to-head total")]
 SM_GHZ = 1.83
 
 
@@ -140,6 +140,7 @@ def main():
                 n_st = max(s[21], 1)
                 row.update({slot: s[slot] / n_st / SM_GHZ for slot, _ in STAGE})
                 row[21] = s[21]
+                row[23] = s[23] / n_st * 100.0   # % of k+1 waits where data was NOT yet ready
                 rows.append(row)
                 wall.append(start.elapsed_time(end) * 1000.0)
         dist.barrier(group=group)
@@ -163,6 +164,8 @@ def main():
             for slot, name in STAGE:
                 v = [r[slot] for r in rows]
                 print(f"{slot:>4} {name:<32} {statistics.median(v):>9.1f} {min(v):>9.1f} {max(v):>9.1f}")
+            v = [r[23] for r in rows]
+            print(f"  23 {'k+1 tile NOT ready at wait (%)':<32} {statistics.median(v):>9.1f} {min(v):>9.1f} {max(v):>9.1f}")
             print(f"CUDA-event wall (us): median {statistics.median(wall):.2f}  "
                   f"min {min(wall):.2f}  max {max(wall):.2f}")
     finally:
