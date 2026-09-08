@@ -142,6 +142,14 @@
     DG_STATIC_ASSERT(!(kQoQ && kSwapPipelineDecode),
                      "QoQ uses the serial swapAB main loop");
     using swap_accum_t = std::conditional_t<kQoQ, int32_t, float>;
+    // RF decode (swapAB MXFP4 tiers): each thread decodes its own WGMMA A
+    // fragment straight from the packed-B rows (host stores MXFP4 rows in RF
+    // fragment order, see `store_decoded_quad`) and issues RS-form WGMMAs.
+    // No decoded-FP8 SMEM tile, no per-stage STS, no per-WG decode barrier.
+    DG_STATIC_ASSERT(!(kMXFP4 && kQoQ), "MXFP4 and QoQ are exclusive");
+    constexpr bool kRFDecode = kSwapABRequested && kMXFP4;
+    DG_STATIC_ASSERT(!(kRFDecode && kSwapPipelineDecode),
+                     "RF decode is only implemented for the serial swapAB main loop");
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -168,7 +176,9 @@
     constexpr uint32_t SMEM_NVFP4_LUT_SIZE =
         math::constexpr_align<uint32_t>(128u * sizeof(uint2), kSharedMemoryAlignment);
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
-    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
+    // RF decode feeds WGMMA A straight from registers; no decoded-B tile.
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE =
+        kRFDecode ? 0u : LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // BM128 split-M alternates two decoded-B slots. This lets one WG begin
     // decoding K+1 after its K WGMMA completes without overwriting the slot
     // that the paired WG may still be consuming.
@@ -1008,6 +1018,69 @@
                         128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
                 }
             };
+            // RF decode: build this thread's m64nNk32 A fragments for one 64-row
+            // weight half straight from the packed rows and issue the four K32
+            // RS WGMMAs. Thread (warp w, lane l) owns rows r_0 = 16w + l/4 and
+            // r_1 = r_0 + 8 of the half; column c = l % 4 owns K = 4c..4c+3 and
+            // 16+4c..16+4c+3 of every K32 step, i.e. exactly word c of each
+            // 16-byte quad in the RF-ordered packed row (one uint4 per row covers
+            // all four K32 steps). Decoded bytes are identical to the SMEM tile
+            // decoder's, so the result is bit-exact vs the SS path. The four
+            // steps share one commit group, so each has its own fragment array;
+            // registers are only reused after `warpgroup_wait<0>`.
+            const auto issue_swap_ab_half_rf = [&]<typename SwapRS, uint32_t kSwapAccum>(
+                    float (&swap_accum)[kSwapAccum], const uint32_t& half) {
+                DG_STATIC_ASSERT(BLOCK_K / SwapRS::K == 4, "Expects 4 K32 steps per K128");
+                const auto* packed_rows =
+                    reinterpret_cast<const uint8_t*>(smem_packed_b[stage_idx]);
+                const uint32_t row_0 = wg_n_idx + half * 64u + r_0;
+                const uint32_t row_1 = row_0 + 8u;
+                const uint4 w_r0 = *reinterpret_cast<const uint4*>(
+                    packed_rows + row_0 * 80u + col_idx * 16u);
+                const uint4 w_r1 = *reinterpret_cast<const uint4*>(
+                    packed_rows + row_1 * 80u + col_idx * 16u);
+                const uint32_t sw_r0 = *reinterpret_cast<const uint32_t*>(
+                    packed_rows + row_0 * 80u + 64u);
+                const uint32_t sw_r1 = *reinterpret_cast<const uint32_t*>(
+                    packed_rows + row_1 * 80u + 64u);
+                uint32_t frag[4][4];
+                #pragma unroll
+                for (uint32_t k = 0; k < 4; ++ k) {
+                    const uint32_t word_r0 = k == 0 ? w_r0.x : k == 1 ? w_r0.y :
+                                             k == 2 ? w_r0.z : w_r0.w;
+                    const uint32_t word_r1 = k == 0 ? w_r1.x : k == 1 ? w_r1.y :
+                                             k == 2 ? w_r1.z : w_r1.w;
+                    const uint2 lut_r0 = smem_nvfp4_lut[(sw_r0 >> (k * 8u)) & 0x7fu];
+                    const uint2 lut_r1 = smem_nvfp4_lut[(sw_r1 >> (k * 8u)) & 0x7fu];
+                    const uint2 d0 = deep_gemm::nvfp4::dequant_mode2_nibble_word(word_r0, lut_r0);
+                    const uint2 d1 = deep_gemm::nvfp4::dequant_mode2_nibble_word(word_r1, lut_r1);
+                    // a0: (r_0, K 4c..), a1: (r_1, K 4c..), a2: (r_0, K 16+4c..), a3: (r_1, K 16+4c..)
+                    frag[k][0] = d0.x; frag[k][1] = d1.x;
+                    frag[k][2] = d0.y; frag[k][3] = d1.y;
+                }
+                #pragma unroll
+                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                    ptx::warpgroup_fence_operand(swap_accum[i]);
+                #pragma unroll
+                for (uint32_t k = 0; k < 4; ++ k) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < 4; ++ i)
+                        ptx::warpgroup_fence_operand(reinterpret_cast<float&>(frag[k][i]));
+                }
+                ptx::warpgroup_arrive();
+                #pragma unroll
+                for (uint32_t k = 0; k < 4; ++ k) {
+                    auto desc_b = mma::sm90::make_smem_desc(
+                        smem_a[stage_idx] + k * SwapRS::K, 1);
+                    SwapRS::wgmma(frag[k], desc_b, swap_accum, k > 0);
+                }
+                ptx::warpgroup_commit_batch();
+                #pragma unroll
+                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                    ptx::warpgroup_fence_operand(swap_accum[i]);
+                ptx::warpgroup_wait<0>();
+            };
+
             // Software-pipelined swapAB main loop (kSwapPipelineDecode): the WGMMAs
             // of stage k for both weight halves are issued asynchronously, stage
             // k+1 is decoded while the tensor cores run, then k is waited on,
@@ -1115,7 +1188,8 @@
                     if (k_block_idx == 0)
                         interleaved_scheduler.release_task_info(lane_idx);
                 }
-                decode_b_stage(stage_idx);
+                if constexpr (!kRFDecode)
+                    decode_b_stage(stage_idx);
 
                 // Read SF (must precede warpgroup_arrive)
                 const float scale_a_0_lo =
@@ -1148,6 +1222,11 @@
 
                             #pragma unroll
                             for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                                if constexpr (kRFDecode) {
+                                    using SwapRS = typename mma::sm90::FP8MMARSSelector<N_SWAP>::type;
+                                    DG_STATIC_ASSERT(SwapRS::kNumAccum == kSwapAccum, "RS/SS accumulator mismatch");
+                                    issue_swap_ab_half_rf.template operator()<SwapRS>(swap_accum, half);
+                                } else {
                                 #pragma unroll
                                 for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                     ptx::warpgroup_fence_operand(swap_accum[i]);
@@ -1165,6 +1244,7 @@
                                 for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                     ptx::warpgroup_fence_operand(swap_accum[i]);
                                 ptx::warpgroup_wait<0>();
+                                }
 
                                 // QoQ: fold the per-row/K128 integer s2 (byte 64 of the
                                 // packed row, still resident in this stage) into the promote.
@@ -1262,6 +1342,11 @@
 
                             #pragma unroll
                             for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                                if constexpr (kRFDecode) {
+                                    using SwapRS = typename mma::sm90::FP8MMARSSelector<N_SWAP>::type;
+                                    DG_STATIC_ASSERT(SwapRS::kNumAccum == kSwapAccum, "RS/SS accumulator mismatch");
+                                    issue_swap_ab_half_rf.template operator()<SwapRS>(swap_accum, half);
+                                } else {
                                 #pragma unroll
                                 for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                     ptx::warpgroup_fence_operand(swap_accum[i]);
@@ -1279,6 +1364,7 @@
                                 for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                     ptx::warpgroup_fence_operand(swap_accum[i]);
                                 ptx::warpgroup_wait<0>();
+                                }
                                 float s2_r0 = 1.0f, s2_r1 = 1.0f;
                                 if constexpr (kQoQ) {
                                     const auto* packed_rows = reinterpret_cast<const uint8_t*>(smem_packed_b[stage_idx]);

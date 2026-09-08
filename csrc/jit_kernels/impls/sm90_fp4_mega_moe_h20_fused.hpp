@@ -235,7 +235,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         // DG_FP4_DIST_BCAST defaults ON since the H20 09-09 A/B.
         //   DG_FP4_SWAP_PIPE=1   overlap decode(k+1) with WGMMA(k) in swapAB tiles
         //   DG_FP4_DIST_BCAST=1  spread the dispatch expert-count broadcast over all SMs
-        .swap_pipeline_decode = !qoq && get_env<int>("DG_FP4_SWAP_PIPE", 0) != 0,
+        // MXFP4 swapAB tiers use the RF-decode serial loop (kRFDecode).
+        .swap_pipeline_decode = !qoq && !mxfp4 && get_env<int>("DG_FP4_SWAP_PIPE", 0) != 0,
         // H20 A/B (2026-09-09): spreading the expert-count broadcast over all
         // SMs removes ~10us of SM0-serial sys-scope atomics (M=2: 62->52us).
         .distributed_expert_bcast = get_env<int>("DG_FP4_DIST_BCAST", 1) != 0,

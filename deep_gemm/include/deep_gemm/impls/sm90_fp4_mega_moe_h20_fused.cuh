@@ -49,6 +49,34 @@ __device__ __forceinline__ uint2 dequant_mode2_nibble_word(
 // `kPer32Scale` (MXFP4): one scale byte per 32 K values, i.e. one LUT row per
 // 16-byte quad, stored in the first 4 bytes of the scale word. NVFP4 uses two
 // scale bytes per quad (per 16 K values).
+//
+// MXFP4 rows are additionally stored in WGMMA "RF fragment" order (host
+// `_mxfp4_rf_fragment_order`): within the 16-byte quad of K32 group g, word c
+// (c = 0..3) holds K = g*32 + 4c + {0..3} in its "hi" braid slots and
+// K = g*32 + 16 + 4c + {0..3} in its "lo" slots. That is exactly the A
+// fragment thread `lane % 4 == c` needs for an m64nNk32 RS WGMMA, so the
+// swapAB tiers decode one uint4 per row straight into registers. The SMEM
+// tile decoders below gather (q0.x, q1.x, q2.x, q3.x) for K[0..16) and
+// (q0.y, q1.y, q2.y, q3.y) for K[16..32) so the decoded tile is unchanged.
+template <bool kRFOrder>
+__device__ __forceinline__ void store_decoded_quad(
+        uint8_t* __restrict__ fp8_dst,
+        const uint2& q0, const uint2& q1, const uint2& q2, const uint2& q3,
+        const uint32_t k_offset0, const uint32_t k_offset1,
+        const uint32_t row_swizzle) {
+    if constexpr (kRFOrder) {
+        *reinterpret_cast<uint4*>(fp8_dst + (k_offset0 ^ row_swizzle)) =
+            make_uint4(q0.x, q1.x, q2.x, q3.x);
+        *reinterpret_cast<uint4*>(fp8_dst + (k_offset1 ^ row_swizzle)) =
+            make_uint4(q0.y, q1.y, q2.y, q3.y);
+    } else {
+        *reinterpret_cast<uint4*>(fp8_dst + (k_offset0 ^ row_swizzle)) =
+            make_uint4(q0.x, q0.y, q1.x, q1.y);
+        *reinterpret_cast<uint4*>(fp8_dst + (k_offset1 ^ row_swizzle)) =
+            make_uint4(q2.x, q2.y, q3.x, q3.y);
+    }
+}
+
 template <bool kQuadILP = false, bool kPer32Scale = false>
 __device__ __forceinline__ void dequant_mode2_nibble_row_regs(
         uint8_t* __restrict__ fp8_dst,
@@ -80,7 +108,7 @@ __device__ __forceinline__ void dequant_mode2_nibble_row_regs(
 
         const uint2 q0 = dequant_mode2_nibble_word(q.x, lut0);
         const uint2 q1 = dequant_mode2_nibble_word(q.y, lut0);
-        if constexpr (!kQuadILP) {
+        if constexpr (!kQuadILP && !kPer32Scale) {
             *reinterpret_cast<uint4*>(
                 fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
                 make_uint4(q0.x, q0.y, q1.x, q1.y);
@@ -88,14 +116,20 @@ __device__ __forceinline__ void dequant_mode2_nibble_row_regs(
 
         const uint2 q2 = dequant_mode2_nibble_word(q.z, lut1);
         const uint2 q3 = dequant_mode2_nibble_word(q.w, lut1);
-        if constexpr (kQuadILP) {
+        if constexpr (kPer32Scale) {
+            // RF-ordered row: both 16B chunks depend on all four words.
+            store_decoded_quad<true>(fp8_dst, q0, q1, q2, q3,
+                                     scale_i0 * 16, scale_i1 * 16, row_swizzle);
+        } else {
+            if constexpr (kQuadILP) {
+                *reinterpret_cast<uint4*>(
+                    fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
+                    make_uint4(q0.x, q0.y, q1.x, q1.y);
+            }
             *reinterpret_cast<uint4*>(
-                fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
-                make_uint4(q0.x, q0.y, q1.x, q1.y);
+                fp8_dst + ((scale_i1 * 16) ^ row_swizzle)) =
+                make_uint4(q2.x, q2.y, q3.x, q3.y);
         }
-        *reinterpret_cast<uint4*>(
-            fp8_dst + ((scale_i1 * 16) ^ row_swizzle)) =
-            make_uint4(q2.x, q2.y, q3.x, q3.y);
     }
 }
 
@@ -164,10 +198,8 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_mode2_nibble_split_m(
             k_half_idx * 64u + scale_i0 * 16u;
         const uint32_t k_offset1 =
             k_half_idx * 64u + scale_i1 * 16u;
-        *reinterpret_cast<uint4*>(fp8_dst + (k_offset0 ^ row_swizzle)) =
-            make_uint4(q0.x, q0.y, q1.x, q1.y);
-        *reinterpret_cast<uint4*>(fp8_dst + (k_offset1 ^ row_swizzle)) =
-            make_uint4(q2.x, q2.y, q3.x, q3.y);
+        store_decoded_quad<kPer32Scale>(fp8_dst, q0, q1, q2, q3,
+                                        k_offset0, k_offset1, row_swizzle);
     }
 }
 
@@ -182,6 +214,7 @@ __device__ __forceinline__ uint2 dequant_braided_selector_word(
     return make_uint2(out0, out1);
 }
 
+template <bool kRFOrder = false>
 __device__ __forceinline__ void dequant_braided_quad(
         uint8_t* __restrict__ fp8_dst,
         const uint4& q,
@@ -191,15 +224,23 @@ __device__ __forceinline__ void dequant_braided_quad(
         const uint32_t row_swizzle) {
     const uint2 q0 = dequant_braided_selector_word(q.x, lut0);
     const uint2 q1 = dequant_braided_selector_word(q.y, lut0);
-    *reinterpret_cast<uint4*>(fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
-        make_uint4(q0.x, q0.y, q1.x, q1.y);
+    if constexpr (!kRFOrder) {
+        *reinterpret_cast<uint4*>(fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
+            make_uint4(q0.x, q0.y, q1.x, q1.y);
+    }
 
     const uint2 q2 = dequant_braided_selector_word(q.z, lut1);
     const uint2 q3 = dequant_braided_selector_word(q.w, lut1);
-    *reinterpret_cast<uint4*>(fp8_dst + (((scale_i0 + 1) * 16) ^ row_swizzle)) =
-        make_uint4(q2.x, q2.y, q3.x, q3.y);
+    if constexpr (kRFOrder) {
+        store_decoded_quad<true>(fp8_dst, q0, q1, q2, q3,
+                                 scale_i0 * 16, (scale_i0 + 1) * 16, row_swizzle);
+    } else {
+        *reinterpret_cast<uint4*>(fp8_dst + (((scale_i0 + 1) * 16) ^ row_swizzle)) =
+            make_uint4(q2.x, q2.y, q3.x, q3.y);
+    }
 }
 
+template <bool kRFOrder = false>
 __device__ __forceinline__ void dequant_braided_quad_ilp(
         uint8_t* __restrict__ fp8_dst,
         const uint4& q,
@@ -236,10 +277,11 @@ __device__ __forceinline__ void dequant_braided_quad_ilp(
     q3_out0 |= q.w & 0x80808080u;
     q3_out1 |= (q.w << 4) & 0x80808080u;
 
-    *reinterpret_cast<uint4*>(fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
-        make_uint4(q0_out0, q0_out1, q1_out0, q1_out1);
-    *reinterpret_cast<uint4*>(fp8_dst + (((scale_i0 + 1) * 16) ^ row_swizzle)) =
-        make_uint4(q2_out0, q2_out1, q3_out0, q3_out1);
+    store_decoded_quad<kRFOrder>(
+        fp8_dst,
+        make_uint2(q0_out0, q0_out1), make_uint2(q1_out0, q1_out1),
+        make_uint2(q2_out0, q2_out1), make_uint2(q3_out0, q3_out1),
+        scale_i0 * 16, (scale_i0 + 1) * 16, row_swizzle);
 }
 
 template <int kQuad, bool kQuadIlp, bool kPer32Scale = false>
@@ -274,10 +316,10 @@ __device__ __forceinline__ void dequant_braided_quad_lut_window(
     }
 
     if constexpr (kQuadIlp) {
-        dequant_braided_quad_ilp(
+        dequant_braided_quad_ilp<kPer32Scale>(
             fp8_dst, fp4_quads[kQuad], lut0, lut1, kQuad * 2, row_swizzle);
     } else {
-        dequant_braided_quad(
+        dequant_braided_quad<kPer32Scale>(
             fp8_dst, fp4_quads[kQuad], lut0, lut1, kQuad * 2, row_swizzle);
     }
 
