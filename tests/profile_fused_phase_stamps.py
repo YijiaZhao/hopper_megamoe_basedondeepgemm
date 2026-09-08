@@ -68,6 +68,8 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--no-graph", action="store_true")
+    ap.add_argument("--no-stamps", action="store_true",
+                    help="launch without phase_stamps (wall-time only) to measure probe overhead")
     args = ap.parse_args()
     args.backend = "fused"
 
@@ -107,7 +109,7 @@ def main():
 
         def launch():
             kernel(y, *weights, buffer, cumulative_local_expert_recv_stats=None,
-                   activation_clamp=10.0, phase_stamps=stamps)
+                   activation_clamp=10.0, phase_stamps=None if args.no_stamps else stamps)
 
         launch()
         torch.cuda.synchronize()
@@ -149,7 +151,10 @@ def main():
                 wall.append(start.elapsed_time(end) * 1000.0)
         dist.barrier(group=group)
 
-        if rank == 0:
+        if rank == 0 and args.no_stamps:
+            print(f"\n=== fused {args.quant} M={args.global_tokens} NO-STAMPS wall (us): "
+                  f"median {statistics.median(wall):.2f} min {min(wall):.2f} max {max(wall):.2f} ===")
+        if rank == 0 and not args.no_stamps:
             med = {slot: statistics.median(r[slot] for r in rows) for slot, _ in REPORT}
             mn = {slot: min(r[slot] for r in rows) for slot, _ in REPORT}
             mx = {slot: max(r[slot] for r in rows) for slot, _ in REPORT}

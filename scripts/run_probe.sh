@@ -17,7 +17,7 @@ unset DG_W4A8_INT DG_W4A8_INT_PRE DG_W4A8_INT_SHADOW
 nvidia-smi -L | head -1
 for M in "$@"; do
   log="probe_${QUANT}_m${M}${LOG_TAG:-}.log"
-  torchrun --standalone --nproc_per_node=8 tests/profile_fused_phase_stamps.py \
+  torchrun --standalone --nproc_per_node=8 tests/profile_fused_phase_stamps.py ${PROBE_ARGS:-} \
     --quant "$QUANT" --global-tokens "$M" --iters 20 > "$log" 2>&1
   echo "PROBE_EXIT=$?" >> "$log"
 done
