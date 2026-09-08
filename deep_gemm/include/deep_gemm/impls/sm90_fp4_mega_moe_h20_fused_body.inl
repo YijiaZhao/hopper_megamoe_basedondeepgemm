@@ -8,7 +8,7 @@
     DG_STATIC_ASSERT(BLOCK_M == 8 || BLOCK_M == 16 ||
                      BLOCK_M == 24 || BLOCK_M == 64 || BLOCK_M == 128,
                      "H200 fused kernel requires BM8/BM16/BM24/BM64/BM128");
-    DG_STATIC_ASSERT((BLOCK_M == 8 && kNumStages == 4) ||
+    DG_STATIC_ASSERT((BLOCK_M == 8 && kNumStages >= 4 && kNumStages <= 7) ||
                      ((BLOCK_M == 16 || BLOCK_M == 24) && kNumStages == 3) ||
                      (BLOCK_M == 64 && kNumStages == 3) ||
                      (BLOCK_M == 128 && kNumStages == 6),
@@ -132,8 +132,7 @@
     constexpr uint32_t kNumActiveDispatchWarps =
         kSingleActiveDispatchWarp ? 1u : kNumDispatchWarps;
     constexpr uint32_t kNumActiveDispatchThreads = kNumActiveDispatchWarps * 32;
-    constexpr bool kQuadDequantIlp =
-        BLOCK_M == 8 && kNumStages == 4;
+    constexpr bool kQuadDequantIlp = BLOCK_M == 8;
     // QoQ W4A8: int8 activations, (code - z) int8 weights, int32 IGMMA
     // accumulators promoted per K128 by s2[row] * s_act[token]; per-row s1 is
     // applied through the same [E, N] epilogue scale path as MXFP4's 2^e_ref.
@@ -173,8 +172,13 @@
     // BM128 split-M alternates two decoded-B slots. This lets one WG begin
     // decoding K+1 after its K WGMMA completes without overwriting the slot
     // that the paired WG may still be consuming.
+    // swapAB BM8 (tiny-M): every WG decodes exactly the 128 rows it consumes
+    // and drains its WGMMAs (wait<0>) before decoding the next stage, so two
+    // decoded slots suffice; this frees ~64 KB for deeper packed-B prefetch.
+    constexpr bool kDoubleBufferDecodedB =
+        kSplitMDecodedWeightReuse || (kSwapABRequested && BLOCK_M == 8);
     constexpr uint32_t kNumDecodedBStages =
-        kSplitMDecodedWeightReuse ? 2u : kNumStages;
+        kDoubleBufferDecodedB ? 2u : kNumStages;
     constexpr uint32_t B_LOAD_BYTES_PER_ROW = 80u;
     constexpr uint32_t SMEM_PACKED_B_SIZE_PER_STAGE =
         LOAD_BLOCK_N * B_LOAD_BYTES_PER_ROW * sizeof(b_dtype_t);
@@ -235,7 +239,7 @@
     });
     auto smem_b = utils::PatternVisitor([=](const uint32_t& i) {
         const uint32_t decoded_stage =
-            kSplitMDecodedWeightReuse ? (i & 1u) : i;
+            kDoubleBufferDecodedB ? (i & 1u) : i;
         return math::advance_ptr<b_dtype_t>(
             smem_gemm_base,
             SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE +

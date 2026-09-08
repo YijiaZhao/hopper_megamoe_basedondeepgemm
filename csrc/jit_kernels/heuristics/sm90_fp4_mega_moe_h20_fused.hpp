@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include <deep_gemm/layout/mega_moe_fused.cuh>
 
 #include "../../utils/exception.hpp"
@@ -101,14 +103,15 @@ select_sm90_nvfp4_h200_fused(
         bool single_active_dispatch_warp;
     } tuning {};
 
+    const int bm8_stages = std::clamp(get_env<int>("DG_FP4_BM8_STAGES", 7), 4, 7);
     if (input.num_tokens <= 1)
-        tuning = {8, 256, 24, 4, SM90ArchSpec::smem_capacity,
+        tuning = {8, 256, 24, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 8)
-        tuning = {8, 256, 16, 4, SM90ArchSpec::smem_capacity,
+        tuning = {8, 256, 16, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 16)
-        tuning = {8, 256, 24, 4, SM90ArchSpec::smem_capacity,
+        tuning = {8, 256, 24, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 32)
         tuning = {16, 256, 48, 3, SM90ArchSpec::smem_capacity,
