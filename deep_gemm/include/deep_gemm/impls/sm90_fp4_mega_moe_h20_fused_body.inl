@@ -1075,6 +1075,20 @@
             const auto kstage_add = [&](const uint32_t slot, const unsigned long long& v) {
                 if (kstage_probe_on) atomicAdd(phase_stamps + slot, v);
             };
+            // Non-blocking mbarrier phase check. The blocking `wait()` costs ~250 ns
+            // even when the phase has already completed (suspend/wake path), and the
+            // k+1 tile is essentially always landed by the time the math warps ask
+            // for it (probe slot 23), so test first and only block on a miss.
+            const auto barrier_ready = [](Barrier* bar, const uint32_t& parity) -> bool {
+                uint32_t ready = 0;
+                asm volatile(
+                    "{\n .reg .pred P;\n"
+                    " mbarrier.test_wait.parity.shared::cta.b64 P, [%1], %2;\n"
+                    " selp.u32 %0, 1, 0, P;\n}"
+                    : "=r"(ready)
+                    : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(bar))), "r"(parity));
+                return ready != 0;
+            };
 
             // Software-pipelined swapAB main loop (kSwapPipelineDecode): the WGMMAs
             // of stage k for both weight halves are issued asynchronously, stage
@@ -1237,20 +1251,11 @@
                         if (k_block_idx + 1 < num_k_blocks) {
                             const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
                             const uint32_t next_phase = phase ^ (next_stage == 0);
-                            if (kstage_probe_on) {
-                                // Non-blocking readiness check: was the k+1 tile already landed?
-                                uint32_t ready = 0;
-                                asm volatile(
-                                    "{\n .reg .pred P;\n"
-                                    " mbarrier.test_wait.parity.shared::cta.b64 P, [%1], %2;\n"
-                                    " selp.u32 %0, 1, 0, P;\n}"
-                                    : "=r"(ready)
-                                    : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(full_barriers[next_stage]))),
-                                      "r"(next_phase));
+                            if (!barrier_ready(full_barriers[next_stage], next_phase)) {
                                 if constexpr (!kBlockIsL2)
-                                    if (!ready) kstage_add(23, 1ull);
+                                    kstage_add(23, 1ull);
+                                full_barriers[next_stage]->wait(next_phase);
                             }
-                            full_barriers[next_stage]->wait(next_phase);
                             const unsigned long long kt_a = clock64();
                             if constexpr (!kBlockIsL2)
                                 kstage_add(17, kt_a - kt_b);
