@@ -1087,8 +1087,8 @@
             const bool kstage_probe_on =
                 (phase_stamps != nullptr) && (sm_idx == 0) && (epilogue_thread_idx == 0);
             unsigned long long kstage_t_prev = 0;
-            // Timing-only experiments (numerics invalid): phase_stamps[24] = 1 skip decode,
-            // 2 skip wgmma issue, 3 skip both. 0 / no stamps = normal execution.
+            // Timing-only experiments (numerics invalid), bitmask in phase_stamps[24]:
+            // 1 skip decode | 2 skip wgmma issue | 4 skip k+1 barrier check | 8 skip promote.
             const uint32_t kexp = (phase_stamps != nullptr) ?
                 static_cast<uint32_t>(phase_stamps[24]) : 0u;
             const auto kstage_add = [&](const uint32_t slot, const unsigned long long& v) {
@@ -1271,10 +1271,12 @@
                         if (k_block_idx + 1 < num_k_blocks) {
                             const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
                             const uint32_t next_phase = phase ^ (next_stage == 0);
-                            if (!barrier_ready(full_barriers[next_stage], next_phase)) {
-                                if constexpr (!kBlockIsL2)
-                                    kstage_add(23, 1ull);
-                                full_barriers[next_stage]->wait(next_phase);
+                            if ((kexp & 4u) == 0u) {
+                                if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                    if constexpr (!kBlockIsL2)
+                                        kstage_add(23, 1ull);
+                                    full_barriers[next_stage]->wait(next_phase);
+                                }
                             }
                             const unsigned long long kt_a = clock64();
                             if constexpr (!kBlockIsL2)
@@ -1288,7 +1290,8 @@
                         ptx::warpgroup_wait<0>();
                         fence_frag(fcur);
                         kstage_add(19, clock64() - kt_b);
-                        promote_stage_rf(cur_stage);
+                        if ((kexp & 8u) == 0u)
+                            promote_stage_rf(cur_stage);
                         arrive_empty_barrier(cur_stage);
                         advance_pipeline(k_block_idx);
                     };
