@@ -28,7 +28,7 @@ def _mxfp4_rf_fragment_order(fused, forward=True):
     # RF word c, slot t (t<4: K 4c+t ; t>=4: K 16+4c+t-4)
     c=kk//8; t=kk%8; src=torch.where(t<4,4*c+t,16+4*c+(t-4))
     perm=kvals[...,src] if forward else kvals[...,torch.argsort(src)]
-    perm=perm.reshape(e,n,k//80,4,8); hi=perm[...,:4]; lo=perm[...,4:]
+    perm=perm.reshape(e,n,k//80,4,4,8); hi=perm[...,:4]; lo=perm[...,4:]   # (group g, word c, 8 nibbles)
     rows[...,:64]=((hi<<4)|lo).reshape(e,n,k//80,64)
     return rows.view(e,n,k).contiguous()
 
