@@ -198,6 +198,12 @@
                      "Dense weight tiles are only packed by the MXFP4/QoQ hosts");
     DG_STATIC_ASSERT(SMEM_PACKED_B_SIZE_PER_STAGE % 16 == 0, "Bulk copy size must be 16 B aligned");
     DG_STATIC_ASSERT(SMEM_PACKED_B_SIZE_PER_STAGE == BLOCK_N * 80u, "Unexpected packed-B stage size");
+    // Host packer tile height (rows); a BLOCK_N < 256 kernel tile is a contiguous
+    // BLOCK_N*80 B slice of the 256*80 B packed tile.
+    constexpr uint32_t kPackedTileN = 256u;
+    constexpr uint32_t kPackedTileBytes = kPackedTileN * B_LOAD_BYTES_PER_ROW;
+    DG_STATIC_ASSERT(kPackedTileN % BLOCK_N == 0, "Kernel BLOCK_N must divide the packed tile height");
+    constexpr uint32_t kSubTilesPerPacked = kPackedTileN / BLOCK_N;
     // L1 and L2 each consume one per-128 activation scale per row and K tile.
     constexpr uint32_t kL2SFAHalfStride =
         math::constexpr_align<uint32_t>(BLOCK_M * sizeof(float), 128u) / sizeof(float);
@@ -803,12 +809,14 @@
                             constexpr uint32_t shape_k = kBlockIsL2 ? L2_SHAPE_K : L1_SHAPE_K;
                             const auto* weights_base = reinterpret_cast<const uint8_t*>(
                                 kBlockIsL2 ? l2_weights_ptr : l1_weights_ptr);
-                            const uint32_t tile_row = local_expert_idx * (shape_n / BLOCK_N) + n_block_idx;
+                            const uint32_t tile_row = local_expert_idx * (shape_n / kPackedTileN) +
+                                                      n_block_idx / kSubTilesPerPacked;
                             const auto* tiles = weights_base +
-                                static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * SMEM_PACKED_B_SIZE_PER_STAGE;
+                                static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * kPackedTileBytes +
+                                (n_block_idx % kSubTilesPerPacked) * SMEM_PACKED_B_SIZE_PER_STAGE;
                             for (uint32_t kb = kNumStages; kb < k_end; ++ kb)
-                                ptx::tma_prefetch_1d(tiles + static_cast<size_t>(kb) * SMEM_PACKED_B_SIZE_PER_STAGE,
-                                                SMEM_PACKED_B_SIZE_PER_STAGE);
+                                ptx::tma_prefetch_1d(tiles + static_cast<size_t>(kb) * kPackedTileBytes,
+                                                     SMEM_PACKED_B_SIZE_PER_STAGE);
                         } else {
                             const auto tensor_map_b_ptr = kBlockIsL2 ?
                                 &tensor_map_l2_weights : &tensor_map_l1_weights;
@@ -889,13 +897,16 @@
                 &tensor_map_l2_weights : &tensor_map_l1_weights;
             constexpr uint32_t shape_n = kBlockIsL2 ? L2_SHAPE_N : L1_SHAPE_N;
             constexpr uint32_t shape_k = kBlockIsL2 ? L2_SHAPE_K : L1_SHAPE_K;
-            // Dense tiles (MXFP4/QoQ): tile (expert, n_block, k_block) lives at
-            // ((expert * n_blocks + n_block) * k_blocks + k_block) * (BLOCK_N * 80 B).
+            // Dense tiles (MXFP4/QoQ): packed tile (expert, n256_block, k_block) lives at
+            // ((expert * n256_blocks + n256_block) * k_blocks + k_block) * (256 * 80 B);
+            // a BLOCK_N=128 kernel tile is the contiguous upper/lower 10 KB half.
             const uint8_t* dense_tiles = nullptr;
             if constexpr (kDenseWeightTiles) {
-                const uint32_t tile_row = local_expert_idx * (shape_n / BLOCK_N) + n_block_idx;
+                const uint32_t tile_row = local_expert_idx * (shape_n / kPackedTileN) +
+                                          n_block_idx / kSubTilesPerPacked;
                 dense_tiles = reinterpret_cast<const uint8_t*>(kBlockIsL2 ? l2_weights_ptr : l1_weights_ptr) +
-                    static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * SMEM_PACKED_B_SIZE_PER_STAGE;
+                    static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * kPackedTileBytes +
+                    (n_block_idx % kSubTilesPerPacked) * SMEM_PACKED_B_SIZE_PER_STAGE;
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
@@ -906,7 +917,7 @@
                         // One 1D bulk copy per stage (20 KB for BN256); the
                         // decoders still see 80 B rows at row * 80.
                         ptx::tma_load_1d(smem_packed_b[stage_idx],
-                                    dense_tiles + static_cast<size_t>(k_block_idx) * SMEM_PACKED_B_SIZE_PER_STAGE,
+                                    dense_tiles + static_cast<size_t>(k_block_idx) * kPackedTileBytes,
                                     full_barriers[stage_idx], SMEM_PACKED_B_SIZE_PER_STAGE);
                     } else {
                         const uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;

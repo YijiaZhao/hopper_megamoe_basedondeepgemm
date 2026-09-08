@@ -178,12 +178,12 @@ static void sm90_fp4_h20_fused_mega_moe(
                     config.block_m == 128));
     DG_HOST_ASSERT(config.block_n == 128 || config.block_n == 256);
     DG_HOST_ASSERT(plan.swap_ab == (num_tokens <= 64));
-    // MXFP4/QoQ fused weights are packed as dense BN256 x BK128 tiles (80 B rows)
-    // and loaded with one 1D bulk copy per stage; the tile shape is baked in by
-    // the host packer, so the kernel tile must match.
+    // MXFP4/QoQ fused weights are packed as dense 256 x BK128 tiles (80 B rows,
+    // kSM90FusedPackedTileN) and loaded with one 1D bulk copy per stage. A
+    // BLOCK_N=128 kernel tile is one contiguous half of a packed tile.
     const bool dense_weight_tiles = mxfp4 || qoq;
     if (dense_weight_tiles) {
-        DG_HOST_ASSERT(config.block_n == 256);
+        DG_HOST_ASSERT(256 % config.block_n == 0);
         DG_HOST_ASSERT(l1_weights.is_contiguous() && l2_weights.is_contiguous());
         DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(l1_weights.data_ptr()) % 16 == 0);
         DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(l2_weights.data_ptr()) % 16 == 0);
