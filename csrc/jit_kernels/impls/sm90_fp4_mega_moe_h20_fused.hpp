@@ -34,6 +34,7 @@ public:
         bool dense_weight_tiles;
         bool half_tile_tasks;
         bool split_k_l1;
+        bool l2_half_row_tasks;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -76,7 +77,8 @@ public:
             "        /* kQoQ */ {},\n"
             "        /* kDenseWeightTiles */ {},\n"
             "        /* kHalfTileTasksRequested */ {},\n"
-            "        /* kSplitKL1Requested */ {}",
+            "        /* kSplitKL1Requested */ {},\n"
+            "        /* kL2HalfRowTasksRequested */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -88,7 +90,8 @@ public:
             args.qoq ? "true" : "false",
             args.dense_weight_tiles ? "true" : "false",
             args.half_tile_tasks ? "true" : "false",
-            args.split_k_l1 ? "true" : "false");
+            args.split_k_l1 ? "true" : "false",
+            args.l2_half_row_tasks ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -224,6 +227,16 @@ static void sm90_fp4_h20_fused_mega_moe(
     const bool split_k_l1 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && plan.use_interleaved_scheduler &&
         get_env<int>("DG_FP4_SPLITK_L1", 1) != 0;
+    // L2 half-row tasks (kernel `kL2HalfRowTasks`): the BM8 MXFP4 RF swapAB tier
+    // schedules 128-row L2 tasks (24 per M block instead of 12) and the two math
+    // WGs each own 64 of those rows over the full K (own accumulators + epilogue,
+    // no reduction), so the per-WG per-stage work and the L2 task latency halve.
+    // Targets the post-split-K critical tail (L2 tasks quantising on 78 SMs).
+    // L1 tasks / TMA boxes / SF granularity are untouched. Exclusive with
+    // half-tile tasks. Default ON for that tier; DG_FP4_L2_HALFROW=0 disables.
+    const bool l2_half_row_tasks = mxfp4 && plan.swap_ab && config.block_m == 8 &&
+        !half_tile_tasks && plan.use_interleaved_scheduler && dense_weight_tiles &&
+        get_env<int>("DG_FP4_L2_HALFROW", 1) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;
@@ -299,6 +312,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         .dense_weight_tiles = dense_weight_tiles,
         .half_tile_tasks = half_tile_tasks,
         .split_k_l1 = split_k_l1,
+        .l2_half_row_tasks = l2_half_row_tasks,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,

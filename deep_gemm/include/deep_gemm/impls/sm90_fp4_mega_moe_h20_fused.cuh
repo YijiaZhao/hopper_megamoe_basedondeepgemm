@@ -449,7 +449,12 @@ template <
     // on two SMs, cross-CTA fp32 reduction through the workspace) on the BM8
     // MXFP4 RF swapAB path; see `kSplitKL1` in the body. Ignored by every other
     // tier. Env DG_FP4_SPLITK_L1 (default 1).
-    bool kSplitKL1Requested = false
+    bool kSplitKL1Requested = false,
+    // Host-selected L2 half-row tasks (128-row L2 tasks, the two math WGs each own
+    // 64 rows over the full K, no cross-WG reduction) on the BM8 MXFP4 RF swapAB
+    // path; see `kL2HalfRowTasks` in the body. Ignored by every other tier.
+    // Env DG_FP4_L2_HALFROW (default 1).
+    bool kL2HalfRowTasksRequested = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
