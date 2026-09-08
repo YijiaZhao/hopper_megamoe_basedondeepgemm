@@ -1347,47 +1347,13 @@
                             sw[h][1] = *reinterpret_cast<const uint32_t*>(packed_rows + row_1 * 80u + 64u);
                         }
                         uint2 lut[2][2][4];
-                        // MXFP4 relative rows s = 4..15 of kE2M1AndE8M0RelToFp8Lut are byte-wise
-                        // linear in s (each +1 adds 8 to every E4M3 byte); rows 0..3 (flush /
-                        // subnormal) are irregular. When every scale byte of the whole warp is
-                        // >= 4 (the common case) build the LUT words arithmetically -- no
-                        // dependent SMEM gather. Warp-uniform branch keeps the hot path clean.
-                        bool all_linear = false;
-                        if constexpr (kMXFP4) {
-                            uint32_t ok = 1u;
+                        #pragma unroll
+                        for (uint32_t h = 0; h < 2; ++ h) {
                             #pragma unroll
-                            for (uint32_t h = 0; h < 2; ++ h) {
+                            for (uint32_t r = 0; r < 2; ++ r) {
                                 #pragma unroll
-                                for (uint32_t r = 0; r < 2; ++ r) {
-                                    const uint32_t t = sw[h][r] & 0xfcfcfcfcu;   // byte >= 4  <=>  (byte & 0xfc) != 0
-                                    const uint32_t has_zero_byte = ((t - 0x01010101u) & ~t & 0x80808080u);
-                                    ok &= (has_zero_byte == 0u) ? 1u : 0u;
-                                }
-                            }
-                            all_linear = __all_sync(0xffffffffu, ok != 0u);
-                        }
-                        if (all_linear) {
-                            #pragma unroll
-                            for (uint32_t h = 0; h < 2; ++ h) {
-                                #pragma unroll
-                                for (uint32_t r = 0; r < 2; ++ r) {
-                                    #pragma unroll
-                                    for (uint32_t k = 0; k < 4; ++ k) {
-                                        const uint32_t sm4 = ((sw[h][r] >> (k * 8u)) & 0xffu) - 4u;
-                                        lut[h][r][k] = make_uint2(sm4 * 0x08080800u + 0x14100800u,
-                                                                  sm4 * 0x08080808u + 0x24201c18u);
-                                    }
-                                }
-                            }
-                        } else {
-                            #pragma unroll
-                            for (uint32_t h = 0; h < 2; ++ h) {
-                                #pragma unroll
-                                for (uint32_t r = 0; r < 2; ++ r) {
-                                    #pragma unroll
-                                    for (uint32_t k = 0; k < 4; ++ k)
-                                        lut[h][r][k] = smem_nvfp4_lut[(sw[h][r] >> (k * 8u)) & 0x7fu];
-                                }
+                                for (uint32_t k = 0; k < 4; ++ k)
+                                    lut[h][r][k] = smem_nvfp4_lut[(sw[h][r] >> (k * 8u)) & 0x7fu];
                             }
                         }
                         #pragma unroll
