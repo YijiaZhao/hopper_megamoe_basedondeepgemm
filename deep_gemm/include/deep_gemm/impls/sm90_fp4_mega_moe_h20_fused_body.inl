@@ -866,19 +866,24 @@
                 const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
                 const uint32_t pool_token_idx =
                     expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+                // Issue the remote top-k weight load together with the SF loads (it used to
+                // wait behind the SF stores, adding a full NVLink round trip to the chain).
+                float weight = 0.0f;
+                if (lane_idx == 0)
+                    weight = *sym_buffer.map(
+                        input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+                        current_rank_in_expert_idx);
                 #pragma unroll
                 for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
                     if (j < kNumSFFloats)
                         local_sf_ptr[j * kNumPaddedSFPoolTokens + pool_token_idx] = remote_sf_ptr[j];
                 }
+                if (lane_idx == 0)
+                    *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
                 __syncwarp();
 
                 if (cute::elect_one_sync()) {
-                    const auto weight = *sym_buffer.map(
-                        input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                        current_rank_in_expert_idx);
-                    *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
                     ptx::mbarrier_arrive_and_set_tx(pull_mbarrier, kHidden);
                     ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
