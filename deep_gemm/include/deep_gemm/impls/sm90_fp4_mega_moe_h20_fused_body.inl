@@ -1866,7 +1866,9 @@
                     //    with colsum[tok] = sum_k B[k][tok] over the block (computed by
                     //    this WG from the int8 tile, `compute_colsum_rf`). Same integer
                     //    sum as the fused (code - z) * s2 decode, ~2 fewer ALU ops per
-                    //    A word.
+                    //    A word. Measured a loss on H20 (see the host knob comment): the
+                    //    stage-end drain it needs (below) plus the fold on the critical
+                    //    path outweigh the decode savings; default off.
                     constexpr bool kQIS2Plain = kInlineS2 && !kQoQInlineS2Ilv && kQoQInlineS2Frags == 2;
                     constexpr bool kQIS2Prefetch = kQIS2Plain && kQoQInlineS2PrefetchPacked;
                     constexpr bool kQIS2RawU8 = kQIS2Plain && kQoQInlineS2RawU8;

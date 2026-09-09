@@ -539,12 +539,20 @@ static void sm90_fp4_h20_fused_mega_moe(
         .qoq_inline_s2_ilv = qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0,
         // DG_FP4_QIS2_PREFETCH_PACKED (default 1): in the 2-buffer inline-s2 loop, issue
         // the LDS of the next block's packed weight words before the wgmma wait that
-        // frees its fragment buffer, so the smem latency overlaps the wait.
+        // frees its fragment buffer, so the smem latency overlaps the wait. H20 probe
+        // (2 passes, skew-corrected kernel end, us): M16 64.6/61.5 vs 67.7/67.4 off,
+        // M8 42.1/40.5 vs 40.9/41.2 (L1 phase M16 41.7/42.2 vs 44.0/44.1).
         .qoq_inline_s2_prefetch_packed = qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) != 0,
-        // DG_FP4_QIS2_RAWU8 (default 1): raw-u8 decode (nibble extraction only), RS wgmma
-        // s32.u8.s8 into a per-K128-block int32 set and an exact int32 deferred affine
-        // (s2 * acc_blk - z * s2 * colsum(B)) at block retire; bit-identical sums.
-        .qoq_inline_s2_rawu8 = qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 1) != 0,
+        // DG_FP4_QIS2_RAWU8 (default 0): raw-u8 decode (nibble extraction only), RS wgmma
+        // s32.u8.s8 into per-K128-block int32 sets and an exact int32 deferred affine
+        // (s2 * acc_blk - z * s2 * colsum(B)) per block; bit-identical sums (cos_min
+        // identical to 10 digits). Folding a retired set while the other block's group
+        // is in flight trips ptxas C7514 (every wgmma serialised), so the fold sits
+        // after a stage-end wait<0>: the drain + ~230 ns fold on the critical path cost
+        // more than the ~2 ALU ops per A word it saves (H20 stage 1415-1434 ns vs
+        // 1136-1244, skew-corrected end M8 44.3-45.0 vs 40.5-42.1 us, M16 65.0-65.6 vs
+        // 61.5-64.6 with prefetch). Kept as an experiment knob.
+        .qoq_inline_s2_rawu8 = qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0,
         .strided_pool_debug = strided_pool_debug,
         .config = config,
         .y = y.data_ptr(),
@@ -587,7 +595,7 @@ static void sm90_fp4_h20_fused_mega_moe(
             fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
-        ((qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 1) == 0) ? "_noraw" : "");
+        ((qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0) ? "_rawu8" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }
