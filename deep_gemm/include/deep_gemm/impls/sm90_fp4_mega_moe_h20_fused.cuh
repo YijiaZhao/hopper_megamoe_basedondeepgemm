@@ -532,7 +532,12 @@ template <
     // for this CTA's 1/kNumSMs slice of every active local expert's W1 (then W2)
     // dense tiles, up to kL2PrefetchMaxMB per rank; see `kL2PrefetchAll` in the body.
     bool kL2PrefetchAllRequested = false,
-    uint32_t kL2PrefetchMaxMB = 48
+    uint32_t kL2PrefetchMaxMB = 48,
+    // Leading K128 blocks of every (expert, n_block) W1 task to prefetch (host env
+    // DG_FP4_L2_PREFETCH_KBLOCKS, 0 = the whole K range): the first-wave tasks then
+    // find their head stages resident while the flood stays inside what HBM can
+    // deliver during the communication window.
+    uint32_t kL2PrefetchKBlocks = 0
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

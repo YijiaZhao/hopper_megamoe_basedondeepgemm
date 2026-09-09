@@ -1622,18 +1622,26 @@
         };
         if constexpr (kL2PrefetchAll && !kTinyMGemv) {
             // Communication-window L2 weight prefetch (see `kL2PrefetchAll` above).
-            constexpr uint32_t kL1TilesPerExpert = (L1_SHAPE_N / kPackedTileN) * (L1_SHAPE_K / BLOCK_K);
-            constexpr uint32_t kL2TilesPerExpert = (L2_SHAPE_N / kPackedTileN) * (L2_SHAPE_K / BLOCK_K);
+            constexpr uint32_t kL1KBlocks = L1_SHAPE_K / BLOCK_K, kL2KBlocks = L2_SHAPE_K / BLOCK_K;
+            constexpr uint32_t kL1PrefetchKBlocks =
+                (kL2PrefetchKBlocks == 0 || kL2PrefetchKBlocks > kL1KBlocks) ? kL1KBlocks : kL2PrefetchKBlocks;
+            constexpr uint32_t kL1TilesPerExpert = (L1_SHAPE_N / kPackedTileN) * kL1PrefetchKBlocks;
+            constexpr uint32_t kL2TilesPerExpert = (L2_SHAPE_N / kPackedTileN) * kL2KBlocks;
             constexpr uint64_t kL1BytesPerExpert = static_cast<uint64_t>(kL1TilesPerExpert) * kPackedTileBytes;
             constexpr uint64_t kL2BytesPerExpert = static_cast<uint64_t>(kL2TilesPerExpert) * kPackedTileBytes;
+            constexpr uint64_t kL1RegionBytes = static_cast<uint64_t>(L1_SHAPE_N / kPackedTileN) * kL1KBlocks * kPackedTileBytes;
             constexpr uint64_t kBudgetBytes = static_cast<uint64_t>(kL2PrefetchMaxMB) << 20;
             constexpr uint32_t kExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
             constexpr uint32_t kFinalHigh = kNumSMs * kNumRanks;
-            // This CTA's slice of one expert's contiguous tile region: tiles
-            // sm_idx, sm_idx + kNumSMs, ... ; lane l takes the l-th, (l+32)-th, ... of them.
-            const auto prefetch_expert_region = [&](const uint8_t* region, const uint32_t& num_tiles) {
-                for (uint32_t t = sm_idx + lane_idx * kNumSMs; t < num_tiles; t += 32u * kNumSMs)
-                    ptx::tma_prefetch_1d(region + static_cast<size_t>(t) * kPackedTileBytes, kPackedTileBytes);
+            // This CTA's slice of one expert's dense region (tiles (n, k) at (n * k_stride
+            // + k) * 20 KB, k < k_count): logical tiles sm_idx, sm_idx + kNumSMs, ... ;
+            // lane l takes the l-th, (l+32)-th, ... of them.
+            const auto prefetch_expert_region = [&](const uint8_t* region, const uint32_t& num_tiles,
+                                                    const uint32_t& k_count, const uint32_t& k_stride) {
+                for (uint32_t t = sm_idx + lane_idx * kNumSMs; t < num_tiles; t += 32u * kNumSMs) {
+                    const uint32_t off = (t / k_count) * k_stride + (t % k_count);
+                    ptx::tma_prefetch_1d(region + static_cast<size_t>(off) * kPackedTileBytes, kPackedTileBytes);
+                }
             };
             const auto* l1_base = reinterpret_cast<const uint8_t*>(l1_weights_ptr);
             const auto* l2_base = reinterpret_cast<const uint8_t*>(l2_weights_ptr);
@@ -1655,8 +1663,8 @@
                     while (mask != 0 && issued_bytes + kL1BytesPerExpert <= kBudgetBytes) {
                         const uint32_t owner = static_cast<uint32_t>(__ffs(mask) - 1);
                         mask &= mask - 1;
-                        prefetch_expert_region(l1_base + static_cast<size_t>(i * 32 + owner) * kL1BytesPerExpert,
-                                               kL1TilesPerExpert);
+                        prefetch_expert_region(l1_base + static_cast<size_t>(i * 32 + owner) * kL1RegionBytes,
+                                               kL1TilesPerExpert, kL1PrefetchKBlocks, kL1KBlocks);
                         issued_bytes += kL1BytesPerExpert;
                         if (lane_idx == owner) issued_flags |= 1u << i;
                     }
@@ -1676,7 +1684,7 @@
                         const uint32_t owner = static_cast<uint32_t>(__ffs(mask) - 1);
                         mask &= mask - 1;
                         prefetch_expert_region(l2_base + static_cast<size_t>(i * 32 + owner) * kL2BytesPerExpert,
-                                               kL2TilesPerExpert);
+                                               kL2TilesPerExpert, kL2KBlocks, kL2KBlocks);
                         issued_bytes += kL2BytesPerExpert;
                     }
                 }

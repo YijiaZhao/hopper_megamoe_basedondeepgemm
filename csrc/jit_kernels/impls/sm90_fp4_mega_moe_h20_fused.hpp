@@ -55,6 +55,7 @@ public:
         bool strided_pool_debug;
         bool l2_prefetch_all;
         int l2_prefetch_max_mb;
+        int l2_prefetch_k_blocks;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -120,7 +121,8 @@ public:
             "        /* kRFPrefetchPacked */ {},\n"
             "        /* kStridedPoolDebug */ {},\n"
             "        /* kL2PrefetchAllRequested */ {},\n"
-            "        /* kL2PrefetchMaxMB */ {}",
+            "        /* kL2PrefetchMaxMB */ {},\n"
+            "        /* kL2PrefetchKBlocks */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -151,7 +153,8 @@ public:
             args.rf_prefetch_packed ? "true" : "false",
             args.strided_pool_debug ? "true" : "false",
             args.l2_prefetch_all ? "true" : "false",
-            args.l2_prefetch_max_mb);
+            args.l2_prefetch_max_mb,
+            args.l2_prefetch_k_blocks);
         return fmt::format(R"(
 {}
 
@@ -584,6 +587,9 @@ static void sm90_fp4_h20_fused_mega_moe(
             get_env<int>("DG_FP4_L2_PREFETCH_ALL", 1) != 0 &&
             num_global_tokens_upper <= get_env<int>("DG_FP4_L2_PREFETCH_MAX_M", 16),
         .l2_prefetch_max_mb = std::clamp(get_env<int>("DG_FP4_L2_PREFETCH_MAX_MB", 48), 1, 4096),
+        // DG_FP4_L2_PREFETCH_KBLOCKS (default 0 = whole K): leading K128 blocks of each
+        // W1 task to prefetch, to keep the flood within the window's HBM capacity.
+        .l2_prefetch_k_blocks = std::clamp(get_env<int>("DG_FP4_L2_PREFETCH_KBLOCKS", 0), 0, 24),
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
