@@ -131,6 +131,9 @@ struct Workspace {
         // Split-K L1 + L2 ready flags (padded to keep `uint64_t` alignment)
         num_bytes += math::align<uint64_t>(kSM90SplitKNumSlots * sizeof(uint32_t), 8);
 
+        // Fine-grained combine arrival counters, one per local token (padded)
+        num_bytes += math::align<uint64_t>(num_max_tokens_per_rank * sizeof(int), 8);
+
         // Dispatch pulling source token-topk
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
 
@@ -239,12 +242,27 @@ struct Workspace {
             pool_block_idx * kSM90SplitKL2NumL2BlockNs + n_block_idx;
     }
 
+    // Fine-grained combine (kernel `kFineCombine`): per-local-token arrival counter.
+    // Every L2 task that scatters a (token, topk-slot) hidden slice into this rank's
+    // combine pool does one `red.release.sys.add 1` on the token's counter (over
+    // NVLink for remote writers); the combine warp spins until the counter reaches
+    // popc(valid topk slots) * (L2 N-blocks per token) and then resets it to 0
+    // (the reader owns the reset: all writers of this launch have already arrived,
+    // and the next launch's writers only start after its first NVLink barrier,
+    // which every CTA of this rank reaches only after this launch has exited).
+    CUTLASS_DEVICE
+    int* get_combine_arrival_count_ptr(const uint32_t& token_idx = 0) const {
+        const auto base = get_splitk_l1_flag_ptr(0, 0) +
+            math::align<uint64_t>(kSM90SplitKNumSlots * sizeof(uint32_t), 8) / sizeof(uint32_t);
+        return reinterpret_cast<int*>(base) + token_idx;
+    }
+
     // For dispatch pulling
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
-        const auto base = get_splitk_l1_flag_ptr(0, 0) +
-            math::align<uint64_t>(kSM90SplitKNumSlots * sizeof(uint32_t), 8) / sizeof(uint32_t);
+        const auto base = get_combine_arrival_count_ptr(0) +
+            math::align<uint64_t>(num_max_tokens_per_rank * sizeof(int), 8) / sizeof(int);
         return reinterpret_cast<uint32_t*>(base) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;

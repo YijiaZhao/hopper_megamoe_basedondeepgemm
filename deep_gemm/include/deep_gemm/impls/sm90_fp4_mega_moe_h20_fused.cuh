@@ -469,6 +469,10 @@ template <
     // one word instead of a second grid-wide sync); see `kNvlFastEpilogue` in the
     // body. Env DG_FP4_NVL_FAST_EPI (default 0: within noise on H20, see the host).
     bool kNvlFastEpilogueRequested = false,
+    // Host-selected fine-grained combine (per-token NVLink arrival counters replace
+    // the combine NVLink barrier); see `kFineCombine` in the body. Env
+    // DG_FP4_FINE_COMBINE (default 1).
+    bool kFineCombineRequested = true,
     // Host-selected K128 blocks per pipeline stage for the BM8 MXFP4 RF swapAB
     // path (2 or 4; see `kKBlocksPerStage` in the body). Ignored by every other
     // tier (one K-block per stage). Env DG_FP4_KBLOCKS_PER_STAGE (see the heuristic).

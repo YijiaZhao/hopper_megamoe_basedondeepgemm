@@ -198,6 +198,20 @@
     // SM0's first write of the done word is ordered after every CTA's kernel-start
     // snapshot of it.
     constexpr bool kNvlFastEpilogue = kNvlFastEpilogueRequested && kDistributedExpertBcast;
+    // Fine-grained combine (host env DG_FP4_FINE_COMBINE, default 1): the combine
+    // NVLink barrier (#2) is replaced by per-(destination rank, token) arrival
+    // counters (`Workspace::get_combine_arrival_count_ptr`). Every L2 task, after its
+    // CTA-wide post-scatter sync, red.release.sys-adds 1 per valid token row to the
+    // row's destination counter (NVLink for remote destinations); a combine warp
+    // spins (ld.acquire.sys) on its token's counter until it equals
+    // popc(valid topk slots) * kNumRoutedL2BlockNs, then resets it and reads the
+    // partials. The barrier's second job (all local math tasks done before the
+    // dispatch warps clean the workspace) moves to a dispatch-warp grid sync, so
+    // the combine warps never wait for other CTAs. Pool reuse across launches is
+    // protected by NVLink barrier #1 of the next launch (a remote rank only starts
+    // scattering after every CTA of every rank has entered that launch) and #3
+    // (workspace cleanup), exactly as before.
+    constexpr bool kFineCombine = kFineCombineRequested;
     constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / TASK_BLOCK_N;
     constexpr uint32_t kNumRoutedL2BlockNs = L2_SHAPE_N / TASK_BLOCK_N_L2;
     using interleaved_scheduler_t = fused_sched::InterleavedMegaMoEScheduler<
@@ -1017,6 +1031,16 @@
         // Cleanup workspace, overlapping with combine
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+        // Fine-grained combine: the epilogue-side sync above only covers this CTA's
+        // math tasks (no combine NVLink barrier); the cleanup below zeroes the L1
+        // arrival counts / L2 arrival masks that other CTAs' L1/L2 tasks still
+        // touch, so wait for every CTA's math tasks here (dispatch warps only; the
+        // combine warps are not held up).
+        if constexpr (kFineCombine)
+            fused_comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+
         cleanup_workspace();
         fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                              kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
@@ -1347,6 +1371,24 @@
             const bool is_epilogue_wg = !kHalfTileTasks || epilogue_wg_idx == 0;
             const uint32_t row_block_offset =
                 kSplitMDecodedWeightReuse ? epilogue_wg_idx * WG_BLOCK_M : 0u;
+            // Fine-grained combine: called by every epilogue thread right after the
+            // CTA-wide sync that follows the L2 NVLink scatter of this task; row r's
+            // signaller (thread r) release-adds 1 to the destination token's counter.
+            // The bar.sync makes every thread's scatter stores of this task
+            // happen-before the release (cumulativity), so the acquiring combine warp
+            // sees the whole slice.
+            const auto signal_combine_arrivals = [&]() {
+                if constexpr (kFineCombine) {
+                    for (uint32_t row = epilogue_thread_idx; row < valid_m; row += kNumEpilogueThreads) {
+                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(
+                            pool_block_idx * BLOCK_M + row);
+                        asm volatile("fence.acq_rel.sys;" ::: "memory");
+                        ptx::red_add_rel_sys(
+                            sym_buffer.map(workspace.get_combine_arrival_count_ptr(src_metadata.token_idx),
+                                           src_metadata.rank_idx), 1);
+                    }
+                }
+            };
             const uint32_t row_offset_r0 = row_block_offset + r_0;
             const uint32_t row_offset_r1 = row_block_offset + r_1;
             // NVFP4: one scale per expert. MXFP4: one scale per weight row
@@ -2908,6 +2950,7 @@
                         }
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    signal_combine_arrivals();
                 } else {
                     DG_STATIC_ASSERT(WG_BLOCK_N == 64 || WG_BLOCK_N == 128,
                                      "Direct L2 scatter requires N64/N128");
@@ -2947,6 +2990,7 @@
                     scatter_direct_row(row_offset_r0, valid_r0, 0);
                     scatter_direct_row(row_offset_r1, valid_r1, 2);
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    signal_combine_arrivals();
                 }
             }
         };
@@ -2991,19 +3035,23 @@
             for_each_static_selected_block(run_math_task);
 
         // ---------------- COMBINE ----------------
-        // NVLink barrier first: signals remote ranks that this rank's GEMM
-        // outputs (NVLink scatter targets) are fully written.
-        fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
-                             kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
-            workspace, sym_buffer, sm_idx, epilogue_thread_idx,
-            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); },
-            true, true,
-            /* fast epilogue: barrier #2 of the launch (#3 = after cleanup, no epilogue) */
-            kNvlFastEpilogue, nvl_done_base, 2u);
-        if (epilogue_thread_idx == 0) stamp_max(6);
+        // Barrier path: NVLink barrier first, signals remote ranks that this rank's
+        // GEMM outputs (NVLink scatter targets) are fully written. Fine-grained
+        // combine (kFineCombine) skips it: readiness is per token (see the loop).
+        if constexpr (!kFineCombine) {
+            fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
+                                 kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
+                workspace, sym_buffer, sm_idx, epilogue_thread_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); },
+                true, true,
+                /* fast epilogue: barrier #2 of the launch (#3 = after cleanup, no epilogue) */
+                kNvlFastEpilogue, nvl_done_base, 2u);
+            if (epilogue_thread_idx == 0) stamp_max(6);
+        }
 
         // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
-        // dispatch may now safely clean workspace state.
+        // dispatch may now safely clean workspace state (kFineCombine: this only
+        // says "this CTA's math tasks are done"; the dispatch warps then grid-sync).
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
@@ -3042,6 +3090,21 @@
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+
+            if constexpr (kFineCombine) {
+                // Wait until every (topk slot, L2 N-block) slice of this token has
+                // landed, then hand the counter back (see the layout header) and
+                // order the generic-proxy acquire before the TMA (async-proxy) loads.
+                if (lane_idx == 0) {
+                    const auto counter_ptr = workspace.get_combine_arrival_count_ptr(token_idx);
+                    const int target = static_cast<int>(__popc(total_mask) * kNumRoutedL2BlockNs);
+                    while (ptx::ld_acq_sys(counter_ptr) != target) {}
+                    *counter_ptr = 0;
+                    asm volatile("fence.proxy.async.global;" ::: "memory");
+                    stamp_max(6);
+                }
+                __syncwarp();
+            }
 
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
                 const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;

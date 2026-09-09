@@ -37,6 +37,7 @@ public:
         bool l2_half_row_tasks;
         bool split_k_l2;
         bool nvl_fast_epilogue;
+        bool fine_combine;
         int k_blocks_per_stage;
         SM90FP4H20FusedConfig config;
 
@@ -84,6 +85,7 @@ public:
             "        /* kL2HalfRowTasksRequested */ {},\n"
             "        /* kSplitKL2Requested */ {},\n"
             "        /* kNvlFastEpilogueRequested */ {},\n"
+            "        /* kFineCombineRequested */ {},\n"
             "        /* kKBlocksPerStageRequested */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
@@ -100,6 +102,7 @@ public:
             args.l2_half_row_tasks ? "true" : "false",
             args.split_k_l2 ? "true" : "false",
             args.nvl_fast_epilogue ? "true" : "false",
+            args.fine_combine ? "true" : "false",
             args.k_blocks_per_stage);
         return fmt::format(R"(
 {}
@@ -281,6 +284,12 @@ static void sm90_fp4_h20_fused_mega_moe(
     // M=2 47.3 vs 48.2). Default OFF; DG_FP4_NVL_FAST_EPI=1 enables (numerics
     // verified: T=2/8/16/128/512 + QoQ pass).
     const bool nvl_fast_epilogue = get_env<int>("DG_FP4_NVL_FAST_EPI", 0) != 0;
+    // Fine-grained combine (kernel `kFineCombine`): the combine NVLink barrier is
+    // replaced by per-token arrival counters (each L2 task red.release.sys-adds 1
+    // per scattered token row into the destination rank's counter; the combine
+    // warp of a token spins on its own counter), so a rank's combine overlaps the
+    // other ranks' L2 tails. DG_FP4_FINE_COMBINE=0 restores the barrier path.
+    const bool fine_combine = get_env<int>("DG_FP4_FINE_COMBINE", 1) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;
@@ -359,6 +368,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l2_half_row_tasks = l2_half_row_tasks,
         .split_k_l2 = split_k_l2,
         .nvl_fast_epilogue = nvl_fast_epilogue,
+        .fine_combine = fine_combine,
         // K128 blocks per pipeline stage on the BM8 RF swapAB tiers (MXFP4 and QoQ,
         // kernel `kKBlocksPerStage`; other tiers ignore it). DG_FP4_KBLOCKS_PER_STAGE in
         // {2, 4}: 2 blocks x 4 stages (default) or 4 blocks x 2 stages (same 173 KB
