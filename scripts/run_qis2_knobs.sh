@@ -86,4 +86,12 @@ if [ "$MODE" = perf ] || [ "$MODE" = all ]; then
   run_probe pf1raw1 "2" DG_FP4_QIS2_PREFETCH_PACKED=1 DG_FP4_QIS2_RAWU8=1
   echo ALL_PERF_DONE >> "$LOG"
 fi
+if [ "$MODE" = perf2 ]; then
+  # second pass, reverse order (run-to-run drift check)
+  run_probe pf1raw1 "16 8" DG_FP4_QIS2_PREFETCH_PACKED=1 DG_FP4_QIS2_RAWU8=1
+  run_probe pf0raw1 "16 8" DG_FP4_QIS2_PREFETCH_PACKED=0 DG_FP4_QIS2_RAWU8=1
+  run_probe pf1raw0 "16 8" DG_FP4_QIS2_PREFETCH_PACKED=1 DG_FP4_QIS2_RAWU8=0
+  run_probe pf0raw0 "16 8" DG_FP4_QIS2_PREFETCH_PACKED=0 DG_FP4_QIS2_RAWU8=0
+  echo ALL_PERF2_DONE >> "$LOG"
+fi
 echo ALL_DONE >> "$LOG"
