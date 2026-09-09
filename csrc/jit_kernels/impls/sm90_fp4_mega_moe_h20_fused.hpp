@@ -361,10 +361,16 @@ static void sm90_fp4_h20_fused_mega_moe(
         .nvl_fast_epilogue = nvl_fast_epilogue,
         // K128 blocks per pipeline stage on the BM8 MXFP4 RF swapAB tier (kernel
         // `kKBlocksPerStage`; other tiers ignore it). DG_FP4_KBLOCKS_PER_STAGE in
-        // {2, 4}; 4 blocks/stage x 2 stages amortises the ~540 ns per-stage
-        // skeleton over twice the K, the L2 K loop (10 blocks) then ends with a
-        // 2-block partial stage. Default 2 (see the heuristic helper); H20 A/B
-        // numbers are recorded below once measured.
+        // {2, 4}: 2 blocks x 4 stages (default) or 4 blocks x 2 stages (same 173 KB
+        // of stages, the L2 K loop (10 blocks) ends with a 2-block partial stage).
+        // H20 A/B (2026-09-09, phase stamps, kernel end us, 4 vs 2 blocks, same
+        // session): M=2 53.5-54.4 vs 46.9; M=8 73.9-75.0 vs 64.9; M=16 101-115 vs
+        // 88.3. The per-K128 stage cost barely moves (slot 22: 2655/4 = 664 ns vs
+        // 1386/2 = 693 ns at M=8; the exposed drain per block doubles, 330 vs 132 ns)
+        // while the task head must land an 80 KB first stage and only ONE stage can
+        // be in flight while the other is consumed (vs 3 x 40 KB), so the L1 and L2
+        // phases lose 5-6 us / 2-5 us. Default 2 (the 4-block kernel also carries
+        // 16 B of ptxas spill at 168 regs; the 2-block one has none).
         .k_blocks_per_stage = mxfp4 ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 2,
         .config = config,
         .y = y.data_ptr(),

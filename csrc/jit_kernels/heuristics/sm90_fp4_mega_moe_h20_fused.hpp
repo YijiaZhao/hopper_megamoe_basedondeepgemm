@@ -13,8 +13,9 @@ static constexpr int kSM90NVFP4BStoragePerKBlock = 80;
 
 // K128 blocks per pipeline stage of the BM8 MXFP4 RF swapAB tier (kernel
 // `kKBlocksPerStage`): env DG_FP4_KBLOCKS_PER_STAGE in {2, 4}. Shared by the
-// heuristic (stage depth) and the host (kernel template argument). The default
-// is set in the host comment next to `k_blocks_per_stage` (measured on H20).
+// heuristic (stage depth) and the host (kernel template argument). Default 2:
+// 4 blocks x 2 stages measured slower on H20 (see the host comment next to
+// `k_blocks_per_stage`).
 static inline int get_sm90_fp4_h20_bm8_k_blocks_per_stage() {
     const int v = get_env<int>("DG_FP4_KBLOCKS_PER_STAGE", 2);
     return v == 4 ? 4 : 2;
