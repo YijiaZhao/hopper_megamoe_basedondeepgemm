@@ -29,6 +29,9 @@
     DG_STATIC_ASSERT(kTMPrefetch >= 1 && kTMPrefetch <= 4, "TinyM prefetch depth 1..4");
     constexpr uint32_t kTMRowsPerLane = 4;                        // 32 rows per warp, 4 lanes per row
     constexpr uint32_t kTMMaxTokens = BLOCK_M;                    // 8
+    // NOTE: lambda array-reference parameters below spell these bounds as literals
+    // (float (&acc)[4][8] etc.): nvcc 13.0's cicc segfaults on constexpr-local bounds.
+    DG_STATIC_ASSERT(kTMRowsPerLane == 4 && kTMMaxTokens == 8, "Literal array bounds in the lambdas assume 4 rows x 8 tokens");
     constexpr uint32_t kTMMaxKBlocks = L1_SHAPE_K / BLOCK_K;      // 24 (L2 uses the first 10)
     constexpr uint32_t kTMActBytesPerToken = L1_SHAPE_K * (kMXFP4 ? 2u : 1u);  // fp16 or int8
     constexpr uint32_t kTMActBytes = kTMMaxTokens * kTMActBytesPerToken;
@@ -231,7 +234,7 @@
     const auto tm_flush_tile = [&](const auto& is_l2_tag, const uint32_t& pool_block_idx,
                                    const uint32_t& n_block_idx, const uint32_t& valid_m,
                                    const uint32_t& k_first, const uint32_t& k_last,
-                                   const uint32_t& num_splits, float (&acc)[kTMRowsPerLane][kTMMaxTokens]) {
+                                   const uint32_t& num_splits, float (&acc)[4][8]) {
         constexpr bool kL2 = std::remove_cv_t<std::remove_reference_t<decltype(is_l2_tag)>>::value;
         constexpr uint32_t kNKB = (kL2 ? L2_SHAPE_K : L1_SHAPE_K) / BLOCK_K;
         const uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -455,7 +458,7 @@
         // Lane's 4 row chunks (16 B nibbles + 4 B meta) of the next kTMPrefetch units
         uint4 raw_q[kTMPrefetch][kTMRowsPerLane];
         uint32_t raw_meta[kTMPrefetch][kTMRowsPerLane];
-        const auto issue_unit = [&](uint4 (&dst_q)[kTMRowsPerLane], uint32_t (&dst_meta)[kTMRowsPerLane],
+        const auto issue_unit = [&](uint4 (&dst_q)[4], uint32_t (&dst_meta)[4],
                                     const uint32_t& u) {
             const uint32_t p = u / kUnitsPerPoolBlock;
             const uint32_t rem = u - p * kUnitsPerPoolBlock;
@@ -482,7 +485,7 @@
         uint32_t cur_valid_m = 0, k_first = 0, k_prev = 0;
 
         // Compute one unit from its raw chunks
-        const auto consume_unit = [&](const uint4 (&rw_q)[kTMRowsPerLane], const uint32_t (&rw_meta)[kTMRowsPerLane],
+        const auto consume_unit = [&](const uint4 (&rw_q)[4], const uint32_t (&rw_meta)[4],
                                       const uint32_t& k, const uint32_t& valid_m) {
             const uint32_t k_off = k * BLOCK_K;
             if constexpr (kMXFP4) {
