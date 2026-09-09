@@ -22,7 +22,8 @@ LOG=corr_tinym$TAG.log
 wait_idle() {
   while true; do
     n=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)
-    m=$(pgrep -x nvcc | grep -c .)
+    # live nvcc only (defunct/zombie nvcc entries linger when a parent never reaps them)
+    m=$(ps -C nvcc -o stat= 2>/dev/null | grep -v '^Z' | grep -c .)
     [ "$n" = 0 ] && [ "$m" = 0 ] && break
     sleep 5
   done

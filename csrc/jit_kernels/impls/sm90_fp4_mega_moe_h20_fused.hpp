@@ -311,12 +311,13 @@ static void sm90_fp4_h20_fused_mega_moe(
     // for <= DG_FP4_TINYM_MAX_M (default 16) global tokens the L1/L2 math is a
     // bandwidth-shaped weight-streaming GEMV on the CUDA cores (stream-K unit
     // ranges, fp32 fixup through the split-K scratch); the TMA/WGMMA task pipeline,
-    // split-K tails and stream-K scheduler are off for that launch. DG_FP4_TINYM=0
-    // disables; DG_FP4_TINYM_PREFETCH (1..4, default 2) sets the units in flight.
+    // split-K tails and stream-K scheduler are off for that launch. DG_FP4_TINYM=1
+    // enables (default 0 until the path is validated and measured; see the tinym
+    // design note); DG_FP4_TINYM_PREFETCH (1..4, default 2) sets the units in flight.
     const bool tinym = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
         config.block_n == 256 && !half_tile_tasks && !l2_half_row_tasks &&
         plan.use_interleaved_scheduler && dense_weight_tiles &&
-        get_env<int>("DG_FP4_TINYM", 1) != 0 &&
+        get_env<int>("DG_FP4_TINYM", 0) != 0 &&
         num_global_tokens_upper <= get_env<int>("DG_FP4_TINYM_MAX_M", 16);
     const int tinym_prefetch = std::clamp(get_env<int>("DG_FP4_TINYM_PREFETCH", 2), 1, 4);
     // Fast NVLink-barrier epilogue (kernel `kNvlFastEpilogue`, needs the

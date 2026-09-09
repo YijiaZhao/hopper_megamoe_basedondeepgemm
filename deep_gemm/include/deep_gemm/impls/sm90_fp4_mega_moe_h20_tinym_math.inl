@@ -277,7 +277,8 @@
             tm_bar();
             if (*tm_flag == 0u)
                 return;  // not the last arriver: the finisher runs the epilogue
-            // Last arriver: fold the other contributors' partials in, re-zero the slot
+            // Last arriver: the slot holds every contributor's partial (this CTA's
+            // included, added above), so it REPLACES the registers; re-zero the slot.
             #pragma unroll
             for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
                 const uint32_t row = tm_row(r);
@@ -286,7 +287,7 @@
                     const uint32_t t = tm_c + j * 4u;
                     if (t < valid_m) {
                         float* p = slot + row * kTMMaxTokens + t;
-                        acc[r][t] += __ldcg(p);
+                        acc[r][t] = __ldcg(p);
                         __stcg(p, 0.0f);
                     }
                 }
