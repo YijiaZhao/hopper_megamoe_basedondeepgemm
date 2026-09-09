@@ -51,6 +51,12 @@ static constexpr uint32_t kSM90SplitKL2NumSlots =
     kSM90SplitKL1MaxPoolBlocks * kSM90SplitKL2NumL2BlockNs;
 // Total (L1 + L2) split-K slots: flags and fp32 partial scratch are sized by this.
 static constexpr uint32_t kSM90SplitKNumSlots = kSM90SplitKL1NumSlots + kSM90SplitKL2NumSlots;
+// Fine-grained combine (kernel `kFineCombine`): per-CTA epilogue -> dispatch mailbox
+// (see `Workspace::get_combine_mailbox_ptr`).
+static constexpr uint32_t kSM90FineCombineMaxSMs = 160;
+static constexpr uint32_t kSM90FineCombineMailboxBytes = 32;
+static constexpr uint32_t kSM90FineCombineRingSize = 4;
+static constexpr uint32_t kSM90FineCombineDoneEntry = 0xffffffffu;
 static constexpr uint64_t kSM90SplitKL1ScratchBytes =
     static_cast<uint64_t>(kSM90SplitKNumSlots) * kSM90SplitKL1PartialBytes;  // 11 MB (L1 5 MB + L2 6 MB)
 
@@ -133,6 +139,9 @@ struct Workspace {
 
         // Fine-grained combine arrival counters, one per local token (padded)
         num_bytes += math::align<uint64_t>(num_max_tokens_per_rank * sizeof(int), 8);
+
+        // Fine-grained combine per-CTA mailboxes (epilogue -> dispatch warp)
+        num_bytes += kSM90FineCombineMaxSMs * kSM90FineCombineMailboxBytes;
 
         // Dispatch pulling source token-topk
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
@@ -257,12 +266,24 @@ struct Workspace {
         return reinterpret_cast<int*>(base) + token_idx;
     }
 
+    // Fine-grained combine per-CTA mailbox (32 B per SM, never reset): the epilogue
+    // warps of a CTA post one entry per finished L2 task (packed pool block + valid
+    // rows) and the CTA's dispatch warp 0 turns each entry into the sys-scope
+    // arrival signals, so the sys-scope fence never stalls the math warps.
+    //   [0] producer sequence (st.release.gpu), [1] consumer sequence,
+    //   [4..7] 4-entry ring indexed by sequence & 3.
+    CUTLASS_DEVICE
+    uint32_t* get_combine_mailbox_ptr(const uint32_t& sm_idx) const {
+        const auto base = get_combine_arrival_count_ptr(0) +
+            math::align<uint64_t>(num_max_tokens_per_rank * sizeof(int), 8) / sizeof(int);
+        return reinterpret_cast<uint32_t*>(base) + sm_idx * (kSM90FineCombineMailboxBytes / sizeof(uint32_t));
+    }
+
     // For dispatch pulling
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
-        const auto base = get_combine_arrival_count_ptr(0) +
-            math::align<uint64_t>(num_max_tokens_per_rank * sizeof(int), 8) / sizeof(int);
+        const auto base = get_combine_mailbox_ptr(kSM90FineCombineMaxSMs);
         return reinterpret_cast<uint32_t*>(base) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;

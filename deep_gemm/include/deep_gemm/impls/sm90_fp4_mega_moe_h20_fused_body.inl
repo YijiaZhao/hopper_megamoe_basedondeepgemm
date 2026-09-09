@@ -1028,18 +1028,53 @@
         }
 
         if (thread_idx == 0) stamp_max(2);
-        // Cleanup workspace, overlapping with combine
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
-
-        // Fine-grained combine: the epilogue-side sync above only covers this CTA's
-        // math tasks (no combine NVLink barrier); the cleanup below zeroes the L1
-        // arrival counts / L2 arrival masks that other CTAs' L1/L2 tasks still
-        // touch, so wait for every CTA's math tasks here (dispatch warps only; the
-        // combine warps are not held up).
-        if constexpr (kFineCombine)
+        if constexpr (kFineCombine) {
+            // Fine-grained combine signaller (dispatch warp 0): consume this CTA's
+            // mailbox; for every finished L2 task release-add 1 per scattered token
+            // row to the destination rank's counter (sys-scope fence here, off the
+            // math warps), until the epilogue posts DONE (all math tasks finished).
+            DG_STATIC_ASSERT(kNumSMs <= fused_layout::kSM90FineCombineMaxSMs, "Too many SMs for the combine mailboxes");
+            if (warp_idx == 0) {
+                auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
+                uint32_t consumed = ld_volatile(mailbox + 1);
+                while (true) {
+                    while (ptx::ld_acq(mailbox) == consumed) {}
+                    const uint32_t entry = ld_volatile(
+                        mailbox + 4 + (consumed & (fused_layout::kSM90FineCombineRingSize - 1)));
+                    __syncwarp();
+                    if (entry == fused_layout::kSM90FineCombineDoneEntry)
+                        break;
+                    const uint32_t signal_pool_block_idx = entry & 0xffffffu, signal_valid_m = entry >> 24;
+                    for (uint32_t row = lane_idx; row < signal_valid_m; row += 32) {
+                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(
+                            signal_pool_block_idx * BLOCK_M + row);
+                        asm volatile("fence.acq_rel.sys;" ::: "memory");
+                        ptx::red_add_rel_sys(
+                            sym_buffer.map(workspace.get_combine_arrival_count_ptr(src_metadata.token_idx),
+                                           src_metadata.rank_idx), 1);
+                    }
+                    __syncwarp();
+                    ++ consumed;
+                    if (lane_idx == 0)
+                        mailbox[1] = consumed;
+                }
+                // Terminal entry consumed too (keeps producer/consumer sequences aligned)
+                ++ consumed;
+                if (lane_idx == 0)
+                    mailbox[1] = consumed;
+                __syncwarp();
+            }
+            // All dispatch warps: this CTA's math tasks are done (warp 0 saw DONE);
+            // the cleanup below zeroes the L1 arrival counts / L2 arrival masks that
+            // other CTAs' L1/L2 tasks still touch, so wait for every CTA's math tasks
+            // (dispatch warps only; the combine warps are not held up).
             fused_comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
                 workspace, sm_idx, thread_idx,
                 [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+        } else {
+            // Cleanup workspace, overlapping with combine
+            ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        }
 
         cleanup_workspace();
         fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
@@ -1338,36 +1373,13 @@
         // Sync with dispatch
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
-        // Fine-grained combine: the L2 task whose combine arrivals are still to be
-        // signalled (CTA-uniform; valid_m == 0 means none). Signalling needs a
-        // sys-scope release (a NVLink write drain, ~1.5 us on H20), so it is deferred
-        // to the start of the next task's epilogue (the drain then overlaps that
-        // task's K loop) or to the end of the task loop.
-        uint32_t pending_combine_pool_block_idx = 0u, pending_combine_valid_m = 0u;
-        // Row r's signaller (thread r) release-adds 1 to the destination token's
-        // counter; the CTA-wide bar.sync after the scatter made every thread's
-        // stores of that task happen-before the release (cumulativity).
-        const auto signal_combine_arrivals_now = [&](const uint32_t& signal_pool_block_idx,
-                                                     const uint32_t& signal_valid_m) {
-            if constexpr (kFineCombine) {
-                for (uint32_t row = epilogue_thread_idx; row < signal_valid_m; row += kNumEpilogueThreads) {
-                    const auto src_metadata = *workspace.get_token_src_metadata_ptr(
-                        signal_pool_block_idx * BLOCK_M + row);
-                    asm volatile("fence.acq_rel.sys;" ::: "memory");
-                    ptx::red_add_rel_sys(
-                        sym_buffer.map(workspace.get_combine_arrival_count_ptr(src_metadata.token_idx),
-                                       src_metadata.rank_idx), 1);
-                }
-            }
-        };
-        const auto flush_pending_combine_arrivals = [&]() {
-            if constexpr (kFineCombine) {
-                if (pending_combine_valid_m != 0u) {
-                    signal_combine_arrivals_now(pending_combine_pool_block_idx, pending_combine_valid_m);
-                    pending_combine_valid_m = 0u;
-                }
-            }
-        };
+        // Fine-grained combine: this CTA's mailbox producer sequence (CTA-uniform;
+        // only epilogue thread 0 writes). Baseline = the word's value left by the
+        // previous launch (ordered by the kernel boundary; the consumer reads the
+        // same baseline from its own word).
+        uint32_t combine_mailbox_seq = 0u;
+        if constexpr (kFineCombine)
+            combine_mailbox_seq = *workspace.get_combine_mailbox_ptr(sm_idx);
         const auto run_math_task_impl = [&](const auto& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1402,17 +1414,21 @@
             const uint32_t row_block_offset =
                 kSplitMDecodedWeightReuse ? epilogue_wg_idx * WG_BLOCK_M : 0u;
             // Fine-grained combine: called by every epilogue thread right after the
-            // CTA-wide sync that follows the L2 NVLink scatter of this task; row r's
-            // signaller (thread r) release-adds 1 to the destination token's counter.
-            // The bar.sync makes every thread's scatter stores of this task
-            // happen-before the release (cumulativity), so the acquiring combine warp
-            // sees the whole slice.
-            // Called right after the CTA-wide post-scatter sync of an L2 task.
+            // CTA-wide sync that follows the L2 NVLink scatter of this task. Thread 0
+            // posts (pool block, valid rows) to the CTA mailbox with st.release.gpu;
+            // the bar.sync made every thread's scatter stores happen-before that
+            // release, and the dispatch consumer's acquire + sys-scope release make
+            // them visible to the remote combine warp (cumulativity).
             const auto signal_combine_arrivals = [&]() {
                 if constexpr (kFineCombine) {
-                    flush_pending_combine_arrivals();
-                    pending_combine_pool_block_idx = pool_block_idx;
-                    pending_combine_valid_m = valid_m;
+                    if (epilogue_thread_idx == 0 && valid_m > 0) {
+                        auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
+                        while (combine_mailbox_seq - ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize) {}
+                        mailbox[4 + (combine_mailbox_seq & (fused_layout::kSM90FineCombineRingSize - 1))] =
+                            pool_block_idx | (valid_m << 24);
+                        ptx::st_rel_gpu(mailbox, combine_mailbox_seq + 1);
+                    }
+                    ++ combine_mailbox_seq;
                 }
             };
             const uint32_t row_offset_r0 = row_block_offset + r_0;
@@ -2514,10 +2530,6 @@
                 }
             }
 
-            // Fine-grained combine: the previous L2 task's NVLink stores have drained
-            // during this task's K loop; signal them now (cheap fence).
-            flush_pending_combine_arrivals();
-
             if constexpr (!kBlockIsL2) {
                 const float l1_global_scale = (kPerRowEpilogueScale || l1_global_scales == nullptr) ?
                     1.0f : __ldg(l1_global_scales + local_expert_idx);
@@ -3064,8 +3076,17 @@
         else
             for_each_static_selected_block(run_math_task);
 
-        // Fine-grained combine: signal the last L2 task of this CTA.
-        flush_pending_combine_arrivals();
+        // Fine-grained combine: tell the dispatch warps that this CTA's math tasks
+        // are done (replaces the epilogue/dispatch pairing below).
+        if constexpr (kFineCombine) {
+            if (epilogue_thread_idx == 0) {
+                auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
+                while (combine_mailbox_seq - ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize) {}
+                mailbox[4 + (combine_mailbox_seq & (fused_layout::kSM90FineCombineRingSize - 1))] =
+                    fused_layout::kSM90FineCombineDoneEntry;
+                ptx::st_rel_gpu(mailbox, combine_mailbox_seq + 1);
+            }
+        }
 
         // ---------------- COMBINE ----------------
         // Barrier path: NVLink barrier first, signals remote ranks that this rank's
@@ -3083,9 +3104,10 @@
         }
 
         // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
-        // dispatch may now safely clean workspace state (kFineCombine: this only
-        // says "this CTA's math tasks are done"; the dispatch warps then grid-sync).
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        // dispatch may now safely clean workspace state (kFineCombine: the mailbox
+        // DONE entry carries that information instead).
+        if constexpr (!kFineCombine)
+            ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
         constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
