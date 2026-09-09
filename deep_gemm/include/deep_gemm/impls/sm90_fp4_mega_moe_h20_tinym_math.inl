@@ -179,7 +179,7 @@
     // per-(token, K128) int32 activation sum (for the z fold). Both: per-(token, K128)
     // fp32 SF (MXFP4: x 4096 = 2^6 weight LUT shift x 2^6 activation prescale).
     const auto tm_stage_acts = [&](const auto& is_l2_tag, const uint32_t& pool_block_idx,
-                                   const uint32_t& valid_m) {
+                                   const uint32_t& valid_m) __attribute__((always_inline)) {
         constexpr bool kL2 = std::remove_cv_t<std::remove_reference_t<decltype(is_l2_tag)>>::value;
         constexpr uint32_t kK = kL2 ? L2_SHAPE_K : L1_SHAPE_K;
         constexpr uint32_t kNKB = kK / BLOCK_K;
@@ -253,7 +253,7 @@
     const auto tm_flush_tile = [&](const auto& is_l2_tag, const uint32_t& dense_p,
                                    const uint32_t& n_block_idx, const uint32_t& valid_m,
                                    const uint32_t& k_first, const uint32_t& k_last,
-                                   const uint32_t& num_splits, float (&acc)[4][8]) {
+                                   const uint32_t& num_splits, float (&acc)[4][8]) __attribute__((always_inline)) {
         constexpr bool kL2 = std::remove_cv_t<std::remove_reference_t<decltype(is_l2_tag)>>::value;
         constexpr uint32_t kNKB = (kL2 ? L2_SHAPE_K : L1_SHAPE_K) / BLOCK_K;
         const uint32_t pool_block_idx = tm_pb_pool[dense_p];
@@ -463,7 +463,7 @@
     };
 
     // ---------------- Phase runner ----------------
-    const auto tm_run_phase = [&](const auto& is_l2_tag) {
+    const auto tm_run_phase = [&](const auto& is_l2_tag) __attribute__((always_inline)) {
         constexpr bool kL2 = std::remove_cv_t<std::remove_reference_t<decltype(is_l2_tag)>>::value;
         constexpr uint32_t kK = kL2 ? L2_SHAPE_K : L1_SHAPE_K;
         constexpr uint32_t kNKB = kK / BLOCK_K;
@@ -471,6 +471,12 @@
         constexpr uint32_t kUnitsPerPoolBlock = kNB * kNKB;
         const uint8_t* weights = reinterpret_cast<const uint8_t*>(kL2 ? l2_weights_ptr : l1_weights_ptr);
         const uint32_t num_units = tm_num_pool_blocks * kUnitsPerPoolBlock;
+        // SM0 thread-0 probe (L1 phase, SM cycles; the probe script divides by slot 21):
+        // 21 units consumed | 22 consume_unit cycles | 17 staging (wait + convert) | 19 tile flush
+        const bool tm_probe = (!kL2) && (phase_stamps != nullptr) && (sm_idx == 0) && (tm_tid == 0);
+        const auto tm_probe_add = [&](const uint32_t& slot, const unsigned long long& v) __attribute__((always_inline)) {
+            if (tm_probe) atomicAdd(phase_stamps + slot, v);
+        };
         uint32_t u_begin = 0, u_end = 0;
         interleaved_scheduler_t::get_streamk_range(num_units, sm_idx, u_begin, u_end);
         if (u_begin >= u_end)
@@ -480,7 +486,7 @@
         uint4 raw_q[kTMPrefetch][kTMRowsPerLane];
         uint32_t raw_meta[kTMPrefetch][kTMRowsPerLane];
         const auto issue_unit = [&](uint4 (&dst_q)[4], uint32_t (&dst_meta)[4],
-                                    const uint32_t& u) {
+                                    const uint32_t& u) __attribute__((always_inline)) {
             const uint32_t p = u / kUnitsPerPoolBlock;
             const uint32_t rem = u - p * kUnitsPerPoolBlock;
             const uint32_t n = rem / kNKB, k = rem - n * kNKB;
@@ -507,7 +513,7 @@
 
         // Compute one unit from its raw chunks
         const auto consume_unit = [&](const uint4 (&rw_q)[4], const uint32_t (&rw_meta)[4],
-                                      const uint32_t& k, const uint32_t& valid_m) {
+                                      const uint32_t& k, const uint32_t& valid_m) __attribute__((always_inline)) {
             const uint32_t k_off = k * BLOCK_K;
             if constexpr (kMXFP4) {
                 // Decode 4 rows x 4 K32 groups -> fp16x2 pairs [row][group][pair]
@@ -605,10 +611,12 @@
             const uint32_t last = interleaved_scheduler_t::get_streamk_worker_of_unit(num_units, tile * kNKB + kNKB - 1u);
             return last - first + 1u;
         };
-        const auto flush_current = [&]() {
+        const auto flush_current = [&]() __attribute__((always_inline)) {
             if (cur_tile != 0xffffffffu) {
                 const uint32_t p = cur_tile / kNB, n = cur_tile - p * kNB;
+                const unsigned long long t0 = clock64();
                 tm_flush_tile(is_l2_tag, p, n, cur_valid_m, k_first, k_prev, num_splits_of(cur_tile), acc);
+                tm_probe_add(19, clock64() - t0);
                 #pragma unroll
                 for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
                     #pragma unroll
@@ -620,7 +628,7 @@
 
         // Walk the range kTMPrefetch units per iteration. Slot indices are compile-time
         // constants (integral_constant steps), so the ring stays in registers.
-        const auto step = [&](const auto& slot_tag, const uint32_t& uu) {
+        const auto step = [&](const auto& slot_tag, const uint32_t& uu) __attribute__((always_inline)) {
             constexpr uint32_t S = std::remove_cv_t<std::remove_reference_t<decltype(slot_tag)>>::value;
             const uint32_t p = uu / kUnitsPerPoolBlock;
             const uint32_t rem = uu - p * kUnitsPerPoolBlock;
@@ -633,10 +641,15 @@
                 if (p != cur_pool_block) {
                     cur_pool_block = p;
                     cur_valid_m = tm_pb_valid[p];
+                    const unsigned long long t0 = clock64();
                     tm_stage_acts(is_l2_tag, tm_pb_pool[p], cur_valid_m);
+                    tm_probe_add(17, clock64() - t0);
                 }
             }
+            const unsigned long long tc0 = clock64();
             consume_unit(raw_q[S], raw_meta[S], k, cur_valid_m);
+            tm_probe_add(22, clock64() - tc0);
+            tm_probe_add(21, 1ull);
             k_prev = k;
             if (uu + kTMPrefetch < u_end)
                 issue_unit(raw_q[S], raw_meta[S], uu + kTMPrefetch);
