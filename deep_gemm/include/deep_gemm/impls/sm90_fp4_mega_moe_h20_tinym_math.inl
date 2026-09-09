@@ -452,10 +452,11 @@
         if (u_begin >= u_end)
             return;
 
-        // Lane's 4 row chunks (16 B nibbles + 4 B meta) of unit u
-        struct RawUnit { uint4 q[kTMRowsPerLane]; uint32_t meta[kTMRowsPerLane]; };
-        RawUnit raw[kTMPrefetch];
-        const auto issue_unit = [&](RawUnit& dst, const uint32_t& u) {
+        // Lane's 4 row chunks (16 B nibbles + 4 B meta) of the next kTMPrefetch units
+        uint4 raw_q[kTMPrefetch][kTMRowsPerLane];
+        uint32_t raw_meta[kTMPrefetch][kTMRowsPerLane];
+        const auto issue_unit = [&](uint4 (&dst_q)[kTMRowsPerLane], uint32_t (&dst_meta)[kTMRowsPerLane],
+                                    const uint32_t& u) {
             const uint32_t p = u / kUnitsPerPoolBlock;
             const uint32_t rem = u - p * kUnitsPerPoolBlock;
             const uint32_t n = rem / kNKB, k = rem - n * kNKB;
@@ -465,8 +466,8 @@
             #pragma unroll
             for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
                 const uint8_t* row_ptr = tile + tm_row(r) * 80u;
-                dst.q[r] = tm_ldg16(row_ptr + tm_c * 16u);
-                dst.meta[r] = tm_ldg4(row_ptr + 64u);
+                dst_q[r] = tm_ldg16(row_ptr + tm_c * 16u);
+                dst_meta[r] = tm_ldg4(row_ptr + 64u);
             }
         };
 
@@ -481,17 +482,18 @@
         uint32_t cur_valid_m = 0, k_first = 0, k_prev = 0;
 
         // Compute one unit from its raw chunks
-        const auto consume_unit = [&](const RawUnit& rw, const uint32_t& k, const uint32_t& valid_m) {
+        const auto consume_unit = [&](const uint4 (&rw_q)[kTMRowsPerLane], const uint32_t (&rw_meta)[kTMRowsPerLane],
+                                      const uint32_t& k, const uint32_t& valid_m) {
             const uint32_t k_off = k * BLOCK_K;
             if constexpr (kMXFP4) {
                 // Decode 4 rows x 4 K32 groups -> fp16x2 pairs [row][group][pair]
                 uint32_t wq[kTMRowsPerLane][4][4];
                 #pragma unroll
                 for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
-                    const uint32_t words[4] = {rw.q[r].x, rw.q[r].y, rw.q[r].z, rw.q[r].w};
+                    const uint32_t words[4] = {rw_q[r].x, rw_q[r].y, rw_q[r].z, rw_q[r].w};
                     #pragma unroll
                     for (uint32_t g = 0; g < 4; ++ g) {
-                        const uint2 lut = tm_lut[(rw.meta[r] >> (g * 8u)) & 0xfu];
+                        const uint2 lut = tm_lut[(rw_meta[r] >> (g * 8u)) & 0xfu];
                         const uint32_t w = words[g];
                         const uint32_t sel = w & 0x77777777u;
                         uint32_t hb_hi = __byte_perm(lut.x, lut.y, sel);
@@ -536,14 +538,14 @@
                 int32_t zi[kTMRowsPerLane];
                 #pragma unroll
                 for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
-                    const uint32_t words[4] = {rw.q[r].x, rw.q[r].y, rw.q[r].z, rw.q[r].w};
+                    const uint32_t words[4] = {rw_q[r].x, rw_q[r].y, rw_q[r].z, rw_q[r].w};
                     #pragma unroll
                     for (uint32_t g = 0; g < 4; ++ g) {
                         hi[r][g] = (words[g] >> 4) & 0x0f0f0f0fu;
                         lo[r][g] = words[g] & 0x0f0f0f0fu;
                     }
-                    zi[r] = static_cast<int32_t>((rw.meta[r] >> 8) & 0xffu);
-                    s2f[r] = tm_i2f_small(static_cast<int32_t>(rw.meta[r] & 0xffu));
+                    zi[r] = static_cast<int32_t>((rw_meta[r] >> 8) & 0xffu);
+                    s2f[r] = tm_i2f_small(static_cast<int32_t>(rw_meta[r] & 0xffu));
                 }
                 #pragma unroll
                 for (uint32_t t = 0; t < kTMMaxTokens; ++ t) {
@@ -596,7 +598,7 @@
         #pragma unroll
         for (uint32_t s = 0; s < kTMPrefetch; ++ s) {
             if (u_begin + s < u_end)
-                issue_unit(raw[s], u_begin + s);
+                issue_unit(raw_q[s], raw_meta[s], u_begin + s);
         }
         for (uint32_t u = u_begin; u < u_end; u += kTMPrefetch) {
             #pragma unroll
@@ -617,10 +619,10 @@
                             tm_stage_acts(is_l2_tag, p, cur_valid_m);
                         }
                     }
-                    consume_unit(raw[s], k, cur_valid_m);
+                    consume_unit(raw_q[s], raw_meta[s], k, cur_valid_m);
                     k_prev = k;
                     if (uu + kTMPrefetch < u_end)
-                        issue_unit(raw[s], uu + kTMPrefetch);
+                        issue_unit(raw_q[s], raw_meta[s], uu + kTMPrefetch);
                 }
             }
         }
