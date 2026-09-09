@@ -2,7 +2,7 @@
 # Task A: official 24-report capture twice, customer method (DG_PROFILE_HOST_BARRIER=0)
 # and with the all-rank host barrier before each launch (DG_PROFILE_HOST_BARRIER=1),
 # then the last-3 summary + per-device reconcile of the Mega-only Fused reports.
-# Usage (inside four_api_build): bash scripts/run_hostbar_ab.sh /raid/kimi/results
+# Usage (inside four_api_build): [MODES="off on"] bash scripts/run_hostbar_ab.sh /raid/kimi/results
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
@@ -22,7 +22,7 @@ wait_idle() {
 wait_idle || exit 1
 echo "$$ $(date)" > "$MARK"
 trap 'rm -f "$MARK"' EXIT
-for mode in off on; do
+for mode in ${MODES:-off on}; do
   out="$RES/hostbar_$mode"
   bar=0; [ "$mode" = on ] && bar=1
   echo "=== capture host barrier=$mode -> $out ($(date))"
