@@ -60,7 +60,60 @@ SM_GHZ = 1.83
 
 
 PROBE_EXP = int(os.environ.get("PROBE_EXP", "0"))  # 1 skip decode, 2 skip wgmma, 3 both (timing only)
-PROBE_DUMP = int(os.environ.get("PROBE_DUMP", "0"))  # 1: rank0 prints one line per measured iteration
+PROBE_DUMP = int(os.environ.get("PROBE_DUMP", "0"))
+# 1: rank0 prints the per-CTA task timeline of the last measured launch (kernel task log,
+# slots 48 + sm * 16 + ..., enabled by the magic word in slot 47; see the body).
+PROBE_TASKLOG = int(os.environ.get("PROBE_TASKLOG", "0"))
+TASKLOG_BASE, TASKLOG_PER_CTA, TASKLOG_MAX_SMS, TASKLOG_MAGIC = 48, 16, 160, 0x5441534B
+
+
+def print_tasklog(s, t0):
+    ctas = []
+    for sm in range(TASKLOG_MAX_SMS):
+        base = TASKLOG_BASE + sm * TASKLOG_PER_CTA
+        count = s[base + 15]
+        if count <= 0:
+            continue
+        entry = s[base + 14]
+        tasks = []
+        for t in range(min(count, 7)):
+            w0, w1 = s[base + 2 * t], s[base + 2 * t + 1]
+            meta = (w0 >> 32) & 0xffffffff
+            start = (entry + (w0 & 0xffffffff) - t0) / 1000.0
+            end = (entry + w1 - t0) / 1000.0
+            tasks.append(dict(l2=bool(meta >> 31 & 1), pb=(meta >> 24) & 0x7f, nb=(meta >> 16) & 0xff,
+                              ks=(meta >> 8) & 0xff, nks=meta & 0xff, start=start, end=end))
+        ctas.append((sm, tasks))
+    if not ctas:
+        print("TASKLOG: empty (kernel built without the task log?)")
+        return
+    def pct(v, q):
+        v = sorted(v); return v[min(len(v) - 1, int(q * len(v)))]
+    first = [c[1][0]['start'] for c in ctas]
+    l1_end = [max(t['end'] for t in c[1] if not t['l2']) for c in ctas if any(not t['l2'] for t in c[1])]
+    l2_start = [t['start'] for c in ctas for t in c[1] if t['l2']]
+    l2_end = [t['end'] for c in ctas for t in c[1] if t['l2']]
+    l1_dur = [t['end'] - t['start'] for c in ctas for t in c[1] if not t['l2'] and t['nks'] == 1]
+    l2_dur = [t['end'] - t['start'] for c in ctas for t in c[1] if t['l2'] and t['nks'] == 1]
+    kend = max(l2_end) if l2_end else max(l1_end)
+    idle = [sum(max(0.0, c[1][i + 1]['start'] - c[1][i]['end']) for i in range(len(c[1]) - 1)) +
+            max(0.0, kend - c[1][-1]['end']) for c in ctas]
+    print(f"TASKLOG: {len(ctas)} CTAs, tasks/CTA hist "
+          f"{ {n: sum(1 for c in ctas if len(c[1]) == n) for n in sorted(set(len(c[1]) for c in ctas))} }")
+    print(f"TASKLOG: first task start p0/p50/p100 {pct(first,0):.1f}/{pct(first,.5):.1f}/{pct(first,1):.1f} | "
+          f"L1 end per CTA p0/p50/p90/p100 {pct(l1_end,0):.1f}/{pct(l1_end,.5):.1f}/{pct(l1_end,.9):.1f}/{pct(l1_end,1):.1f} | "
+          f"L2 start p0/p50/p90/p100 {pct(l2_start,0):.1f}/{pct(l2_start,.5):.1f}/{pct(l2_start,.9):.1f}/{pct(l2_start,1):.1f} | "
+          f"L2 end p50/p100 {pct(l2_end,.5):.1f}/{pct(l2_end,1):.1f}")
+    if l1_dur:
+        print(f"TASKLOG: full L1 task dur p50/p100 {pct(l1_dur,.5):.2f}/{pct(l1_dur,1):.2f}  "
+              f"full L2 task dur p50/p100 {pct(l2_dur,.5):.2f}/{pct(l2_dur,1):.2f}  "
+              f"idle per CTA (gaps + wait for kernel-wide last L2 end) p50/p100 {pct(idle,.5):.1f}/{pct(idle,1):.1f} "
+              f"sum {sum(idle):.0f} us")
+    ctas.sort(key=lambda c: -c[1][-1]['end'])
+    for sm, tasks in ctas[:10]:
+        chain = " ".join(f"{'L2' if t['l2'] else 'L1'}[b{t['pb']},n{t['nb']}{('/' + str(t['ks']) + 'of' + str(t['nks'])) if t['nks'] > 1 else ''}]"
+                         f"{t['start']:.1f}-{t['end']:.1f}" for t in tasks)
+        print(f"TASKLOG: sm{sm:3d} {chain}")  # 1: rank0 prints one line per measured iteration
 
 
 def reset(stamps):
@@ -68,6 +121,8 @@ def reset(stamps):
     for s in MIN_SLOTS:
         stamps[s] = INT64_MAX
     stamps[24] = PROBE_EXP
+    if PROBE_TASKLOG:
+        stamps[47] = TASKLOG_MAGIC
 
 
 def main():
@@ -95,7 +150,7 @@ def main():
     kernel = (deep_gemm_fused_kernel(args.quant))
     weights = prepare_weights(args, rank, local_experts)
 
-    stamps = torch.zeros(48, dtype=torch.int64, device="cuda")
+    stamps = torch.zeros(48 + TASKLOG_MAX_SMS * TASKLOG_PER_CTA, dtype=torch.int64, device="cuda")
     try:
         torch.manual_seed(17000 + rank * 1000003 + args.global_tokens)
         x = torch.randn(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
@@ -171,6 +226,8 @@ def main():
         if rank == 0 and args.no_stamps:
             print(f"\n=== fused {args.quant} M={args.global_tokens} NO-STAMPS wall (us): "
                   f"median {statistics.median(wall):.2f} min {min(wall):.2f} max {max(wall):.2f} ===")
+        if rank == 0 and not args.no_stamps and PROBE_TASKLOG:
+            print_tasklog(raw_rows[-1], raw_rows[-1][0])
         if rank == 0 and not args.no_stamps:
             med = {slot: statistics.median(r[slot] for r in rows) for slot, _ in REPORT}
             mn = {slot: min(r[slot] for r in rows) for slot, _ in REPORT}

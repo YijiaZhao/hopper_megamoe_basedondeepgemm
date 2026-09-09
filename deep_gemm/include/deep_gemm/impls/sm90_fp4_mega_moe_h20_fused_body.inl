@@ -4421,6 +4421,15 @@
             }
         };
         unsigned long long ktask_prev_end = 0ull;
+        // Per-CTA task log (probe buffers with >= 48 + 160 * 16 slots; see
+        // tests/profile_fused_phase_stamps.py PROBE_TASKLOG): slot 48 + sm * 16 + {2t, 2t+1}
+        // = task t's (start, end) in ns since this CTA's kernel entry (low 32 bits), start
+        // word high bits = meta (bit 31 L2, 30..24 pool block, 23..16 n block, 15..8 k split,
+        // 7..0 num k splits); + 14 = this CTA's absolute entry globaltimer, + 15 = task count.
+        constexpr uint32_t kTaskLogBase = 48, kTaskLogPerCTA = 16, kTaskLogMaxTasks = 7, kTaskLogMaxSMs = 160;
+        uint32_t task_log_seq = 0;
+        const bool task_log_on = (phase_stamps != nullptr) && (epilogue_thread_idx == 0) &&
+                                 (sm_idx < kTaskLogMaxSMs) && (phase_stamps[47] == 0x5441534bull);
         const auto run_math_task = [&](const auto& block_phase,
                                        const uint32_t& local_expert_idx,
                                        const uint32_t& num_k_blocks,
@@ -4446,10 +4455,27 @@
                 kt_task0 = clock64();
                 if (ktask_prev_end != 0ull) atomicAdd(phase_stamps + 29, kt_task0 - ktask_prev_end);
             }
+            unsigned long long tl_start = 0ull;
+            if (task_log_on) asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tl_start));
             run_math_task_impl(block_phase, local_expert_idx, num_k_blocks,
                                m_block_idx, n_block_idx, pool_block_idx, valid_m,
                                k_split_idx, num_k_splits, k_block_begin, first_worker_idx);
             if (epilogue_thread_idx == 0) stamp_max(kBlockIsL2 ? 5 : 4);
+            if (task_log_on) {
+                unsigned long long tl_end; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tl_end));
+                auto* log = phase_stamps + kTaskLogBase + sm_idx * kTaskLogPerCTA;
+                if (task_log_seq < kTaskLogMaxTasks) {
+                    const unsigned long long meta =
+                        (kBlockIsL2 ? 1ull << 31 : 0ull) | (static_cast<unsigned long long>(pool_block_idx & 0x7fu) << 24) |
+                        (static_cast<unsigned long long>(n_block_idx & 0xffu) << 16) |
+                        (static_cast<unsigned long long>(k_split_idx & 0xffu) << 8) |
+                        static_cast<unsigned long long>(num_k_splits & 0xffu);
+                    log[2 * task_log_seq] = ((tl_start - t_kernel_entry) & 0xffffffffull) | (meta << 32);
+                    log[2 * task_log_seq + 1] = (tl_end - t_kernel_entry) & 0xffffffffull;
+                }
+                log[14] = t_kernel_entry;
+                log[15] = ++ task_log_seq;
+            }
             if (ktask_probe_on) {
                 const unsigned long long kt_task1 = clock64();
                 if (valid_m > 0) {
