@@ -524,7 +524,15 @@ template <
     // Debug (host env DG_FP4_POOL_STRIDE_DEBUG, pull dispatch only): address the
     // token pool with the push-dispatch fixed per-expert stride while keeping the
     // pull protocol; see `kStridedPool` in the body.
-    bool kStridedPoolDebug = false
+    bool kStridedPoolDebug = false,
+    // Communication-window L2 weight prefetch (host env DG_FP4_L2_PREFETCH_ALL /
+    // DG_FP4_L2_PREFETCH_MAX_MB, push dispatch + dense tiles only): while the CTAs
+    // idle between their routing duties and NVLink barrier #1, the B loader warp
+    // polls the local per-expert ticket counts and issues cp.async.bulk.prefetch.L2
+    // for this CTA's 1/kNumSMs slice of every active local expert's W1 (then W2)
+    // dense tiles, up to kL2PrefetchMaxMB per rank; see `kL2PrefetchAll` in the body.
+    bool kL2PrefetchAllRequested = false,
+    uint32_t kL2PrefetchMaxMB = 48
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

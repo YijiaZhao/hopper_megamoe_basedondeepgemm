@@ -187,6 +187,12 @@ def main():
             for slot, name in STAGE:
                 v = [r[slot] for r in rows]
                 print(f"{slot:>4} {name:<32} {statistics.median(v):>9.1f} {min(v):>9.1f} {max(v):>9.1f}")
+            # 38/39 = comm-window L2 weight prefetch (kL2PrefetchAll): max-over-CTAs issue-done
+            # time (us from entry) and rank-wide bytes issued
+            if any(sr[38] > 0 for sr in raw_rows):
+                pf_t = statistics.median((sr[38] - sr[0]) / 1000.0 for sr in raw_rows if sr[38] > 0)
+                pf_mb = statistics.median(sr[39] / 1048576.0 for sr in raw_rows)
+                print(f"--- L2 weight prefetch (slots 38/39): issue done at {pf_t:.2f} us, {pf_mb:.1f} MB issued ---")
             # per-task probe: slots 25/27 L1, 26/28 L2, 29 inter-task gap (cycles @1.83GHz)
             def _task_us(sl, cnt):
                 return [ (sr[sl] / max(sr[cnt], 1) / SM_GHZ / 1000.0) for sr in raw_rows ]

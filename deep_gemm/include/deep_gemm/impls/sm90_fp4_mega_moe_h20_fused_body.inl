@@ -270,6 +270,27 @@
     // pool addressing under the PULL protocol, to separate the layout's cost from
     // the push protocol's (tickets / arrival publish) in the phase-stamp probe.
     constexpr bool kStridedPool = kUseInterleavedScheduler && (kPushDispatch || kStridedPoolDebug);
+    // Communication-window L2 weight prefetch (kL2PrefetchAll; host env
+    // DG_FP4_L2_PREFETCH_ALL, default 1 for <= 16 global tokens, and
+    // DG_FP4_L2_PREFETCH_MAX_MB, default 48). Tiny M is loader/HBM-bound (the L1 K
+    // loop exposes 270-740 ns per 40 KB stage of "k+1 not ready" wait) while the
+    // ~10 us between routing and the first math task leave the memory system idle.
+    // Under push dispatch the DESTINATION's `expert_recv_count_sum` low words grow by
+    // one per remote ticket during the senders' routing, i.e. well before NVLink
+    // barrier #1 completes, so the B loader warp (idle until the first task is
+    // published; its `fetch_expert_recv_count` would spin on the same words anyway)
+    // polls the 48 local words and, for every expert whose count turns non-zero,
+    // issues `cp.async.bulk.prefetch.L2` for this CTA's tiles (t % kNumSMs == sm_idx)
+    // of the expert's contiguous dense W1 region (all CTAs together cover the region,
+    // ~4.9 MB incl. the 16 B per-K128 SF, in one shot); once every count is final
+    // (all high words published after barrier #1) the remaining budget goes to the
+    // active experts' W2 regions in scheduler (expert index) order. Rank-wide bytes
+    // are capped at kL2PrefetchMaxMB (accounted per CTA in whole-expert units, so the
+    // CTAs agree up to their discovery order). Prefetch only: numerics unchanged; no
+    // barrier / pool-ready path is delayed (the loop lives entirely inside the B
+    // loader's pre-task idle time and also exits when the budget is spent).
+    constexpr bool kL2PrefetchAll = kL2PrefetchAllRequested && kPushDispatch &&
+                                    kDenseWeightTiles && kUseInterleavedScheduler;
     constexpr uint32_t kPushBlocksPerExpert = kStridedPool ?
         math::constexpr_ceil_div(kNumRanks * kPushMaxTokensPerRank, BLOCK_M) : 0u;
     DG_STATIC_ASSERT(!kStridedPool ||
@@ -1596,6 +1617,76 @@
                 __syncwarp();
             }
         };
+        if constexpr (kL2PrefetchAll && !kTinyMGemv) {
+            // Communication-window L2 weight prefetch (see `kL2PrefetchAll` above).
+            constexpr uint32_t kL1TilesPerExpert = (L1_SHAPE_N / kPackedTileN) * (L1_SHAPE_K / BLOCK_K);
+            constexpr uint32_t kL2TilesPerExpert = (L2_SHAPE_N / kPackedTileN) * (L2_SHAPE_K / BLOCK_K);
+            constexpr uint64_t kL1BytesPerExpert = static_cast<uint64_t>(kL1TilesPerExpert) * kPackedTileBytes;
+            constexpr uint64_t kL2BytesPerExpert = static_cast<uint64_t>(kL2TilesPerExpert) * kPackedTileBytes;
+            constexpr uint64_t kBudgetBytes = static_cast<uint64_t>(kL2PrefetchMaxMB) << 20;
+            constexpr uint32_t kExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
+            constexpr uint32_t kFinalHigh = kNumSMs * kNumRanks;
+            // This CTA's slice of one expert's contiguous tile region: tiles
+            // sm_idx, sm_idx + kNumSMs, ... ; lane l takes the l-th, (l+32)-th, ... of them.
+            const auto prefetch_expert_region = [&](const uint8_t* region, const uint32_t& num_tiles) {
+                for (uint32_t t = sm_idx + lane_idx * kNumSMs; t < num_tiles; t += 32u * kNumSMs)
+                    ptx::tma_prefetch_1d(region + static_cast<size_t>(t) * kPackedTileBytes, kPackedTileBytes);
+            };
+            const auto* l1_base = reinterpret_cast<const uint8_t*>(l1_weights_ptr);
+            const auto* l2_base = reinterpret_cast<const uint8_t*>(l2_weights_ptr);
+            uint64_t issued_bytes = 0;                 // warp-uniform
+            uint32_t issued_flags = 0;                 // per lane: bit i = expert i*32+lane W1 issued
+            bool all_final = false;
+            while (!all_final && issued_bytes + kL1BytesPerExpert <= kBudgetBytes) {
+                all_final = true;
+                #pragma unroll
+                for (uint32_t i = 0; i < kExpertsPerLane; ++ i) {
+                    const uint32_t e = i * 32 + lane_idx;
+                    uint64_t v = static_cast<uint64_t>(kFinalHigh) << 32;
+                    if (e < kNumExpertsPerRank)
+                        v = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(e));
+                    all_final &= (static_cast<uint32_t>(v >> 32) == kFinalHigh);
+                    const bool need = e < kNumExpertsPerRank && static_cast<uint32_t>(v) != 0 &&
+                                      ((issued_flags >> i) & 1u) == 0;
+                    uint32_t mask = __ballot_sync(0xffffffff, need);
+                    while (mask != 0 && issued_bytes + kL1BytesPerExpert <= kBudgetBytes) {
+                        const uint32_t owner = static_cast<uint32_t>(__ffs(mask) - 1);
+                        mask &= mask - 1;
+                        prefetch_expert_region(l1_base + static_cast<size_t>(i * 32 + owner) * kL1BytesPerExpert,
+                                               kL1TilesPerExpert);
+                        issued_bytes += kL1BytesPerExpert;
+                        if (lane_idx == owner) issued_flags |= 1u << i;
+                    }
+                }
+                all_final = __all_sync(0xffffffff, all_final);
+                if (!all_final) __nanosleep(128);
+            }
+            if (all_final) {
+                // Counts are final: W2 of the active experts in scheduler (index) order.
+                #pragma unroll
+                for (uint32_t i = 0; i < kExpertsPerLane; ++ i) {
+                    const uint32_t e = i * 32 + lane_idx;
+                    const bool active = e < kNumExpertsPerRank &&
+                        static_cast<uint32_t>(ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(e))) != 0;
+                    uint32_t mask = __ballot_sync(0xffffffff, active);
+                    while (mask != 0 && issued_bytes + kL2BytesPerExpert <= kBudgetBytes) {
+                        const uint32_t owner = static_cast<uint32_t>(__ffs(mask) - 1);
+                        mask &= mask - 1;
+                        prefetch_expert_region(l2_base + static_cast<size_t>(i * 32 + owner) * kL2BytesPerExpert,
+                                               kL2TilesPerExpert);
+                        issued_bytes += kL2BytesPerExpert;
+                    }
+                }
+            }
+            // Probe: slot 38 = max over CTAs of the issue-done time, slot 39 = rank-wide
+            // bytes issued (each CTA adds its 1/kNumSMs share).
+            if (lane_idx == 0) {
+                stamp_max(38);
+                if (phase_stamps != nullptr)
+                    atomicAdd(phase_stamps + 39, issued_bytes / kNumSMs);
+            }
+            __syncwarp();
+        }
         if constexpr (kTinyMGemv) {
             // TinyM GEMV: no task pipeline (see above)
         } else if constexpr (kUseInterleavedScheduler) {

@@ -53,6 +53,8 @@ public:
         bool qoq_inline_s2_rawu8;
         bool rf_prefetch_packed;
         bool strided_pool_debug;
+        bool l2_prefetch_all;
+        int l2_prefetch_max_mb;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -116,7 +118,9 @@ public:
             "        /* kQoQInlineS2PrefetchPacked */ {},\n"
             "        /* kQoQInlineS2RawU8 */ {},\n"
             "        /* kRFPrefetchPacked */ {},\n"
-            "        /* kStridedPoolDebug */ {}",
+            "        /* kStridedPoolDebug */ {},\n"
+            "        /* kL2PrefetchAllRequested */ {},\n"
+            "        /* kL2PrefetchMaxMB */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -145,7 +149,9 @@ public:
             args.qoq_inline_s2_prefetch_packed ? "true" : "false",
             args.qoq_inline_s2_rawu8 ? "true" : "false",
             args.rf_prefetch_packed ? "true" : "false",
-            args.strided_pool_debug ? "true" : "false");
+            args.strided_pool_debug ? "true" : "false",
+            args.l2_prefetch_all ? "true" : "false",
+            args.l2_prefetch_max_mb);
         return fmt::format(R"(
 {}
 
@@ -566,6 +572,18 @@ static void sm90_fp4_h20_fused_mega_moe(
         // ns) — so off. The L1 loop is loader/HBM-bound at these token counts.
         .rf_prefetch_packed = get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0,
         .strided_pool_debug = strided_pool_debug,
+        // Communication-window L2 weight prefetch (kernel `kL2PrefetchAll`, needs push
+        // dispatch + dense tiles): DG_FP4_L2_PREFETCH_ALL (default 1 for <= 16 global
+        // tokens) lets the idle B loader warps warm L2 with every active local expert's
+        // W1 (then W2) dense tiles as soon as the remote tickets reveal the expert,
+        // i.e. during the ~10 us routing -> first-math window in which the memory
+        // system is otherwise idle; DG_FP4_L2_PREFETCH_MAX_MB (default 48, H20 L2 =
+        // 60 MB) caps the rank-wide bytes (M2/M8: ~4.9 MB W1 + 2.5 MB W2 per active
+        // expert all fit; M16 (~15 experts, 74 MB of W1) gets the first ~9 experts).
+        .l2_prefetch_all = push_dispatch && dense_weight_tiles &&
+            get_env<int>("DG_FP4_L2_PREFETCH_ALL", 1) != 0 &&
+            num_global_tokens_upper <= get_env<int>("DG_FP4_L2_PREFETCH_MAX_M", 16),
+        .l2_prefetch_max_mb = std::clamp(get_env<int>("DG_FP4_L2_PREFETCH_MAX_MB", 48), 1, 4096),
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
