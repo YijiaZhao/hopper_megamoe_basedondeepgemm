@@ -44,6 +44,7 @@ public:
         int tinym_prefetch;
         bool push_dispatch;
         int push_max_tokens_per_rank;
+        bool lean_routing;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -96,7 +97,8 @@ public:
             "        /* kKBlocksPerStageRequested */ {},\n"
             "        /* kTinyMGemvRequested */ {},\n"
             "        /* kPushDispatchRequested */ {},\n"
-            "        /* kPushMaxTokensPerRank */ {}",
+            "        /* kPushMaxTokensPerRank */ {},\n"
+            "        /* kLeanRouting */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -117,7 +119,8 @@ public:
             args.k_blocks_per_stage,
             args.tinym ? "true" : "false",
             args.push_dispatch ? "true" : "false",
-            args.push_max_tokens_per_rank);
+            args.push_max_tokens_per_rank,
+            args.lean_routing ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -468,6 +471,14 @@ static void sm90_fp4_h20_fused_mega_moe(
         .tinym_prefetch = tinym_prefetch,
         .push_dispatch = push_dispatch,
         .push_max_tokens_per_rank = push_max_tokens_per_rank,
+        // Lean routing (kernel `kLeanRouting`, DG_FP4_LEAN_ROUTING, default 1): the
+        // dispatch warps only atomically publish experts with a non-zero local count
+        // (the per-CTA arrival high word is replaced by the constant the scheduler
+        // expects, the grid sync before the broadcast already orders the counts);
+        // with push dispatch the local send counts, the extra grid sync and the
+        // cross-rank count broadcast disappear entirely (the destination finalises
+        // its own counts after NVLink barrier #1). DG_FP4_LEAN_ROUTING=0 = old path.
+        .lean_routing = get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -501,7 +512,8 @@ static void sm90_fp4_h20_fused_mega_moe(
             "_h200_fused_interleaved" :
             (plan.use_mode2_row_decoder ?
                 "_h200_fused_mode2_row" :
-                "_h200_fused_lut_window")) + (tinym ? "_tinym" : "") + (push_dispatch ? "_push" : "");
+                "_h200_fused_lut_window")) + (tinym ? "_tinym" : "") + (push_dispatch ? "_push" : "") +
+        (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

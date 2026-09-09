@@ -495,7 +495,10 @@ template <
     // can send to one expert (== its local token count) and sizes the per-expert
     // pool stride.
     bool kPushDispatchRequested = false,
-    uint32_t kPushMaxTokensPerRank = 2
+    uint32_t kPushMaxTokensPerRank = 2,
+    // Lean routing (host env DG_FP4_LEAN_ROUTING): see the dispatch prologue in
+    // the body (`kLeanRouting` / `kLeanPush`).
+    bool kLeanRouting = true
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

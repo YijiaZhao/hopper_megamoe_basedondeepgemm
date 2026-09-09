@@ -890,20 +890,46 @@
             }
         };
 
-        // Count tokens per expert
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-            atomicAdd_block(smem_expert_count + expert_idx, 1);
-        });
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        // Lean routing (kLeanRouting; host env DG_FP4_LEAN_ROUTING, default 1).
+        // Baseline: every CTA adds `(1 << 32) | count` to ALL 384 `expert_send_count`
+        // words (78 x 384 = 30k serialised L2 atomics, ~5 us at any M, most of them
+        // count 0); the high word (CTA arrivals) is forwarded by the broadcast into
+        // `expert_recv_count_sum`, whose high word the destination's scheduler polls
+        // for kNumSMs * kNumRanks (completeness). The grid sync before the broadcast
+        // already guarantees every CTA's count landed, so the per-CTA arrival word is
+        // redundant: lean routing adds only non-zero counts (no high word) and the
+        // broadcast supplies the constant kNumSMs high word instead. Push dispatch
+        // (kLeanPush) needs neither the local send counts (only the broadcast read
+        // them), nor the extra grid sync, nor the cross-rank broadcast: the per-row
+        // remote tickets already carry the low word, all of them are ordered before
+        // this rank's barrier #1 signal by the barrier's prologue grid sync, and the
+        // DESTINATION adds the kNumSMs * kNumRanks high word to its own 48 sums after
+        // barrier #1 (one local atomic per expert). Data seen by the scheduler /
+        // dispatch (`expert_recv_count`, `expert_recv_count_sum`) is unchanged.
+        constexpr bool kLeanPush = kLeanRouting && kPushDispatch;
+        if constexpr (!kLeanPush) {
+            // Count tokens per expert
+            read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+                atomicAdd_block(smem_expert_count + expert_idx, 1);
+            });
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Stake out per-expert SM offsets via global atomic
-        #pragma unroll
-        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
-            smem_expert_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+            // Stake out per-expert SM offsets via global atomic
+            #pragma unroll
+            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                const uint32_t count = smem_expert_count[i];
+                if constexpr (kLeanRouting) {
+                    if (count != 0)
+                        smem_expert_count[i] = static_cast<uint32_t>(ptx::atomic_add(
+                            workspace.get_expert_send_count_ptr(i), static_cast<uint64_t>(count)));
+                } else {
+                    const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(count);
+                    smem_expert_count[i] = static_cast<uint32_t>(
+                        ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+                }
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
         }
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
         if (thread_idx == 0) stamp_max(8);
 
         if constexpr (kPushDispatch) {
@@ -974,16 +1000,25 @@
             if (thread_idx == 0) stamp_max(9);
         }
 
-        fused_comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
-            workspace, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
-        );
+        // Lean push: no cross-CTA total is needed before barrier #1 (the barrier's
+        // prologue grid sync orders the pushes), so the routing grid sync is dropped.
+        if constexpr (!kLeanPush) {
+            fused_comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+            );
+        }
         if (thread_idx == 0) stamp_max(10);
 
         const auto broadcast_expert_status = [&](const uint32_t& i) {
             const auto dst_rank_idx = i / kNumExpertsPerRank;
             const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-            const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+            // Lean routing: the send count carries no arrival high word; supply the
+            // constant the destination's scheduler expects (kNumSMs per source rank).
+            const uint64_t expert_status = kLeanRouting ?
+                ((static_cast<uint64_t>(kNumSMs) << 32) |
+                 (*workspace.get_expert_send_count_ptr(i) & 0xffffffffull)) :
+                *workspace.get_expert_send_count_ptr(i);
             *sym_buffer.map(
                 workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                 dst_rank_idx) = expert_status & 0xffffffff;
@@ -994,7 +1029,9 @@
                 sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                 kPushDispatch ? (expert_status & 0xffffffff00000000ull) : expert_status);
         };
-        if constexpr (kDistributedExpertBcast) {
+        if constexpr (kLeanPush) {
+            // No broadcast: the destination finalises its counts after barrier #1.
+        } else if constexpr (kDistributedExpertBcast) {
             // Spread the per-expert cross-rank count updates over every SM
             // (<= 3 blocking sys-scope atomics per thread) instead of 12 serial
             // rounds on SM 0; the NVLink barrier below then needs its grid-sync
@@ -1019,7 +1056,7 @@
                              kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            kDistributedExpertBcast, true,
+            kDistributedExpertBcast || kLeanPush, true,
             /* fast epilogue: barrier #1 of the launch */ kNvlFastEpilogue, nvl_done_base, 1u);
         if (thread_idx == 0) {
             stamp_max(1);
@@ -1039,8 +1076,22 @@
             // per lane, with release.gpu: the loaders' acquire on the count then also
             // covers the remotely written rows (this thread acquired barrier #1).
             if (warp_idx == 0 and sm_idx < kNumExpertsPerRank) {
-                const auto num_recv_tokens = static_cast<uint32_t>(
-                    ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(sm_idx)));
+                uint32_t num_recv_tokens;
+                if constexpr (kLeanPush) {
+                    // Finalise expert `sm_idx`'s count: every rank's row tickets landed
+                    // before its barrier #1 signal (acquired by this CTA), so add the
+                    // completeness high word the scheduler polls for and take the
+                    // total from the same atomic.
+                    uint32_t low = 0;
+                    if (lane_idx == 0)
+                        low = static_cast<uint32_t>(ptx::atomic_add(
+                            workspace.get_expert_recv_count_sum_ptr(sm_idx),
+                            static_cast<uint64_t>(kNumSMs * kNumRanks) << 32));
+                    num_recv_tokens = __shfl_sync(0xffffffff, low, 0);
+                } else {
+                    num_recv_tokens = static_cast<uint32_t>(
+                        ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(sm_idx)));
+                }
                 const uint32_t num_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
                 if (lane_idx < num_blocks)
                     ptx::red_add_rel(
