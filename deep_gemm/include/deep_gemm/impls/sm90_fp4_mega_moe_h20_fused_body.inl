@@ -683,12 +683,12 @@
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear1>{},
                      local_expert_idx, L1_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u);
+                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, 0u);
             } else {
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear2>{},
                      local_expert_idx, L2_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u);
+                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, 0u);
             }
         }
     };
