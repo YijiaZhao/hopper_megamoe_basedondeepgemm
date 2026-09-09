@@ -1036,10 +1036,10 @@
             DG_STATIC_ASSERT(kNumSMs <= fused_layout::kSM90FineCombineMaxSMs, "Too many SMs for the combine mailboxes");
             if (warp_idx == 0) {
                 auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
-                uint32_t consumed = ld_volatile(mailbox + 1);
+                uint32_t consumed = ptx::ld_volatile(mailbox + 1);
                 while (true) {
                     while (ptx::ld_acq(mailbox) == consumed) {}
-                    const uint32_t entry = ld_volatile(
+                    const uint32_t entry = ptx::ld_volatile(
                         mailbox + 4 + (consumed & (fused_layout::kSM90FineCombineRingSize - 1)));
                     __syncwarp();
                     if (entry == fused_layout::kSM90FineCombineDoneEntry)
@@ -1056,12 +1056,12 @@
                     __syncwarp();
                     ++ consumed;
                     if (lane_idx == 0)
-                        mailbox[1] = consumed;
+                        ptx::st_rel_gpu(mailbox + 1, consumed);  // release: slot read done before reuse
                 }
                 // Terminal entry consumed too (keeps producer/consumer sequences aligned)
                 ++ consumed;
                 if (lane_idx == 0)
-                    mailbox[1] = consumed;
+                    ptx::st_rel_gpu(mailbox + 1, consumed);
                 __syncwarp();
             }
             // All dispatch warps: this CTA's math tasks are done (warp 0 saw DONE);
@@ -1423,12 +1423,12 @@
                 if constexpr (kFineCombine) {
                     if (epilogue_thread_idx == 0 && valid_m > 0) {
                         auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
-                        while (combine_mailbox_seq - ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize) {}
+                        while (combine_mailbox_seq - ptx::ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize) {}
                         mailbox[4 + (combine_mailbox_seq & (fused_layout::kSM90FineCombineRingSize - 1))] =
                             pool_block_idx | (valid_m << 24);
                         ptx::st_rel_gpu(mailbox, combine_mailbox_seq + 1);
+                        ++ combine_mailbox_seq;
                     }
-                    ++ combine_mailbox_seq;
                 }
             };
             const uint32_t row_offset_r0 = row_block_offset + r_0;
@@ -3081,7 +3081,7 @@
         if constexpr (kFineCombine) {
             if (epilogue_thread_idx == 0) {
                 auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
-                while (combine_mailbox_seq - ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize) {}
+                while (combine_mailbox_seq - ptx::ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize) {}
                 mailbox[4 + (combine_mailbox_seq & (fused_layout::kSM90FineCombineRingSize - 1))] =
                     fused_layout::kSM90FineCombineDoneEntry;
                 ptx::st_rel_gpu(mailbox, combine_mailbox_seq + 1);
