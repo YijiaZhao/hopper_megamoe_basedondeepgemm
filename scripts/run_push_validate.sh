@@ -35,11 +35,21 @@ run_corr() {  # $1 = api list (space separated), $2 = token list (one launch per
   for T in $toks; do
     wait_idle
     echo "--- apis=[$apis] tokens=$T ($*)" >> "$LOG"
-    env "$@" timeout 1200 $TR --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
+    env "$@" timeout ${CORR_TIMEOUT:-1200} $TR --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
       --apis $apis --tokens $T >> "$LOG" 2>&1
     echo "EXIT=$?" >> "$LOG"
   done
 }
+
+if [ "$MODE" = isolate ]; then
+  # Hang isolation with spin-wait timeouts (DG_FP4_SPIN_TIMEOUT=1 -> trap + site tag):
+  # push T=2 (mxfp4 only), then the pull path with the same layout.
+  LOG=push_isolate$TAG.log; : > "$LOG"
+  run_corr "mxfp4_mega_moe_fused" "2" DG_FP4_PUSH_DISPATCH=1 DG_FP4_SPIN_TIMEOUT=1
+  run_corr "mxfp4_mega_moe_fused" "2" DG_FP4_PUSH_DISPATCH=0 DG_FP4_SPIN_TIMEOUT=1
+  echo ALL_ISOLATE_DONE >> "$LOG"
+  exit 0
+fi
 
 if [ "$MODE" = build ] || [ "$MODE" = all ]; then
   : > "$LOG"
