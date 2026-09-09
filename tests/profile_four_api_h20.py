@@ -39,6 +39,11 @@ def flush_l2_cache():
     if n:
         torch.empty(n, dtype=torch.int32, device="cuda").zero_()
 
+# DG_PROFILE_HOST_BARRIER=1: dist.barrier() on all 8 ranks right before each launch
+# (after the L2 flush + synchronize) so the ranks launch together and the kernel
+# span is not inflated by host launch skew.  Default off = customer method.
+HOST_BARRIER = os.environ.get("DG_PROFILE_HOST_BARRIER", "0") == "1"
+
 WORLD = 8
 TP = 4
 HIDDEN = 3072
@@ -157,6 +162,9 @@ def run_e2e(args, rank, tp_group, group):
             flush_l2_cache()
             torch.cuda.synchronize()
             work.copy_(partials[input_id])
+            if HOST_BARRIER:
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
             if annotate:
                 nvtx.range_push(f"rank{rank}/tp_reduce_scatter")
             dist.reduce_scatter_tensor(x, work, group=tp_group)
@@ -235,6 +243,8 @@ def run_mega(args, rank, group):
         def replay(annotate):
             flush_l2_cache()
             torch.cuda.synchronize()
+            if HOST_BARRIER:
+                dist.barrier(group=group)
             if annotate:
                 nvtx.range_push(
                     f"rank{rank}/megamoe_graph/{args.backend}/{args.quant}/M{args.global_tokens}")
