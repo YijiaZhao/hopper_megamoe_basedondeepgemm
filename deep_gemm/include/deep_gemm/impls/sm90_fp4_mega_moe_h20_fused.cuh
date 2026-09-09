@@ -463,7 +463,11 @@ template <
     // Host-selected fast NVLink-barrier epilogue (SM0 publishes completion through
     // one word instead of a second grid-wide sync); see `kNvlFastEpilogue` in the
     // body. Env DG_FP4_NVL_FAST_EPI (default 0: within noise on H20, see the host).
-    bool kNvlFastEpilogueRequested = false
+    bool kNvlFastEpilogueRequested = false,
+    // Host-selected K128 blocks per pipeline stage for the BM8 MXFP4 RF swapAB
+    // path (2 or 4; see `kKBlocksPerStage` in the body). Ignored by every other
+    // tier (one K-block per stage). Env DG_FP4_KBLOCKS_PER_STAGE (see the heuristic).
+    uint32_t kKBlocksPerStageRequested = 2
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

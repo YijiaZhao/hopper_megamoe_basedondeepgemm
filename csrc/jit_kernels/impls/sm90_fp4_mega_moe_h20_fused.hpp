@@ -37,6 +37,7 @@ public:
         bool l2_half_row_tasks;
         bool split_k_l2;
         bool nvl_fast_epilogue;
+        int k_blocks_per_stage;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -82,7 +83,8 @@ public:
             "        /* kSplitKL1Requested */ {},\n"
             "        /* kL2HalfRowTasksRequested */ {},\n"
             "        /* kSplitKL2Requested */ {},\n"
-            "        /* kNvlFastEpilogueRequested */ {}",
+            "        /* kNvlFastEpilogueRequested */ {},\n"
+            "        /* kKBlocksPerStageRequested */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -97,7 +99,8 @@ public:
             args.split_k_l1 ? "true" : "false",
             args.l2_half_row_tasks ? "true" : "false",
             args.split_k_l2 ? "true" : "false",
-            args.nvl_fast_epilogue ? "true" : "false");
+            args.nvl_fast_epilogue ? "true" : "false",
+            args.k_blocks_per_stage);
         return fmt::format(R"(
 {}
 
@@ -355,6 +358,13 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l2_half_row_tasks = l2_half_row_tasks,
         .split_k_l2 = split_k_l2,
         .nvl_fast_epilogue = nvl_fast_epilogue,
+        // K128 blocks per pipeline stage on the BM8 MXFP4 RF swapAB tier (kernel
+        // `kKBlocksPerStage`; other tiers ignore it). DG_FP4_KBLOCKS_PER_STAGE in
+        // {2, 4}; 4 blocks/stage x 2 stages amortises the ~540 ns per-stage
+        // skeleton over twice the K, the L2 K loop (10 blocks) then ends with a
+        // 2-block partial stage. Default 2 (see the heuristic helper); H20 A/B
+        // numbers are recorded below once measured.
+        .k_blocks_per_stage = get_sm90_fp4_h20_bm8_k_blocks_per_stage(),
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
