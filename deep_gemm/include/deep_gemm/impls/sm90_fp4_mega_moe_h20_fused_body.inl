@@ -531,16 +531,22 @@
     // =====================================================================
     // Initialization
     // =====================================================================
-    if (thread_idx < 64) {
-        reinterpret_cast<uint4*>(smem_nvfp4_lut)[thread_idx] =
-            kMXFP4 ?
-                reinterpret_cast<const uint4*>(deep_gemm::nvfp4::kE2M1AndE8M0RelToFp8Lut)[thread_idx] :
-                reinterpret_cast<const uint4*>(deep_gemm::nvfp4::kE2M1AndUe4m3ToFp8Lut)[thread_idx];
+    // QoQ decodes with plain ALU ops (shift/mask/subtract, see `decode_stage_rf`),
+    // so it has no LUT to stage; only the FP4 paths fill the 1 KB LUT.
+    if constexpr (!kQoQ) {
+        if (thread_idx < 64) {
+            reinterpret_cast<uint4*>(smem_nvfp4_lut)[thread_idx] =
+                kMXFP4 ?
+                    reinterpret_cast<const uint4*>(deep_gemm::nvfp4::kE2M1AndE8M0RelToFp8Lut)[thread_idx] :
+                    reinterpret_cast<const uint4*>(deep_gemm::nvfp4::kE2M1AndUe4m3ToFp8Lut)[thread_idx];
+        }
     }
-    if constexpr (kRFDecode) {
-        const uint2* lut_src = kMXFP4 ?
-            reinterpret_cast<const uint2*>(deep_gemm::nvfp4::kE2M1AndE8M0RelToFp8Lut) :
-            reinterpret_cast<const uint2*>(deep_gemm::nvfp4::kE2M1AndUe4m3ToFp8Lut);
+    // Per-lane replicated RF LUT: only when its region is actually allocated
+    // (SMEM_RF_LUT_REP_SIZE, currently 0: the RF decoders gather from the 1 KB LUT
+    // above). With a 0-byte region the 32 KB fill would land in the GEMM stage
+    // area as dead stores in the prologue of every CTA.
+    if constexpr (kRFDecode && kMXFP4 && SMEM_RF_LUT_REP_SIZE > 0) {
+        const uint2* lut_src = reinterpret_cast<const uint2*>(deep_gemm::nvfp4::kE2M1AndE8M0RelToFp8Lut);
         for (uint32_t i = thread_idx; i < 128u * 32u; i += blockDim.x)
             smem_rf_lut[i] = lut_src[i >> 5];
     }
@@ -1742,7 +1748,15 @@
                                     #pragma unroll
                                     for (uint32_t c = 1; c < kAccChains; ++ c)
                                         v += acc[g][half][c][j];
-                                    return static_cast<float>(v);
+                                    if constexpr (kQoQ) {
+                                        // int32 -> float without I2F (quarter-rate on SM90; 32
+                                        // per thread per K-block here). |v| <= 127 * 15 * 128 <
+                                        // 2^22, so 1.5 * 2^23 + v is exact in fp32 and the
+                                        // subtract recovers v exactly (bit-exact vs cvt.rn).
+                                        return __int_as_float(0x4B400000 + v) - 12582912.0f;
+                                    } else {
+                                        return static_cast<float>(v);
+                                    }
                                 };
                                 if (token_0 < valid_m) {
                                     const float scale_0 = ptx::ld_shared(sfa + token_0);
