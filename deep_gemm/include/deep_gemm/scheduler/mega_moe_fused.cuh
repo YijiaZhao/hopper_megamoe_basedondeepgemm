@@ -476,7 +476,13 @@ struct InterleavedMegaMoEScheduler {
         __syncwarp();
 
         num_total_m_blocks = get_pool_block_offset(kNumExpertsPerRank);
-        streamk_active = kStreamK && num_total_m_blocks <= kMaxSplitKPoolBlocks;
+        // Stream-K only pays when L1 tasks leave SMs idle (fewer L1 tasks than SMs:
+        // H20 M=2, 16-20 tasks). With >= 1 full L1 wave the per-SM stage chain, not
+        // idle SMs, bounds the phase, and serialising L1 before L2 (a CTA runs its
+        // whole L1 range first) loses the wave scheduler's L1/L2 overlap: H20
+        // 2026-09-09 M=8 +10 us, M=16 +20 us kernel end (see the host).
+        streamk_active = kStreamK && num_total_m_blocks <= kMaxSplitKPoolBlocks &&
+            num_total_m_blocks * kNumL1BlockNs < kNumSMs;
         if (streamk_active) {
             sk_num_l1_units = num_total_m_blocks * kNumL1BlockNs * kNumL1StreamKUnitsPerTask;
             sk_num_l2_units = num_total_m_blocks * kNumL2BlockNs * kNumL2StreamKUnitsPerTask;

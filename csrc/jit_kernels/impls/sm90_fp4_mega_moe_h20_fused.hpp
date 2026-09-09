@@ -289,6 +289,19 @@ static void sm90_fp4_h20_fused_mega_moe(
     // when the launch's global token count (num_tokens per rank x ranks, an upper
     // bound: 1 token/rank == M <= 8 global) is <= DG_FP4_STREAMK_MAX_M (default 16),
     // so M=128/512 launches are untouched. DG_FP4_STREAMK=1 enables (default 0).
+    // The scheduler additionally activates it only when the launch has fewer L1
+    // tasks than SMs (idle SMs to fill): H20 A/B (2026-09-09, 8 ranks, rank-0 phase
+    // stamps, skew-corrected kernel end = slot 7 - slot 16, ON x2 / OFF, TINYM off):
+    //   M=2  L1 phase 13.4/12.7 vs 15.6 us, L2 tail 6.9/7.0 vs 8.1, end 36.4/35.8 vs 38.7
+    //   M=8  L1 25.7/25.2 vs 29.5, L2 14.0/14.2 vs 7.1, end 55.6/55.8 vs 45.6 (worse)
+    //   M=16 L1 52.3/52.1 vs 46.7, L2 23.7/23.3 vs 12.7, end 88.1/86.9 vs 67.2 (worse)
+    // Per-task probe: a 6-K-block L1 segment costs 12.5 us (M=2; ~8 us fixed + 0.7
+    // us/block), a full 24-block task 23-25 us, so with >= 1 full L1 wave the L1
+    // phase is bounded by the per-SM stage chain (~1 us/K-block incl. fills), not
+    // by idle SMs, and running every CTA's L1 range before its L2 range removes the
+    // L1/L2 overlap of the wave scheduler (L2 tail doubles). Hence the in-kernel
+    // fewer-L1-tasks-than-SMs gate; M=8 (80 tasks) and M=16 fall back to the wave
+    // scheduler + tail split-K even with the knob on.
     const int num_global_tokens_upper = num_tokens * num_ranks;
     const bool stream_k = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
