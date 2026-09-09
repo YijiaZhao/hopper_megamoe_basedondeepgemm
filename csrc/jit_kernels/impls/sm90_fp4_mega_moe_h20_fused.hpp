@@ -354,13 +354,21 @@ static void sm90_fp4_h20_fused_mega_moe(
     // fixed stride of ceil(num_ranks * tokens_per_rank / BLOCK_M) blocks per local
     // expert (2 at M <= 16), which must fit the token pool and the split-K / tiny-M
     // slot count (kSM90SplitKL1MaxPoolBlocks); larger launches keep the pull path.
-    // Default OFF until the H20 validation/probe is complete; DG_FP4_PUSH_DISPATCH=1 enables.
+    // Default ON (DG_FP4_PUSH_DISPATCH=0 = pull). H20 A/B (2026-09-09, phase stamps,
+    // skew-corrected kernel end = slot 7 - slot 16, us, push x2 vs pull): mxfp4 M=2
+    // 32.9/32.6 vs 37.1, M=8 41.1/42.8 + 42.9/42.9 vs 43.3/44.2, M=16 62.6/63.8 vs
+    // 67.0; qoq M=8 41.2/41.0 vs 42.3/43.5. The win needed three fixes on top of the
+    // protocol: one routed row per dispatch warp (the 4-token packing serialised the
+    // remote stores: routing +5 us at M=16), no per-task arrival spin (release/acquire
+    // on the count completeness word), and no weight prefetch (it competed with the
+    // stage fills once the pool wait dropped from ~7 to ~2 us). The pool layout
+    // itself is free (DG_FP4_POOL_STRIDE_DEBUG=1 under pull: end within 0.1-1 us).
     const int push_max_m = get_env<int>("DG_FP4_PUSH_DISPATCH_MAX_M", 16);
     const int push_max_tokens_per_rank = std::max(1, (push_max_m + num_ranks - 1) / num_ranks);
     const int push_blocks_per_expert =
         (num_ranks * push_max_tokens_per_rank + config.block_m - 1) / config.block_m;
     const bool push_dispatch = plan.use_interleaved_scheduler &&
-        get_env<int>("DG_FP4_PUSH_DISPATCH", 0) != 0 &&
+        get_env<int>("DG_FP4_PUSH_DISPATCH", 1) != 0 &&
         num_global_tokens_upper <= push_max_m && num_tokens <= push_max_tokens_per_rank &&
         num_experts_per_rank * push_blocks_per_expert * config.block_m <= config.num_max_pool_tokens &&
         num_experts_per_rank * push_blocks_per_expert <=

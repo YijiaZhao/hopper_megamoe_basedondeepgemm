@@ -236,8 +236,9 @@
     // scattering after every CTA of every rank has entered that launch) and #3
     // (workspace cleanup), exactly as before.
     constexpr bool kFineCombine = kFineCombineRequested;
-    // Push dispatch (kPushDispatch; host env DG_FP4_PUSH_DISPATCH, default 1, gated by
-    // DG_FP4_PUSH_DISPATCH_MAX_M on the global token count, default 16). Pull model
+    // Push dispatch (kPushDispatch; host env DG_FP4_PUSH_DISPATCH, see the host for
+    // the default, gated by DG_FP4_PUSH_DISPATCH_MAX_M on the global token count,
+    // default 16). Pull model
     // (default for larger M): after NVLink barrier #1 the dispatch warps pull every
     // received row (TMA over NVLink, ~6.7 us round trip + local store) before the
     // first math task can start. Push model: during routing the SOURCE rank takes a
@@ -253,9 +254,10 @@
     // dense task indices and only remaps `pool_block_idx` (see
     // InterleavedMegaMoEScheduler::create_task). Visibility: the pushes precede the
     // sender's grid sync + SM0's release.sys barrier signal exactly like the top-k
-    // index writes of the pull model; after barrier #1 each CTA's dispatch warp 0
-    // publishes the arrival counts locally (release.gpu), so the loaders' acquire
-    // wait is unchanged (plus a proxy fence before the TMA loads). Pool reuse: a rank
+    // index writes of the pull model; after barrier #1 SM e's dispatch warp 0
+    // finalises expert e's count with atom.release.gpu (the scheduler's acquire poll
+    // of that word then covers the rows, so lean-push L1 loaders skip the per-task
+    // arrival spin) and still publishes the arrival counts (tiny-M path). Pool reuse: a rank
     // can only push launch N+1 rows after NVLink barrier #3 of launch N, which every
     // rank reaches after ALL its math tasks and its workspace cleanup, so no
     // destination still reads launch N's L1 pool / metadata or has counters pending.
