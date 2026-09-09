@@ -94,7 +94,7 @@ DEC=2 run ss8u 2 2
 ;;
 sass)
 echo "# SASS excerpt: rs8d<2,2,0> and rs8t<2,2,0> main loop (tensor / warpgroup / LDS / branch instructions only)"
-for fn in _Z12bench_kernelILi8ELi2ELi2ELi0EEvPyS_Piii _Z12bench_kernelILi8ELi2ELi2ELi96EEvPyS_Piii; do
+for fn in $(cuobjdump -symbols "$OUT/mb" 2>/dev/null | grep -o "_Z12bench_kernelILi8ELi2ELi2ELi\(0\|96\)EE[A-Za-z0-9_]*" | sort -u); do
   cuobjdump -sass -fun "$fn" "$OUT/mb" > "$OUT/$fn.sass" 2>/dev/null || true
   echo "## $fn: $(grep -c IGMMA "$OUT/$fn.sass") IGMMA, $(grep -c 'WARPGROUP.ARRIVE' "$OUT/$fn.sass") ARRIVE, $(grep -c 'WARPGROUP.DEPBAR' "$OUT/$fn.sass") DEPBAR, $(grep -c 'LDS' "$OUT/$fn.sass") LDS, $(wc -l < "$OUT/$fn.sass") lines"
   echo "   per-block instruction mix in the loop (opcode histogram):"; awk '/WARPGROUP.DEPBAR/{c++} c==2' "$OUT/$fn.sass" | grep -o '^ */\*[0-9a-f]*\*/ *[@!P0-9 ]*[A-Z][A-Z0-9_.]*' | sed 's/.*\*\/ *//; s/^@!*P[0-9] *//' | sort | uniq -c | sort -rn | head -14 | awk '{printf "      %5d %s\n", $1, $2}'
