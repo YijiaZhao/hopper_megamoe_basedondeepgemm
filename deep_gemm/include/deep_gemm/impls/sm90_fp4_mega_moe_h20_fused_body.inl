@@ -938,70 +938,54 @@
         if (thread_idx == 0) stamp_max(8);
 
         if constexpr (kPushDispatch) {
-            // Push: one remote ticket per (token, top-k slot) lane (all lanes of the
-            // warp in flight together, one NVLink round trip), then the warp streams
-            // each routed row into the destination pool (16 B per lane per store).
+            // Push: one routed ROW (token, top-k slot) per dispatch warp, all rows of
+            // the rank in flight across the grid at once (M <= 16 global tokens means
+            // <= 16 rows per rank, so the old 4-tokens-per-warp packing serialised up
+            // to 32 x 3 KB of remote stores behind one warp: +5 us in the routing
+            // phase at M=16). Lane 0 takes the remote ticket first so its NVLink
+            // round trip overlaps the local row / SF loads; the warp then streams the
+            // row (16 B per lane per store) into the destination pool.
             if (warp_idx < kNumActiveDispatchWarps) {
                 constexpr uint32_t kNumSFFloats = kHidden / 128;
                 constexpr uint32_t kNumTokenChunksPerLane = kHidden / (16 * 32);
                 DG_STATIC_ASSERT(kHidden % 512 == 0 and kNumSFFloats <= 32, "Invalid token / SF shape");
-                for (uint32_t i = (sm_idx * kNumActiveDispatchWarps + warp_idx) * kNumTokensPerWarp;
-                     i < num_tokens;
-                     i += kNumSMs * kNumActiveDispatchWarps * kNumTokensPerWarp) {
-                    // Lane = (token i + lane / topk, slot lane % topk); tickets first so the
-                    // round trip overlaps the row loads below.
-                    int expert_idx = -1;
-                    const uint32_t token_topk_idx = i * kNumTopk + lane_idx;
-                    if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes)
-                        expert_idx = static_cast<int>(
-                            __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_topk_idx));
-                    const bool active = expert_idx >= 0;
-                    const uint32_t dst_rank_idx = active ? static_cast<uint32_t>(expert_idx) / kNumExpertsPerRank : 0u;
-                    const uint32_t dst_local_expert_idx = active ? static_cast<uint32_t>(expert_idx) % kNumExpertsPerRank : 0u;
-                    uint32_t row_in_expert = 0;
-                    if (active)
-                        row_in_expert = static_cast<uint32_t>(ptx::atomic_add_sys(
-                            sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                            1ull));
-                    const uint32_t active_mask = __ballot_sync(0xffffffff, active);
-                    #pragma unroll 1
-                    for (uint32_t t = 0; t < kNumTokensPerWarp; ++ t) {
-                        const uint32_t src_token_idx = i + t;
-                        uint32_t token_mask = active_mask & (((1u << kNumTopk) - 1u) << (t * kNumTopk));
-                        if (token_mask == 0)
-                            continue;
-                        // One 3 KB row + SF load per token (registers), then one store per slot
-                        const auto* src_token = input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint4>();
-                        uint4 row[kNumTokenChunksPerLane];
-                        #pragma unroll
-                        for (uint32_t c = 0; c < kNumTokenChunksPerLane; ++ c)
-                            row[c] = __ldg(src_token + c * 32 + lane_idx);
-                        const float sf = lane_idx < kNumSFFloats ?
-                            __ldg(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>() + lane_idx) : 0.0f;
-                        while (token_mask) {
-                            const uint32_t src_lane = __ffs(token_mask) - 1;
-                            token_mask &= token_mask - 1;
-                            const uint32_t row_idx = __shfl_sync(0xffffffff, row_in_expert, src_lane);
-                            const uint32_t dr  = __shfl_sync(0xffffffff, dst_rank_idx, src_lane);
-                            const uint32_t de  = __shfl_sync(0xffffffff, dst_local_expert_idx, src_lane);
-                            DG_TRAP_ONLY_DEVICE_ASSERT(row_idx < kPushBlocksPerExpert * BLOCK_M);
-                            const uint32_t pool_token_idx = de * kPushBlocksPerExpert * BLOCK_M + row_idx;
-                            auto* dst_token = sym_buffer.map(
-                                l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr<uint4>(), dr);
-                            #pragma unroll
-                            for (uint32_t c = 0; c < kNumTokenChunksPerLane; ++ c)
-                                dst_token[c * 32 + lane_idx] = row[c];
-                            if (lane_idx < kNumSFFloats)
-                                sym_buffer.map(l1_sf_buffer.get_base_ptr<float>(), dr)
-                                    [lane_idx * kNumPaddedSFPoolTokens + pool_token_idx] = sf;
-                            if (lane_idx == 0) {
-                                const uint32_t tti = src_token_idx * kNumTopk + src_lane % kNumTopk;
-                                *sym_buffer.map(l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>(), dr) =
-                                    __ldg(input_topk_weights_buffer.get_base_ptr<float>() + tti);
-                                *sym_buffer.map(workspace.get_token_src_metadata_ptr(pool_token_idx), dr) =
-                                    {static_cast<uint32_t>(sym_buffer.rank_idx), src_token_idx, src_lane % kNumTopk};
-                            }
-                        }
+                const uint32_t num_rows = num_tokens * kNumTopk;
+                for (uint32_t r = sm_idx * kNumActiveDispatchWarps + warp_idx; r < num_rows;
+                     r += kNumSMs * kNumActiveDispatchWarps) {
+                    const uint32_t src_token_idx = r / kNumTopk, src_topk_idx = r % kNumTopk;
+                    const int expert_idx = static_cast<int>(
+                        __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + r));
+                    if (expert_idx < 0)
+                        continue;
+                    const uint32_t dr = static_cast<uint32_t>(expert_idx) / kNumExpertsPerRank;
+                    const uint32_t de = static_cast<uint32_t>(expert_idx) % kNumExpertsPerRank;
+                    uint32_t row_idx = 0;
+                    if (lane_idx == 0)
+                        row_idx = static_cast<uint32_t>(ptx::atomic_add_sys(
+                            sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(de), dr), 1ull));
+                    const auto* src_token = input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint4>();
+                    uint4 row[kNumTokenChunksPerLane];
+                    #pragma unroll
+                    for (uint32_t c = 0; c < kNumTokenChunksPerLane; ++ c)
+                        row[c] = __ldg(src_token + c * 32 + lane_idx);
+                    const float sf = lane_idx < kNumSFFloats ?
+                        __ldg(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>() + lane_idx) : 0.0f;
+                    const float weight = __ldg(input_topk_weights_buffer.get_base_ptr<float>() + r);
+                    row_idx = __shfl_sync(0xffffffff, row_idx, 0);
+                    DG_TRAP_ONLY_DEVICE_ASSERT(row_idx < kPushBlocksPerExpert * BLOCK_M);
+                    const uint32_t pool_token_idx = de * kPushBlocksPerExpert * BLOCK_M + row_idx;
+                    auto* dst_token = sym_buffer.map(
+                        l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr<uint4>(), dr);
+                    #pragma unroll
+                    for (uint32_t c = 0; c < kNumTokenChunksPerLane; ++ c)
+                        dst_token[c * 32 + lane_idx] = row[c];
+                    if (lane_idx < kNumSFFloats)
+                        sym_buffer.map(l1_sf_buffer.get_base_ptr<float>(), dr)
+                            [lane_idx * kNumPaddedSFPoolTokens + pool_token_idx] = sf;
+                    if (lane_idx == 0) {
+                        *sym_buffer.map(l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>(), dr) = weight;
+                        *sym_buffer.map(workspace.get_token_src_metadata_ptr(pool_token_idx), dr) =
+                            {static_cast<uint32_t>(sym_buffer.rank_idx), src_token_idx, src_topk_idx};
                     }
                     __syncwarp();
                 }
@@ -2189,7 +2173,7 @@
                         const unsigned long long kt_head = clock64();
                         full_barriers[stage_idx]->wait(phase);
                         if constexpr (!kBlockIsL2)
-                            kstage_add(17, clock64() - kt_head);
+                            { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
                         if constexpr (kUseInterleavedScheduler)
                             interleaved_scheduler.release_task_info(lane_idx);
                         decode_stage_rf(stage_idx, ksplit_kb, frag[0]);
@@ -2349,7 +2333,7 @@
                     if (num_k_blocks > 0) {
                         const unsigned long long kt_head = clock64();
                         full_barriers[stage_idx]->wait(phase);
-                        kstage_add(17, clock64() - kt_head);
+                        { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
                         if constexpr (kUseInterleavedScheduler)
                             interleaved_scheduler.release_task_info(lane_idx);
                         capture_act_scale(stage_idx);
@@ -2437,7 +2421,7 @@
                     if (num_k_blocks > 0) {
                         const unsigned long long kt_head = clock64();
                         full_barriers[stage_idx]->wait(phase);
-                        kstage_add(17, clock64() - kt_head);
+                        { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
                         if constexpr (kUseInterleavedScheduler)
                             interleaved_scheduler.release_task_info(lane_idx);
                         capture_act_scale(stage_idx);
@@ -2547,7 +2531,7 @@
                     if (num_k_blocks > 0) {
                         const unsigned long long kt_head = clock64();
                         full_barriers[stage_idx]->wait(phase);
-                        kstage_add(17, clock64() - kt_head);
+                        { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
                         if constexpr (kUseInterleavedScheduler)
                             interleaved_scheduler.release_task_info(lane_idx);
                         capture_act_scale(stage_idx);
@@ -2639,7 +2623,7 @@
                         const unsigned long long kt_head = clock64();
                         full_barriers[stage_idx]->wait(phase);
                         if constexpr (!kBlockIsL2)
-                            kstage_add(17, clock64() - kt_head);
+                            { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
                         if constexpr (kUseInterleavedScheduler)
                             interleaved_scheduler.release_task_info(lane_idx);
                         decode_stage_rf(stage_idx, ksplit_kb, frag[0]);
@@ -2726,7 +2710,7 @@
                         const unsigned long long kt_head = clock64();
                         full_barriers[stage_idx]->wait(phase);
                         if constexpr (!kBlockIsL2)
-                            kstage_add(17, clock64() - kt_head);
+                            { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
                         if constexpr (kUseInterleavedScheduler)
                             interleaved_scheduler.release_task_info(lane_idx);
                         decode_stage_rf(stage_idx, 0, frag[0]);
@@ -2921,7 +2905,7 @@
                 const unsigned long long kt_head = clock64();
                 full_barriers[stage_idx]->wait(phase);
                 if constexpr (!kBlockIsL2) {
-                    kstage_add(17, clock64() - kt_head);
+                    { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
                     kstage_add(21, 1ull);
                     if (k_block_idx > 0)
                         kstage_add(22, kt_head - kstage_t_prev);

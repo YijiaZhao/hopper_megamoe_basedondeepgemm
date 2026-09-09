@@ -192,6 +192,9 @@ def main():
             arr = [ (sr[34] / max(sr[35], 1) / SM_GHZ / 1000.0) for sr in raw_rows ]
             print(f"--- SM0 loader L1 arrival-count wait: {statistics.median(arr):.2f} us per task "
                   f"({statistics.median(sr[35] for sr in raw_rows):.0f} tasks) ---")
+            # 36/37 = SM0 math: first-stage full-barrier wait per L1 task (pool arrival + stage fill)
+            fst = [ (sr[36] / max(sr[37], 1) / SM_GHZ / 1000.0) for sr in raw_rows ]
+            print(f"--- SM0 math L1 first-stage wait: {statistics.median(fst):.2f} us per task ---")
             # 32/33 = K128 blocks (stream-K units) run by SM0 in L1 / L2
             print(f"--- SM0 K-blocks: L1 {statistics.median(sr[32] for sr in raw_rows):.0f}  "
                   f"L2 {statistics.median(sr[33] for sr in raw_rows):.0f} ---")
