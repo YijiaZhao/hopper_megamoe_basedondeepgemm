@@ -186,6 +186,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens,
+        mxfp4,
     };
     const auto plan = select_sm90_nvfp4_h200_fused(heuristic_input);
     const auto& config = plan.config;
@@ -364,7 +365,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // skeleton over twice the K, the L2 K loop (10 blocks) then ends with a
         // 2-block partial stage. Default 2 (see the heuristic helper); H20 A/B
         // numbers are recorded below once measured.
-        .k_blocks_per_stage = get_sm90_fp4_h20_bm8_k_blocks_per_stage(),
+        .k_blocks_per_stage = mxfp4 ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 2,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,

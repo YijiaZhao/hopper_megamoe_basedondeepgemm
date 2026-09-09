@@ -71,6 +71,9 @@ struct SM90FP4H20FusedInput {
     int num_max_tokens_per_rank, num_tokens, num_topk;
     int hidden, intermediate_hidden;
     int num_padded_sf_pool_tokens;
+    // MXFP4 (RF-decode swapAB) hosts run multi-K-block BM8 stages; NVFP4/QoQ keep
+    // one K-block per stage (>= 4 stages).
+    bool mxfp4 = false;
 
     SM90FP4H20FusedShape shape() const noexcept {
         return {
@@ -118,9 +121,9 @@ select_sm90_nvfp4_h200_fused(
     // stages = 173056 B) or 4 (4 KB + 80 KB + 4 slots, 2 stages = 173056 B); both
     // keep 8 K-blocks in flight at the smem capacity. DG_FP4_BM8_STAGES overrides
     // the depth (kernel static-asserts 2..4 for 2 blocks, exactly 2 for 4 blocks).
-    const int bm8_k_blocks = get_sm90_fp4_h20_bm8_k_blocks_per_stage();
+    const int bm8_k_blocks = input.mxfp4 ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 1;
     const int bm8_stages = bm8_k_blocks == 4 ? 2 :
-        std::clamp(get_env<int>("DG_FP4_BM8_STAGES", 4), 2, 4);
+        std::clamp(get_env<int>("DG_FP4_BM8_STAGES", 4), bm8_k_blocks == 2 ? 2 : 4, bm8_k_blocks == 2 ? 4 : 7);
     if (input.num_tokens <= 1)
         tuning = {8, 256, 24, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};
