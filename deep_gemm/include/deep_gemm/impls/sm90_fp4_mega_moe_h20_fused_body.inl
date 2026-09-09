@@ -2291,6 +2291,19 @@
                             f[h][k][3] = ((word_r1 & 0x0f0f0f0fu) * s2_1 + a4_1) ^ 0x80808080u;
                         }
                     };
+                    // Fence only the K32-step-k registers of a fragment buffer: the other steps
+                    // are still being read by in-flight groups, and a fence (an asm output
+                    // operand, i.e. a definition to ptxas) on a register an in-flight wgmma
+                    // reads serialises the pipe (C7513 "non wgmma instructions defining input
+                    // registers of a wgmma between start and end of the pipeline stage").
+                    const auto fence_frag_k = [&](uint32_t (&f)[kWGHalves][4][4], const uint32_t& k) {
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < 4; ++ i)
+                                ptx::warpgroup_fence_operand(reinterpret_cast<float&>(f[h][k][i]));
+                        }
+                    };
                     // Issue the 4 K32-step groups of block (stage, kb) from fcur, decoding
                     // block (nstage, nkb) step by step into fnext behind wait<4>.
                     const auto block_step_ilv = [&](const uint32_t& stage, const uint32_t& kb,
@@ -2304,7 +2317,7 @@
                             unsigned long long kt_a = clock64();
                             if (!exp_skip(2u)) {
                                 fence_accum();
-                                fence_frag(fcur);
+                                fence_frag_k(fcur, k);
                                 ptx::warpgroup_arrive();
                                 #pragma unroll
                                 for (uint32_t h = 0; h < kWGHalves; ++ h) {
@@ -2322,7 +2335,7 @@
                             // write inside a runtime branch makes ptxas serialise the pipe.
                             fence_accum();
                             ptx::warpgroup_wait<4>();
-                            fence_frag(fnext);
+                            fence_frag_k(fnext, k);
                             if (release_prev && k == 3)
                                 arrive_empty_barrier(prev_stage);
                             kt_a = clock64();
