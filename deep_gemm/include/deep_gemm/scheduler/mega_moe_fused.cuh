@@ -353,9 +353,17 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           // scratch (kMaxSplitKPoolBlocks); otherwise the launch falls back to the
           // wave scheduler above.
           bool kStreamK = false,
+          // Stream-K unit = one pipeline stage (kKBlocksPerStage K128 blocks): the RF
+          // math loop consumes whole stages, so segments must be stage-aligned.
+          uint32_t kStreamKKBlocksPerUnit = 2,
           uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
           uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K>
 struct InterleavedMegaMoEScheduler {
+    DG_STATIC_ASSERT(!kStreamK || (kNumL1BlockKs % kStreamKKBlocksPerUnit == 0 &&
+                                   kNumL2BlockKs % kStreamKKBlocksPerUnit == 0),
+                     "Stream-K units (stages) must tile both K extents");
+    static constexpr uint32_t kNumL1StreamKUnitsPerTask = kNumL1BlockKs / kStreamKKBlocksPerUnit;
+    static constexpr uint32_t kNumL2StreamKUnitsPerTask = kNumL2BlockKs / kStreamKKBlocksPerUnit;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using task_info_t = TaskInfo;
 
@@ -470,8 +478,8 @@ struct InterleavedMegaMoEScheduler {
         num_total_m_blocks = get_pool_block_offset(kNumExpertsPerRank);
         streamk_active = kStreamK && num_total_m_blocks <= kMaxSplitKPoolBlocks;
         if (streamk_active) {
-            sk_num_l1_units = num_total_m_blocks * kNumL1BlockNs * kNumL1BlockKs;
-            sk_num_l2_units = num_total_m_blocks * kNumL2BlockNs * kNumL2BlockKs;
+            sk_num_l1_units = num_total_m_blocks * kNumL1BlockNs * kNumL1StreamKUnitsPerTask;
+            sk_num_l2_units = num_total_m_blocks * kNumL2BlockNs * kNumL2StreamKUnitsPerTask;
         }
         const uint32_t num_l1_full_tasks = num_total_m_blocks * kNumL1BlockNs;
         const uint32_t num_l1_tail_tasks = num_l1_full_tasks % kNumSMs;
@@ -596,20 +604,23 @@ struct InterleavedMegaMoEScheduler {
             rem + (unit_idx - num_long_units) / base;
     }
 
-    // Number of units of the phase; each task has `num_k_blocks` units
+    // Next segment of the current range: the task owning unit `sk_unit` and the
+    // stage-aligned K-block range of the range's units inside that task.
     template <bool kIsL2>
     CUTLASS_DEVICE task_info_t make_streamk_segment() {
-        constexpr uint32_t num_k_blocks = kIsL2 ? kNumL2BlockKs : kNumL1BlockKs;
+        constexpr uint32_t units_per_task = kIsL2 ? kNumL2StreamKUnitsPerTask : kNumL1StreamKUnitsPerTask;
         const uint32_t num_units = kIsL2 ? sk_num_l2_units : sk_num_l1_units;
-        const uint32_t task_idx = sk_unit / num_k_blocks;
-        const uint32_t k_block_begin = sk_unit % num_k_blocks;
-        const uint32_t k_block_end = cute::min(num_k_blocks, k_block_begin + (sk_unit_end - sk_unit));
-        sk_unit += k_block_end - k_block_begin;
+        const uint32_t task_idx = sk_unit / units_per_task;
+        const uint32_t unit_begin = sk_unit % units_per_task;
+        const uint32_t unit_end = cute::min(units_per_task, unit_begin + (sk_unit_end - sk_unit));
+        sk_unit += unit_end - unit_begin;
+        const uint32_t k_block_begin = unit_begin * kStreamKKBlocksPerUnit;
+        const uint32_t k_block_end = unit_end * kStreamKKBlocksPerUnit;
         // Contributors of this tile: the workers owning its first and last unit
         const uint32_t first_worker_idx =
-            get_streamk_worker_of_unit(num_units, task_idx * num_k_blocks);
+            get_streamk_worker_of_unit(num_units, task_idx * units_per_task);
         const uint32_t last_worker_idx =
-            get_streamk_worker_of_unit(num_units, task_idx * num_k_blocks + num_k_blocks - 1);
+            get_streamk_worker_of_unit(num_units, task_idx * units_per_task + units_per_task - 1);
         auto task_info = kIsL2 ?
             create_task(BlockPhase::Linear2, task_idx, kNumL2BlockNs, L2_SHAPE_N, L2_SHAPE_K) :
             create_task(BlockPhase::Linear1, task_idx, kNumL1BlockNs, L1_SHAPE_N, L1_SHAPE_K);

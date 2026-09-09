@@ -208,12 +208,14 @@
     // split order (deterministic: fixed order regardless of who finishes) and runs
     // the normal epilogue (L1: SwiGLU + notify; L2: scatter + arrival counters). The
     // L2 activation loader keeps its per-stage wait on the L1 bits of its own
-    // K-blocks. Same tier gate as kSplitKL2; the wave scheduler (and its tail
+    // K-blocks. Units are whole 2-K-block stages (the RF loop consumes full
+    // stages), so only the 2-blocks-per-stage tier qualifies (L2: 10 % 2 == 0).
+    // Same tier gate as kSplitKL2 otherwise; the wave scheduler (and its tail
     // splits) remains the fallback when the pool block count exceeds the scratch.
     constexpr bool kStreamK =
         kStreamKRequested && kSwapABRequested && (kMXFP4 || kQoQ) && BLOCK_M == 8 &&
         !kHalfTileTasks && !kL2HalfRowTasks && kUseInterleavedScheduler &&
-        kDenseWeightTiles && BLOCK_N == 256;
+        kDenseWeightTiles && BLOCK_N == 256 && kKBlocksPerStageRequested == 2;
     // Fast NVLink-barrier epilogue (kNvlFastEpilogue; host env DG_FP4_NVL_FAST_EPI):
     // see fused_comm::nvlink_barrier. Needs the first barrier (before dispatch
     // pull) to have a prologue grid sync, i.e. kDistributedExpertBcast, so that
@@ -245,7 +247,7 @@
         math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
         /* phase-specific task N: L1 256-row tasks, L2 TASK_BLOCK_N_L2-row tasks */
         kNumRoutedL1BlockNs, kNumRoutedL2BlockNs,
-        kNumL2KSplits, kStreamK>;
+        kNumL2KSplits, kStreamK, /* stream-K unit == one 2-K-block stage */ 2u>;
     constexpr bool kSplitMDecodedWeightReuse =
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
     constexpr uint32_t WG_BLOCK_M =
@@ -3244,7 +3246,7 @@
                     atomicAdd(phase_stamps + (kBlockIsL2 ? 26 : 25), kt_task1 - kt_task0);
                     atomicAdd(phase_stamps + (kBlockIsL2 ? 28 : 27), 1ull);
                 }
-                // 32/33 = K-blocks (stream-K units) run by SM0 in L1 / L2
+                // 32/33 = K-blocks (2 per stream-K unit) run by SM0 in L1 / L2
                 atomicAdd(phase_stamps + (kBlockIsL2 ? 33 : 32), static_cast<unsigned long long>(num_k_blocks));
                 ktask_prev_end = kt_task1;
             }
