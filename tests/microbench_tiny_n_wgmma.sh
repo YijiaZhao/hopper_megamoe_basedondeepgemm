@@ -60,6 +60,13 @@ run rs8d 2 1
 run rs8d 1 4
 FLAGS=8 run rs8d 2 2
 FLAGS=8 run rs8t 2 2
+echo "# offloaded decode + SS wgmma (ss8p): writers = WG0 (4 warps) | FLAGS=16 all 12 warps; FLAGS+2 = no proxy fence"
+run ss8p 2 2
+FLAGS=16 run ss8p 2 2
+FLAGS=2 run ss8p 2 2
+FLAGS=18 run ss8p 2 2
+DEC=2 run ss8p 2 2
+DEC=2 FLAGS=16 run ss8p 2 2
 echo "# ss8d decomposition: 2 = no fence.proxy, 4 = conflict-free stores"
 run ss8d 2 2
 FLAGS=2 run ss8d 2 2
@@ -68,10 +75,10 @@ FLAGS=6 run ss8d 2 2
 ;;
 sass)
 echo "# SASS excerpt: rs8d<2,2,0> and rs8t<2,2,0> main loop (tensor / warpgroup / LDS / branch instructions only)"
-for fn in _Z12bench_kernelILi8ELi2ELi2ELi0EEvPyPiii _Z12bench_kernelILi12ELi2ELi2ELi0EEvPyPiii; do
+for fn in _Z12bench_kernelILi8ELi2ELi2ELi0EEvPyPiii _Z12bench_kernelILi13ELi2ELi2ELi0EEvPyPiii; do
   cuobjdump -sass -fun "$fn" "$OUT/mb" > "$OUT/$fn.sass" 2>/dev/null || true
   echo "## $fn: $(grep -c IGMMA "$OUT/$fn.sass") IGMMA, $(grep -c 'WARPGROUP.ARRIVE' "$OUT/$fn.sass") ARRIVE, $(grep -c 'WARPGROUP.DEPBAR' "$OUT/$fn.sass") DEPBAR, $(grep -c 'LDS' "$OUT/$fn.sass") LDS, $(wc -l < "$OUT/$fn.sass") lines"
-  grep -o 'IGMMA[^;]*;\|WARPGROUP[^;]*;\|LDS[^;]*;\|BRA [^;]*;\|DEPBAR[^;]*;\|BAR[^;]*;' "$OUT/$fn.sass" | sed 's/  */ /g' | awk '{print "   " $0}' | head -80
+  grep -o 'IGMMA[^;]*;\|WARPGROUP[^;]*;\|LDS[^;]*;\|STS[^;]*;\|BRA [^;]*;\|DEPBAR[^;]*;\|BAR[^;]*;\|FENCE[^;]*;' "$OUT/$fn.sass" | sed 's/  */ /g' | awk '{print "   " $0}' | head -60
 done
 ;;
 esac; done

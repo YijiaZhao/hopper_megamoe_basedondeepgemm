@@ -25,6 +25,10 @@
 //              the wgmma — does warp-side work overlap RS wgmma at all?
 //   ss8d   :     decode -> int8 smem A tile (st.shared.v4) + fence.proxy.async + SS wgmma
 //   dec    :     decode only (rs8d without the wgmma)
+//   ss8p   :     decode OFFLOADED: writer warps decode int8 into a double-buffered SW128 smem A
+//              tile (conflict-free st.shared.v4 + fence.proxy.async), named-barrier handoff,
+//              math WGs only issue SS m64n8k32 + wait<1>. FLAGS 16 = all 12 warps decode
+//              (else only the 4 producer warps of WG0); nwg=2 halves=2 only
 //   DEC=<n> env: repeat the decode n times per block (rs8d/rs8t/ss8d/dec/rs8a), default 1
 //   FLAGS=<bits> (compile-time instantiations, see main): 1 = decode without LDS (ALU only)
 //        2 = ss8d: skip fence.proxy.async (timing only)   4 = ss8d: conflict-free stores
@@ -45,9 +49,9 @@
     printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); exit(1); } } while (0)
 
 enum Mode { RS8 = 0, SS8 = 1, RS16 = 2, SS16 = 3, IMMA = 4, IMMAL = 5, RS8FP8 = 6, RS8K = 7,
-            RS8D = 8, SS8D = 9, DEC = 10, RS8A = 11, RS8T = 12, NUM_MODES = 13 };
+            RS8D = 8, SS8D = 9, DEC = 10, RS8A = 11, RS8T = 12, SS8P = 13, NUM_MODES = 14 };
 static const char* kModeNames[NUM_MODES] = {"rs8", "ss8", "rs16", "ss16", "imma", "immal", "rs8fp8", "rs8k",
-                                            "rs8d", "ss8d", "dec", "rs8a", "rs8t"};
+                                            "rs8d", "ss8d", "dec", "rs8a", "rs8t", "ss8p"};
 
 __device__ __forceinline__ uint64_t gtimer() {
     uint64_t t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t;
@@ -63,6 +67,8 @@ __device__ __forceinline__ uint64_t make_desc_sw128(const void* smem_ptr) {
     return desc;
 }
 
+__device__ __forceinline__ void nbar_sync(int id, int n)   { asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(n) : "memory"); }
+__device__ __forceinline__ void nbar_arrive(int id, int n) { asm volatile("bar.arrive %0, %1;\n" :: "r"(id), "r"(n) : "memory"); }
 __device__ __forceinline__ void wg_fence()  { asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory"); }
 __device__ __forceinline__ void wg_commit() { asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory"); }
 template <int N> __device__ __forceinline__ void wg_wait() {
@@ -146,6 +152,28 @@ __device__ __forceinline__ void decode_half(uint32_t (&f)[4][4], const uint8_t* 
         f[k][2] = ((wr0[k] & 0x0f0f0f0fu) * s2_0 + a4_0) ^ 0x80808080u;
         f[k][3] = ((wr1[k] & 0x0f0f0f0fu) * s2_1 + a4_1) ^ 0x80808080u;
     }
+}
+
+// Offloaded decode: one work item = 16 B packed (32 int4 of one row) -> 32 int8 -> two 16 B
+// chunks of the SW128 K-major smem A tile (tile t = row/64, 64 rows x 128 B, chunk ^= row&7).
+__device__ __forceinline__ void decode_item_to_tile(uint32_t tile_base, const uint8_t* packed_rows, int row, int c16) {
+    const uint4 w = *reinterpret_cast<const uint4*>(packed_rows + row * 80 + c16 * 16);
+    const uint32_t sw = *reinterpret_cast<const uint32_t*>(packed_rows + row * 80 + 64);
+    const uint32_t s2 = sw & 0xffu;
+    const uint32_t a4 = (0x80u - ((sw >> 8u) & 0xffu) * s2) * 0x01010101u;
+    const uint32_t wr[4] = {w.x, w.y, w.z, w.w};
+    uint32_t lo[4], hi[4];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        lo[k] = ((wr[k] & 0x0f0f0f0fu) * s2 + a4) ^ 0x80808080u;
+        hi[k] = (((wr[k] >> 4) & 0x0f0f0f0fu) * s2 + a4) ^ 0x80808080u;
+    }
+    const int rr = row & 63;
+    const uint32_t base = tile_base + (row >> 6) * 2 * 8192 + rr * 128;
+    const uint32_t a_lo = base + (((2 * c16) ^ (rr & 7)) * 16);
+    const uint32_t a_hi = base + (((2 * c16 + 1) ^ (rr & 7)) * 16);
+    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};\n" :: "r"(a_lo), "r"(lo[0]), "r"(lo[1]), "r"(lo[2]), "r"(lo[3]) : "memory");
+    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};\n" :: "r"(a_hi), "r"(hi[0]), "r"(hi[1]), "r"(hi[2]), "r"(hi[3]) : "memory");
 }
 
 template <int MODE, int NWG, int HALVES, int FLAGS>
@@ -319,13 +347,13 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
                     }
                 wg_commit();
             };
-            auto consume = [&](auto bconst) {  // DEC / RS8A: opaque use of the decoded registers
+            auto consume = [&](auto bconst) {  // DEC / RS8A: fold the decoded registers into the per-thread sink
                 constexpr int b = decltype(bconst)::value;
                 #pragma unroll
                 for (int h = 0; h < HALVES; ++h)
                     #pragma unroll
                     for (int k = 0; k < 4; ++k)
-                        asm volatile("" :: "r"(fbuf[b][h][k][0]), "r"(fbuf[b][h][k][1]), "r"(fbuf[b][h][k][2]), "r"(fbuf[b][h][k][3]));
+                        acc_sink ^= (int)(fbuf[b][h][k][0] ^ (fbuf[b][h][k][1] << 1) ^ (fbuf[b][h][k][2] << 2) ^ (fbuf[b][h][k][3] << 3));
             };
             using I0 = std::integral_constant<int, 0>;
             using I1 = std::integral_constant<int, 1>;
@@ -374,6 +402,85 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
             consume(I0{}); consume(I1{});
             if constexpr (NBUF == 3) consume(I2{});
         }
+    } else if constexpr (MODE == SS8P) {
+        static_assert(NWG == 2 && HALVES == 2, "ss8p: 2 math WGs x 2 halves");
+        constexpr bool ALL_DECODE = FLAGS & 16;
+        constexpr int kF0 = 1, kF1 = 2, kE0 = 3, kE1 = 4;   // named barriers: tile full / tile empty
+        const bool writer = ALL_DECODE || wg == 0;
+        const uint32_t smem_a_u32 = static_cast<uint32_t>(__cvta_generic_to_shared(smem_a));
+        // writer round: decode block `blk` parity tile p = blk&1 from packed stage st
+        auto write_tile = [&](int p, int st) {
+            const uint8_t* packed_rows = smem_p + st * (256 * 80);
+            const uint32_t tile_base = smem_a_u32 + p * 8192;   // tile t at (t*2 + p) * 8192
+            asm volatile("" ::: "memory");
+            if constexpr (ALL_DECODE) {
+                #pragma unroll
+                for (int i = threadIdx.x; i < 1024; i += 384) {
+                    for (int r = 0; r < dec_rep; ++r) decode_item_to_tile(tile_base, packed_rows, i >> 2, i & 3);
+                }
+            } else {
+                #pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    const int i = threadIdx.x + q * 128;
+                    for (int r = 0; r < dec_rep; ++r) decode_item_to_tile(tile_base, packed_rows, i >> 2, i & 3);
+                }
+            }
+            if constexpr (!(FLAGS & 2)) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        };
+        uint32_t acc[2][4] = {};
+        const uint64_t desc_b0 = make_desc_sw128(smem_b);
+        const uint64_t desc_b1 = make_desc_sw128(smem_b + 1024);
+        uint64_t desc_a[2][2];
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+            #pragma unroll
+            for (int b = 0; b < 2; ++b)
+                desc_a[h][b] = make_desc_sw128(smem_a + ((((wg - 1) * 2 + h) & 3) * 2 + b) * 8192);
+        auto issue = [&](int p) {
+            const uint64_t db = p ? desc_b1 : desc_b0;
+            wg_fence();
+            #pragma unroll
+            for (int h = 0; h < 2; ++h)
+                #pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    wgmma_ss8(acc[h], desc_a[h][p] + (uint64_t)((k * 32) >> 4), db + (uint64_t)((k * 32) >> 4));
+            wg_commit();
+        };
+        // prologue: tile 0 (block 0)
+        if (writer) { write_tile(0, 0); if constexpr (!ALL_DECODE) nbar_arrive(kF0, 384); }
+        #pragma unroll 1
+        for (int it = 0; it < iters; ++it) {
+            const int st = it & 1;
+            #pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                // math: wait tile p full, issue, retire the previous group (tile p^1), release tile p^1
+                // writers: wait tile p^1 empty, decode the next block into it, publish
+                if constexpr (ALL_DECODE) {
+                    nbar_sync(p ? kF1 : kF0, 384);
+                    if (math) { issue(p); wg_wait<1>(); }
+                    nbar_sync(p ? kE0 : kE1, 384);
+                    write_tile(p ^ 1, st ^ p);
+                } else {
+                    if (math) {
+                        nbar_sync(p ? kF1 : kF0, 384);
+                        issue(p); wg_wait<1>();
+                        nbar_arrive(p ? kE0 : kE1, 384);
+                    } else {
+                        nbar_sync(p ? kE0 : kE1, 384);
+                        write_tile(p ^ 1, st ^ p);
+                        nbar_arrive(p ? kF0 : kF1, 384);
+                    }
+                }
+            }
+        }
+        if constexpr (!ALL_DECODE) { if (math) nbar_sync(kF0, 384); }   // consume the writers' last publish
+        if (math) {
+            wg_wait<0>();
+            #pragma unroll
+            for (int h = 0; h < 2; ++h)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc_sink += (int)acc[h][j];
+        }
     } else {
         // IMMA: 8 warps (warps 4..11), each owns 32 rows = 2 m16 tiles; 8 k32 steps per block.
         if (warp >= 4 && warp < 12) {
@@ -421,20 +528,22 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
 
     __syncthreads();
     if (threadIdx.x == 0) out[blockIdx.x] = gtimer() - t0;
-    if (acc_sink == 0x7eadbeef) sink[0] = acc_sink;  // keep accumulators alive
+    sink[blockIdx.x * 384 + threadIdx.x] = acc_sink;  // keep accumulators / decode alive
 }
 
 typedef void (*kern_t)(unsigned long long*, int*, int, int);
 
 template <int MODE, int FLAGS>
 kern_t pick_nh(int nwg, int halves) {
-    if (nwg == 1 && halves == 1) return bench_kernel<MODE, 1, 1, FLAGS>;
-    if (nwg == 1 && halves == 2) return bench_kernel<MODE, 1, 2, FLAGS>;
-    if (nwg == 1 && halves == 4) return bench_kernel<MODE, 1, 4, FLAGS>;
-    if (nwg == 2 && halves == 1) return bench_kernel<MODE, 2, 1, FLAGS>;
     if (nwg == 2 && halves == 2) return bench_kernel<MODE, 2, 2, FLAGS>;
-    if (nwg == 3 && halves == 1) return bench_kernel<MODE, 3, 1, FLAGS>;
-    if (nwg == 3 && halves == 2) return bench_kernel<MODE, 3, 2, FLAGS>;
+    if constexpr (MODE != SS8P) {
+        if (nwg == 1 && halves == 1) return bench_kernel<MODE, 1, 1, FLAGS>;
+        if (nwg == 1 && halves == 2) return bench_kernel<MODE, 1, 2, FLAGS>;
+        if (nwg == 1 && halves == 4) return bench_kernel<MODE, 1, 4, FLAGS>;
+        if (nwg == 2 && halves == 1) return bench_kernel<MODE, 2, 1, FLAGS>;
+        if (nwg == 3 && halves == 1) return bench_kernel<MODE, 3, 1, FLAGS>;
+        if (nwg == 3 && halves == 2) return bench_kernel<MODE, 3, 2, FLAGS>;
+    }
     return nullptr;
 }
 template <int MODE>
@@ -448,6 +557,8 @@ kern_t pick_f(int flags, int nwg, int halves) {
         case 2: if constexpr (MODE == SS8D) return pick_nh<MODE, 2>(nwg, halves); break;
         case 4: if constexpr (MODE == SS8D) return pick_nh<MODE, 4>(nwg, halves); break;
         case 6: if constexpr (MODE == SS8D) return pick_nh<MODE, 6>(nwg, halves); break;
+        case 16: if constexpr (MODE == SS8P) return pick_nh<MODE, 16>(nwg, halves); break;
+        case 18: if constexpr (MODE == SS8P) return pick_nh<MODE, 18>(nwg, halves); break;
     }
     return nullptr;
 }
@@ -464,7 +575,7 @@ int main(int argc, char** argv) {
     if (mode < 0) { printf("bad mode\n"); return 1; }
     const int dec_rep = getenv("DEC") ? atoi(getenv("DEC")) : 1;
     const int flags = getenv("FLAGS") ? atoi(getenv("FLAGS")) : 0;
-    const bool decode_mode = (mode == RS8D || mode == SS8D || mode == DEC || mode == RS8A || mode == RS8T);
+    const bool decode_mode = (mode == RS8D || mode == SS8D || mode == DEC || mode == RS8A || mode == RS8T || mode == SS8P);
     const int f = decode_mode ? flags : (flags & 8);
 
     kern_t k = nullptr;
@@ -482,6 +593,7 @@ int main(int argc, char** argv) {
         case DEC: k = pick_f<DEC>(f, nwg, halves); break;
         case RS8A: k = pick_f<RS8A>(f, nwg, halves); break;
         case RS8T: k = pick_f<RS8T>(f, nwg, halves); break;
+        case SS8P: k = pick_f<SS8P>(f, nwg, halves); break;
     }
     if (!k) { printf("unsupported mode/flags/nwg/halves combo\n"); return 1; }
 
@@ -494,7 +606,7 @@ int main(int argc, char** argv) {
 
     unsigned long long* d_out; int* d_sink;
     CK(cudaMalloc(&d_out, nsm * sizeof(unsigned long long)));
-    CK(cudaMalloc(&d_sink, sizeof(int)));
+    CK(cudaMalloc(&d_sink, nsm * 384 * sizeof(int)));
     k<<<nsm, 384, smem>>>(d_out, d_sink, 30, dec_rep);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
