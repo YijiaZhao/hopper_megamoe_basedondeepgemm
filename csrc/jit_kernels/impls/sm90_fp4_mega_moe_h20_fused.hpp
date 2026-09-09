@@ -344,13 +344,13 @@ static void sm90_fp4_h20_fused_mega_moe(
     // fixed stride of ceil(num_ranks * tokens_per_rank / BLOCK_M) blocks per local
     // expert (2 at M <= 16), which must fit the token pool and the split-K / tiny-M
     // slot count (kSM90SplitKL1MaxPoolBlocks); larger launches keep the pull path.
-    // DG_FP4_PUSH_DISPATCH=0 disables.
+    // Default OFF until the H20 validation/probe is complete; DG_FP4_PUSH_DISPATCH=1 enables.
     const int push_max_m = get_env<int>("DG_FP4_PUSH_DISPATCH_MAX_M", 16);
     const int push_max_tokens_per_rank = std::max(1, (push_max_m + num_ranks - 1) / num_ranks);
     const int push_blocks_per_expert =
         (num_ranks * push_max_tokens_per_rank + config.block_m - 1) / config.block_m;
     const bool push_dispatch = plan.use_interleaved_scheduler &&
-        get_env<int>("DG_FP4_PUSH_DISPATCH", 1) != 0 &&
+        get_env<int>("DG_FP4_PUSH_DISPATCH", 0) != 0 &&
         num_global_tokens_upper <= push_max_m && num_tokens <= push_max_tokens_per_rank &&
         num_experts_per_rank * push_blocks_per_expert * config.block_m <= config.num_max_pool_tokens &&
         num_experts_per_rank * push_blocks_per_expert <=
