@@ -1829,6 +1829,23 @@
                                         return static_cast<float>(v);
                                     }
                                 };
+                                if constexpr (kQoQ) {
+                                    // Branch-free: the token guards compiled to one BSSY/BRA/BSYNC
+                                    // block per token pair, each with an exposed LDS -> FMUL -> FFMA
+                                    // chain (SASS of the 09-09 build; slot-30 probe 525 ns/stage vs
+                                    // 150 for MXFP4). Load both SFs unconditionally (the SFA stage
+                                    // slot holds BLOCK_M >= token entries) and zero the scale of a
+                                    // padded token instead: acc is a finite int32 sum, so 0 * acc == 0
+                                    // and final_accum of the padded token stays untouched.
+                                    const float raw_0 = ptx::ld_shared(sfa + token_0);
+                                    const float raw_1 = ptx::ld_shared(sfa + token_1);
+                                    const float scale_0 = token_0 < valid_m ? raw_0 : 0.0f;
+                                    const float scale_1 = token_1 < valid_m ? raw_1 : 0.0f;
+                                    final_accum[accum_offset + 0] += (scale_0 * s2_r0) * acc_sum(i * 4 + 0);
+                                    final_accum[accum_offset + 2] += (scale_0 * s2_r1) * acc_sum(i * 4 + 2);
+                                    final_accum[accum_offset + 1] += (scale_1 * s2_r0) * acc_sum(i * 4 + 1);
+                                    final_accum[accum_offset + 3] += (scale_1 * s2_r1) * acc_sum(i * 4 + 3);
+                                } else {
                                 if (token_0 < valid_m) {
                                     const float scale_0 = ptx::ld_shared(sfa + token_0);
                                     final_accum[accum_offset + 0] += (scale_0 * s2_r0) * acc_sum(i * 4 + 0);
@@ -1838,6 +1855,7 @@
                                     const float scale_1 = ptx::ld_shared(sfa + token_1);
                                     final_accum[accum_offset + 1] += (scale_1 * s2_r0) * acc_sum(i * 4 + 1);
                                     final_accum[accum_offset + 3] += (scale_1 * s2_r1) * acc_sum(i * 4 + 3);
+                                }
                                 }
                             }
                         }
