@@ -3227,7 +3227,13 @@
                         if constexpr (kQoQ) {
                             // INT8 activation for L2: symmetric per-token scale amax/127.
                             sf_pair.x = sf_pair.y = amax * (1.0f / 127.0f);
-                            sf_inv_pair.x = sf_inv_pair.y = amax > 0.0f ? 127.0f / amax : 0.0f;
+                            // `__fdividef` (MUFU.RCP + FMUL), NOT `127.0f / amax`: the IEEE
+                            // fp32 division emits a CALL to a slow-path subroutine, and ANY
+                            // call in this function makes ptxas serialise every wgmma of the
+                            // kernel (C7510 "wgmma pipeline crossing function boundary":
+                            // WARPGROUP.DEPBAR.LE gsb0, 0x0 after each IGMMA). Measured on
+                            // H20 (SASS audit 2026-09-09): 16 serialised m64n8k32 per stage.
+                            sf_inv_pair.x = sf_inv_pair.y = amax > 0.0f ? __fdividef(127.0f, amax) : 0.0f;
                         } else {
                             math::get_e4m3_sf_and_sf_inv(amax_pair, sf_pair, sf_inv_pair);
                         }
