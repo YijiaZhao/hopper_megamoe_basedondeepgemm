@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Build + run the tiny-N tensor-pipe microbenchmark on one idle H20 GPU.
 # usage: CUDA_VISIBLE_DEVICES=7 bash tests/microbench_tiny_n_wgmma.sh [outdir] [section...]
-# sections: pipe decode offload sass (default: all)
+# sections: pipe decode knobs offload sass (default: all)
 set -euo pipefail
 cd "$(dirname "$0")"
 OUT="${1:-/tmp/mb_tiny_n}"; shift || true
-SECTIONS="${*:-pipe decode offload sass}"
+SECTIONS="${*:-pipe decode knobs offload sass}"
 mkdir -p "$OUT"
 nvcc -gencode arch=compute_90a,code=sm_90a -O3 -std=c++17 -Xptxas -v -o "$OUT/mb" microbench_tiny_n_wgmma.cu 2> "$OUT/build.log" || { cat "$OUT/build.log"; exit 1; }
 grep -i "C75\|warn\|error" "$OUT/build.log" || true
@@ -66,6 +66,17 @@ FLAGS=2 run ss8d 2 2
 FLAGS=4 run ss8d 2 2
 FLAGS=6 run ss8d 2 2
 ;;
+knobs)
+echo "# kernel knobs on the rs8d loop: 32 = prefetch packed LDS before wait<1>, 64 = raw-u8 RS wgmma + deferred affine, 96 = both"
+run rs8d 2 2
+FLAGS=32 run rs8d 2 2
+FLAGS=64 run rs8d 2 2
+FLAGS=96 run rs8d 2 2
+FLAGS=1 run rs8d 2 2
+FLAGS=65 run rs8d 2 2
+FLAGS=96 run rs8d 3 2
+FLAGS=96 run rs8d 3 1
+;;
 offload)
 echo "# reference: kernel form rs8d with phase stamps"
 run rs8d 2 2
@@ -83,9 +94,10 @@ DEC=2 run ss8u 2 2
 ;;
 sass)
 echo "# SASS excerpt: rs8d<2,2,0> and rs8t<2,2,0> main loop (tensor / warpgroup / LDS / branch instructions only)"
-for fn in _Z12bench_kernelILi8ELi2ELi2ELi0EEvPyS_Piii _Z12bench_kernelILi14ELi2ELi2ELi0EEvPyS_Piii; do
+for fn in _Z12bench_kernelILi8ELi2ELi2ELi0EEvPyS_Piii _Z12bench_kernelILi8ELi2ELi2ELi96EEvPyS_Piii; do
   cuobjdump -sass -fun "$fn" "$OUT/mb" > "$OUT/$fn.sass" 2>/dev/null || true
   echo "## $fn: $(grep -c IGMMA "$OUT/$fn.sass") IGMMA, $(grep -c 'WARPGROUP.ARRIVE' "$OUT/$fn.sass") ARRIVE, $(grep -c 'WARPGROUP.DEPBAR' "$OUT/$fn.sass") DEPBAR, $(grep -c 'LDS' "$OUT/$fn.sass") LDS, $(wc -l < "$OUT/$fn.sass") lines"
+  echo "   per-block instruction mix in the loop (opcode histogram):"; awk '/WARPGROUP.DEPBAR/{c++} c==2' "$OUT/$fn.sass" | grep -o '^ */\*[0-9a-f]*\*/ *[@!P0-9 ]*[A-Z][A-Z0-9_.]*' | sed 's/.*\*\/ *//; s/^@!*P[0-9] *//' | sort | uniq -c | sort -rn | head -14 | awk '{printf "      %5d %s\n", $1, $2}'
   grep -o 'IGMMA[^;]*;\|WARPGROUP[^;]*;\|LDS[^;]*;\|STS[^;]*;\|BRA [^;]*;\|DEPBAR[^;]*;\|BAR[^;]*;\|FENCE[^;]*;' "$OUT/$fn.sass" | sed 's/  */ /g' | awk '{print "   " $0}' | head -60
 done
 ;;

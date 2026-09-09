@@ -34,6 +34,10 @@
 //              accumulator and fold acc_main += s2*acc_blk + (a-128)*colsum(B) in int32 after the
 //              wait (exact integers -> bit-identical to the inline-s2 form). Two tiles ahead, so the
 //              writers' decode overlaps the math WGs' (blocking) IGMMA issue.
+//   FLAGS 32 (rs8d): PREFETCH — issue the next block's packed LDS before wait<1> (kernel knob 1)
+//   FLAGS 64 (rs8d): RAWU8 — decode raw nibble codes only (AND / SHF+AND), RS wgmma s32.u8.s8 into a
+//        per-block accumulator, fold acc_main += s2*acc_blk + (-z*s2)*colsum(B) in int32 after the
+//        wait (exact integers -> bit-identical to the inline-s2 form)  (kernel knob 2)
 //   Per-phase clock64 stamps (lane 0 of each warp) are printed for rs8d / ss8p / ss8u:
 //     rs8d math: issue | wait | decode      ss8p/ss8u math: barF | issue | wait+promote | barE
 //     writers: barE | decode+store | fence | barF
@@ -89,6 +93,14 @@ __device__ __forceinline__ void wgmma_rs8(uint32_t (&d)[4], const uint32_t (&a)[
         "wgmma.mma_async.sync.aligned.m64n8k32.s32.s8.s8 {%0,%1,%2,%3}, {%4,%5,%6,%7}, %8, p;\n}\n"
         : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(1));
+}
+// RS m64n8k32 s32.u8.s8 (A unsigned raw codes in registers)
+__device__ __forceinline__ void wgmma_rs8_u8(uint32_t (&d)[4], const uint32_t (&a)[4], uint64_t desc_b, bool scale_d) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %9, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n8k32.s32.u8.s8 {%0,%1,%2,%3}, {%4,%5,%6,%7}, %8, p;\n}\n"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"((int)scale_d));
 }
 // SS m64n8k32 s32.u8.s8 (A unsigned raw codes)
 __device__ __forceinline__ void wgmma_ss8_u8(uint32_t (&d)[4], uint64_t desc_a, uint64_t desc_b, bool scale_d) {
@@ -338,14 +350,90 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
             const int r0 = lane >> 2;          // kernel r_0
             const int col = lane & 3;          // kernel col_idx
             const int wrow = (warp & 3) * 16;  // warp's 16-row slab within the m64 half
-            // decode fragment buffer `b` (both halves) from packed stage `st`
-            auto decode = [&](auto bconst, int st) {
-                constexpr int b = decltype(bconst)::value;
+            constexpr bool PREFETCH = FLAGS & 32;
+            constexpr bool RAWU8 = FLAGS & 64;
+            uint32_t acc_blk[2][HALVES][4];     // RAWU8: per-block accumulators (scale_d=0 on k=0)
+            uint32_t swk[2][HALVES][2];         // RAWU8: scale words kept per buffer for the promote
+            uint4 wld[HALVES][2]; uint32_t swld[HALVES][2];   // loaded packed words (temporaries)
+            #pragma unroll
+            for (int b = 0; b < 2; ++b)
+                #pragma unroll
+                for (int h = 0; h < HALVES; ++h) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) acc_blk[b][h][j] = 0;
+                    swk[b][h][0] = swk[b][h][1] = 0x0300u;
+                }
+            // step 1: load the packed words of one block (4 LDS.128 + 4 LDS.32 per thread)
+            auto load_words = [&](int st) {
                 const uint8_t* packed_rows = smem_p + st * (256 * 80);
                 asm volatile("" ::: "memory");
                 #pragma unroll
-                for (int h = 0; h < HALVES; ++h)
-                    decode_half<NO_LDS>(fbuf[b][h], packed_rows, wg_n + h * 64 + wrow + r0, col, (uint32_t)(lane + h * 8 + b * 16 + st * 32));
+                for (int h = 0; h < HALVES; ++h) {
+                    const int row0 = wg_n + h * 64 + wrow + r0;
+                    if constexpr (NO_LDS) {
+                        const uint32_t salt = (uint32_t)(lane + h * 8 + st * 32);
+                        wld[h][0] = make_uint4(salt, salt * 3u, salt * 5u, salt * 7u);
+                        wld[h][1] = make_uint4(salt ^ 0x11u, salt ^ 0x33u, salt ^ 0x55u, salt ^ 0x77u);
+                        swld[h][0] = (salt & 0x7u) | 0x0300u; swld[h][1] = ((salt >> 3) & 0x7u) | 0x0500u;
+                    } else {
+                        wld[h][0] = *reinterpret_cast<const uint4*>(packed_rows + row0 * 80 + col * 16);
+                        wld[h][1] = *reinterpret_cast<const uint4*>(packed_rows + (row0 + 8) * 80 + col * 16);
+                        swld[h][0] = *reinterpret_cast<const uint32_t*>(packed_rows + row0 * 80 + 64);
+                        swld[h][1] = *reinterpret_cast<const uint32_t*>(packed_rows + (row0 + 8) * 80 + 64);
+                    }
+                }
+            };
+            // step 2: ALU decode into fragment buffer b (affine inline-s2 form, or raw u8 codes)
+            auto compute = [&](auto bconst) {
+                constexpr int b = decltype(bconst)::value;
+                #pragma unroll
+                for (int h = 0; h < HALVES; ++h) {
+                    uint4 w0 = wld[h][0], w1 = wld[h][1]; uint32_t sw0 = swld[h][0], sw1 = swld[h][1];
+                    asm volatile("" : "+r"(w0.x), "+r"(w0.y), "+r"(w0.z), "+r"(w0.w), "+r"(w1.x), "+r"(w1.y), "+r"(w1.z), "+r"(w1.w), "+r"(sw0), "+r"(sw1));
+                    const uint32_t wr0[4] = {w0.x, w0.y, w0.z, w0.w};
+                    const uint32_t wr1[4] = {w1.x, w1.y, w1.z, w1.w};
+                    if constexpr (RAWU8) {
+                        swk[b][h][0] = sw0; swk[b][h][1] = sw1;
+                        #pragma unroll
+                        for (int k = 0; k < 4; ++k) {
+                            fbuf[b][h][k][0] = (wr0[k] >> 4) & 0x0f0f0f0fu;
+                            fbuf[b][h][k][1] = (wr1[k] >> 4) & 0x0f0f0f0fu;
+                            fbuf[b][h][k][2] = wr0[k] & 0x0f0f0f0fu;
+                            fbuf[b][h][k][3] = wr1[k] & 0x0f0f0f0fu;
+                        }
+                    } else {
+                        const uint32_t s2_0 = sw0 & 0xffu, s2_1 = sw1 & 0xffu;
+                        const uint32_t a4_0 = (0x80u - ((sw0 >> 8u) & 0xffu) * s2_0) * 0x01010101u;
+                        const uint32_t a4_1 = (0x80u - ((sw1 >> 8u) & 0xffu) * s2_1) * 0x01010101u;
+                        #pragma unroll
+                        for (int k = 0; k < 4; ++k) {
+                            fbuf[b][h][k][0] = (((wr0[k] >> 4) & 0x0f0f0f0fu) * s2_0 + a4_0) ^ 0x80808080u;
+                            fbuf[b][h][k][1] = (((wr1[k] >> 4) & 0x0f0f0f0fu) * s2_1 + a4_1) ^ 0x80808080u;
+                            fbuf[b][h][k][2] = ((wr0[k] & 0x0f0f0f0fu) * s2_0 + a4_0) ^ 0x80808080u;
+                            fbuf[b][h][k][3] = ((wr1[k] & 0x0f0f0f0fu) * s2_1 + a4_1) ^ 0x80808080u;
+                        }
+                    }
+                }
+            };
+            auto decode = [&](auto bconst, int st) {   // non-prefetch form: load + compute
+                load_words(st);
+                compute(bconst);
+            };
+            // RAWU8: fold the retired block (buffer b) into acc_main; colsum(B) for this thread's 2 tokens
+            auto promote = [&](auto bconst, int blk) {
+                constexpr int b = decltype(bconst)::value;
+                if constexpr (RAWU8) {
+                    const int2 cs = *reinterpret_cast<const int2*>(smem_b + 2048 - 64 + blk * 32 + (lane & 3) * 8);
+                    #pragma unroll
+                    for (int h = 0; h < HALVES; ++h) {
+                        const int s2_0 = swk[b][h][0] & 0xff, s2_1 = swk[b][h][1] & 0xff;
+                        const int zs_0 = -(int)((swk[b][h][0] >> 8) & 0xff) * s2_0, zs_1 = -(int)((swk[b][h][1] >> 8) & 0xff) * s2_1;
+                        acc[h][0] += s2_0 * (int)acc_blk[b][h][0] + zs_0 * cs.x;
+                        acc[h][1] += s2_0 * (int)acc_blk[b][h][1] + zs_0 * cs.y;
+                        acc[h][2] += s2_1 * (int)acc_blk[b][h][2] + zs_1 * cs.x;
+                        acc[h][3] += s2_1 * (int)acc_blk[b][h][3] + zs_1 * cs.y;
+                    }
+                }
             };
             auto fence_buf = [&](auto bconst) {   // the kernel's fence_frag: definition point after the wait
                 constexpr int b = decltype(bconst)::value;
@@ -374,7 +462,8 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
                     #pragma unroll
                     for (int k = 0; k < 4; ++k) {
                         const uint64_t dbk = db + (uint64_t)((k * 32) >> 4);
-                        if constexpr (MODE == RS8D || MODE == RS8T) wgmma_rs8(acc[h], fbuf[b][h][k], dbk);
+                        if constexpr ((MODE == RS8D || MODE == RS8T) && !RAWU8) wgmma_rs8(acc[h], fbuf[b][h][k], dbk);
+                        if constexpr (MODE == RS8D && RAWU8) wgmma_rs8_u8(acc_blk[b][h], fbuf[b][h][k], dbk, k != 0);
                         if constexpr (MODE == RS8A) wgmma_rs8(acc[h], fconst[h][k], dbk);
                         if constexpr (MODE == SS8D) wgmma_ss8(acc[h], desc_a[h][blk] + (uint64_t)((k * 32) >> 4), dbk);
                     }
@@ -415,15 +504,21 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
                     // kernel loop body (2-buffer form):
                     //   issue(b0,f0); wait<1> [retires prev b1 -> f1 free]; decode f1; issue(b1,f1);
                     //   wait<1> [retires b0 -> f0 free]; [next stage barrier]; decode f0 (next stage)
-                    if constexpr (MODE != DEC) { STAMP(0, issue(I0{}, 0)); STAMP(1, wg_wait<1>()); }
+                    if constexpr (MODE != DEC) STAMP(0, issue(I0{}, 0));
+                    if constexpr (PREFETCH) STAMP(3, load_words(st));
+                    if constexpr (MODE != DEC) STAMP(1, (wg_wait<1>(), promote(I1{}, 1)));
                     if constexpr (MODE == DEC || MODE == RS8A) consume(I0{});
                     fence_buf(I1{});
-                    STAMP(2, for (int r = 0; r < dec_rep; ++r) decode(I1{}, st));
+                    if constexpr (PREFETCH) STAMP(2, for (int r = 0; r < dec_rep; ++r) compute(I1{}));
+                    else STAMP(2, for (int r = 0; r < dec_rep; ++r) decode(I1{}, st));
                     if constexpr (MODE == SS8D) store_tile(I1{});
-                    if constexpr (MODE != DEC) { STAMP(0, issue(I1{}, 1)); STAMP(1, wg_wait<1>()); }
+                    if constexpr (MODE != DEC) STAMP(0, issue(I1{}, 1));
+                    if constexpr (PREFETCH) STAMP(3, load_words(st ^ 1));
+                    if constexpr (MODE != DEC) STAMP(1, (wg_wait<1>(), promote(I0{}, 0)));
                     if constexpr (MODE == DEC || MODE == RS8A) consume(I1{});
                     fence_buf(I0{});
-                    STAMP(2, for (int r = 0; r < dec_rep; ++r) decode(I0{}, st ^ 1));
+                    if constexpr (PREFETCH) STAMP(2, for (int r = 0; r < dec_rep; ++r) compute(I0{}));
+                    else STAMP(2, for (int r = 0; r < dec_rep; ++r) decode(I0{}, st ^ 1));
                     if constexpr (MODE == SS8D) store_tile(I0{});
                 }
                 if constexpr (MODE != DEC) wg_wait<0>();
@@ -431,7 +526,7 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
             #pragma unroll
             for (int h = 0; h < HALVES; ++h)
                 #pragma unroll
-                for (int j = 0; j < 4; ++j) acc_sink += (int)acc[h][j];
+                for (int j = 0; j < 4; ++j) acc_sink += (int)acc[h][j] + (int)acc_blk[0][h][j] + (int)acc_blk[1][h][j];
             consume(I0{}); consume(I1{});
             if constexpr (NBUF == 3) consume(I2{});
         }
@@ -695,6 +790,12 @@ kern_t pick_f(int flags, int nwg, int halves) {
         case 4: if constexpr (MODE == SS8D) return pick_nh<MODE, 4>(nwg, halves); break;
         case 6: if constexpr (MODE == SS8D) return pick_nh<MODE, 6>(nwg, halves); break;
         case 16: if constexpr (MODE == SS8P) return pick_nh<MODE, 16>(nwg, halves); break;
+        case 32: if constexpr (MODE == RS8D) return pick_nh<MODE, 32>(nwg, halves); break;
+        case 64: if constexpr (MODE == RS8D) return pick_nh<MODE, 64>(nwg, halves); break;
+        case 96: if constexpr (MODE == RS8D) return pick_nh<MODE, 96>(nwg, halves); break;
+        case 33: if constexpr (MODE == RS8D) return pick_nh<MODE, 33>(nwg, halves); break;
+        case 65: if constexpr (MODE == RS8D) return pick_nh<MODE, 65>(nwg, halves); break;
+        case 97: if constexpr (MODE == RS8D) return pick_nh<MODE, 97>(nwg, halves); break;
         case 18: if constexpr (MODE == SS8P) return pick_nh<MODE, 18>(nwg, halves); break;
     }
     return nullptr;
@@ -774,7 +875,7 @@ int main(int argc, char** argv) {
         const int warps[2] = {0, 4};
         const char* lbl[2] = {"writer warp0", "math   warp4"};
         for (int w = 0; w < 2; ++w) {
-            printf("   %s clk/stage:", lbl[w]);
+            printf("   %s clk/stage (rs8d: ph0 issue, ph1 wait+promote, ph2 decode-ALU, ph3 prefetch LDS):", lbl[w]);
             for (int i = 0; i < 8; ++i) {
                 double s = 0; for (int b = 0; b < nsm; ++b) s += (double)hp[(b * 12 + warps[w]) * 8 + i];
                 printf(" ph%d=%6.0f", i, s / nsm / iters);

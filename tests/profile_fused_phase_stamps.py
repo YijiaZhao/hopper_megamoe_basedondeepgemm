@@ -57,6 +57,7 @@ SM_GHZ = 1.83
 
 
 PROBE_EXP = int(os.environ.get("PROBE_EXP", "0"))  # 1 skip decode, 2 skip wgmma, 3 both (timing only)
+PROBE_DUMP = int(os.environ.get("PROBE_DUMP", "0"))  # 1: rank0 prints one line per measured iteration
 
 
 def reset(stamps):
@@ -156,6 +157,12 @@ def main():
                 row[23] = s[23] / n_st * 100.0   # % of k+1 waits where data was NOT yet ready
                 rows.append(row)
                 wall.append(start.elapsed_time(end) * 1000.0)
+                if PROBE_DUMP and rank == 0:
+                    # per-iteration raw numbers (us): kernel entry->combine end, SM0 barrier#1 wait,
+                    # entry->after barrier#1, CUDA-event wall around graph.replay()
+                    print(f"PROBE_ITER {i - args.warmup:02d} slot7 {row[7]:.2f} slot16 {row[16]:.2f} "
+                          f"slot13 {row[13]:.2f} slot7_minus_16 {row[7] - row[16]:.2f} "
+                          f"wall {wall[-1]:.2f}", flush=True)
         dist.barrier(group=group)
 
         if rank == 0 and args.no_stamps:
