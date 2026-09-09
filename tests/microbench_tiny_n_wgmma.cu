@@ -29,6 +29,14 @@
 //              tile (conflict-free st.shared.v4 + fence.proxy.async), named-barrier handoff,
 //              math WGs only issue SS m64n8k32 + wait<1>. FLAGS 16 = all 12 warps decode
 //              (else only the 4 producer warps of WG0); nwg=2 halves=2 only
+//   ss8u   :     3-tile offload, deferred affine: WG0 decodes RAW nibble codes to u8 (AND/SHF only)
+//              into 3 rotating SW128 tiles; math WGs issue SS m64n8k32 s32.u8.s8 into a per-block
+//              accumulator and fold acc_main += s2*acc_blk + (a-128)*colsum(B) in int32 after the
+//              wait (exact integers -> bit-identical to the inline-s2 form). Two tiles ahead, so the
+//              writers' decode overlaps the math WGs' (blocking) IGMMA issue.
+//   Per-phase clock64 stamps (lane 0 of each warp) are printed for rs8d / ss8p / ss8u:
+//     rs8d math: issue | wait | decode      ss8p/ss8u math: barF | issue | wait+promote | barE
+//     writers: barE | decode+store | fence | barF
 //   DEC=<n> env: repeat the decode n times per block (rs8d/rs8t/ss8d/dec/rs8a), default 1
 //   FLAGS=<bits> (compile-time instantiations, see main): 1 = decode without LDS (ALU only)
 //        2 = ss8d: skip fence.proxy.async (timing only)   4 = ss8d: conflict-free stores
@@ -49,9 +57,9 @@
     printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); exit(1); } } while (0)
 
 enum Mode { RS8 = 0, SS8 = 1, RS16 = 2, SS16 = 3, IMMA = 4, IMMAL = 5, RS8FP8 = 6, RS8K = 7,
-            RS8D = 8, SS8D = 9, DEC = 10, RS8A = 11, RS8T = 12, SS8P = 13, NUM_MODES = 14 };
+            RS8D = 8, SS8D = 9, DEC = 10, RS8A = 11, RS8T = 12, SS8P = 13, SS8U = 14, NUM_MODES = 15 };
 static const char* kModeNames[NUM_MODES] = {"rs8", "ss8", "rs16", "ss16", "imma", "immal", "rs8fp8", "rs8k",
-                                            "rs8d", "ss8d", "dec", "rs8a", "rs8t", "ss8p"};
+                                            "rs8d", "ss8d", "dec", "rs8a", "rs8t", "ss8p", "ss8u"};
 
 __device__ __forceinline__ uint64_t gtimer() {
     uint64_t t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t;
@@ -81,6 +89,14 @@ __device__ __forceinline__ void wgmma_rs8(uint32_t (&d)[4], const uint32_t (&a)[
         "wgmma.mma_async.sync.aligned.m64n8k32.s32.s8.s8 {%0,%1,%2,%3}, {%4,%5,%6,%7}, %8, p;\n}\n"
         : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b), "r"(1));
+}
+// SS m64n8k32 s32.u8.s8 (A unsigned raw codes)
+__device__ __forceinline__ void wgmma_ss8_u8(uint32_t (&d)[4], uint64_t desc_a, uint64_t desc_b, bool scale_d) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %6, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n8k32.s32.u8.s8 {%0,%1,%2,%3}, %4, %5, p;\n}\n"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "l"(desc_a), "l"(desc_b), "r"((int)scale_d));
 }
 __device__ __forceinline__ void wgmma_rs8_fp8(float (&d)[4], const uint32_t (&a)[4], uint64_t desc_b) {
     asm volatile(
@@ -120,7 +136,7 @@ __device__ __forceinline__ void mma_imma(uint32_t (&d)[4], const uint32_t (&a)[4
 // SMEM: B (activations) 2 blocks x 8 tokens x 128 B; A tiles (SS) 4 halves x 2 blocks x 8 KB;
 //       packed int4 weights 2 stages x 256 rows x 80 B (kernel layout: 64 B nibbles + scale words).
 constexpr int kSmemB = 2 * 8 * 128;
-constexpr int kSmemA = 4 * 2 * 64 * 128;
+constexpr int kSmemA = 4 * 3 * 64 * 128;   // 4 m64 tiles x up to 3 rotating buffers x 8 KB
 constexpr int kSmemP = 2 * 256 * 80;
 
 // QoQ inline-s2 decode of one m64 half for one K128 block: rows (r0, r0+8) x 4 k32 steps
@@ -169,7 +185,22 @@ __device__ __forceinline__ void decode_item_to_tile(uint32_t tile_base, const ui
         hi[k] = (((wr[k] >> 4) & 0x0f0f0f0fu) * s2 + a4) ^ 0x80808080u;
     }
     const int rr = row & 63;
-    const uint32_t base = tile_base + (row >> 6) * 2 * 8192 + rr * 128;
+    const uint32_t base = tile_base + (row >> 6) * 3 * 8192 + rr * 128;   // tile t at (t*3 + p) * 8192
+    const uint32_t a_lo = base + (((2 * c16) ^ (rr & 7)) * 16);
+    const uint32_t a_hi = base + (((2 * c16 + 1) ^ (rr & 7)) * 16);
+    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};\n" :: "r"(a_lo), "r"(lo[0]), "r"(lo[1]), "r"(lo[2]), "r"(lo[3]) : "memory");
+    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};\n" :: "r"(a_hi), "r"(hi[0]), "r"(hi[1]), "r"(hi[2]), "r"(hi[3]) : "memory");
+}
+
+// Raw-code variant: nibble -> u8 code only (no affine), 3 ALU per word pair.
+__device__ __forceinline__ void decode_item_raw_to_tile(uint32_t tile_base, const uint8_t* packed_rows, int row, int c16) {
+    const uint4 w = *reinterpret_cast<const uint4*>(packed_rows + row * 80 + c16 * 16);
+    const uint32_t wr[4] = {w.x, w.y, w.z, w.w};
+    uint32_t lo[4], hi[4];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) { lo[k] = wr[k] & 0x0f0f0f0fu; hi[k] = (wr[k] >> 4) & 0x0f0f0f0fu; }
+    const int rr = row & 63;
+    const uint32_t base = tile_base + (row >> 6) * 3 * 8192 + rr * 128;   // tile t at (t*3 + p) * 8192
     const uint32_t a_lo = base + (((2 * c16) ^ (rr & 7)) * 16);
     const uint32_t a_hi = base + (((2 * c16 + 1) ^ (rr & 7)) * 16);
     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};\n" :: "r"(a_lo), "r"(lo[0]), "r"(lo[1]), "r"(lo[2]), "r"(lo[3]) : "memory");
@@ -177,7 +208,9 @@ __device__ __forceinline__ void decode_item_to_tile(uint32_t tile_base, const ui
 }
 
 template <int MODE, int NWG, int HALVES, int FLAGS>
-__global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, int* sink, int iters, int dec_rep) {
+__global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, unsigned long long* out_ph, int* sink, int iters, int dec_rep) {
+    unsigned long long ph[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    #define STAMP(i, expr) do { const unsigned long long _t0 = clock64(); expr; ph[i] += clock64() - _t0; } while (0)
     extern __shared__ __align__(1024) uint8_t smem[];
     uint8_t* smem_b = smem;
     uint8_t* smem_a = smem + kSmemB;
@@ -221,7 +254,7 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
             for (int h = 0; h < HALVES; ++h)
                 #pragma unroll
                 for (int b = 0; b < 2; ++b)
-                    desc_a[h][b] = make_desc_sw128(smem_a + ((((wg - 1) * HALVES + h) & 3) * 2 + b) * 64 * 128);
+                    desc_a[h][b] = make_desc_sw128(smem_a + ((((wg - 1) * HALVES + h) & 3) * 3 + b) * 64 * 128);
 
             #pragma unroll 1
             for (int it = 0; it < iters; ++it) {
@@ -296,7 +329,7 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
             for (int h = 0; h < HALVES; ++h)
                 #pragma unroll
                 for (int b = 0; b < 2; ++b) {
-                    uint8_t* t = smem_a + ((((wg - 1) * HALVES + h) & 3) * 2 + b) * 64 * 128;
+                    uint8_t* t = smem_a + ((((wg - 1) * HALVES + h) & 3) * 3 + b) * 64 * 128;
                     desc_a[h][b] = make_desc_sw128(t);
                     tile_addr[h][b] = static_cast<uint32_t>(__cvta_generic_to_shared(t)) +
                                       ((FLAGS & 4) ? (threadIdx.x & 127) * 16 : (threadIdx.x & 127) * 64);
@@ -382,15 +415,15 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
                     // kernel loop body (2-buffer form):
                     //   issue(b0,f0); wait<1> [retires prev b1 -> f1 free]; decode f1; issue(b1,f1);
                     //   wait<1> [retires b0 -> f0 free]; [next stage barrier]; decode f0 (next stage)
-                    if constexpr (MODE != DEC) { issue(I0{}, 0); wg_wait<1>(); }
+                    if constexpr (MODE != DEC) { STAMP(0, issue(I0{}, 0)); STAMP(1, wg_wait<1>()); }
                     if constexpr (MODE == DEC || MODE == RS8A) consume(I0{});
                     fence_buf(I1{});
-                    for (int r = 0; r < dec_rep; ++r) decode(I1{}, st);
+                    STAMP(2, for (int r = 0; r < dec_rep; ++r) decode(I1{}, st));
                     if constexpr (MODE == SS8D) store_tile(I1{});
-                    if constexpr (MODE != DEC) { issue(I1{}, 1); wg_wait<1>(); }
+                    if constexpr (MODE != DEC) { STAMP(0, issue(I1{}, 1)); STAMP(1, wg_wait<1>()); }
                     if constexpr (MODE == DEC || MODE == RS8A) consume(I1{});
                     fence_buf(I0{});
-                    for (int r = 0; r < dec_rep; ++r) decode(I0{}, st ^ 1);
+                    STAMP(2, for (int r = 0; r < dec_rep; ++r) decode(I0{}, st ^ 1));
                     if constexpr (MODE == SS8D) store_tile(I0{});
                 }
                 if constexpr (MODE != DEC) wg_wait<0>();
@@ -411,21 +444,22 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
         // writer round: decode block `blk` parity tile p = blk&1 from packed stage st
         auto write_tile = [&](int p, int st) {
             const uint8_t* packed_rows = smem_p + st * (256 * 80);
-            const uint32_t tile_base = smem_a_u32 + p * 8192;   // tile t at (t*2 + p) * 8192
+            const uint32_t tile_base = smem_a_u32 + p * 8192;   // tile t at (t*3 + p) * 8192
             asm volatile("" ::: "memory");
-            if constexpr (ALL_DECODE) {
-                #pragma unroll
-                for (int i = threadIdx.x; i < 1024; i += 384) {
-                    for (int r = 0; r < dec_rep; ++r) decode_item_to_tile(tile_base, packed_rows, i >> 2, i & 3);
-                }
-            } else {
-                #pragma unroll
-                for (int q = 0; q < 8; ++q) {
-                    const int i = threadIdx.x + q * 128;
-                    for (int r = 0; r < dec_rep; ++r) decode_item_to_tile(tile_base, packed_rows, i >> 2, i & 3);
+            for (int r = 0; r < dec_rep; ++r) {
+                if constexpr (ALL_DECODE) {
+                    #pragma unroll
+                    for (int i = threadIdx.x; i < 1024; i += 384)
+                        decode_item_to_tile(tile_base, packed_rows, i >> 2, i & 3);
+                } else {
+                    #pragma unroll
+                    for (int q = 0; q < 8; ++q) {
+                        const int i = threadIdx.x + q * 128;
+                        decode_item_to_tile(tile_base, packed_rows, i >> 2, i & 3);
+                    }
                 }
             }
-            if constexpr (!(FLAGS & 2)) asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+            if constexpr (!(FLAGS & 2)) STAMP(6, asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"));
         };
         uint32_t acc[2][4] = {};
         const uint64_t desc_b0 = make_desc_sw128(smem_b);
@@ -435,7 +469,7 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
         for (int h = 0; h < 2; ++h)
             #pragma unroll
             for (int b = 0; b < 2; ++b)
-                desc_a[h][b] = make_desc_sw128(smem_a + ((((wg - 1) * 2 + h) & 3) * 2 + b) * 8192);
+                desc_a[h][b] = make_desc_sw128(smem_a + ((((wg - 1) * 2 + h) & 3) * 3 + b) * 8192);
         auto issue = [&](int p) {
             const uint64_t db = p ? desc_b1 : desc_b0;
             wg_fence();
@@ -456,19 +490,19 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
                 // math: wait tile p full, issue, retire the previous group (tile p^1), release tile p^1
                 // writers: wait tile p^1 empty, decode the next block into it, publish
                 if constexpr (ALL_DECODE) {
-                    nbar_sync(p ? kF1 : kF0, 384);
-                    if (math) { issue(p); wg_wait<1>(); }
-                    nbar_sync(p ? kE0 : kE1, 384);
-                    write_tile(p ^ 1, st ^ p);
+                    STAMP(0, nbar_sync(p ? kF1 : kF0, 384));
+                    if (math) { STAMP(1, issue(p)); STAMP(2, wg_wait<1>()); }
+                    STAMP(3, nbar_sync(p ? kE0 : kE1, 384));
+                    STAMP(5, write_tile(p ^ 1, st ^ p));
                 } else {
                     if (math) {
-                        nbar_sync(p ? kF1 : kF0, 384);
-                        issue(p); wg_wait<1>();
-                        nbar_arrive(p ? kE0 : kE1, 384);
+                        STAMP(0, nbar_sync(p ? kF1 : kF0, 384));
+                        STAMP(1, issue(p)); STAMP(2, wg_wait<1>());
+                        STAMP(3, nbar_arrive(p ? kE0 : kE1, 384));
                     } else {
-                        nbar_sync(p ? kE0 : kE1, 384);
-                        write_tile(p ^ 1, st ^ p);
-                        nbar_arrive(p ? kF0 : kF1, 384);
+                        STAMP(4, nbar_sync(p ? kE0 : kE1, 384));
+                        STAMP(5, write_tile(p ^ 1, st ^ p));
+                        STAMP(7, nbar_arrive(p ? kF0 : kF1, 384));
                     }
                 }
             }
@@ -480,6 +514,104 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
             for (int h = 0; h < 2; ++h)
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) acc_sink += (int)acc[h][j];
+        }
+    } else if constexpr (MODE == SS8U) {
+        static_assert(NWG == 2 && HALVES == 2, "ss8u: 2 math WGs x 2 halves");
+        // named barriers: F[t] tile t full (1..3), E[t] tile t empty (4..6)
+        const uint32_t smem_a_u32 = static_cast<uint32_t>(__cvta_generic_to_shared(smem_a));
+        const bool writer = (wg == 0);
+        auto write_tile = [&](int t, int st) {
+            const uint8_t* packed_rows = smem_p + st * (256 * 80);
+            const uint32_t tile_base = smem_a_u32 + t * 8192;
+            asm volatile("" ::: "memory");
+            for (int r = 0; r < dec_rep; ++r) {
+                #pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    const int i = threadIdx.x + q * 128;
+                    decode_item_raw_to_tile(tile_base, packed_rows, i >> 2, i & 3);
+                }
+            }
+            if constexpr (!(FLAGS & 2)) STAMP(6, asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"));
+        };
+        uint32_t acc_main[2][4] = {};
+        uint32_t acc_blk[2][2][4] = {};   // [parity][half][4]
+        const uint64_t desc_b0 = make_desc_sw128(smem_b);
+        const uint64_t desc_b1 = make_desc_sw128(smem_b + 1024);
+        uint64_t desc_a[2][3];
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+            #pragma unroll
+            for (int t = 0; t < 3; ++t)
+                desc_a[h][t] = make_desc_sw128(smem_a + ((((wg - 1) * 2 + h) & 3) * 3 + t) * 8192);
+        // per-row affine (s2, a-128) for the 2 rows this thread's accumulator covers, per block parity
+        // (in the kernel: 2 LDS.32 of the packed scale words per half per block); colsum(B) per token
+        // (2 tokens per thread) from smem (kernel: produced by the activation quant / producer)
+        const uint8_t* packed_rows0 = smem_p;
+        const int r0 = lane >> 2;
+        const int wrow = (warp & 3) * 16;
+        auto issue = [&](auto tconst, int blk) {
+            constexpr int t = decltype(tconst)::value;
+            constexpr int par = t & 1;
+            const uint64_t db = blk ? desc_b1 : desc_b0;
+            wg_fence();
+            #pragma unroll
+            for (int h = 0; h < 2; ++h)
+                #pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    wgmma_ss8_u8(acc_blk[par][h], desc_a[h][t] + (uint64_t)((k * 32) >> 4), db + (uint64_t)((k * 32) >> 4), k != 0);
+            wg_commit();
+        };
+        auto promote = [&](auto tconst, int blk) {   // fold the retired block (tile t) into acc_main
+            constexpr int par = decltype(tconst)::value & 1;
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int row0 = ((wg - 1) * 2 + h) * 64 + wrow + r0;
+                const uint32_t sw0 = *reinterpret_cast<const uint32_t*>(packed_rows0 + row0 * 80 + 64 + blk * 20480);
+                const uint32_t sw1 = *reinterpret_cast<const uint32_t*>(packed_rows0 + (row0 + 8) * 80 + 64 + blk * 20480);
+                const int s2_0 = sw0 & 0xff, s2_1 = sw1 & 0xff;
+                const int zs_0 = -(int)((sw0 >> 8) & 0xff) * s2_0, zs_1 = -(int)((sw1 >> 8) & 0xff) * s2_1;
+                const int2 cs = *reinterpret_cast<const int2*>(smem_b + 2048 - 64 + blk * 32 + (lane & 3) * 8);  // colsum(B) for tokens 2*(lane&3), +1
+                acc_main[h][0] += s2_0 * (int)acc_blk[par][h][0] + zs_0 * cs.x;
+                acc_main[h][1] += s2_0 * (int)acc_blk[par][h][1] + zs_0 * cs.y;
+                acc_main[h][2] += s2_1 * (int)acc_blk[par][h][2] + zs_1 * cs.x;
+                acc_main[h][3] += s2_1 * (int)acc_blk[par][h][3] + zs_1 * cs.y;
+            }
+        };
+        using T0 = std::integral_constant<int, 0>;
+        using T1 = std::integral_constant<int, 1>;
+        using T2 = std::integral_constant<int, 2>;
+        // block j uses tile j%3 and activation block j&1; writers run two blocks ahead
+        if (writer) { write_tile(0, 0); nbar_arrive(1, 384); write_tile(1, 0); nbar_arrive(2, 384); }
+        #pragma unroll 1
+        for (int it = 0; it < iters / 3; ++it) {
+            // 6 blocks: tiles 0 1 2 0 1 2, activation blocks 0 1 0 1 0 1
+            #define SS8U_MATH(TC, TPREV, BLK) \
+                STAMP(0, nbar_sync(1 + decltype(TC)::value, 384)); \
+                STAMP(1, issue(TC, BLK)); \
+                STAMP(2, (wg_wait<1>(), promote(TPREV, BLK ^ 1))); \
+                STAMP(3, nbar_arrive(4 + decltype(TPREV)::value, 384));
+            #define SS8U_WRITE(TC, ST, NEEDE) \
+                if (NEEDE) STAMP(4, nbar_sync(4 + decltype(TC)::value, 384)); \
+                STAMP(5, write_tile(decltype(TC)::value, ST)); \
+                STAMP(7, nbar_arrive(1 + decltype(TC)::value, 384));
+            if (math) {
+                SS8U_MATH(T0{}, T2{}, 0) SS8U_MATH(T1{}, T0{}, 1) SS8U_MATH(T2{}, T1{}, 0)
+                SS8U_MATH(T0{}, T2{}, 1) SS8U_MATH(T1{}, T0{}, 0) SS8U_MATH(T2{}, T1{}, 1)
+            } else if (writer) {
+                // writes tiles for blocks j+2: 2 0 1 2 0 1 (first tile 2 of the run needs no E wait)
+                SS8U_WRITE(T2{}, 0, (it > 0)) SS8U_WRITE(T0{}, 1, true) SS8U_WRITE(T1{}, 0, true)
+                SS8U_WRITE(T2{}, 1, true) SS8U_WRITE(T0{}, 0, true) SS8U_WRITE(T1{}, 1, true)
+            }
+        }
+        // drain: the writers published 2 tiles beyond the math loop; math consumes F, writers consume E
+        if (math) { nbar_sync(1 + 0, 384); nbar_sync(1 + 1, 384); }
+        if (writer) { nbar_sync(4 + 2, 384); nbar_sync(4 + 0, 384); nbar_sync(4 + 1, 384); }
+        if (math) {
+            wg_wait<0>();
+            #pragma unroll
+            for (int h = 0; h < 2; ++h)
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc_sink += (int)acc_main[h][j] + (int)acc_blk[0][h][j] + (int)acc_blk[1][h][j];
         }
     } else {
         // IMMA: 8 warps (warps 4..11), each owns 32 rows = 2 m16 tiles; 8 k32 steps per block.
@@ -528,15 +660,19 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
 
     __syncthreads();
     if (threadIdx.x == 0) out[blockIdx.x] = gtimer() - t0;
+    if (lane == 0) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) out_ph[(blockIdx.x * 12 + warp) * 8 + i] = ph[i];
+    }
     sink[blockIdx.x * 384 + threadIdx.x] = acc_sink;  // keep accumulators / decode alive
 }
 
-typedef void (*kern_t)(unsigned long long*, int*, int, int);
+typedef void (*kern_t)(unsigned long long*, unsigned long long*, int*, int, int);
 
 template <int MODE, int FLAGS>
 kern_t pick_nh(int nwg, int halves) {
     if (nwg == 2 && halves == 2) return bench_kernel<MODE, 2, 2, FLAGS>;
-    if constexpr (MODE != SS8P) {
+    if constexpr (MODE != SS8P && MODE != SS8U) {
         if (nwg == 1 && halves == 1) return bench_kernel<MODE, 1, 1, FLAGS>;
         if (nwg == 1 && halves == 2) return bench_kernel<MODE, 1, 2, FLAGS>;
         if (nwg == 1 && halves == 4) return bench_kernel<MODE, 1, 4, FLAGS>;
@@ -554,7 +690,7 @@ kern_t pick_f(int flags, int nwg, int halves) {
         case 1: return pick_nh<MODE, 1>(nwg, halves);
         case 8: return pick_nh<MODE, 8>(nwg, halves);
         case 9: return pick_nh<MODE, 9>(nwg, halves);
-        case 2: if constexpr (MODE == SS8D) return pick_nh<MODE, 2>(nwg, halves); break;
+        case 2: if constexpr (MODE == SS8D || MODE == SS8P || MODE == SS8U) return pick_nh<MODE, 2>(nwg, halves); break;
         case 4: if constexpr (MODE == SS8D) return pick_nh<MODE, 4>(nwg, halves); break;
         case 6: if constexpr (MODE == SS8D) return pick_nh<MODE, 6>(nwg, halves); break;
         case 16: if constexpr (MODE == SS8P) return pick_nh<MODE, 16>(nwg, halves); break;
@@ -575,7 +711,7 @@ int main(int argc, char** argv) {
     if (mode < 0) { printf("bad mode\n"); return 1; }
     const int dec_rep = getenv("DEC") ? atoi(getenv("DEC")) : 1;
     const int flags = getenv("FLAGS") ? atoi(getenv("FLAGS")) : 0;
-    const bool decode_mode = (mode == RS8D || mode == SS8D || mode == DEC || mode == RS8A || mode == RS8T || mode == SS8P);
+    const bool decode_mode = (mode == RS8D || mode == SS8D || mode == DEC || mode == RS8A || mode == RS8T || mode == SS8P || mode == SS8U);
     const int f = decode_mode ? flags : (flags & 8);
 
     kern_t k = nullptr;
@@ -594,6 +730,7 @@ int main(int argc, char** argv) {
         case RS8A: k = pick_f<RS8A>(f, nwg, halves); break;
         case RS8T: k = pick_f<RS8T>(f, nwg, halves); break;
         case SS8P: k = pick_f<SS8P>(f, nwg, halves); break;
+        case SS8U: k = pick_f<SS8U>(f, nwg, halves); break;
     }
     if (!k) { printf("unsupported mode/flags/nwg/halves combo\n"); return 1; }
 
@@ -604,15 +741,16 @@ int main(int argc, char** argv) {
     CK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     cudaFuncAttributes fa; CK(cudaFuncGetAttributes(&fa, k));
 
-    unsigned long long* d_out; int* d_sink;
+    unsigned long long* d_out; unsigned long long* d_ph; int* d_sink;
     CK(cudaMalloc(&d_out, nsm * sizeof(unsigned long long)));
+    CK(cudaMalloc(&d_ph, nsm * 12 * 8 * sizeof(unsigned long long)));
     CK(cudaMalloc(&d_sink, nsm * 384 * sizeof(int)));
-    k<<<nsm, 384, smem>>>(d_out, d_sink, 30, dec_rep);
+    k<<<nsm, 384, smem>>>(d_out, d_ph, d_sink, 30, dec_rep);
     CK(cudaGetLastError());
     CK(cudaDeviceSynchronize());
     std::vector<double> per_run;
     for (int r = 0; r < 5; ++r) {
-        k<<<nsm, 384, smem>>>(d_out, d_sink, iters, dec_rep);
+        k<<<nsm, 384, smem>>>(d_out, d_ph, d_sink, iters, dec_rep);
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
         std::vector<unsigned long long> h(nsm);
@@ -629,5 +767,19 @@ int main(int argc, char** argv) {
     const double clk = ns_stage * 1.83;
     printf("mode=%-6s dec=%d flags=%d nwg=%d halves=%d regs=%d rows=%.0f ntok=%d : %7.1f ns/stage (%5.0f clk) ; %6.1f MAC/clk/SM ; norm(256x8xK256)=%7.1f ns\n",
            mode_s, dec_rep, flags, nwg, halves, fa.numRegs, rows, n_tok, ns_stage, clk, macs / clk, ns_norm);
+    if (mode == RS8D || mode == SS8P || mode == SS8U) {
+        std::vector<unsigned long long> hp(nsm * 12 * 8);
+        CK(cudaMemcpy(hp.data(), d_ph, hp.size() * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        const int warps[2] = {0, 4};
+        const char* lbl[2] = {"writer warp0", "math   warp4"};
+        for (int w = 0; w < 2; ++w) {
+            printf("   %s clk/stage:", lbl[w]);
+            for (int i = 0; i < 8; ++i) {
+                double s = 0; for (int b = 0; b < nsm; ++b) s += (double)hp[(b * 12 + warps[w]) * 8 + i];
+                printf(" ph%d=%6.0f", i, s / nsm / iters);
+            }
+            printf("\n");
+        }
+    }
     return 0;
 }
