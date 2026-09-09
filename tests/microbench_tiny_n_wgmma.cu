@@ -591,21 +591,22 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
                 STAMP(2, (wg_wait<1>(), promote(TPREV, BLK ^ 1))); \
                 STAMP(3, nbar_arrive(4 + decltype(TPREV)::value, 384));
             #define SS8U_WRITE(TC, ST, NEEDE) \
-                if (NEEDE) STAMP(4, nbar_sync(4 + decltype(TC)::value, 384)); \
+                STAMP(4, nbar_sync(4 + decltype(TC)::value, 384)); \
                 STAMP(5, write_tile(decltype(TC)::value, ST)); \
                 STAMP(7, nbar_arrive(1 + decltype(TC)::value, 384));
             if (math) {
                 SS8U_MATH(T0{}, T2{}, 0) SS8U_MATH(T1{}, T0{}, 1) SS8U_MATH(T2{}, T1{}, 0)
                 SS8U_MATH(T0{}, T2{}, 1) SS8U_MATH(T1{}, T0{}, 0) SS8U_MATH(T2{}, T1{}, 1)
             } else if (writer) {
-                // writes tiles for blocks j+2: 2 0 1 2 0 1 (first tile 2 of the run needs no E wait)
-                SS8U_WRITE(T2{}, 0, (it > 0)) SS8U_WRITE(T0{}, 1, true) SS8U_WRITE(T1{}, 0, true)
+                // writes tiles for blocks j+2: 2 0 1 2 0 1; every E sync matches the math arrive on
+                // E[(j-1)%3] after block j (block 0 arrives E2 too, consumed by the first write of tile 2)
+                SS8U_WRITE(T2{}, 0, true) SS8U_WRITE(T0{}, 1, true) SS8U_WRITE(T1{}, 0, true)
                 SS8U_WRITE(T2{}, 1, true) SS8U_WRITE(T0{}, 0, true) SS8U_WRITE(T1{}, 1, true)
             }
         }
-        // drain: the writers published 2 tiles beyond the math loop; math consumes F, writers consume E
+        // drain: the writers published 2 tiles (0, 1) beyond the math loop; math consumes those F arrives.
+        // E is balanced (6 arrives / 6 syncs per iteration).
         if (math) { nbar_sync(1 + 0, 384); nbar_sync(1 + 1, 384); }
-        if (writer) { nbar_sync(4 + 2, 384); nbar_sync(4 + 0, 384); nbar_sync(4 + 1, 384); }
         if (math) {
             wg_wait<0>();
             #pragma unroll

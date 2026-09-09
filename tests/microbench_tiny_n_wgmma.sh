@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Build + run the tiny-N tensor-pipe microbenchmark on one idle H20 GPU.
 # usage: CUDA_VISIBLE_DEVICES=7 bash tests/microbench_tiny_n_wgmma.sh [outdir] [section...]
-# sections: pipe decode sass (default: all)
+# sections: pipe decode offload sass (default: all)
 set -euo pipefail
 cd "$(dirname "$0")"
 OUT="${1:-/tmp/mb_tiny_n}"; shift || true
-SECTIONS="${*:-pipe decode sass}"
+SECTIONS="${*:-pipe decode offload sass}"
 mkdir -p "$OUT"
 nvcc -gencode arch=compute_90a,code=sm_90a -O3 -std=c++17 -Xptxas -v -o "$OUT/mb" microbench_tiny_n_wgmma.cu 2> "$OUT/build.log" || { cat "$OUT/build.log"; exit 1; }
 grep -i "C75\|warn\|error" "$OUT/build.log" || true
@@ -60,6 +60,15 @@ run rs8d 2 1
 run rs8d 1 4
 FLAGS=8 run rs8d 2 2
 FLAGS=8 run rs8t 2 2
+echo "# ss8d decomposition: 2 = no fence.proxy, 4 = conflict-free stores"
+run ss8d 2 2
+FLAGS=2 run ss8d 2 2
+FLAGS=4 run ss8d 2 2
+FLAGS=6 run ss8d 2 2
+;;
+offload)
+echo "# reference: kernel form rs8d with phase stamps"
+run rs8d 2 2
 echo "# offloaded decode + SS wgmma (ss8p): writers = WG0 (4 warps) | FLAGS=16 all 12 warps; FLAGS+2 = no proxy fence"
 run ss8p 2 2
 FLAGS=16 run ss8p 2 2
@@ -71,11 +80,6 @@ echo "# 3-tile offload, raw u8 codes + deferred per-row affine (ss8u); FLAGS=2 n
 run ss8u 2 2
 FLAGS=2 run ss8u 2 2
 DEC=2 run ss8u 2 2
-echo "# ss8d decomposition: 2 = no fence.proxy, 4 = conflict-free stores"
-run ss8d 2 2
-FLAGS=2 run ss8d 2 2
-FLAGS=4 run ss8d 2 2
-FLAGS=6 run ss8d 2 2
 ;;
 sass)
 echo "# SASS excerpt: rs8d<2,2,0> and rs8t<2,2,0> main loop (tensor / warpgroup / LDS / branch instructions only)"
