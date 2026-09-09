@@ -12,6 +12,8 @@ cd "$ROOT"
 MODE=${MODE:-all}; PASSES=${PASSES:-2}; OFFICIAL=${OFFICIAL:-1}
 OUT=${OUT:-/raid/kimi/results/l2pf}
 POINTS=${POINTS:-"mxfp4:2 mxfp4:8 mxfp4:16 qoq:8 qoq:16"}
+# knob configurations: tag:ENV=V,ENV=V ...
+CONFIGS=${CONFIGS:-"k1:DG_FP4_L2_PREFETCH_ALL=1 k0:DG_FP4_L2_PREFETCH_ALL=0"}
 export PYTHONPATH="$ROOT"
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:/usr/local/bin:$PATH"
@@ -61,11 +63,12 @@ if [ "$MODE" = perf ] || [ "$MODE" = all ]; then
   for pass in $(seq 1 "$PASSES"); do
     for pt in $POINTS; do
       Q=${pt%%:*}; M=${pt##*:}
-      for K in 1 0; do
-        name="${Q}_M${M}_k${K}_p${pass}"
+      for CFG in $CONFIGS; do
+        K=${CFG%%:*}; ENVS=$(echo "${CFG#*:}" | tr ',' ' ')
+        name="${Q}_M${M}_${K}_p${pass}"
         wait_idle
-        echo "--- PROBE+NSYS $name" >> "$LOG"
-        DG_FP4_L2_PREFETCH_ALL=$K PROBE_DUMP=1 timeout 600 "${NSYS[@]}" --output="$OUT/probe_nsys_$name" "${TR[@]}" \
+        echo "--- PROBE+NSYS $name ($ENVS)" >> "$LOG"
+        env $ENVS PROBE_DUMP=1 timeout 600 "${NSYS[@]}" --output="$OUT/probe_nsys_$name" "${TR[@]}" \
           tests/profile_fused_phase_stamps.py --quant "$Q" --global-tokens "$M" --iters 20 > "$OUT/probe_nsys_$name.log" 2>&1
         echo "EXIT=$?" >> "$LOG"
         sed -n '/=== fused/,$p' "$OUT/probe_nsys_$name.log" | grep -v "PROBE_ITER\|Warning\|warn" >> "$LOG"
@@ -73,7 +76,7 @@ if [ "$MODE" = perf ] || [ "$MODE" = all ]; then
         if [ "$OFFICIAL" = 1 ] && [ "$pass" = 1 ]; then
           wait_idle
           echo "--- OFFICIAL $name" >> "$LOG"
-          DG_FP4_L2_PREFETCH_ALL=$K timeout 600 "${NSYS[@]}" --output="$OUT/official_$name" "${TR[@]}" tests/profile_four_api_h20.py \
+          env $ENVS timeout 600 "${NSYS[@]}" --output="$OUT/official_$name" "${TR[@]}" tests/profile_four_api_h20.py \
             --scope mega --backend fused --quant "$Q" --global-tokens "$M" > "$OUT/official_$name.log" 2>&1
           echo "EXIT=$?" >> "$LOG"
           python3 scripts/reconcile_nsys_devices.py "$OUT/official_$name.nsys-rep" 2>&1 | grep -v "^$" >> "$LOG"
