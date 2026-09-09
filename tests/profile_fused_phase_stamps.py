@@ -38,6 +38,9 @@ REPORT = [
     (2, "dispatch pull done"),
     (3, "first math task start"),
     (4, "last L1 task end"),
+    (36, "last L2 task math start"),
+    (37, "last L2 last-stage inputs ready"),
+    (40, "last L2 epilogue start"),
     (5, "last L2 task end"),
     (6, "after combine NVLink barrier"),
     (7, "combine end (kernel end)"),
@@ -92,7 +95,7 @@ def main():
     kernel = (deep_gemm_fused_kernel(args.quant))
     weights = prepare_weights(args, rank, local_experts)
 
-    stamps = torch.zeros(40, dtype=torch.int64, device="cuda")
+    stamps = torch.zeros(48, dtype=torch.int64, device="cuda")
     try:
         torch.manual_seed(17000 + rank * 1000003 + args.global_tokens)
         x = torch.randn(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)

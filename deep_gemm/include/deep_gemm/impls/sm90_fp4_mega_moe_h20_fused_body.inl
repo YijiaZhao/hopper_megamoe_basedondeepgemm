@@ -1464,6 +1464,9 @@
                             const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
                             DG_SPIN_WHILE(((l1_ready_mask = ptx::ld_acq_gpu(ptr)) & need) != need, 1357);
                         }
+                        // L2 tail probe: 37 = max time the LAST stage's L1 inputs were seen ready
+                        if (k_block_idx + kKBlocksPerStage >= num_k_blocks && ptx::get_lane_idx() == 0)
+                            stamp_max(37);
                     }
                 }
 
@@ -3693,6 +3696,8 @@
             // its own from registers) and runs the epilogue. The partial store of
             // the eventual finisher is wasted (8 KB) but keeps the protocol
             // role-free. Deadlock-free: no contributor waits on anything here.
+            // L2 tail probe: 40 = max L2 epilogue start (K loop drained)
+            if (kBlockIsL2 && epilogue_thread_idx == 0) stamp_max(40);
             if constexpr (kStreamK) {
                 if (num_k_splits > 1) {
                     constexpr uint32_t kNumPartialElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
@@ -4344,6 +4349,8 @@
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
             if (epilogue_thread_idx == 0) stamp_min(3);
+            // L2 tail probe (all SMs, globaltimer): 36 = max L2 task math start
+            if (kBlockIsL2 && epilogue_thread_idx == 0) stamp_max(36);
             // Per-task probe (SM0 thread0, SM cycles): 25/27 = L1 task time / count,
             // 26/28 = L2 task time / count, 29 = gap between consecutive tasks.
             // (kL2HalfRowTasks: an L2 task is 5 stages of 128 rows, 64 per WG.)
