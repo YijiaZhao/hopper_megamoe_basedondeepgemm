@@ -288,7 +288,7 @@ struct MegaMoEScheduler {
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
                 DG_SPIN_WHILE(static_cast<uint32_t>(
-                    (value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
+                    (value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
                     kNumSMs * kNumRanks, 90001);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
@@ -474,7 +474,7 @@ struct InterleavedMegaMoEScheduler {
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
                 DG_SPIN_WHILE(static_cast<uint32_t>(
-                    (value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
+                    (value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
                     kNumSMs * kNumRanks, 90002);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);

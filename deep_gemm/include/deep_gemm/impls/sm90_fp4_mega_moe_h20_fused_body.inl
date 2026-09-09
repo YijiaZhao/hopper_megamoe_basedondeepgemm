@@ -260,6 +260,9 @@
     // rank reaches after ALL its math tasks and its workspace cleanup, so no
     // destination still reads launch N's L1 pool / metadata or has counters pending.
     constexpr bool kPushDispatch = kPushDispatchRequested && kUseInterleavedScheduler;
+    // Lean push (see the dispatch prologue): no cross-rank count broadcast, the
+    // destination finalises its counts after NVLink barrier #1.
+    constexpr bool kLeanPush = kLeanRouting && kPushDispatch;
     // Strided pool layout: implied by push dispatch; `kStridedPoolDebug` (host env
     // DG_FP4_POOL_STRIDE_DEBUG=1, pull dispatch only) forces the same fixed-stride
     // pool addressing under the PULL protocol, to separate the layout's cost from
@@ -911,7 +914,6 @@
         // DESTINATION adds the kNumSMs * kNumRanks high word to its own 48 sums after
         // barrier #1 (one local atomic per expert). Data seen by the scheduler /
         // dispatch (`expert_recv_count`, `expert_recv_count_sum`) is unchanged.
-        constexpr bool kLeanPush = kLeanRouting && kPushDispatch;
         if constexpr (!kLeanPush) {
             // Count tokens per expert
             read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -1084,10 +1086,13 @@
                     // Finalise expert `sm_idx`'s count: every rank's row tickets landed
                     // before its barrier #1 signal (acquired by this CTA), so add the
                     // completeness high word the scheduler polls for and take the
-                    // total from the same atomic.
+                    // total from the same atomic. RELEASE (gpu): the scheduler's
+                    // acquire poll of this word then also covers the remotely written
+                    // rows (this CTA acquired barrier #1), so the lean-push L1 loaders
+                    // skip the per-task arrival-count spin (see the A loader).
                     uint32_t low = 0;
                     if (lane_idx == 0)
-                        low = static_cast<uint32_t>(ptx::atomic_add(
+                        low = static_cast<uint32_t>(ptx::atomic_add_rel_gpu(
                             workspace.get_expert_recv_count_sum_ptr(sm_idx),
                             static_cast<uint64_t>(kNumSMs * kNumRanks) << 32));
                     num_recv_tokens = __shfl_sync(0xffffffff, low, 0);
@@ -1389,7 +1394,12 @@
                     const bool arrival_probe_on = (phase_stamps != nullptr) && (sm_idx == 0) &&
                                                   (ptx::get_lane_idx() == 0);
                     const unsigned long long arrival_t0 = arrival_probe_on ? clock64() : 0ull;
-                    DG_SPIN_WHILE(ptx::ld_acq(ptr) != valid_m, 1329);
+                    // Lean push: every row of this launch was in the pool before the
+                    // scheduler's acquire of the expert count's completeness word (released
+                    // by the publishing CTA after it acquired NVLink barrier #1), so the
+                    // per-task arrival spin (1.3-2.6 us on the first task, H20) is skipped.
+                    if constexpr (!kLeanPush)
+                        DG_SPIN_WHILE(ptx::ld_acq(ptr) != valid_m, 1329);
                     if (arrival_probe_on) {
                         atomicAdd(phase_stamps + 34, clock64() - arrival_t0);
                         atomicAdd(phase_stamps + 35, 1ull);

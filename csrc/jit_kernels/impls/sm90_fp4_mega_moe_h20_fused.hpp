@@ -456,8 +456,11 @@ static void sm90_fp4_h20_fused_mega_moe(
         // H20 A/B (2026-09-09, phase stamps): prefetching 8 K-blocks per task is
         // ~neutral at M<=8 but pollutes L2 / steals HBM at M=16 (-6us L1 phase
         // when disabled), so default it off from 16 tokens up.
+        // Push dispatch: the first stage waits ~2 us for the pool instead of ~7,
+        // so the prefetch competes with the stage fills (M=8 H20: first-stage wait
+        // 7.3 vs 4.7 us, per-task L1 25.2 vs 24.2 us); default 0.
         .prefetch_weight_k_blocks = get_env<int>("DG_FP4_PREFETCH_KBLOCKS",
-                                                 num_tokens >= 16 ? 0 : 8),
+                                                 (num_tokens >= 16 || push_dispatch) ? 0 : 8),
         // DG_FP4_SWAP_PIPE stays OFF (no gain on H200 09-02 nor H20 09-09).
         // DG_FP4_DIST_BCAST defaults ON since the H20 09-09 A/B.
         //   DG_FP4_SWAP_PIPE=1   overlap decode(k+1) with WGMMA(k) in swapAB tiles
