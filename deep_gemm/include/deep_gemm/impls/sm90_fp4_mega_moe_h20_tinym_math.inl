@@ -187,11 +187,11 @@
         if (tm_tid == 0) {
             if constexpr (!kL2) {
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
-                while (ptx::ld_acq(ptr) != valid_m) {}
+                DG_SPIN_WHILE(ptx::ld_acq(ptr) != valid_m, 80190);
             } else {
                 constexpr uint64_t need = (1ull << kNKB) - 1ull;
                 const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                while ((ptx::ld_acq_gpu(ptr) & need) != need) {}
+                DG_SPIN_WHILE((ptx::ld_acq_gpu(ptr) & need) != need, 80194);
             }
         }
         tm_bar();
@@ -451,7 +451,7 @@
             if constexpr (kFineCombine) {
                 if (tm_tid == 0 && valid_m > 0) {
                     auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
-                    while (combine_mailbox_seq - ptx::ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize) {}
+                    DG_SPIN_WHILE(combine_mailbox_seq - ptx::ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize, 80455);
                     mailbox[4 + (combine_mailbox_seq & (fused_layout::kSM90FineCombineRingSize - 1))] =
                         pool_block_idx | (valid_m << 24);
                     ptx::st_rel_gpu(mailbox, combine_mailbox_seq + 1);

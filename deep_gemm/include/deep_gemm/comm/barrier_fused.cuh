@@ -27,9 +27,7 @@ CUTLASS_DEVICE void grid_sync(const fused_layout::Workspace& workspace,
         const auto old_value = ptx::atomic_add_rel(
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
         uint32_t new_value;
-        do {
-            new_value = ptx::ld_acq(count_ptr);
-        } while (((new_value ^ old_value) & kFinishSumTag) == 0);
+        DG_SPIN_WHILE((((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag) == 0, 70000 + kGridSyncIndex);
     }
     sync_scope();
 }

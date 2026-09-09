@@ -287,9 +287,9 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                DG_SPIN_WHILE(static_cast<uint32_t>(
+                    (value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
+                    kNumSMs * kNumRanks, 90001);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
@@ -473,10 +473,9 @@ struct InterleavedMegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(
-                        workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                DG_SPIN_WHILE(static_cast<uint32_t>(
+                    (value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
+                    kNumSMs * kNumRanks, 90002);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
@@ -726,8 +725,8 @@ struct InterleavedMegaMoEScheduler {
             const uint32_t dense_pool_block_idx = l2_full_task_idx / kNumL2BlockNs;
             const uint32_t num_required_l1_tasks =
                 get_num_l1_task_indices((dense_pool_block_idx + 1) * kNumL1BlockNs);
-            while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) <
-                   num_required_l1_tasks) {}
+            DG_SPIN_WHILE(ptx::ld_volatile(workspace.get_l1_task_count_ptr()) <
+                          num_required_l1_tasks, 90003);
             return task_info;
         }
         return task_info_t();

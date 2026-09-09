@@ -1262,7 +1262,7 @@
                 auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
                 uint32_t consumed = ptx::ld_volatile(mailbox + 1);
                 while (true) {
-                    while (ptx::ld_acq(mailbox) == consumed) {}
+                    DG_SPIN_WHILE(ptx::ld_acq(mailbox) == consumed, 1214);
                     const uint32_t entry = ptx::ld_volatile(
                         mailbox + 4 + (consumed & (fused_layout::kSM90FineCombineRingSize - 1)));
                     __syncwarp();
@@ -1377,7 +1377,7 @@
                 }
                 if constexpr (!kBlockIsL2) {
                     const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
-                    while (ptx::ld_acq(ptr) != valid_m) {}
+                    DG_SPIN_WHILE(ptx::ld_acq(ptr) != valid_m, 1329);
                     // Push dispatch: the rows are generic-proxy (remote st.global)
                     // writes read below through TMA (async proxy).
                     if constexpr (kPushDispatch)
@@ -1403,9 +1403,7 @@
                                               << ((k_block_begin + k_block_idx) * kNumL1BlocksPerL2KBlock);
                         if ((l1_ready_mask & need) != need) {
                             const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                            do {
-                                l1_ready_mask = ptx::ld_acq_gpu(ptr);
-                            } while ((l1_ready_mask & need) != need);
+                            DG_SPIN_WHILE(((l1_ready_mask = ptx::ld_acq_gpu(ptr)) & need) != need, 1357);
                         }
                     }
                 }
@@ -1659,7 +1657,7 @@
                 if constexpr (kFineCombine) {
                     if (epilogue_thread_idx == 0 && valid_m > 0) {
                         auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
-                        while (combine_mailbox_seq - ptx::ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize) {}
+                        DG_SPIN_WHILE(combine_mailbox_seq - ptx::ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize, 1611);
                         mailbox[4 + (combine_mailbox_seq & (fused_layout::kSM90FineCombineRingSize - 1))] =
                             pool_block_idx | (valid_m << 24);
                         ptx::st_rel_gpu(mailbox, combine_mailbox_seq + 1);
@@ -2875,7 +2873,7 @@
                         return;  // PUBLISHER: the finisher CTA completes this task
                     }
                     if (epilogue_thread_idx == 0) {
-                        while (ptx::ld_acq(flag) == 0u) {}
+                        DG_SPIN_WHILE(ptx::ld_acq(flag) == 0u, 2827);
                         *flag = 0u;
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -3450,7 +3448,7 @@
         if constexpr (kFineCombine) {
             if (epilogue_thread_idx == 0) {
                 auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
-                while (combine_mailbox_seq - ptx::ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize) {}
+                DG_SPIN_WHILE(combine_mailbox_seq - ptx::ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize, 3402);
                 mailbox[4 + (combine_mailbox_seq & (fused_layout::kSM90FineCombineRingSize - 1))] =
                     fused_layout::kSM90FineCombineDoneEntry;
                 ptx::st_rel_gpu(mailbox, combine_mailbox_seq + 1);
@@ -3522,7 +3520,7 @@
                 if (lane_idx == 0) {
                     const auto counter_ptr = workspace.get_combine_arrival_count_ptr(token_idx);
                     const int target = static_cast<int>(__popc(total_mask) * kNumRoutedL2BlockNs);
-                    while (ptx::ld_acq_sys(counter_ptr) != target) {}
+                    DG_SPIN_WHILE(ptx::ld_acq_sys(counter_ptr) != target, 3474);
                     *counter_ptr = 0;
                     asm volatile("fence.proxy.async.global;" ::: "memory");
                     stamp_max(6);

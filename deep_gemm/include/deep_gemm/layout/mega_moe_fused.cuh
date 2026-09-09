@@ -5,6 +5,21 @@
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
 
+// Spin-wait with an optional 10 s (at 2 GHz) timeout that prints the site tag and
+// traps (hang diagnosis; host env DG_FP4_SPIN_TIMEOUT=1 defines DG_FUSED_SPIN_TIMEOUT).
+#ifdef DG_FUSED_SPIN_TIMEOUT
+#define DG_SPIN_WHILE(cond, tag) \
+    for (long long __spin_t0 = clock64(); (cond); ) { \
+        if (clock64() - __spin_t0 > 20000000000ll) { \
+            printf("DeepGEMM fused spin timeout: tag=%d blk=%d thr=%d\n", \
+                   static_cast<int>(tag), static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x)); \
+            asm volatile("trap;"); \
+        } \
+    }
+#else
+#define DG_SPIN_WHILE(cond, tag) while (cond) {}
+#endif
+
 namespace deep_gemm::fused_layout {
 
 static constexpr int kNumCandidateBlockMs = 7;
