@@ -275,14 +275,14 @@
                               : workspace.get_splitk_l1_scratch_ptr(dense_p, n_block_idx);
             uint32_t* ticket = kL2 ? workspace.get_splitk_l2_flag_ptr(dense_p, n_block_idx)
                                    : workspace.get_splitk_l1_flag_ptr(dense_p, n_block_idx);
-            // Lane c owns tokens c and c + 4 of its rows
+            // Lane c owns tokens t == c (mod 4) of its rows. Static indices only: a
+            // runtime `acc[r][t]` puts the whole accumulator array in local memory.
             #pragma unroll
             for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
                 const uint32_t row = tm_row(r);
                 #pragma unroll
-                for (uint32_t j = 0; j < 2; ++ j) {
-                    const uint32_t t = tm_c + j * 4u;
-                    if (t < valid_m)
+                for (uint32_t t = 0; t < kTMMaxTokens; ++ t) {
+                    if ((t & 3u) == tm_c && t < valid_m)
                         tm_red_add_f32(slot + row * kTMMaxTokens + t, acc[r][t]);
                 }
             }
@@ -303,9 +303,8 @@
             for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
                 const uint32_t row = tm_row(r);
                 #pragma unroll
-                for (uint32_t j = 0; j < 2; ++ j) {
-                    const uint32_t t = tm_c + j * 4u;
-                    if (t < valid_m) {
+                for (uint32_t t = 0; t < kTMMaxTokens; ++ t) {
+                    if ((t & 3u) == tm_c && t < valid_m) {
                         float* p = slot + row * kTMMaxTokens + t;
                         acc[r][t] = __ldcg(p);
                         __stcg(p, 0.0f);
