@@ -192,6 +192,28 @@
         !kHalfTileTasks && !kL2HalfRowTasks && kUseInterleavedScheduler &&
         kDenseWeightTiles && BLOCK_N == 256;
     constexpr uint32_t kNumL2KSplits = kSplitKL2 ? fused_layout::kSM90SplitKL1NumKSplits : 1u;
+    // Stream-K (kStreamK; host env DG_FP4_STREAMK, gated by DG_FP4_STREAMK_MAX_M on
+    // the global token count): for tiny M the L1 phase is ~16 us per wave of
+    // (expert, n_block) tasks over the full K (24 K128 blocks) while most of the 78
+    // SMs idle (M=2: 16 tasks) or a 2-task second wave doubles it (M=8: 80 tasks).
+    // Instead, all (task, K-block) units of a phase are split into 78 contiguous,
+    // near-equal unit ranges (task-major, K inner; scheduler
+    // `claim_next_streamk_task`), so every SM streams ~1/78 of the phase's weights
+    // and the phase takes ~total_units / 78 K-block times. A range is published as
+    // consecutive segments (task + K-block sub-range: the K loop / RS pipeline is
+    // unchanged, partial last stages are already supported). Every segment of a
+    // tile with > 1 contributor stores its promoted fp32 partial to its worker's
+    // per-phase slot and takes an acq_rel ticket on the tile's arrival counter (the
+    // split-K flag); the last arriver (ticket == splits - 1) sums the partials in
+    // split order (deterministic: fixed order regardless of who finishes) and runs
+    // the normal epilogue (L1: SwiGLU + notify; L2: scatter + arrival counters). The
+    // L2 activation loader keeps its per-stage wait on the L1 bits of its own
+    // K-blocks. Same tier gate as kSplitKL2; the wave scheduler (and its tail
+    // splits) remains the fallback when the pool block count exceeds the scratch.
+    constexpr bool kStreamK =
+        kStreamKRequested && kSwapABRequested && (kMXFP4 || kQoQ) && BLOCK_M == 8 &&
+        !kHalfTileTasks && !kL2HalfRowTasks && kUseInterleavedScheduler &&
+        kDenseWeightTiles && BLOCK_N == 256;
     // Fast NVLink-barrier epilogue (kNvlFastEpilogue; host env DG_FP4_NVL_FAST_EPI):
     // see fused_comm::nvlink_barrier. Needs the first barrier (before dispatch
     // pull) to have a prologue grid sync, i.e. kDistributedExpertBcast, so that
@@ -223,7 +245,7 @@
         math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
         /* phase-specific task N: L1 256-row tasks, L2 TASK_BLOCK_N_L2-row tasks */
         kNumRoutedL1BlockNs, kNumRoutedL2BlockNs,
-        kNumL2KSplits>;
+        kNumL2KSplits, kStreamK>;
     constexpr bool kSplitMDecodedWeightReuse =
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
     constexpr uint32_t WG_BLOCK_M =
@@ -507,9 +529,13 @@
     auto task_infos = reinterpret_cast<task_info_t*>(
         task_info_empty_barriers +
         interleaved_scheduler_t::kNumScheduleStages);
+    // Stream-K: CTA-wide broadcast of the tile arrival ticket (epilogue thread 0 ->
+    // all epilogue threads), 16 B after the task mailbox.
+    auto smem_streamk_ticket = reinterpret_cast<uint32_t*>(
+        task_infos + interleaved_scheduler_t::kNumScheduleStages);
     constexpr uint32_t kInterleavedSchedulerSMEMBytes =
         2 * interleaved_scheduler_t::kNumScheduleStages * sizeof(Barrier) +
-        interleaved_scheduler_t::kNumScheduleStages * sizeof(task_info_t);
+        interleaved_scheduler_t::kNumScheduleStages * sizeof(task_info_t) + 16u;
     DG_STATIC_ASSERT(
         kInterleavedSchedulerSMEMBytes ==
             fused_layout::kSM90InterleavedSchedulerSMEMBytes,
@@ -657,12 +683,12 @@
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear1>{},
                      local_expert_idx, L1_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>(), 0u, 1u);
+                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u);
             } else {
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear2>{},
                      local_expert_idx, L2_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>(), 0u, 1u);
+                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u);
             }
         }
     };
@@ -683,24 +709,39 @@
                                               auto&& func) {
         // Split-K tasks (L1 tail: kSplitKL1, L2 tail: kSplitKL2) cover the K-block
         // range of their K split; every other task covers the whole K.
+        // Stream-K segments carry an explicit K-block range (all tasks of a
+        // stream-K launch are segments, most of them the whole K).
+        // (Marker: only stream-K segments carry a non-zero K-block end; every warp
+        // owns its own scheduler object and only the producer knows the mode.)
+        const bool is_streamk = kStreamK && task_info.get_k_block_end() != 0u;
         if (task_info.block_phase == fused_sched::BlockPhase::Linear1) {
-            const uint32_t num_k_splits = kSplitKL1 ? task_info.get_num_k_splits() : 1u;
-            const uint32_t k_split_idx = kSplitKL1 ? task_info.get_k_split_idx() : 0u;
+            const uint32_t num_k_splits = (kSplitKL1 || kStreamK) ? task_info.get_num_k_splits() : 1u;
+            const uint32_t k_split_idx = (kSplitKL1 || kStreamK) ? task_info.get_k_split_idx() : 0u;
+            const uint32_t num_k_blocks = is_streamk ?
+                task_info.get_k_block_end() - task_info.get_k_block_begin() :
+                get_split_k_num_blocks(L1_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits);
+            const uint32_t k_block_begin = is_streamk ? task_info.get_k_block_begin() :
+                (k_split_idx == 0u ? 0u : L1_SHAPE_K / BLOCK_K - num_k_blocks);
             func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear1>{},
-                 task_info.local_expert_idx,
-                 get_split_k_num_blocks(L1_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits),
+                 task_info.local_expert_idx, num_k_blocks,
                  task_info.m_block_idx, task_info.n_block_idx,
                  task_info.pool_block_idx, task_info.valid_m,
-                 k_split_idx, num_k_splits);
+                 k_split_idx, num_k_splits, k_block_begin,
+                 is_streamk ? task_info.get_first_worker_idx() : 0u);
         } else {
-            const uint32_t num_k_splits = kSplitKL2 ? task_info.get_num_k_splits() : 1u;
-            const uint32_t k_split_idx = kSplitKL2 ? task_info.get_k_split_idx() : 0u;
+            const uint32_t num_k_splits = (kSplitKL2 || kStreamK) ? task_info.get_num_k_splits() : 1u;
+            const uint32_t k_split_idx = (kSplitKL2 || kStreamK) ? task_info.get_k_split_idx() : 0u;
+            const uint32_t num_k_blocks = is_streamk ?
+                task_info.get_k_block_end() - task_info.get_k_block_begin() :
+                get_split_k_num_blocks(L2_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits);
+            const uint32_t k_block_begin = is_streamk ? task_info.get_k_block_begin() :
+                (k_split_idx == 0u ? 0u : L2_SHAPE_K / BLOCK_K - num_k_blocks);
             func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear2>{},
-                 task_info.local_expert_idx,
-                 get_split_k_num_blocks(L2_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits),
+                 task_info.local_expert_idx, num_k_blocks,
                  task_info.m_block_idx, task_info.n_block_idx,
                  task_info.pool_block_idx, task_info.valid_m,
-                 k_split_idx, num_k_splits);
+                 k_split_idx, num_k_splits, k_block_begin,
+                 is_streamk ? task_info.get_first_worker_idx() : 0u);
         }
     };
 
@@ -733,7 +774,7 @@
                     *workspace.get_l1_task_count_ptr() = 0;
                     *workspace.get_l2_task_count_ptr() = 0;
                 }
-                if constexpr (kSplitKL1 || kSplitKL2) {
+                if constexpr (kSplitKL1 || kSplitKL2 || kStreamK) {
                     // L1 and L2 flag slots are contiguous (L1 first)
                     for (uint32_t i = thread_idx; i < fused_layout::kSM90SplitKNumSlots; i += kNumDispatchThreads)
                         *workspace.get_splitk_l1_flag_ptr(0, i) = 0;
@@ -1103,13 +1144,13 @@
                                      const uint32_t& pool_block_idx,
                                      const uint32_t& valid_m,
                                      const uint32_t& k_split_idx,
-                                     const uint32_t& num_k_splits) {
+                                     const uint32_t& num_k_splits,
+                                     const uint32_t& k_block_begin,
+                                     const uint32_t& first_worker_idx) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
-            // First absolute K-block of this task (split-K K half 1 starts mid-K; the
-            // halves may differ in size, so half 1 starts at total - its own count)
-            const uint32_t k_block_begin = k_split_idx == 0u ? 0u :
-                (kBlockIsL2 ? L2_SHAPE_K / BLOCK_K : L1_SHAPE_K / BLOCK_K) - num_k_blocks;
+            // `k_block_begin`: first absolute K-block of this task (split-K K half 1
+            // / stream-K segments start mid-K).
             const auto tensor_map_a_ptr = kBlockIsL2 ?
                 &tensor_map_l2_acts : &tensor_map_l1_acts;
             const auto tensor_map_sfa_ptr = kBlockIsL2 ?
@@ -1263,11 +1304,11 @@
                                      const uint32_t& pool_block_idx,
                                      const uint32_t& valid_m,
                                      const uint32_t& k_split_idx,
-                                     const uint32_t& num_k_splits) {
+                                     const uint32_t& num_k_splits,
+                                     const uint32_t& k_block_begin,
+                                     const uint32_t& first_worker_idx) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
-            const uint32_t k_block_begin = k_split_idx == 0u ? 0u :
-                (kBlockIsL2 ? L2_SHAPE_K / BLOCK_K : L1_SHAPE_K / BLOCK_K) - num_k_blocks;
             const auto tensor_map_b_ptr = kBlockIsL2 ?
                 &tensor_map_l2_weights : &tensor_map_l1_weights;
             constexpr uint32_t shape_n = kBlockIsL2 ? L2_SHAPE_N : L1_SHAPE_N;
@@ -1393,7 +1434,9 @@
                                      const uint32_t& pool_block_idx,
                                      const uint32_t& valid_m,
                                      const uint32_t& k_split_idx,
-                                     const uint32_t& num_k_splits) {
+                                     const uint32_t& num_k_splits,
+                                     const uint32_t& k_block_begin,
+                                     const uint32_t& first_worker_idx) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
             // Per-phase task geometry. L2 half-row tasks: 128-row tasks, WG w owns rows
@@ -2499,7 +2542,91 @@
             // publisher (index i) only waits on L1-ready bits, the finisher (i + 1)
             // only on the publisher; by induction on the claim order every earlier
             // task completes.
-            if constexpr ((kSplitKL1 && !kBlockIsL2) || (kSplitKL2 && kBlockIsL2)) {
+            // Stream-K (kStreamK, active launches): n-way generalisation. Every
+            // contributor of a > 1-split tile stores its partial to its own worker
+            // slot (slot 0 if its segment starts at K-block 0, else slot 1: a worker
+            // has at most one of each per phase), then thread 0 takes an acq_rel
+            // ticket on the tile's arrival counter and broadcasts it through smem.
+            // Non-last arrivers leave (no epilogue); the last one (ticket ==
+            // splits - 1) resets the counter for the next launch, sums the partials
+            // in split order (contributor i == worker first + i, slot i == 0 ? 0 : 1;
+            // its own from registers) and runs the epilogue. The partial store of
+            // the eventual finisher is wasted (8 KB) but keeps the protocol
+            // role-free. Deadlock-free: no contributor waits on anything here.
+            if constexpr (kStreamK) {
+                if (num_k_splits > 1) {
+                    constexpr uint32_t kNumPartialElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
+                    DG_STATIC_ASSERT(!kStreamK ||
+                                     kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
+                                     fused_layout::kSM90SplitKL1PartialBytes,
+                                     "Stream-K partial slot size mismatch");
+                    DG_STATIC_ASSERT(!kStreamK || kNumSMs <= fused_layout::kSM90StreamKMaxSMs,
+                                     "Stream-K per-worker slots do not cover the grid");
+                    DG_STATIC_ASSERT(!kBlockIsL2 || kWGHalves == kSwapABWeightHalves,
+                                     "Stream-K L2 expects both weight halves per WG");
+                    const uint32_t worker_idx = first_worker_idx + k_split_idx;
+                    float* my_slot = workspace.get_streamk_scratch_ptr(
+                        kBlockIsL2, worker_idx, k_split_idx == 0u ? 0u : 1u);
+                    uint32_t* counter = kBlockIsL2 ?
+                        workspace.get_splitk_l2_flag_ptr(pool_block_idx, n_block_idx) :
+                        workspace.get_splitk_l1_flag_ptr(pool_block_idx, n_block_idx);
+                    #pragma unroll
+                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 4; ++ j)
+                                __stcg(my_slot + ((h * kSwapABTokenChunks + i) * 4 + j) * kNumEpilogueThreads + epilogue_thread_idx,
+                                       final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j]);
+                        }
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (epilogue_thread_idx == 0) {
+                        const uint32_t ticket = ptx::atomic_add_acq_rel(counter, 1u);
+                        if (ticket == num_k_splits - 1u)
+                            *counter = 0u;
+                        *smem_streamk_ticket = ticket;
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    const uint32_t ticket = *smem_streamk_ticket;
+                    if (ticket != num_k_splits - 1u)
+                        return;  // another contributor finishes this tile
+                    float partial_sum[kNumPartialElems];
+                    #pragma unroll
+                    for (uint32_t e = 0; e < kNumPartialElems; ++ e)
+                        partial_sum[e] = 0.0f;
+                    for (uint32_t c = 0; c < num_k_splits; ++ c) {
+                        if (c == k_split_idx) {
+                            #pragma unroll
+                            for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                                    #pragma unroll
+                                    for (uint32_t j = 0; j < 4; ++ j)
+                                        partial_sum[(h * kSwapABTokenChunks + i) * 4 + j] +=
+                                            final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j];
+                                }
+                            }
+                        } else {
+                            const float* slot = workspace.get_streamk_scratch_ptr(
+                                kBlockIsL2, first_worker_idx + c, c == 0u ? 0u : 1u);
+                            #pragma unroll
+                            for (uint32_t e = 0; e < kNumPartialElems; ++ e)
+                                partial_sum[e] += __ldcg(slot + e * kNumEpilogueThreads + epilogue_thread_idx);
+                        }
+                    }
+                    #pragma unroll
+                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 4; ++ j)
+                                final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j] =
+                                    partial_sum[(h * kSwapABTokenChunks + i) * 4 + j];
+                        }
+                    }
+                }
+            } else if constexpr ((kSplitKL1 && !kBlockIsL2) || (kSplitKL2 && kBlockIsL2)) {
                 if (num_k_splits > 1) {
                     constexpr uint32_t kNumPartialElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
                     // (Guarded: this discarded branch is not template-dependent.)
@@ -3065,7 +3192,9 @@
                                        const uint32_t& pool_block_idx,
                                        const uint32_t& valid_m,
                                        const uint32_t& k_split_idx,
-                                       const uint32_t& num_k_splits) {
+                                       const uint32_t& num_k_splits,
+                                       const uint32_t& k_block_begin,
+                                       const uint32_t& first_worker_idx) {
             using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
             constexpr bool kBlockIsL2 = BlockPhaseTag::value == fused_sched::BlockPhase::Linear2;
             if (epilogue_thread_idx == 0) stamp_min(3);
@@ -3081,7 +3210,7 @@
             }
             run_math_task_impl(block_phase, local_expert_idx, num_k_blocks,
                                m_block_idx, n_block_idx, pool_block_idx, valid_m,
-                               k_split_idx, num_k_splits);
+                               k_split_idx, num_k_splits, k_block_begin, first_worker_idx);
             if (epilogue_thread_idx == 0) stamp_max(kBlockIsL2 ? 5 : 4);
             if (ktask_probe_on) {
                 const unsigned long long kt_task1 = clock64();
@@ -3089,6 +3218,8 @@
                     atomicAdd(phase_stamps + (kBlockIsL2 ? 26 : 25), kt_task1 - kt_task0);
                     atomicAdd(phase_stamps + (kBlockIsL2 ? 28 : 27), 1ull);
                 }
+                // 30/31 = K-blocks (stream-K units) run by SM0 in L1 / L2
+                atomicAdd(phase_stamps + (kBlockIsL2 ? 31 : 30), static_cast<unsigned long long>(num_k_blocks));
                 ktask_prev_end = kt_task1;
             }
         };

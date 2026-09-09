@@ -465,6 +465,11 @@ template <
     // the BM8 MXFP4 RF swapAB path; see `kSplitKL2` in the body. Env DG_FP4_SPLITK_L2
     // (default 0: measured neutral/slower on H20, see the host).
     bool kSplitKL2Requested = false,
+    // Host-selected stream-K (tiny M: the (task, K128 block) units of a phase are
+    // split into kNumSMs contiguous ranges, n-way cross-CTA fp32 reduction per
+    // tile) on the BM8 MXFP4/QoQ RF swapAB path; see `kStreamK` in the body. Env
+    // DG_FP4_STREAMK / DG_FP4_STREAMK_MAX_M.
+    bool kStreamKRequested = false,
     // Host-selected fast NVLink-barrier epilogue (SM0 publishes completion through
     // one word instead of a second grid-wide sync); see `kNvlFastEpilogue` in the
     // body. Env DG_FP4_NVL_FAST_EPI (default 0: within noise on H20, see the host).

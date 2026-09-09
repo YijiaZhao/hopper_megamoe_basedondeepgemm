@@ -36,6 +36,7 @@ public:
         bool split_k_l1;
         bool l2_half_row_tasks;
         bool split_k_l2;
+        bool stream_k;
         bool nvl_fast_epilogue;
         bool fine_combine;
         int k_blocks_per_stage;
@@ -84,6 +85,7 @@ public:
             "        /* kSplitKL1Requested */ {},\n"
             "        /* kL2HalfRowTasksRequested */ {},\n"
             "        /* kSplitKL2Requested */ {},\n"
+            "        /* kStreamKRequested */ {},\n"
             "        /* kNvlFastEpilogueRequested */ {},\n"
             "        /* kFineCombineRequested */ {},\n"
             "        /* kKBlocksPerStageRequested */ {}",
@@ -101,6 +103,7 @@ public:
             args.split_k_l1 ? "true" : "false",
             args.l2_half_row_tasks ? "true" : "false",
             args.split_k_l2 ? "true" : "false",
+            args.stream_k ? "true" : "false",
             args.nvl_fast_epilogue ? "true" : "false",
             args.fine_combine ? "true" : "false",
             args.k_blocks_per_stage);
@@ -274,6 +277,18 @@ static void sm90_fp4_h20_fused_mega_moe(
     const bool split_k_l2 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
         dense_weight_tiles && get_env<int>("DG_FP4_SPLITK_L2", 0) != 0;
+    // Stream-K (kernel `kStreamK`): for tiny M the (task, K128 block) units of the
+    // L1 and of the L2 phase are split into 78 contiguous near-equal unit ranges (one
+    // per SM, task-major) with an n-way cross-CTA fp32 reduction per tile through
+    // the split-K scratch, replacing the wave scheduler and both tail splits. Only
+    // when the launch's global token count (num_tokens per rank x ranks, an upper
+    // bound: 1 token/rank == M <= 8 global) is <= DG_FP4_STREAMK_MAX_M (default 16),
+    // so M=128/512 launches are untouched. DG_FP4_STREAMK=1 enables (default 0).
+    const int num_global_tokens_upper = num_tokens * num_ranks;
+    const bool stream_k = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
+        !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
+        dense_weight_tiles && get_env<int>("DG_FP4_STREAMK", 0) != 0 &&
+        num_global_tokens_upper <= get_env<int>("DG_FP4_STREAMK_MAX_M", 16);
     // Fast NVLink-barrier epilogue (kernel `kNvlFastEpilogue`, needs the
     // distributed expert bcast so the first barrier has a prologue grid sync):
     // the two barriers with an epilogue (before dispatch pull, before combine)
@@ -376,6 +391,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         .split_k_l1 = split_k_l1,
         .l2_half_row_tasks = l2_half_row_tasks,
         .split_k_l2 = split_k_l2,
+        .stream_k = stream_k,
         .nvl_fast_epilogue = nvl_fast_epilogue,
         .fine_combine = fine_combine,
         // K128 blocks per pipeline stage on the BM8 RF swapAB tiers (MXFP4 and QoQ,

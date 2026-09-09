@@ -12,7 +12,8 @@ static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96
 static constexpr int kMaxCandidateBlockM = 192;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 384;
-static constexpr int kSM90InterleavedSchedulerSMEMBytes = 96;
+// 2 x 2 mbarriers (32 B) + 2 TaskInfo (64 B) + 16 B stream-K ticket broadcast word.
+static constexpr int kSM90InterleavedSchedulerSMEMBytes = 112;
 // SM90 fused MXFP4 BM8 (RF swapAB, 2 K128 blocks per stage): HALF-tile tasks
 // (128 of the 256 packed weight rows per task, intra-CTA K-split between the two
 // math WGs). Compile-time master gate shared by host (TMA boxes / SF granularity)
@@ -59,6 +60,21 @@ static constexpr uint32_t kSM90FineCombineRingSize = 4;
 static constexpr uint32_t kSM90FineCombineDoneEntry = 0xffffffffu;
 static constexpr uint64_t kSM90SplitKL1ScratchBytes =
     static_cast<uint64_t>(kSM90SplitKNumSlots) * kSM90SplitKL1PartialBytes;  // 11 MB (L1 5 MB + L2 6 MB)
+// Stream-K (kernel `kStreamK`, host env DG_FP4_STREAMK): all (task, K128 block) units
+// of a phase are split into kNumSMs contiguous near-equal ranges (task-major, K
+// inner); a range that enters or leaves a task mid-K contributes an fp32 partial
+// of that tile. Partials live in per-WORKER slots inside the split-K scratch: a
+// worker has at most two partial tiles per phase (the tile its range starts in,
+// slot 1 == starts mid-K, and the tile it ends in, slot 0 == starts at K-block 0;
+// a range inside one task uses slot 1 or 0 by the same rule). L1 and L2 use
+// separate slot spaces (a worker's L1 partial may still be unread when it writes
+// its L2 partial). The per-tile arrival counters are the split-K flags
+// (`get_splitk_l{1,2}_flag_ptr`, reader-reset by the finisher).
+static constexpr uint32_t kSM90StreamKMaxSMs = 160;
+static constexpr uint32_t kSM90StreamKSlotsPerWorker = 2;
+static constexpr uint32_t kSM90StreamKSlotsPerPhase = kSM90StreamKMaxSMs * kSM90StreamKSlotsPerWorker;
+static_assert(2 * kSM90StreamKSlotsPerPhase <= kSM90SplitKNumSlots,
+              "Stream-K per-worker partial slots must fit the split-K scratch");
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -308,6 +324,15 @@ struct Workspace {
         return reinterpret_cast<float*>(base +
             static_cast<uint64_t>(pool_block_idx * kSM90SplitKL1NumL1BlockNs + n_block_idx) *
                 kSM90SplitKL1PartialBytes);
+    }
+
+    // Stream-K: fp32 partial slot (phase, worker, slot) inside the split-K scratch
+    CUTLASS_DEVICE
+    float* get_streamk_scratch_ptr(const bool& is_l2, const uint32_t& worker_idx, const uint32_t& slot_idx) const {
+        return get_splitk_l1_scratch_ptr(0, 0) +
+            (static_cast<uint64_t>(is_l2 ? kSM90StreamKSlotsPerPhase : 0u) +
+             worker_idx * kSM90StreamKSlotsPerWorker + slot_idx) *
+                (kSM90SplitKL1PartialBytes / sizeof(float));
     }
 
     // Split-K L2: fp32 partial scratch slot (pool_block, L2 n_block), after the L1 slots
