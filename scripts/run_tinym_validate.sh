@@ -33,7 +33,7 @@ run_corr() {  # $1 = api, $2 = T, $3.. = env assignments
   local api=$1 T=$2; shift 2
   wait_idle
   echo "--- $api T=$T ($*)" >> "$LOG"
-  env "$@" timeout 900 $TR --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
+  env "$@" timeout 300 $TR --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
     --apis "$api" --tokens "$T" >> "$LOG" 2>&1
   echo "EXIT=$?" >> "$LOG"
 }
@@ -51,8 +51,11 @@ fi
 if [ "$MODE" = perf ] || [ "$MODE" = all ]; then
   for rep in ${REPS:-1 2}; do
     for q in mxfp4 qoq; do
-      wait_idle; DG_FP4_TINYM=1 LOG_TAG=_tinymON${TAG}$rep bash scripts/run_probe.sh $q 2 8 16 > /dev/null 2>&1
-      wait_idle; DG_FP4_TINYM=0 LOG_TAG=_tinymOFF${TAG}$rep bash scripts/run_probe.sh $q 2 8 16 > /dev/null 2>&1
+      # one probe per invocation under a hard timeout so a hang never holds the GPUs
+      for M in 2 8 16; do
+        wait_idle; DG_FP4_TINYM=1 LOG_TAG=_tinymON${TAG}$rep timeout 300 bash scripts/run_probe.sh $q $M > /dev/null 2>&1
+        wait_idle; DG_FP4_TINYM=0 LOG_TAG=_tinymOFF${TAG}$rep timeout 300 bash scripts/run_probe.sh $q $M > /dev/null 2>&1
+      done
     done
   done
   echo ALL_PERF_DONE >> "$LOG"
