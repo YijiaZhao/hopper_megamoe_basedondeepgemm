@@ -41,7 +41,8 @@
     constexpr uint32_t kTMPbExpertOff = kTMLutOff + 128u;                        // [64] u32
     constexpr uint32_t kTMPbValidOff = kTMPbExpertOff + 64u * 4u;                // [64] u32
     constexpr uint32_t kTMPbPoolOff = kTMPbValidOff + 64u * 4u;                  // [64] u32 pool block of dense block
-    constexpr uint32_t kTMFlagOff = kTMPbPoolOff + 64u * 4u;                     // u32
+    constexpr uint32_t kTMFlagOff = kTMPbPoolOff + 64u * 4u;                     // u32 (last-arriver broadcast)
+    constexpr uint32_t kTMNumPbOff = kTMFlagOff + 4u;                            // u32 (pool block count)
     constexpr uint32_t kTMSmemBytes = kTMFlagOff + 16u;
     DG_STATIC_ASSERT(kTMSmemBytes <= kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_PACKED_B_SIZE_PER_STAGE),
                      "TinyM GEMV staging must fit the idle pipeline stages");
@@ -57,6 +58,7 @@
     // Pool block index of dense block p (== p unless push dispatch strides the pool)
     uint32_t* tm_pb_pool = reinterpret_cast<uint32_t*>(tm_smem + kTMPbPoolOff);
     uint32_t* tm_flag = reinterpret_cast<uint32_t*>(tm_smem + kTMFlagOff);
+    uint32_t* tm_num_pb = reinterpret_cast<uint32_t*>(tm_smem + kTMNumPbOff);
 
     const uint32_t tm_row8 = lane_idx >> 2;   // row within an 8-row group
     const uint32_t tm_c = lane_idx & 3u;      // 16 B chunk / K column of the row
@@ -129,13 +131,17 @@
     };
 
     // ---------------- One-time init ----------------
-    // Every math warp caches the per-expert recv counts (the B loader normally does
-    // this for the scheduler); warp 0 then tabulates (expert, valid_m) per pool block.
-    interleaved_scheduler.fetch_expert_recv_count();
-    const uint32_t tm_num_pool_blocks = interleaved_scheduler.num_total_m_blocks;
-    DG_DEVICE_ASSERT(tm_num_pool_blocks <= 64u);  // smem tables above
+    // Math warp 0 alone spins on the per-expert recv counters (the B loader normally
+    // does this for the scheduler; 8 warps x 78 CTAs polling the counters that the
+    // remote ranks' sys-scope atomics target slowed the routing phase by ~35 us at
+    // M=16) and tabulates (expert, valid_m, pool block) per dense block for the others.
     if (epilogue_warp_idx == 0) {
-        for (uint32_t p = 0; p < tm_num_pool_blocks; ++ p) {
+        interleaved_scheduler.fetch_expert_recv_count();
+        const uint32_t num_pb = interleaved_scheduler.num_total_m_blocks;
+        DG_DEVICE_ASSERT(num_pb <= 64u);  // smem tables above
+        if (lane_idx == 0)
+            *tm_num_pb = num_pb;
+        for (uint32_t p = 0; p < num_pb; ++ p) {
             const auto t = interleaved_scheduler.create_task(
                 fused_sched::BlockPhase::Linear1, p * kNumRoutedL1BlockNs, kNumRoutedL1BlockNs,
                 L1_SHAPE_N, L1_SHAPE_K);
@@ -166,6 +172,7 @@
         }
     }
     tm_bar();
+    const uint32_t tm_num_pool_blocks = *tm_num_pb;
 
     // ---------------- Activation staging (CTA-wide, per phase x pool block) ----------------
     // MXFP4: fp8 e4m3 -> fp16 x 2^-6 (exact), [token][K] halves. QoQ: int8 copy plus the
@@ -611,37 +618,42 @@
             }
         };
 
-        // Prime the prefetch ring, then walk the range kTMPrefetch units per iteration
-        #pragma unroll
-        for (uint32_t s = 0; s < kTMPrefetch; ++ s) {
-            if (u_begin + s < u_end)
-                issue_unit(raw_q[s], raw_meta[s], u_begin + s);
-        }
-        for (uint32_t u = u_begin; u < u_end; u += kTMPrefetch) {
-            #pragma unroll
-            for (uint32_t s = 0; s < kTMPrefetch; ++ s) {
-                const uint32_t uu = u + s;
-                if (uu < u_end) {
-                    const uint32_t p = uu / kUnitsPerPoolBlock;
-                    const uint32_t rem = uu - p * kUnitsPerPoolBlock;
-                    const uint32_t n = rem / kNKB, k = rem - n * kNKB;
-                    const uint32_t tile = p * kNB + n;
-                    if (tile != cur_tile) {
-                        flush_current();
-                        cur_tile = tile;
-                        k_first = k;
-                        if (p != cur_pool_block) {
-                            cur_pool_block = p;
-                            cur_valid_m = tm_pb_valid[p];
-                            tm_stage_acts(is_l2_tag, tm_pb_pool[p], cur_valid_m);
-                        }
-                    }
-                    consume_unit(raw_q[s], raw_meta[s], k, cur_valid_m);
-                    k_prev = k;
-                    if (uu + kTMPrefetch < u_end)
-                        issue_unit(raw_q[s], raw_meta[s], uu + kTMPrefetch);
+        // Walk the range kTMPrefetch units per iteration. Slot indices are compile-time
+        // constants (integral_constant steps), so the ring stays in registers.
+        const auto step = [&](const auto& slot_tag, const uint32_t& uu) {
+            constexpr uint32_t S = std::remove_cv_t<std::remove_reference_t<decltype(slot_tag)>>::value;
+            const uint32_t p = uu / kUnitsPerPoolBlock;
+            const uint32_t rem = uu - p * kUnitsPerPoolBlock;
+            const uint32_t n = rem / kNKB, k = rem - n * kNKB;
+            const uint32_t tile = p * kNB + n;
+            if (tile != cur_tile) {
+                flush_current();
+                cur_tile = tile;
+                k_first = k;
+                if (p != cur_pool_block) {
+                    cur_pool_block = p;
+                    cur_valid_m = tm_pb_valid[p];
+                    tm_stage_acts(is_l2_tag, tm_pb_pool[p], cur_valid_m);
                 }
             }
+            consume_unit(raw_q[S], raw_meta[S], k, cur_valid_m);
+            k_prev = k;
+            if (uu + kTMPrefetch < u_end)
+                issue_unit(raw_q[S], raw_meta[S], uu + kTMPrefetch);
+        };
+        using tm_ic0 = std::integral_constant<uint32_t, 0>;
+        using tm_ic1 = std::integral_constant<uint32_t, (kTMPrefetch > 1 ? 1 : 0)>;
+        using tm_ic2 = std::integral_constant<uint32_t, (kTMPrefetch > 2 ? 2 : 0)>;
+        using tm_ic3 = std::integral_constant<uint32_t, (kTMPrefetch > 3 ? 3 : 0)>;
+        issue_unit(raw_q[0], raw_meta[0], u_begin);
+        if constexpr (kTMPrefetch > 1) { if (u_begin + 1 < u_end) issue_unit(raw_q[tm_ic1::value], raw_meta[tm_ic1::value], u_begin + 1); }
+        if constexpr (kTMPrefetch > 2) { if (u_begin + 2 < u_end) issue_unit(raw_q[tm_ic2::value], raw_meta[tm_ic2::value], u_begin + 2); }
+        if constexpr (kTMPrefetch > 3) { if (u_begin + 3 < u_end) issue_unit(raw_q[tm_ic3::value], raw_meta[tm_ic3::value], u_begin + 3); }
+        for (uint32_t u = u_begin; u < u_end; u += kTMPrefetch) {
+            step(tm_ic0{}, u);
+            if constexpr (kTMPrefetch > 1) { if (u + 1 < u_end) step(tm_ic1{}, u + 1); }
+            if constexpr (kTMPrefetch > 2) { if (u + 2 < u_end) step(tm_ic2{}, u + 2); }
+            if constexpr (kTMPrefetch > 3) { if (u + 3 < u_end) step(tm_ic3{}, u + 3); }
         }
         flush_current();
     };
