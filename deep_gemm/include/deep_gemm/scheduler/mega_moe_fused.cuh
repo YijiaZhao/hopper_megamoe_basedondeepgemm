@@ -280,16 +280,26 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0, 0, 0};
     }
 
-    CUTLASS_DEVICE void fetch_expert_recv_count() {
+    // `push_done_ptr` (kPushDoneFlags): wait for the push DONE count to reach
+    // `push_done_target` (acquire.sys: every source rank's rows and tickets of this
+    // launch are then visible) and take the final low words directly, instead of
+    // polling the per-expert completeness high word published by SM e.
+    CUTLASS_DEVICE void fetch_expert_recv_count(const int* push_done_ptr = nullptr,
+                                                const int& push_done_target = 0) {
         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                DG_SPIN_WHILE(static_cast<uint32_t>(
-                    (value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
-                    kNumSMs * kNumRanks, 90001);
+                if (push_done_ptr != nullptr) {
+                    DG_SPIN_WHILE(ptx::ld_acq_sys(push_done_ptr) - push_done_target < 0, 90001 + 10);
+                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                } else {
+                    DG_SPIN_WHILE(static_cast<uint32_t>(
+                        (value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
+                        kNumSMs * kNumRanks, 90001);
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
@@ -467,15 +477,25 @@ struct InterleavedMegaMoEScheduler {
         return __reduce_add_sync(0xffffffff, num_blocks);
     }
 
-    CUTLASS_DEVICE void fetch_expert_recv_count() {
+    // `push_done_ptr` (kPushDoneFlags): wait for the push DONE count to reach
+    // `push_done_target` (acquire.sys: every source rank's rows and tickets of this
+    // launch are then visible) and take the final low words directly, instead of
+    // polling the per-expert completeness high word published by SM e.
+    CUTLASS_DEVICE void fetch_expert_recv_count(const int* push_done_ptr = nullptr,
+                                                const int& push_done_target = 0) {
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                DG_SPIN_WHILE(static_cast<uint32_t>(
-                    (value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
-                    kNumSMs * kNumRanks, 90002);
+                if (push_done_ptr != nullptr) {
+                    DG_SPIN_WHILE(ptx::ld_acq_sys(push_done_ptr) - push_done_target < 0, 90002 + 10);
+                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                } else {
+                    DG_SPIN_WHILE(static_cast<uint32_t>(
+                        (value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
+                        kNumSMs * kNumRanks, 90002);
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }

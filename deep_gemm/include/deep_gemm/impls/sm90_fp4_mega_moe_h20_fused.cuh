@@ -499,6 +499,10 @@ template <
     // Lean routing (host env DG_FP4_LEAN_ROUTING): see the dispatch prologue in
     // the body (`kLeanRouting` / `kLeanPush`).
     bool kLeanRouting = true,
+    // Push DONE flags (host env DG_FP4_PUSH_DONE_FLAGS, default 1; lean push only):
+    // NVLink barrier #1 is replaced by one release.sys DONE signal per source rank
+    // into every destination's DONE count; see `kPushDoneFlags` in the body.
+    bool kPushDoneFlagsRequested = true,
     // QoQ inline s2 (host env DG_FP4_QOQ_INLINE_S2, default 1): fold the per-(row,
     // K128) integer s2 into the int8 weight at RF decode time and accumulate the
     // whole L1 task K range in one int32 set (see `kInlineS2` in the body).

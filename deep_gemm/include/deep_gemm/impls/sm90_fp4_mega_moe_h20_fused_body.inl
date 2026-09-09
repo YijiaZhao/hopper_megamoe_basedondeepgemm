@@ -265,6 +265,27 @@
     // Lean push (see the dispatch prologue): no cross-rank count broadcast, the
     // destination finalises its counts after NVLink barrier #1.
     constexpr bool kLeanPush = kLeanRouting && kPushDispatch;
+    // Push DONE flags (kPushDoneFlags; host env DG_FP4_PUSH_DONE_FLAGS, default 1):
+    // barrier #1 is not executed. Sender: after a CTA's dispatch warps issued their
+    // last pushed row, thread 0 takes a CTA arrival ticket (atom.acq_rel.gpu, after the
+    // CTA barrier: releases this CTA's remote stores, acquires the earlier CTAs'); the
+    // last CTA resets the ticket and red.release.sys-adds 1 into every rank's DONE
+    // count (its own included). Receiver: the DONE target of a launch is
+    // kNumRanks * (epoch + 1) where `epoch` counts this rank's completed flag
+    // launches (bumped by SM0 in the workspace cleanup, i.e. after every reader of
+    // this launch: the task producers fetch the counts before any math task exists,
+    // SM e's publisher runs before SM e's epilogue warps join the math). Waiters:
+    // (1) every CTA's task producer (ld.acquire.sys of the DONE count, then the final
+    // low words of the 6 sums; the acquire covers the rows for the lean-push loaders,
+    // which skip the per-task arrival spin), (2) SM e's dispatch warp 0, which then
+    // publishes the completeness high word + L1 arrival counts exactly as before (the
+    // tiny-M loaders and the comm-window L2 prefetch poll them). Everything else
+    // barrier #1 ordered under lean push (nothing: no send counts, no broadcast, no
+    // top-k index writes) is untouched; the pool-reuse argument rests on barrier #3.
+    // The DONE count is monotonic (never reset) and a launch N+1 signal can only be
+    // issued by a rank that passed barrier #3 of launch N, i.e. after every rank read
+    // launch N's target, so early (skewed) arrivals for N+1 are counted correctly.
+    constexpr bool kPushDoneFlags = kPushDoneFlagsRequested && kLeanPush;
     // Strided pool layout: implied by push dispatch; `kStridedPoolDebug` (host env
     // DG_FP4_POOL_STRIDE_DEBUG=1, pull dispatch only) forces the same fixed-stride
     // pool addressing under the PULL protocol, to separate the layout's cost from
@@ -838,7 +859,13 @@
     };
 
     const auto produce_interleaved_blocks = [&](auto&& func) {
-        interleaved_scheduler.fetch_expert_recv_count();
+        if constexpr (kPushDoneFlags) {
+            interleaved_scheduler.fetch_expert_recv_count(
+                workspace.get_push_done_count_ptr(),
+                static_cast<int>(kNumRanks * (ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u)));
+        } else {
+            interleaved_scheduler.fetch_expert_recv_count();
+        }
         while (true) {
             interleaved_scheduler.wait_task_slot_empty();
             const auto task_info = interleaved_scheduler.claim_next_task();
@@ -855,6 +882,11 @@
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
                 *workspace.get_expert_send_count_ptr(i) = 0;
+            if constexpr (kPushDoneFlags) {
+                // Next launch's DONE target (see `kPushDoneFlags`)
+                if (thread_idx == 0)
+                    *workspace.get_push_epoch_ptr() = ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u;
+            }
             if constexpr (kUseInterleavedScheduler) {
                 if (thread_idx == 0) {
                     *workspace.get_l1_task_count_ptr() = 0;
@@ -1025,6 +1057,19 @@
                 }
             }
             if (thread_idx == 0) stamp_max(9);  // push issued
+            if constexpr (kPushDoneFlags) {
+                // CTA arrival ticket; the last CTA signals DONE to every rank.
+                ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+                if (thread_idx == 0) {
+                    const uint32_t arrived = ptx::atomic_add_acq_rel(workspace.get_push_cta_arrival_ptr(), 1u);
+                    if (arrived == kNumSMs - 1) {
+                        *workspace.get_push_cta_arrival_ptr() = 0;
+                        #pragma unroll
+                        for (uint32_t r = 0; r < kNumRanks; ++ r)
+                            ptx::red_add_rel_sys(sym_buffer.map(workspace.get_push_done_count_ptr(), r), 1);
+                    }
+                }
+            }
         } else {
             // Write source token-topk indices to remote ranks
             read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
@@ -1089,20 +1134,22 @@
                 asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_before_nvl_barrier));
         }
 
-        fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            kDistributedExpertBcast || kLeanPush, true,
-            /* fast epilogue: barrier #1 of the launch */ kNvlFastEpilogue, nvl_done_base, 1u);
-        if (thread_idx == 0) {
-            stamp_max(1);
-            if (sm_idx == 0) {
-                stamp_accumulate(13);
-                if (phase_stamps != nullptr) {
-                    atomicAdd(phase_stamps + 14, 1ull);
-                    unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-                    atomicAdd(phase_stamps + 16, t - t_before_nvl_barrier);  // barrier wait incl. skew
+        if constexpr (!kPushDoneFlags) {
+            fused_comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                kDistributedExpertBcast || kLeanPush, true,
+                /* fast epilogue: barrier #1 of the launch */ kNvlFastEpilogue, nvl_done_base, 1u);
+            if (thread_idx == 0) {
+                stamp_max(1);
+                if (sm_idx == 0) {
+                    stamp_accumulate(13);
+                    if (phase_stamps != nullptr) {
+                        atomicAdd(phase_stamps + 14, 1ull);
+                        unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+                        atomicAdd(phase_stamps + 16, t - t_before_nvl_barrier);  // barrier wait incl. skew
+                    }
                 }
             }
         }
@@ -1113,6 +1160,25 @@
             // per lane, with release.gpu: the loaders' acquire on the count then also
             // covers the remotely written rows (this thread acquired barrier #1).
             if (warp_idx == 0 and sm_idx < kNumExpertsPerRank) {
+                if constexpr (kPushDoneFlags) {
+                    // Wait for every rank's DONE (replaces barrier #1 for this publisher;
+                    // slots 1 / 13 / 14 / 16 keep their meaning: SM0's wait incl. skew).
+                    if (lane_idx == 0) {
+                        const int target = static_cast<int>(
+                            kNumRanks * (ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u));
+                        DG_SPIN_WHILE(ptx::ld_acq_sys(workspace.get_push_done_count_ptr()) - target < 0, 1094);
+                        stamp_max(1);
+                        if (sm_idx == 0) {
+                            stamp_accumulate(13);
+                            if (phase_stamps != nullptr) {
+                                atomicAdd(phase_stamps + 14, 1ull);
+                                unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+                                atomicAdd(phase_stamps + 16, t - t_before_nvl_barrier);
+                            }
+                        }
+                    }
+                    __syncwarp();
+                }
                 uint32_t num_recv_tokens;
                 if constexpr (kLeanPush) {
                     // Finalise expert `sm_idx`'s count: every rank's row tickets landed

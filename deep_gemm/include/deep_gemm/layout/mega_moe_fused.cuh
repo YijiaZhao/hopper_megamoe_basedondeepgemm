@@ -206,7 +206,13 @@ struct Workspace {
     // [32..35]: `uint32_t` L2 schedule task counter
     // [36..39]: `uint32_t` NVLink barrier completion count (fast epilogue; SM0-written,
     //           never reset: read at kernel start by every CTA as the launch base)
-    // [40..127]: padding to isolate hot schedule and expert counters
+    // [40..43]: `int` push DONE count (kPushDoneFlags): every source rank red.release.sys-adds
+    //           1 after its last pushed row of a launch; never reset (monotonic)
+    // [44..47]: `uint32_t` push epoch: launches with kPushDoneFlags completed on this rank
+    //           (SM0 increments it in the workspace cleanup); DONE target = ranks * (epoch + 1)
+    // [48..51]: `uint32_t` push CTA arrival count (the last CTA of a launch signals DONE
+    //           to every rank and resets it)
+    // [52..127]: padding to isolate hot schedule and expert counters
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
     template <uint32_t kIndex = 0>
@@ -240,6 +246,21 @@ struct Workspace {
     CUTLASS_DEVICE
     uint32_t* get_nvl_done_count_ptr() const {
         return math::advance_ptr<uint32_t>(base, 36u);
+    }
+
+    CUTLASS_DEVICE
+    int* get_push_done_count_ptr() const {
+        return math::advance_ptr<int>(base, 40u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_push_epoch_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 44u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_push_cta_arrival_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 48u);
     }
 
     CUTLASS_DEVICE
