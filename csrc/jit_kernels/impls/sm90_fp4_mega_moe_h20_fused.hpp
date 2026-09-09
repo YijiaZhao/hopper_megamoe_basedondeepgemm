@@ -49,6 +49,8 @@ public:
         bool qoq_inline_s2;
         int qoq_inline_s2_frags;
         bool qoq_inline_s2_ilv;
+        bool qoq_inline_s2_prefetch_packed;
+        bool qoq_inline_s2_rawu8;
         bool strided_pool_debug;
         SM90FP4H20FusedConfig config;
 
@@ -110,6 +112,8 @@ public:
             "        /* kQoQInlineS2 */ {},\n"
             "        /* kQoQInlineS2Frags */ {},\n"
             "        /* kQoQInlineS2Ilv */ {},\n"
+            "        /* kQoQInlineS2PrefetchPacked */ {},\n"
+            "        /* kQoQInlineS2RawU8 */ {},\n"
             "        /* kStridedPoolDebug */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
@@ -136,6 +140,8 @@ public:
             args.qoq_inline_s2 ? "true" : "false",
             args.qoq_inline_s2_frags,
             args.qoq_inline_s2_ilv ? "true" : "false",
+            args.qoq_inline_s2_prefetch_packed ? "true" : "false",
+            args.qoq_inline_s2_rawu8 ? "true" : "false",
             args.strided_pool_debug ? "true" : "false");
         return fmt::format(R"(
 {}
@@ -531,6 +537,14 @@ static void sm90_fp4_h20_fused_mega_moe(
         // Off: ptxas still serialises that loop (C7513) so it measured 2675 ns per
         // stage vs 1250-1290 for the 2-buffer loop (H20 2026-09-09).
         .qoq_inline_s2_ilv = qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0,
+        // DG_FP4_QIS2_PREFETCH_PACKED (default 1): in the 2-buffer inline-s2 loop, issue
+        // the LDS of the next block's packed weight words before the wgmma wait that
+        // frees its fragment buffer, so the smem latency overlaps the wait.
+        .qoq_inline_s2_prefetch_packed = qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) != 0,
+        // DG_FP4_QIS2_RAWU8 (default 1): raw-u8 decode (nibble extraction only), RS wgmma
+        // s32.u8.s8 into a per-K128-block int32 set and an exact int32 deferred affine
+        // (s2 * acc_blk - z * s2 * colsum(B)) at block retire; bit-identical sums.
+        .qoq_inline_s2_rawu8 = qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 1) != 0,
         .strided_pool_debug = strided_pool_debug,
         .config = config,
         .y = y.data_ptr(),
@@ -571,7 +585,9 @@ static void sm90_fp4_h20_fused_mega_moe(
         ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "") +
         ((qoq && std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4) != 2) ?
             fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "") +
-        ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "");
+        ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
+        ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
+        ((qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 1) == 0) ? "_noraw" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

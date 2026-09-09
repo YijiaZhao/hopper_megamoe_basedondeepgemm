@@ -592,6 +592,13 @@
     constexpr uint32_t kInterleavedSchedulerSMEMBytes =
         2 * interleaved_scheduler_t::kNumScheduleStages * sizeof(Barrier) +
         interleaved_scheduler_t::kNumScheduleStages * sizeof(task_info_t) + 16u;
+    // QoQ inline-s2 raw-u8 loop (kQIS2RawU8): per-(stage, K128 block) int32 column
+    // sums of the int8 activation tile, colsum[token], written by the math WG after
+    // the stage's full barrier and read at block retire. 32-token slots (N_SWAP <= 32).
+    constexpr uint32_t kQIS2ColsumStride = 32u;
+    constexpr uint32_t kQIS2ColsumBytes =
+        kQoQ && kQoQInlineS2RawU8 ? kNumStages * kKBlocksPerStage * kQIS2ColsumStride * 4u : 0u;
+    auto smem_qis2_colsum = reinterpret_cast<int32_t*>(smem_streamk_ticket + 4);
     DG_STATIC_ASSERT(
         kInterleavedSchedulerSMEMBytes ==
             fused_layout::kSM90InterleavedSchedulerSMEMBytes,
@@ -609,6 +616,8 @@
     // stages plus the fixed regions and barriers.
     DG_STATIC_ASSERT(kKBlocksPerStage == 1 || kInterleavedSMEMEnd <= 232448,
                      "Multi-K-block pipeline exceeds the SM90 shared-memory capacity");
+    DG_STATIC_ASSERT(kQIS2ColsumBytes == 0 || kInterleavedSMEMEnd + kQIS2ColsumBytes <= 232448,
+                     "QoQ inline-s2 colsum slots exceed the SM90 shared-memory capacity");
 
     // =====================================================================
     // Initialization
@@ -1833,11 +1842,6 @@
                 auto run_swap_ab_rf = [&]<uint32_t N_SWAP>() {
                     // QoQ: int8 RS atoms have no N=24; pad to 32 like the SS path (extra
                     // token columns are masked by `token < valid_m`).
-                    using SwapRS = typename std::conditional_t<kQoQ,
-                        mma::sm90::INT8MMARSSelector<(N_SWAP == 24 ? 32 : N_SWAP)>,
-                        mma::sm90::FP8MMARSSelector<N_SWAP>>::type;
-                    DG_STATIC_ASSERT(BLOCK_K / SwapRS::K == 4, "Expects 4 K32 steps per K128");
-                    constexpr uint32_t kSwapAccum = SwapRS::kNumAccum;
                     // QoQ inline s2 (kQoQInlineS2, host env DG_FP4_QOQ_INLINE_S2): L1 only
                     // (the L1 int8 activations carry ONE per-token scale repeated into
                     // every K128 SF slot; the L2 activations are re-quantised per
@@ -1850,6 +1854,29 @@
                     // 2-K-block stages only (the 1-/4-block loops keep the promote path).
                     constexpr bool kInlineS2 = kQoQ && kQoQInlineS2 && !kBlockIsL2 &&
                                                !kHalfTileTasks && kKBlocksPerStage == 2;
+                    // The plain 2-fragment-buffer inline-s2 loop takes two knobs
+                    // (host env DG_FP4_QIS2_PREFETCH_PACKED / DG_FP4_QIS2_RAWU8):
+                    //  * prefetch: the next block's packed words are loaded (LDS) before
+                    //    the wgmma wait that frees its fragment buffer, decoded after it;
+                    //  * raw-u8: the decode only widens the nibble codes to bytes
+                    //    (u8), the RS wgmma is s32.u8.s8 into a per-K128-block int32 set
+                    //    (two sets alternate) and the affine part is folded exactly in
+                    //    int32 once per block at retire:
+                    //      task += s2[row] * acc_blk[row][tok] - (z[row] * s2[row]) * colsum[tok]
+                    //    with colsum[tok] = sum_k B[k][tok] over the block (computed by
+                    //    this WG from the int8 tile, `compute_colsum_rf`). Same integer
+                    //    sum as the fused (code - z) * s2 decode, ~2 fewer ALU ops per
+                    //    A word.
+                    constexpr bool kQIS2Plain = kInlineS2 && !kQoQInlineS2Ilv && kQoQInlineS2Frags == 2;
+                    constexpr bool kQIS2Prefetch = kQIS2Plain && kQoQInlineS2PrefetchPacked;
+                    constexpr bool kQIS2RawU8 = kQIS2Plain && kQoQInlineS2RawU8;
+                    using SwapRS = typename std::conditional_t<kQoQ,
+                        std::conditional_t<kQIS2RawU8,
+                            mma::sm90::INT8U8MMARSSelector<(N_SWAP == 24 ? 32 : N_SWAP)>,
+                            mma::sm90::INT8MMARSSelector<(N_SWAP == 24 ? 32 : N_SWAP)>>,
+                        mma::sm90::FP8MMARSSelector<N_SWAP>>::type;
+                    DG_STATIC_ASSERT(BLOCK_K / SwapRS::K == 4, "Expects 4 K32 steps per K128");
+                    constexpr uint32_t kSwapAccum = SwapRS::kNumAccum;
                     // One accumulator set per K-block of a stage: the two K128 blocks
                     // carry different per-token activation scales, so they are promoted
                     // separately (the RS WGMMAs of both run concurrently).
@@ -1858,7 +1885,7 @@
                     // block b is promoted right after wait<1> following issue(b+1), which
                     // frees its set for block b+2 (4 sets = +32 regs would spill).
                     constexpr uint32_t kNumAccKBlocks =
-                        (kHalfTileTasks || kInlineS2) ? 1u : cute::min(kKBlocksPerStage, 2u);
+                        (kHalfTileTasks || (kInlineS2 && !kQIS2RawU8)) ? 1u : cute::min(kKBlocksPerStage, 2u);
                     // Per-64 L2 activation scales (kHalfTileTasks): K32 steps {0,1} and
                     // {2,3} of a K128 block accumulate separately (same commit group)
                     // and are promoted with their own SF row.
@@ -1878,6 +1905,8 @@
                     // DG_FP4_QIS2_FRAGS); every other loop uses exactly two.
                     constexpr uint32_t kFragBufs = (kInlineS2 && !kQoQInlineS2Ilv) ? kQoQInlineS2Frags : 2u;
                     uint32_t frag[kFragBufs][kWGHalves][4][4];  // [buffer][half][k32 step][a0..a3]
+                    // Raw-u8: the exact int32 task sum (plain registers, not a wgmma operand).
+                    int32_t qis2_task_acc[kWGHalves][kSwapAccum];
 
                     const auto fence_accum = [&]() {
                         #pragma unroll
@@ -1909,13 +1938,13 @@
                     };
                     // Decode both 64-row halves of K-block `kb` of `stage` into `f` (this
                     // thread's A fragments for the 4 K32 steps x 2 halves).
-                    const auto decode_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                     uint32_t (&f)[kWGHalves][4][4]) {
+                    // Split in two so the plain inline-s2 loop can issue the loads before a
+                    // wgmma wait (kQIS2Prefetch) and decode after it.
+                    const auto load_packed_rf = [&](const uint32_t& stage, const uint32_t& kb,
+                                                    uint4 (&w)[kWGHalves][2], uint32_t (&sw)[kWGHalves][2]) {
                         const auto* packed_rows =
                             reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) +
                             kb * kPackedBKBlockBytes;
-                        uint4 w[kWGHalves][2];
-                        uint32_t sw[kWGHalves][2];
                         #pragma unroll
                         for (uint32_t h = 0; h < kWGHalves; ++ h) {
                             const uint32_t row_0 = wg_n_idx + h * 64u + r_0;
@@ -1927,7 +1956,27 @@
                             sw[h][0] = *reinterpret_cast<const uint32_t*>(packed_rows + row_0 * 80u + 64u);
                             sw[h][1] = *reinterpret_cast<const uint32_t*>(packed_rows + row_1 * 80u + 64u);
                         }
-                        if constexpr (kInlineS2) {
+                    };
+                    const auto decode_words_rf = [&](const uint4 (&w)[kWGHalves][2], const uint32_t (&sw)[kWGHalves][2],
+                                                     uint32_t (&f)[kWGHalves][4][4]) {
+                        if constexpr (kQIS2RawU8) {
+                            // Raw codes only: byte lane = 4-bit code (0..15) as u8; the
+                            // per-row affine is applied to the int32 block sum at retire.
+                            #pragma unroll
+                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                                #pragma unroll
+                                for (uint32_t k = 0; k < 4; ++ k) {
+                                    const uint32_t word_r0 = k == 0 ? w[h][0].x : k == 1 ? w[h][0].y :
+                                                             k == 2 ? w[h][0].z : w[h][0].w;
+                                    const uint32_t word_r1 = k == 0 ? w[h][1].x : k == 1 ? w[h][1].y :
+                                                             k == 2 ? w[h][1].z : w[h][1].w;
+                                    f[h][k][0] = (word_r0 >> 4) & 0x0f0f0f0fu;
+                                    f[h][k][1] = (word_r1 >> 4) & 0x0f0f0f0fu;
+                                    f[h][k][2] = word_r0 & 0x0f0f0f0fu;
+                                    f[h][k][3] = word_r1 & 0x0f0f0f0fu;
+                                }
+                            }
+                        } else if constexpr (kInlineS2) {
                             // QoQ inline s2: byte = (code - z) * s2 as int8, LiquidGEMM form
                             // (arXiv 2509.01229 Sec. 4 Eq. 9-12): with a = 128 - z * s2,
                             //   int8 = ((code * s2 + a) mod 256) XOR 0x80
@@ -2028,6 +2077,13 @@
                         }
                         }
                     };
+                    const auto decode_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
+                                                     uint32_t (&f)[kWGHalves][4][4]) {
+                        uint4 w[kWGHalves][2];
+                        uint32_t sw[kWGHalves][2];
+                        load_packed_rf(stage, kb, w, sw);
+                        decode_words_rf(w, sw, f);
+                    };
                     // One commit group for K-block `kb` of `stage`: 4 K32 steps into
                     // acc[0] with f[0], then into acc[1] with f[1]. The B (activation)
                     // descriptor addresses the kb-th 1 KB swizzled A tile of the stage.
@@ -2049,7 +2105,7 @@
                                 // each chain overwrites (fresh set per K-block).
                                 SwapRS::wgmma(f[h][k], desc_b,
                                               acc[k / kK32PerSFGroup][h][(k % kK32PerSFGroup) % kAccChains],
-                                              kInlineS2 || (((k % kK32PerSFGroup) / kAccChains) > 0));
+                                              (kInlineS2 && !kQIS2RawU8) || (((k % kK32PerSFGroup) / kAccChains) > 0));
                             }
                         }
                         ptx::warpgroup_commit_batch();
@@ -2165,6 +2221,94 @@
                                     // exact I2F per element, 32 per thread per TASK.
                                     final_accum[accum_offset + j] += act_scale[i][j & 1] * static_cast<float>(v);
                                 }
+                            }
+                        }
+                    };
+                    // Raw-u8 (kQIS2RawU8): colsum[tok] = sum over the K128 block of the int8
+                    // activation tile, per (stage, block), by this WG's 128 threads right
+                    // after the stage's full barrier: one 16 B chunk per thread per
+                    // (N_SWAP * kKBlocksPerStage / 16) passes (SW128 only permutes the
+                    // chunks inside a 128 B row, so the row sum is layout-free), 4 IDP4A,
+                    // a 3-step xor-shuffle over the row's 8 chunks, one STS, one WG bar.
+                    const auto compute_colsum_rf = [&](const uint32_t& stage) {
+                        constexpr uint32_t kChunksPerBlock = N_SWAP * 8u;
+                        constexpr uint32_t kChunks = kKBlocksPerStage * kChunksPerBlock;
+                        DG_STATIC_ASSERT(kChunks % 128u == 0, "colsum expects whole passes over the WG");
+                        DG_STATIC_ASSERT(N_SWAP <= kQIS2ColsumStride, "colsum slot too small");
+                        const uint32_t wg_tid = warp_idx_in_wg * 32u + lane_idx;
+                        const auto* tile = reinterpret_cast<const uint8_t*>(smem_a[stage]);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kChunks / 128u; ++ i) {
+                            const uint32_t id = wg_tid + i * 128u;
+                            const uint32_t kb = id / kChunksPerBlock;
+                            const uint32_t tok = (id / 8u) % N_SWAP;
+                            const uint32_t chunk = id % 8u;
+                            const uint4 v = ptx::ld_shared(reinterpret_cast<const uint4*>(
+                                tile + kb * SMEM_A_SIZE_PER_KBLOCK + tok * BLOCK_K + chunk * 16u));
+                            int32_t sum = __dp4a(static_cast<int32_t>(v.x), 0x01010101, 0);
+                            sum = __dp4a(static_cast<int32_t>(v.y), 0x01010101, sum);
+                            sum = __dp4a(static_cast<int32_t>(v.z), 0x01010101, sum);
+                            sum = __dp4a(static_cast<int32_t>(v.w), 0x01010101, sum);
+                            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+                            sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+                            sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+                            if (chunk == 0)
+                                ptx::st_shared(reinterpret_cast<const uint32_t*>(
+                                    smem_qis2_colsum + (stage * kKBlocksPerStage + kb) * kQIS2ColsumStride + tok),
+                                    static_cast<uint32_t>(sum));
+                        }
+                        ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                    };
+                    // Raw-u8: fold the retired block set into the task sum, exactly in int32:
+                    //   task += s2 * (chain0 + chain1) - (z * s2) * colsum[tok]
+                    // s2 / z = bytes 64 / 65 of the packed row (stage still resident: called
+                    // before the stage's empty-barrier arrive), colsum from this stage's slot.
+                    const auto fold_block_rf = [&](const uint32_t& stage, const uint32_t& kb,
+                                                   const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                        const auto* packed_rows =
+                            reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) + kb * kPackedBKBlockBytes;
+                        const uint32_t* cs = reinterpret_cast<const uint32_t*>(
+                            smem_qis2_colsum + (stage * kKBlocksPerStage + kb) * kQIS2ColsumStride);
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            const uint32_t m0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                packed_rows + (wg_n_idx + h * 64u + r_0) * 80u + 64u));
+                            const uint32_t m1 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                packed_rows + (wg_n_idx + h * 64u + r_1) * 80u + 64u));
+                            const int32_t s2_0 = static_cast<int32_t>(m0 & 0xffu);
+                            const int32_t s2_1 = static_cast<int32_t>(m1 & 0xffu);
+                            const int32_t zs_0 = -static_cast<int32_t>((m0 >> 8u) & 0xffu) * s2_0;
+                            const int32_t zs_1 = -static_cast<int32_t>((m1 >> 8u) & 0xffu) * s2_1;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
+                                const uint32_t token_0 = i * 8 + col_idx * 2;
+                                const int32_t c0 = static_cast<int32_t>(ptx::ld_shared(cs + token_0));
+                                const int32_t c1 = static_cast<int32_t>(ptx::ld_shared(cs + token_0 + 1));
+                                const auto blk = [&](const uint32_t& j) -> int32_t {
+                                    swap_accum_t v = acc[0][h][0][j];
+                                    #pragma unroll
+                                    for (uint32_t c = 1; c < kAccChains; ++ c)
+                                        v += acc[0][h][c][j];
+                                    return v;
+                                };
+                                qis2_task_acc[h][i * 4 + 0] += s2_0 * blk(i * 4 + 0) + zs_0 * c0;
+                                qis2_task_acc[h][i * 4 + 1] += s2_0 * blk(i * 4 + 1) + zs_0 * c1;
+                                qis2_task_acc[h][i * 4 + 2] += s2_1 * blk(i * 4 + 2) + zs_1 * c0;
+                                qis2_task_acc[h][i * 4 + 3] += s2_1 * blk(i * 4 + 3) + zs_1 * c1;
+                            }
+                        }
+                    };
+                    // Raw-u8 task-end promote: same as `promote_task_rf` on the int32 task sum.
+                    const auto promote_task_raw_rf = [&]() {
+                        #pragma unroll
+                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
+                                const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
+                                #pragma unroll
+                                for (uint32_t j = 0; j < 4; ++ j)
+                                    final_accum[accum_offset + j] +=
+                                        act_scale[i][j & 1] * static_cast<float>(qis2_task_acc[half][i * 4 + j]);
                             }
                         }
                     };
@@ -2531,15 +2675,35 @@
                     // Probe (per 2-block stage): 17 = exposed k+1 barrier wait, 18 = both
                     // decodes, 19 = exposed wait<1>s, 31 = both issues, 30 = task-end
                     // promote (per stage average), 21 = stage count, 22 = head-to-head.
-                    #pragma unroll
-                    for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                    // Knobs (kQIS2Prefetch / kQIS2RawU8, see their definition): with
+                    // prefetch the packed words of the block to decode next are loaded
+                    // before the wgmma wait that frees its fragment buffer (blk1: before
+                    // the first wait<1>; next blk0: after the k+1 barrier check, before the
+                    // second wait<1>); with raw-u8 block b of a stage accumulates into set
+                    // b, `compute_colsum_rf` runs right after each stage's full barrier and
+                    // the retired set is folded (`fold_block_rf`) after the wait that
+                    // retired it, always before that stage's empty-barrier arrive.
+                    if constexpr (kQIS2RawU8) {
                         #pragma unroll
-                        for (uint32_t c = 0; c < kAccChains; ++ c) {
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                swap_accum[0][0][h][c][i] = 0;
+                                qis2_task_acc[h][i] = 0;
+                        }
+                    } else {
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            #pragma unroll
+                            for (uint32_t c = 0; c < kAccChains; ++ c) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    swap_accum[0][0][h][c][i] = 0;
+                            }
                         }
                     }
+                    constexpr uint32_t kSet1 = kQIS2RawU8 ? 1u : 0u;
+                    uint4 pf_w[kWGHalves][2];      // prefetched packed words (kQIS2Prefetch)
+                    uint32_t pf_sw[kWGHalves][2];
                     if (num_k_blocks > 0) {
                         const unsigned long long kt_head = clock64();
                         full_barriers[stage_idx]->wait(phase);
@@ -2547,6 +2711,8 @@
                         if constexpr (kUseInterleavedScheduler)
                             interleaved_scheduler.release_task_info(lane_idx);
                         capture_act_scale(stage_idx);
+                        if constexpr (kQIS2RawU8)
+                            compute_colsum_rf(stage_idx);
                         decode_stage_rf(stage_idx, 0, frag[0]);
                     }
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;) {
@@ -2561,46 +2727,84 @@
                             issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
+                        if constexpr (kQIS2Prefetch)
+                            load_packed_rf(cur_stage, 1, pf_w, pf_sw);
                         // Retire the previous stage's block-1 group (issued before the k+1
                         // barrier wait and decode, so normally already complete): frag[1]
                         // is free and stage s-1's activation tile can be recycled.
                         fence_accum();
                         ptx::warpgroup_wait<1>();
                         fence_frag(frag[1]);
-                        if (k_block_idx > 0)
+                        if (k_block_idx > 0) {
+                            if constexpr (kQIS2RawU8)
+                                fold_block_rf(prev_stage, 1, swap_accum[kSet1]);
                             arrive_empty_barrier(prev_stage);
+                        }
                         unsigned long long kt_a = clock64();
                         kstage_add(19, kt_a - kt_b);
-                        if (!exp_skip(1u))
-                            decode_stage_rf(cur_stage, 1, frag[1]);
+                        if (!exp_skip(1u)) {
+                            if constexpr (kQIS2Prefetch)
+                                decode_words_rf(pf_w, pf_sw, frag[1]);
+                            else
+                                decode_stage_rf(cur_stage, 1, frag[1]);
+                        }
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[0]);
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[kSet1]);
                         kt_a = clock64();
                         kstage_add(31, kt_a - kt_b);
+                        const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
+                        const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
+                        const uint32_t next_phase = phase ^ (next_stage == 0);
+                        if constexpr (kQIS2Prefetch) {
+                            // k+1 barrier first, then the next block-0 words are in flight
+                            // while block 0's group retires.
+                            if (has_next && (kexp & 4u) == 0u) {
+                                if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                    kstage_add(23, 1ull);
+                                    full_barriers[next_stage]->wait(next_phase);
+                                }
+                            }
+                            kt_b = clock64();
+                            kstage_add(17, kt_b - kt_a);
+                            if constexpr (kQIS2RawU8)
+                                compute_colsum_rf(next_stage);
+                            load_packed_rf(next_stage, 0, pf_w, pf_sw);
+                            kt_a = clock64();
+                            kstage_add(18, kt_a - kt_b);
+                        }
                         // Retire block 0's group so frag[0] can take the next stage's block 0.
                         fence_accum();
                         ptx::warpgroup_wait<1>();
                         fence_frag(frag[0]);
+                        if constexpr (kQIS2RawU8)
+                            fold_block_rf(cur_stage, 0, swap_accum[0]);
                         kt_b = clock64();
                         kstage_add(19, kt_b - kt_a);
-                        const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
-                        const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
-                        const uint32_t next_phase = phase ^ (next_stage == 0);
-                        if (has_next && (kexp & 4u) == 0u) {
-                            if (!barrier_ready(full_barriers[next_stage], next_phase)) {
-                                kstage_add(23, 1ull);
-                                full_barriers[next_stage]->wait(next_phase);
+                        if constexpr (!kQIS2Prefetch) {
+                            if (has_next && (kexp & 4u) == 0u) {
+                                if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                    kstage_add(23, 1ull);
+                                    full_barriers[next_stage]->wait(next_phase);
+                                }
                             }
+                            kt_a = clock64();
+                            kstage_add(17, kt_a - kt_b);
+                            if constexpr (kQIS2RawU8)
+                                compute_colsum_rf(next_stage);
+                        } else {
+                            kt_a = kt_b;
                         }
-                        kt_a = clock64();
-                        kstage_add(17, kt_a - kt_b);
                         // Decoded unconditionally (stale slot on the task's last stage, never
                         // issued): a frag write in a runtime branch serialises the pipe (ptxas
                         // C7518), see `kExpGates`.
-                        if (!exp_skip(1u))
-                            decode_stage_rf(next_stage, 0, frag[0]);
+                        if (!exp_skip(1u)) {
+                            if constexpr (kQIS2Prefetch)
+                                decode_words_rf(pf_w, pf_sw, frag[0]);
+                            else
+                                decode_stage_rf(next_stage, 0, frag[0]);
+                        }
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
                         if (!has_next) {
@@ -2608,11 +2812,17 @@
                             fence_accum();
                             ptx::warpgroup_wait<0>();
                             fence_frag(frag[1]);
+                            if constexpr (kQIS2RawU8)
+                                fold_block_rf(cur_stage, 1, swap_accum[kSet1]);
                             arrive_empty_barrier(cur_stage);
                             kt_a = clock64();
                             kstage_add(19, kt_a - kt_b);
-                            if (!exp_skip(8u))
-                                promote_task_rf(swap_accum[0]);
+                            if (!exp_skip(8u)) {
+                                if constexpr (kQIS2RawU8)
+                                    promote_task_raw_rf();
+                                else
+                                    promote_task_rf(swap_accum[0]);
+                            }
                             kstage_add(30, clock64() - kt_a);
                         }
                         advance_pipeline(k_block_idx);

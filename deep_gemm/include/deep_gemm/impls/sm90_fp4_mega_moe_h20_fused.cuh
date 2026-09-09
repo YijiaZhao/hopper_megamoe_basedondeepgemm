@@ -511,6 +511,13 @@ template <
     // K32 step (2 wgmma) and the next block's K32-step decode between the groups, so
     // the ALU decode runs while the tensor pipe drains instead of after it.
     bool kQoQInlineS2Ilv = false,
+    // QoQ inline s2, 2-buffer loop (host env DG_FP4_QIS2_PREFETCH_PACKED): load the
+    // next block's packed words before the wgmma wait that frees its fragment buffer.
+    bool kQoQInlineS2PrefetchPacked = true,
+    // QoQ inline s2, 2-buffer loop (host env DG_FP4_QIS2_RAWU8): raw-u8 nibble decode,
+    // s32.u8.s8 RS wgmma into per-block int32 sets, exact int32 deferred affine
+    // (see `kQIS2RawU8` in the body).
+    bool kQoQInlineS2RawU8 = true,
     // Debug (host env DG_FP4_POOL_STRIDE_DEBUG, pull dispatch only): address the
     // token pool with the push-dispatch fixed per-expert stride while keeping the
     // pull protocol; see `kStridedPool` in the body.
