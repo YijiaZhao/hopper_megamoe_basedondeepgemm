@@ -188,6 +188,10 @@ def main():
             print(f"--- per-task probe (SM0 thread0), us per task: L1 {statistics.median(l1t):.2f} "
                   f"({statistics.median(sr[27] for sr in raw_rows):.0f} tasks)  L2 {statistics.median(l2t):.2f} "
                   f"({statistics.median(sr[28] for sr in raw_rows):.0f} tasks)  inter-task gap {statistics.median(gap):.2f} ---")
+            # 34/35 = SM0 loader: cycles / count of the L1 arrival-count spin per L1 task
+            arr = [ (sr[34] / max(sr[35], 1) / SM_GHZ / 1000.0) for sr in raw_rows ]
+            print(f"--- SM0 loader L1 arrival-count wait: {statistics.median(arr):.2f} us per task "
+                  f"({statistics.median(sr[35] for sr in raw_rows):.0f} tasks) ---")
             # 32/33 = K128 blocks (stream-K units) run by SM0 in L1 / L2
             print(f"--- SM0 K-blocks: L1 {statistics.median(sr[32] for sr in raw_rows):.0f}  "
                   f"L2 {statistics.median(sr[33] for sr in raw_rows):.0f} ---")

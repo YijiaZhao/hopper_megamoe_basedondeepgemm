@@ -49,6 +49,7 @@ public:
         bool qoq_inline_s2;
         int qoq_inline_s2_frags;
         bool qoq_inline_s2_ilv;
+        bool strided_pool_debug;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -108,7 +109,8 @@ public:
             "        /* kLeanRouting */ {},\n"
             "        /* kQoQInlineS2 */ {},\n"
             "        /* kQoQInlineS2Frags */ {},\n"
-            "        /* kQoQInlineS2Ilv */ {}",
+            "        /* kQoQInlineS2Ilv */ {},\n"
+            "        /* kStridedPoolDebug */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -133,7 +135,8 @@ public:
             args.lean_routing ? "true" : "false",
             args.qoq_inline_s2 ? "true" : "false",
             args.qoq_inline_s2_frags,
-            args.qoq_inline_s2_ilv ? "true" : "false");
+            args.qoq_inline_s2_ilv ? "true" : "false",
+            args.strided_pool_debug ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -362,6 +365,16 @@ static void sm90_fp4_h20_fused_mega_moe(
         num_experts_per_rank * push_blocks_per_expert * config.block_m <= config.num_max_pool_tokens &&
         num_experts_per_rank * push_blocks_per_expert <=
             static_cast<int>(fused_layout::kSM90SplitKL1MaxPoolBlocks);
+    // Debug knob (kernel `kStridedPoolDebug`, DG_FP4_POOL_STRIDE_DEBUG=1): keep the
+    // PULL protocol but address the pool with the push fixed per-expert stride, to
+    // isolate the layout's cost from the push protocol's in the phase-stamp probe.
+    // Same fit conditions as push dispatch.
+    const bool strided_pool_debug = !push_dispatch && plan.use_interleaved_scheduler &&
+        get_env<int>("DG_FP4_POOL_STRIDE_DEBUG", 0) != 0 &&
+        num_global_tokens_upper <= push_max_m && num_tokens <= push_max_tokens_per_rank &&
+        num_experts_per_rank * push_blocks_per_expert * config.block_m <= config.num_max_pool_tokens &&
+        num_experts_per_rank * push_blocks_per_expert <=
+            static_cast<int>(fused_layout::kSM90SplitKL1MaxPoolBlocks);
     // Fast NVLink-barrier epilogue (kernel `kNvlFastEpilogue`, needs the
     // distributed expert bcast so the first barrier has a prologue grid sync):
     // the two barriers with an epilogue (before dispatch pull, before combine)
@@ -505,6 +518,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // DG_FP4_QIS2_ILV (default 1): interleave the next block's per-K32 decode
         // between one-K32-step commit groups (two frag buffers, lag 4 groups).
         .qoq_inline_s2_ilv = qoq && get_env<int>("DG_FP4_QIS2_ILV", 1) != 0,
+        .strided_pool_debug = strided_pool_debug,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -539,6 +553,7 @@ static void sm90_fp4_h20_fused_mega_moe(
             (plan.use_mode2_row_decoder ?
                 "_h200_fused_mode2_row" :
                 "_h200_fused_lut_window")) + (tinym ? "_tinym" : "") + (push_dispatch ? "_push" : "") +
+        (strided_pool_debug ? "_stridedbg" : "") +
         (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "") +
         ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "") +
         ((qoq && std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4) != 2) ?

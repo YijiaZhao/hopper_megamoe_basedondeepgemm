@@ -510,7 +510,11 @@ template <
     // QoQ inline s2 interleaved issue (host env DG_FP4_QIS2_ILV): one commit group per
     // K32 step (2 wgmma) and the next block's K32-step decode between the groups, so
     // the ALU decode runs while the tensor pipe drains instead of after it.
-    bool kQoQInlineS2Ilv = false
+    bool kQoQInlineS2Ilv = false,
+    // Debug (host env DG_FP4_POOL_STRIDE_DEBUG, pull dispatch only): address the
+    // token pool with the push-dispatch fixed per-expert stride while keeping the
+    // pull protocol; see `kStridedPool` in the body.
+    bool kStridedPoolDebug = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

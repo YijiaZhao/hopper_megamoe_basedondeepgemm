@@ -260,12 +260,17 @@
     // rank reaches after ALL its math tasks and its workspace cleanup, so no
     // destination still reads launch N's L1 pool / metadata or has counters pending.
     constexpr bool kPushDispatch = kPushDispatchRequested && kUseInterleavedScheduler;
-    constexpr uint32_t kPushBlocksPerExpert = kPushDispatch ?
+    // Strided pool layout: implied by push dispatch; `kStridedPoolDebug` (host env
+    // DG_FP4_POOL_STRIDE_DEBUG=1, pull dispatch only) forces the same fixed-stride
+    // pool addressing under the PULL protocol, to separate the layout's cost from
+    // the push protocol's (tickets / arrival publish) in the phase-stamp probe.
+    constexpr bool kStridedPool = kUseInterleavedScheduler && (kPushDispatch || kStridedPoolDebug);
+    constexpr uint32_t kPushBlocksPerExpert = kStridedPool ?
         math::constexpr_ceil_div(kNumRanks * kPushMaxTokensPerRank, BLOCK_M) : 0u;
-    DG_STATIC_ASSERT(!kPushDispatch ||
+    DG_STATIC_ASSERT(!kStridedPool ||
                      kNumExpertsPerRank * kPushBlocksPerExpert * BLOCK_M <= kNumMaxPoolTokens,
                      "Push dispatch: strided pool must fit the token pool");
-    DG_STATIC_ASSERT(!kPushDispatch ||
+    DG_STATIC_ASSERT(!kStridedPool ||
                      kNumExpertsPerRank * kPushBlocksPerExpert <= fused_layout::kSM90SplitKL1MaxPoolBlocks,
                      "Push dispatch: strided pool block indices must fit the split-K / tiny-M slots");
     constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / TASK_BLOCK_N;
@@ -831,7 +836,7 @@
                 const auto num_recv_tokens = static_cast<uint32_t>(
                     *workspace.get_expert_recv_count_sum_ptr(i));
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
-                const auto cleanup_pool_block_offset = kPushDispatch ?
+                const auto cleanup_pool_block_offset = kStridedPool ?
                     i * kPushBlocksPerExpert : scheduler.get_pool_block_offset(i);
 
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -1223,8 +1228,12 @@
                     input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
                     current_rank_in_expert_idx);
                 const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
+                // Strided-pool debug: expert e's rows live at block e * stride (as
+                // under push dispatch) instead of the dense prefix-sum block.
+                const uint32_t pull_pool_block_offset = kStridedPool ?
+                    static_cast<uint32_t>(current_expert_idx) * kPushBlocksPerExpert : expert_pool_block_offset;
                 const uint32_t pool_token_idx =
-                    expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
+                    pull_pool_block_offset * BLOCK_M + token_idx_in_expert;
                 // Issue the remote top-k weight load together with the SF loads (it used to
                 // wait behind the SF stores, adding a full NVLink round trip to the chain).
                 float weight = 0.0f;
@@ -1258,7 +1267,7 @@
                     ptx::tma_store_wait<0>();
                     ptx::red_add_rel(
                         workspace.get_l1_arrival_count_ptr(
-                            expert_pool_block_offset + token_idx_in_expert / BLOCK_M),
+                            pull_pool_block_offset + token_idx_in_expert / BLOCK_M),
                         1u);
                 }
                 __syncwarp();
@@ -1391,7 +1400,16 @@
                 }
                 if constexpr (!kBlockIsL2) {
                     const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
+                    // Probe slots 34/35 (SM0 loader, SM cycles / count): time spent in
+                    // this spin per L1 task (push: waits for the post-barrier publish).
+                    const bool arrival_probe_on = (phase_stamps != nullptr) && (sm_idx == 0) &&
+                                                  (ptx::get_lane_idx() == 0);
+                    const unsigned long long arrival_t0 = arrival_probe_on ? clock64() : 0ull;
                     DG_SPIN_WHILE(ptx::ld_acq(ptr) != valid_m, 1329);
+                    if (arrival_probe_on) {
+                        atomicAdd(phase_stamps + 34, clock64() - arrival_t0);
+                        atomicAdd(phase_stamps + 35, 1ull);
+                    }
                     // Push dispatch: the rows were written by REMOTE ranks (weak stores
                     // over NVLink into this GPU's L2/HBM), never by this SM's generic proxy,
                     // so no proxy fence is needed before the TMA loads; the acquire above
