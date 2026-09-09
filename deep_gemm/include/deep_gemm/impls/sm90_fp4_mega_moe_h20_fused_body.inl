@@ -1840,11 +1840,13 @@
                             interleaved_scheduler.release_task_info(lane_idx);
                         decode_stage_rf(stage_idx, 0, frag[0]);
                     }
-                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;) {
+                    // Stage body for a compile-time block count N (kKBlocksPerStage for
+                    // full stages, 2 for the even partial tail) so every frag / acc index
+                    // folds to a constant (a runtime block count spilled 16 B).
+                    DG_STATIC_ASSERT(kKBlocksPerStage % 2 == 0, "Partial tail stages hold 2 blocks");
+                    auto stage_step_n = [&]<uint32_t N>(uint32_t& k_block_idx) {
                         const unsigned long long kt_head = clock64();
                         const uint32_t cur_stage = stage_idx;
-                        const uint32_t num_stage_blocks =
-                            cute::min(kKBlocksPerStage, num_k_blocks - k_block_idx);
                         if constexpr (!kBlockIsL2) {
                             kstage_add(21, 1ull);
                             if (k_block_idx > 0)
@@ -1855,54 +1857,57 @@
                             issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
                         unsigned long long kt_b = clock64(), kt_a = kt_b;
                         #pragma unroll
-                        for (uint32_t b = 0; b < kKBlocksPerStage; ++ b) {
-                            if (b + 1 < num_stage_blocks) {
-                                // Not the last block of this stage: decode + issue b+1,
-                                // retire b and promote it.
-                                if ((kexp & 1u) == 0u)
-                                    decode_stage_rf(cur_stage, b + 1, frag[(b + 1) & 1]);
-                                kt_a = clock64();
-                                kstage_add(18, kt_a - kt_b);
-                                if ((kexp & 2u) == 0u)
-                                    issue_stage_rf(cur_stage, b + 1, frag[(b + 1) & 1], swap_accum[(b + 1) & 1]);
-                                fence_accum();
-                                ptx::warpgroup_wait<1>();
-                                fence_frag(frag[b & 1]);
-                                kt_b = clock64();
-                                kstage_add(19, kt_b - kt_a);
-                                if ((kexp & 8u) == 0u)
-                                    promote_stage_rf(cur_stage, b, swap_accum[b & 1]);
-                            } else if (b + 1 == num_stage_blocks) {
-                                // Last block of the stage (b odd): prefetch-decode the next
-                                // stage's block 0 into frag[0], then drain and promote b.
-                                if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
-                                    const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
-                                    const uint32_t next_phase = phase ^ (next_stage == 0);
-                                    if ((kexp & 4u) == 0u) {
-                                        if (!barrier_ready(full_barriers[next_stage], next_phase)) {
-                                            if constexpr (!kBlockIsL2)
-                                                kstage_add(23, 1ull);
-                                            full_barriers[next_stage]->wait(next_phase);
-                                        }
-                                    }
-                                    kt_a = clock64();
-                                    if constexpr (!kBlockIsL2)
-                                        kstage_add(17, kt_a - kt_b);
-                                    if ((kexp & 1u) == 0u)
-                                        decode_stage_rf(next_stage, 0, frag[0]);
-                                    kt_b = clock64();
-                                    kstage_add(18, kt_b - kt_a);
-                                }
-                                fence_accum();
-                                ptx::warpgroup_wait<0>();
-                                fence_frag(frag[b & 1]);
-                                kstage_add(19, clock64() - kt_b);
-                                if ((kexp & 8u) == 0u)
-                                    promote_stage_rf(cur_stage, b, swap_accum[b & 1]);
-                            }
+                        for (uint32_t b = 0; b + 1 < N; ++ b) {
+                            // Not the last block of this stage: decode + issue b+1, retire b
+                            // and promote it (frees frag[b&1] / acc[b&1] for block b+2).
+                            if ((kexp & 1u) == 0u)
+                                decode_stage_rf(cur_stage, b + 1, frag[(b + 1) & 1]);
+                            kt_a = clock64();
+                            kstage_add(18, kt_a - kt_b);
+                            if ((kexp & 2u) == 0u)
+                                issue_stage_rf(cur_stage, b + 1, frag[(b + 1) & 1], swap_accum[(b + 1) & 1]);
+                            fence_accum();
+                            ptx::warpgroup_wait<1>();
+                            fence_frag(frag[b & 1]);
+                            kt_b = clock64();
+                            kstage_add(19, kt_b - kt_a);
+                            if ((kexp & 8u) == 0u)
+                                promote_stage_rf(cur_stage, b, swap_accum[b & 1]);
                         }
+                        // Last block (N-1, odd): prefetch-decode the next stage's block 0
+                        // into frag[0], then drain and promote it.
+                        if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
+                            const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
+                            const uint32_t next_phase = phase ^ (next_stage == 0);
+                            if ((kexp & 4u) == 0u) {
+                                if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                    if constexpr (!kBlockIsL2)
+                                        kstage_add(23, 1ull);
+                                    full_barriers[next_stage]->wait(next_phase);
+                                }
+                            }
+                            kt_a = clock64();
+                            if constexpr (!kBlockIsL2)
+                                kstage_add(17, kt_a - kt_b);
+                            if ((kexp & 1u) == 0u)
+                                decode_stage_rf(next_stage, 0, frag[0]);
+                            kt_b = clock64();
+                            kstage_add(18, kt_b - kt_a);
+                        }
+                        fence_accum();
+                        ptx::warpgroup_wait<0>();
+                        fence_frag(frag[(N - 1) & 1]);
+                        kstage_add(19, clock64() - kt_b);
+                        if ((kexp & 8u) == 0u)
+                            promote_stage_rf(cur_stage, N - 1, swap_accum[(N - 1) & 1]);
                         arrive_empty_barrier(cur_stage);
                         advance_pipeline(k_block_idx);
+                    };
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;) {
+                        if (num_k_blocks - k_block_idx >= kKBlocksPerStage)
+                            stage_step_n.template operator()<kKBlocksPerStage>(k_block_idx);
+                        else
+                            stage_step_n.template operator()<2>(k_block_idx);
                     }
                     }
                 };
