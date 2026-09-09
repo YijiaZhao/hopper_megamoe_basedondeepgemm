@@ -270,7 +270,7 @@
     // last pushed row, thread 0 takes a CTA arrival ticket (atom.acq_rel.gpu, after the
     // CTA barrier: releases this CTA's remote stores, acquires the earlier CTAs'); the
     // last CTA resets the ticket and red.release.sys-adds 1 into every rank's DONE
-    // count (its own included). Receiver: the DONE target of a launch is
+    // count (its own included; one lane per rank, one warp-wide sys fence). Receiver: the DONE target of a launch is
     // kNumRanks * (epoch + 1) where `epoch` counts this rank's completed flag
     // launches (bumped by SM0 in the workspace cleanup, i.e. after every reader of
     // this launch: the task producers fetch the counts before any math task exists,
@@ -1058,16 +1058,25 @@
             }
             if (thread_idx == 0) stamp_max(9);  // push issued
             if constexpr (kPushDoneFlags) {
-                // CTA arrival ticket; the last CTA signals DONE to every rank.
+                // CTA arrival ticket; the last CTA signals DONE to every rank. The
+                // kNumRanks release.sys signals are issued by kNumRanks lanes of warp 0
+                // at once (one warp-wide sys fence), not serially by one thread: each
+                // release.sys drains this SM's outstanding NVLink stores (~1.5 us on
+                // H20), and 8 in a row put +12 us on the critical path (probe slot 10).
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-                if (thread_idx == 0) {
-                    const uint32_t arrived = ptx::atomic_add_acq_rel(workspace.get_push_cta_arrival_ptr(), 1u);
+                if (warp_idx == 0) {
+                    DG_STATIC_ASSERT(kNumRanks <= 32, "Too many ranks for one signalling warp");
+                    uint32_t arrived = 0;
+                    if (lane_idx == 0)
+                        arrived = ptx::atomic_add_acq_rel(workspace.get_push_cta_arrival_ptr(), 1u);
+                    arrived = __shfl_sync(0xffffffff, arrived, 0);
                     if (arrived == kNumSMs - 1) {
-                        *workspace.get_push_cta_arrival_ptr() = 0;
-                        #pragma unroll
-                        for (uint32_t r = 0; r < kNumRanks; ++ r)
-                            ptx::red_add_rel_sys(sym_buffer.map(workspace.get_push_done_count_ptr(), r), 1);
+                        if (lane_idx == 0)
+                            *workspace.get_push_cta_arrival_ptr() = 0;
+                        if (lane_idx < kNumRanks)
+                            ptx::red_add_rel_sys(sym_buffer.map(workspace.get_push_done_count_ptr(), lane_idx), 1);
                     }
+                    __syncwarp();
                 }
             }
         } else {
@@ -1166,7 +1175,9 @@
                     if (lane_idx == 0) {
                         const int target = static_cast<int>(
                             kNumRanks * (ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u));
-                        DG_SPIN_WHILE(ptx::ld_acq_sys(workspace.get_push_done_count_ptr()) - target < 0, 1094);
+                        DG_SPIN_WHILE(static_cast<int>(ptx::ld_volatile(reinterpret_cast<const uint32_t*>(
+                            workspace.get_push_done_count_ptr()))) - target < 0, 1094);
+                        DG_SPIN_WHILE(ptx::ld_acq_sys(workspace.get_push_done_count_ptr()) - target < 0, 1095);
                         stamp_max(1);
                         if (sm_idx == 0) {
                             stamp_accumulate(13);

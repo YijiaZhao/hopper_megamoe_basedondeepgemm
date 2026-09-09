@@ -412,7 +412,19 @@ static void sm90_fp4_h20_fused_mega_moe(
     // count publisher wait for 8 arrivals with ld.acquire.sys (target = ranks * (launch
     // epoch + 1), epoch bumped in the workspace cleanup). Same information as barrier
     // #1 (all of a rank's rows and tickets landed) with one NVLink hop instead of a
-    // grid sync + hop + grid sync, and no SM0 serialisation.
+    // grid sync + hop + grid sync, and no SM0 serialisation. The kNumRanks signals
+    // are issued by kNumRanks lanes at once: serially from one thread each
+    // release.sys drained the SM's NVLink stores (~1.5 us) and put +8 us on the
+    // kernel. H20 A/B (2026-09-09, phase-stamp probe under nsys, skew-free
+    // min-over-devices kernel duration, us, knob 1 vs 0, same session): with the
+    // default DG_FP4_L2_PREFETCH_ALL=1 mxfp4 M=2 42.7/43.5 vs 42.5/43.6, M=8
+    // 61.3/62.2 vs 62.0/62.3, M=16 80.1/79.4 vs 80.6/81.0, qoq M=8 60.4/60.8 vs
+    // 60.3/61.3 (neutral to -1.6: the B loader's prefetch loop exits on the SM e
+    // high-word publish, so the direct DONE poll is not on its path); with
+    // DG_FP4_L2_PREFETCH_ALL=0 mxfp4 M=2 40.3 vs 41.2, M=8 53.3 vs 54.4, M=16 75.3
+    // vs 76.4, qoq M=8 53.0 vs 54.1 (-1 us: rank-0 push issued -> data complete
+    // 2.9 vs 3.7 us, first math 8.2 vs 9.6). Numerics unchanged (mxfp4/qoq
+    // T=2/8/8/16 x2, mxfp4 128/512, 200-iter graph-replay stress).
     const bool push_done_flags = push_dispatch &&
         get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 &&
         get_env<int>("DG_FP4_PUSH_DONE_FLAGS", 1) != 0;

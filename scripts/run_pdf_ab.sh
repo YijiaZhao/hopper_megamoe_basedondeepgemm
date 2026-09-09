@@ -16,6 +16,8 @@ cd "$ROOT"
 MODE=${MODE:-corr}; PASSES=${PASSES:-2}; OFFICIAL=${OFFICIAL:-0}
 OUT=${OUT:-/raid/kimi/results/pdf}
 POINTS=${POINTS:-"mxfp4:2 mxfp4:8 mxfp4:16 qoq:8"}
+# perf cells: tag:ENV=V[,ENV=V...]
+CONFIGS=${CONFIGS:-"k1:DG_FP4_PUSH_DONE_FLAGS=1 k0:DG_FP4_PUSH_DONE_FLAGS=0"}
 MARK=/raid/kimi/results/pdf_RUNNING
 export PYTHONPATH="$ROOT"
 export CUDA_HOME=/usr/local/cuda
@@ -92,11 +94,12 @@ if [ "$MODE" = perf ]; then
   for pass in $(seq 1 "$PASSES"); do
     for pt in $POINTS; do
       Q=${pt%%:*}; M=${pt##*:}
-      for K in 1 0; do
-        name="${Q}_M${M}_k${K}_p${pass}"
+      for cfg in $CONFIGS; do
+        K=${cfg%%:*}; envs=${cfg#*:}; envs=${envs//,/ }
+        name="${Q}_M${M}_${K}_p${pass}"
         wait_idle
-        echo "--- PROBE+NSYS $name" >> "$LOG"
-        DG_FP4_PUSH_DONE_FLAGS=$K PROBE_DUMP=1 timeout 600 "${NSYS[@]}" --output="$OUT/probe_nsys_$name" "${TR[@]}" \
+        echo "--- PROBE+NSYS $name ($envs)" >> "$LOG"
+        env $envs PROBE_DUMP=1 timeout 600 "${NSYS[@]}" --output="$OUT/probe_nsys_$name" "${TR[@]}" \
           tests/profile_fused_phase_stamps.py --quant "$Q" --global-tokens "$M" --iters 20 > "$OUT/probe_nsys_$name.log" 2>&1
         echo "EXIT=$?" >> "$LOG"
         sed -n '/=== fused/,$p' "$OUT/probe_nsys_$name.log" | grep -v "PROBE_ITER\|Warning\|warn" >> "$LOG"
@@ -104,7 +107,7 @@ if [ "$MODE" = perf ]; then
         if [ "$OFFICIAL" = 1 ] && [ "$pass" = 1 ]; then
           wait_idle
           echo "--- OFFICIAL $name" >> "$LOG"
-          DG_FP4_PUSH_DONE_FLAGS=$K timeout 600 "${NSYS[@]}" --output="$OUT/official_$name" "${TR[@]}" tests/profile_four_api_h20.py \
+          env $envs timeout 600 "${NSYS[@]}" --output="$OUT/official_$name" "${TR[@]}" tests/profile_four_api_h20.py \
             --scope mega --backend fused --quant "$Q" --global-tokens "$M" > "$OUT/official_$name.log" 2>&1
           echo "EXIT=$?" >> "$LOG"
           python3 scripts/reconcile_nsys_devices.py "$OUT/official_$name.nsys-rep" 2>&1 | grep -v "^$" >> "$LOG"
