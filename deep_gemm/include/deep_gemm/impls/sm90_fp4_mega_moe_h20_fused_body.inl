@@ -1825,13 +1825,11 @@
                     // between them so the 4 dependent RS-WGMMAs of a K128 block become
                     // two independent 2-deep chains (tensor-core latency exposed once
                     // less per block); the chains are summed at promote time.
-                    // Inline s2: the single accumulator set spans the whole task, so the
-                    // dependent-wgmma chain would be 4 per block x 24 blocks; the registers
-                    // of the dropped second set buy 4 chains (one per K32 step; 2 halves x 4
-                    // = 8 independent streams, 2 dependent wgmmas per 2-block stage) at the
-                    // same register count as the old 2 sets x 2 chains. Probe (H20, M8, same
-                    // session): 2 chains 1381 ns/stage with ~850 ns of tensor-pipe wait.
-                    constexpr uint32_t kAccChains = kInlineS2 ? 4u : 2u;
+                    // Inline s2 measured 4 chains (8 independent streams, register-neutral
+                    // vs the old 2 sets x 2 chains) at no gain (H20 09-09: M8 1413/1420 vs
+                    // 1381/1501 ns per stage, M16 1558 vs 1547/1487), so the dependent
+                    // RS-wgmma chain is not the stage floor; 2 chains kept.
+                    constexpr uint32_t kAccChains = 2u;
                     swap_accum_t swap_accum[kNumAccKBlocks][kSFGroups][kWGHalves][kAccChains][kSwapAccum];
                     uint32_t frag[2][kWGHalves][4][4];  // [buffer][half][k32 step][a0..a3]
 
