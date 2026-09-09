@@ -330,8 +330,17 @@ static void sm90_fp4_h20_fused_mega_moe(
     // ~0.7 us. DG_FP4_SPLITK_L2=3: the tail tasks run as THREE stage-aligned K ranges
     // (1/2/2 stages, the finisher last and longest, n-1 publisher slots per task),
     // 66 segments <= 78 SMs at M=8 (M=16: 44 * 3 > 78, unsplit as before).
-    // DG_FP4_SPLITK_L2=1|2 keeps the 2-way split; 0 off. Numerics verified (see the
-    // body / tests); exclusive with L2 half-row tasks.
+    // DG_FP4_SPLITK_L2=1|2 keeps the 2-way split; 0 off. Numerics verified with =3
+    // (T=2/8/8/16 cos_min 0.99998-0.99999, 128/512 0.99988, QoQ 8 0.99993).
+    // H20 2026-09-10, =3 vs 0, skew-free (DG_PROFILE_HOST_BARRIER=1) nsys
+    // min-over-devices, 2 passes: rank-0 last-L2 - last-L1 does drop 7.2/6.5 ->
+    // 5.8/5.6 us at M=8, but the kernel gets SLOWER: MXFP4 M8 54.4/54.3 -> 55.8/55.8,
+    // M2 41.9/41.4 -> 43.0/42.8, M16 77.7/77.8 -> 79.6/80.6 (unsplit there, 44 x 3 >
+    // 78), QoQ M8 54.1/53.9 -> 54.0/53.9 (knob is MXFP4-only). The stamps show why:
+    // after the last L2 the critical path is the combine (slot 6 -> 7 = 3.7-4.3 us:
+    // ONE warp on SM0 sums the token's 8 slices after SM0's own L2 tasks), and the
+    // 3-way reduce lengthens the finisher epilogue (1.8 -> 2.6 us) without moving
+    // the combine end. Default stays 0. Exclusive with L2 half-row tasks.
     const int split_k_l2_env = get_env<int>("DG_FP4_SPLITK_L2", 0);
     const bool split_k_l2 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
