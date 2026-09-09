@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <torch/python.h>
 
 #include "../../jit/compiler.hpp"
@@ -46,6 +47,7 @@ public:
         int push_max_tokens_per_rank;
         bool lean_routing;
         bool qoq_inline_s2;
+        int qoq_inline_s2_frags;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -103,7 +105,8 @@ public:
             "        /* kPushDispatchRequested */ {},\n"
             "        /* kPushMaxTokensPerRank */ {},\n"
             "        /* kLeanRouting */ {},\n"
-            "        /* kQoQInlineS2 */ {}",
+            "        /* kQoQInlineS2 */ {},\n"
+            "        /* kQoQInlineS2Frags */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -126,7 +129,8 @@ public:
             args.push_dispatch ? "true" : "false",
             args.push_max_tokens_per_rank,
             args.lean_routing ? "true" : "false",
-            args.qoq_inline_s2 ? "true" : "false");
+            args.qoq_inline_s2 ? "true" : "false",
+            args.qoq_inline_s2_frags);
         return fmt::format(R"(
 {}
 
@@ -492,6 +496,9 @@ static void sm90_fp4_h20_fused_mega_moe(
         // instead of a per-K128 promote (which forced an accumulator readout /
         // tensor-pipe drain per block). 0 = the per-block promote path.
         .qoq_inline_s2 = qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0,
+        // DG_FP4_QIS2_FRAGS (2|3|4, default 2): A-fragment register buffers of the
+        // inline s2 loop (wait_group lag = frags - 1); 3/4 cost +32/+64 regs.
+        .qoq_inline_s2_frags = std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4),
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -527,7 +534,9 @@ static void sm90_fp4_h20_fused_mega_moe(
                 "_h200_fused_mode2_row" :
                 "_h200_fused_lut_window")) + (tinym ? "_tinym" : "") + (push_dispatch ? "_push" : "") +
         (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "") +
-        ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "");
+        ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "") +
+        ((qoq && std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4) != 2) ?
+            fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

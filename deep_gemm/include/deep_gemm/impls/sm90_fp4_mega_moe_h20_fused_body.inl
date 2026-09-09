@@ -1846,7 +1846,10 @@
                     // RS-wgmma chain is not the stage floor; 2 chains kept.
                     constexpr uint32_t kAccChains = 2u;
                     swap_accum_t swap_accum[kNumAccKBlocks][kSFGroups][kWGHalves][kAccChains][kSwapAccum];
-                    uint32_t frag[2][kWGHalves][4][4];  // [buffer][half][k32 step][a0..a3]
+                    // Inline s2 may rotate 3 or 4 A-fragment buffers (kQoQInlineS2Frags,
+                    // DG_FP4_QIS2_FRAGS); every other loop uses exactly two.
+                    constexpr uint32_t kFragBufs = kInlineS2 ? kQoQInlineS2Frags : 2u;
+                    uint32_t frag[kFragBufs][kWGHalves][4][4];  // [buffer][half][k32 step][a0..a3]
 
                     const auto fence_accum = [&]() {
                         #pragma unroll
@@ -2204,6 +2207,122 @@
                         stage_step(k_block_idx, frag[0], frag[1]);
                         if (k_block_idx < num_k_blocks)
                             stage_step(k_block_idx, frag[1], frag[0]);
+                    }
+                    } else if constexpr (kKBlocksPerStage == 2 && kInlineS2 && kFragBufs > 2) {
+                    // QoQ inline s2 with kFragBufs (3 or 4) rotating A-fragment buffers:
+                    // same schedule as the 2-buffer loop below, but block n decodes into
+                    // frag[n % NF] and the group that last read that buffer is G(n - NF),
+                    // so the retire before each decode is wait<NF - 1> (lag NF - 1 groups
+                    // instead of 1). Stage t is released once G(2t + 1) retired, i.e. at
+                    // the decode of block n with n - NF == 2t + 1 (odd) -> stage (n - NF) / 2;
+                    // the stages still pending at task end are released after wait<0>.
+                    // The stage loop is unrolled kRot times so the buffer indices are
+                    // compile-time (period of n % NF over 2-block stages).
+                    constexpr uint32_t NF = kFragBufs;
+                    constexpr uint32_t kRot = (NF % 2u == 0u) ? NF / 2u : NF;
+                    #pragma unroll
+                    for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        #pragma unroll
+                        for (uint32_t c = 0; c < kAccChains; ++ c) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                swap_accum[0][0][h][c][i] = 0;
+                        }
+                    }
+                    uint32_t s_in_task = 0, released = 0;
+                    // Smem slot of task stage t (t <= current stage s_in_task).
+                    const auto slot_of_stage = [&](const uint32_t& t) -> uint32_t {
+                        const uint32_t back = s_in_task - t;
+                        return stage_idx >= back ? stage_idx - back : stage_idx + kNumStages - back;
+                    };
+                    // Block n is about to be decoded: G(n - NF) has retired.
+                    const auto maybe_release = [&](const uint32_t& n) {
+                        if (n >= NF && ((n - NF) & 1u)) {
+                            const uint32_t t = (n - NF) / 2u;
+                            arrive_empty_barrier(slot_of_stage(t));
+                            released = t + 1;
+                        }
+                    };
+                    if (num_k_blocks > 0) {
+                        const unsigned long long kt_head = clock64();
+                        full_barriers[stage_idx]->wait(phase);
+                        kstage_add(17, clock64() - kt_head);
+                        if constexpr (kUseInterleavedScheduler)
+                            interleaved_scheduler.release_task_info(lane_idx);
+                        capture_act_scale(stage_idx);
+                        decode_stage_rf(stage_idx, 0, frag[0]);
+                    }
+                    const auto stage_body = [&](const uint32_t& rot, uint32_t& k_block_idx) {
+                        const uint32_t b0 = (2u * rot) % NF, b1 = (2u * rot + 1u) % NF, b2 = (2u * rot + 2u) % NF;
+                        const uint32_t n0 = 2u * s_in_task, n1 = n0 + 1u, n2 = n0 + 2u;
+                        const unsigned long long kt_head = clock64();
+                        const uint32_t cur_stage = stage_idx;
+                        kstage_add(21, 1ull);
+                        if (k_block_idx > 0)
+                            kstage_add(22, kt_head - kstage_t_prev);
+                        kstage_t_prev = kt_head;
+                        if ((kexp & 2u) == 0u)
+                            issue_stage_rf(cur_stage, 0, frag[b0], swap_accum[0]);
+                        unsigned long long kt_b = clock64();
+                        kstage_add(31, kt_b - kt_head);
+                        fence_accum();
+                        ptx::warpgroup_wait<NF - 1>();
+                        fence_frag(frag[b1]);
+                        maybe_release(n1);
+                        unsigned long long kt_a = clock64();
+                        kstage_add(19, kt_a - kt_b);
+                        if ((kexp & 1u) == 0u)
+                            decode_stage_rf(cur_stage, 1, frag[b1]);
+                        kt_b = clock64();
+                        kstage_add(18, kt_b - kt_a);
+                        if ((kexp & 2u) == 0u)
+                            issue_stage_rf(cur_stage, 1, frag[b1], swap_accum[0]);
+                        kt_a = clock64();
+                        kstage_add(31, kt_a - kt_b);
+                        if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
+                            fence_accum();
+                            ptx::warpgroup_wait<NF - 1>();
+                            fence_frag(frag[b2]);
+                            maybe_release(n2);
+                            kt_b = clock64();
+                            kstage_add(19, kt_b - kt_a);
+                            const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
+                            const uint32_t next_phase = phase ^ (next_stage == 0);
+                            if ((kexp & 4u) == 0u) {
+                                if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                    kstage_add(23, 1ull);
+                                    full_barriers[next_stage]->wait(next_phase);
+                                }
+                            }
+                            kt_a = clock64();
+                            kstage_add(17, kt_a - kt_b);
+                            if ((kexp & 1u) == 0u)
+                                decode_stage_rf(next_stage, 0, frag[b2]);
+                            kt_b = clock64();
+                            kstage_add(18, kt_b - kt_a);
+                        } else {
+                            fence_accum();
+                            ptx::warpgroup_wait<0>();
+                            #pragma unroll
+                            for (uint32_t b = 0; b < NF; ++ b)
+                                fence_frag(frag[b]);
+                            for (uint32_t t = released; t <= s_in_task; ++ t)
+                                arrive_empty_barrier(slot_of_stage(t));
+                            kt_a = clock64();
+                            kstage_add(19, kt_a - kt_b);
+                            if ((kexp & 8u) == 0u)
+                                promote_task_rf(swap_accum[0]);
+                            kstage_add(30, clock64() - kt_a);
+                        }
+                        advance_pipeline(k_block_idx);
+                        ++ s_in_task;
+                    };
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;) {
+                        #pragma unroll
+                        for (uint32_t rot = 0; rot < kRot; ++ rot) {
+                            if (k_block_idx < num_k_blocks)
+                                stage_body(rot, k_block_idx);
+                        }
                     }
                     } else if constexpr (kKBlocksPerStage == 2 && kInlineS2) {
                     // QoQ inline s2, two K128 blocks per stage, ONE int32 accumulator set,

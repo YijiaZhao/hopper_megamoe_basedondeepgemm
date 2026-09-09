@@ -502,7 +502,11 @@ template <
     // QoQ inline s2 (host env DG_FP4_QOQ_INLINE_S2, default 1): fold the per-(row,
     // K128) integer s2 into the int8 weight at RF decode time and accumulate the
     // whole L1 task K range in one int32 set (see `kInlineS2` in the body).
-    bool kQoQInlineS2 = false
+    bool kQoQInlineS2 = false,
+    // QoQ inline s2 A-fragment register buffers (host env DG_FP4_QIS2_FRAGS, 2|3|4,
+    // default 2): the wgmma.wait_group lag before a fragment buffer is re-decoded
+    // is kQoQInlineS2Frags - 1 groups (+32 regs per extra buffer).
+    uint32_t kQoQInlineS2Frags = 2
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
