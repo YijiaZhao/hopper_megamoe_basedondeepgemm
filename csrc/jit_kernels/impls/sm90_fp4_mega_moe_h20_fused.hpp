@@ -186,7 +186,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens,
-        mxfp4,
+        /* rf_decode */ mxfp4 || qoq,
     };
     const auto plan = select_sm90_nvfp4_h200_fused(heuristic_input);
     const auto& config = plan.config;
@@ -359,8 +359,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l2_half_row_tasks = l2_half_row_tasks,
         .split_k_l2 = split_k_l2,
         .nvl_fast_epilogue = nvl_fast_epilogue,
-        // K128 blocks per pipeline stage on the BM8 MXFP4 RF swapAB tier (kernel
-        // `kKBlocksPerStage`; other tiers ignore it). DG_FP4_KBLOCKS_PER_STAGE in
+        // K128 blocks per pipeline stage on the BM8 RF swapAB tiers (MXFP4 and QoQ,
+        // kernel `kKBlocksPerStage`; other tiers ignore it). DG_FP4_KBLOCKS_PER_STAGE in
         // {2, 4}: 2 blocks x 4 stages (default) or 4 blocks x 2 stages (same 173 KB
         // of stages, the L2 K loop (10 blocks) ends with a 2-block partial stage).
         // H20 A/B (2026-09-09, phase stamps, kernel end us, 4 vs 2 blocks, same
@@ -371,7 +371,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // be in flight while the other is consumed (vs 3 x 40 KB), so the L1 and L2
         // phases lose 5-6 us / 2-5 us. Default 2 (the 4-block kernel also carries
         // 16 B of ptxas spill at 168 regs; the 2-block one has none).
-        .k_blocks_per_stage = mxfp4 ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 2,
+        .k_blocks_per_stage = (mxfp4 || qoq) ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 2,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
