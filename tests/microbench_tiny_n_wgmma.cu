@@ -38,6 +38,9 @@
 //   FLAGS 64 (rs8d): RAWU8 — decode raw nibble codes only (AND / SHF+AND), RS wgmma s32.u8.s8 into a
 //        per-block accumulator, fold acc_main += s2*acc_blk + (-z*s2)*colsum(B) in int32 after the
 //        wait (exact integers -> bit-identical to the inline-s2 form)  (kernel knob 2)
+//   FLAGS 128 (rs8d): KORDER — the kernel's kKBlocksPerStage==2 loop order:
+//        issue(b0); decode(b1); issue(b1); wait<1>; decode(next b0); wait<0>; promote(b0,b1)
+//        (RAWU8 promote then runs with no wgmma in flight: no ptxas C7514 serialisation)
 //   Per-phase clock64 stamps (lane 0 of each warp) are printed for rs8d / ss8p / ss8u:
 //     rs8d math: issue | wait | decode      ss8p/ss8u math: barF | issue | wait+promote | barE
 //     writers: barE | decode+store | fence | barF
@@ -495,6 +498,25 @@ __global__ void __launch_bounds__(384, 1) bench_kernel(unsigned long long* out, 
                     issue(I2{}, 1); wg_wait<2>(); fence_buf(I0{}); for (int r = 0; r < dec_rep; ++r) decode(I0{}, 0);
                 }
                 wg_wait<0>();
+            } else if constexpr ((FLAGS & 128) && MODE == RS8D) {
+                for (int r = 0; r < dec_rep; ++r) decode(I0{}, 0);
+                #pragma unroll 1
+                for (int it = 0; it < iters; ++it) {
+                    const int st = it & 1;
+                    STAMP(0, issue(I0{}, 0));
+                    if constexpr (PREFETCH) STAMP(3, load_words(st));
+                    fence_buf(I1{});
+                    if constexpr (PREFETCH) STAMP(2, for (int r = 0; r < dec_rep; ++r) compute(I1{}));
+                    else STAMP(2, for (int r = 0; r < dec_rep; ++r) decode(I1{}, st));
+                    STAMP(0, issue(I1{}, 1));
+                    if constexpr (PREFETCH) STAMP(3, load_words(st ^ 1));
+                    STAMP(1, wg_wait<1>());
+                    fence_buf(I0{});
+                    if constexpr (PREFETCH) STAMP(2, for (int r = 0; r < dec_rep; ++r) compute(I0{}));
+                    else STAMP(2, for (int r = 0; r < dec_rep; ++r) decode(I0{}, st ^ 1));
+                    STAMP(1, wg_wait<0>());
+                    STAMP(4, (promote(I0{}, 0), promote(I1{}, 1)));
+                }
             } else {
                 for (int r = 0; r < dec_rep; ++r) decode(I0{}, 0);
                 if constexpr (MODE == SS8D) store_tile(I0{});
@@ -796,6 +818,11 @@ kern_t pick_f(int flags, int nwg, int halves) {
         case 33: if constexpr (MODE == RS8D) return pick_nh<MODE, 33>(nwg, halves); break;
         case 65: if constexpr (MODE == RS8D) return pick_nh<MODE, 65>(nwg, halves); break;
         case 97: if constexpr (MODE == RS8D) return pick_nh<MODE, 97>(nwg, halves); break;
+        case 128: if constexpr (MODE == RS8D) return pick_nh<MODE, 128>(nwg, halves); break;
+        case 160: if constexpr (MODE == RS8D) return pick_nh<MODE, 160>(nwg, halves); break;
+        case 192: if constexpr (MODE == RS8D) return pick_nh<MODE, 192>(nwg, halves); break;
+        case 224: if constexpr (MODE == RS8D) return pick_nh<MODE, 224>(nwg, halves); break;
+        case 225: if constexpr (MODE == RS8D) return pick_nh<MODE, 225>(nwg, halves); break;
         case 18: if constexpr (MODE == SS8P) return pick_nh<MODE, 18>(nwg, halves); break;
     }
     return nullptr;
@@ -875,7 +902,7 @@ int main(int argc, char** argv) {
         const int warps[2] = {0, 4};
         const char* lbl[2] = {"writer warp0", "math   warp4"};
         for (int w = 0; w < 2; ++w) {
-            printf("   %s clk/stage (rs8d: ph0 issue, ph1 wait+promote, ph2 decode-ALU, ph3 prefetch LDS):", lbl[w]);
+            printf("   %s clk/stage (rs8d: ph0 issue, ph1 wait, ph2 decode-ALU, ph3 prefetch LDS, ph4 promote):", lbl[w]);
             for (int i = 0; i < 8; ++i) {
                 double s = 0; for (int b = 0; b < nsm; ++b) s += (double)hp[(b * 12 + warps[w]) * 8 + i];
                 printf(" ph%d=%6.0f", i, s / nsm / iters);

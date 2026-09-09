@@ -74,8 +74,15 @@ FLAGS=64 run rs8d 2 2
 FLAGS=96 run rs8d 2 2
 FLAGS=1 run rs8d 2 2
 FLAGS=65 run rs8d 2 2
-FLAGS=96 run rs8d 3 2
-FLAGS=96 run rs8d 3 1
+echo "# kernel loop order (128): + prefetch (32), + raw-u8 deferred affine (64)"
+FLAGS=128 run rs8d 2 2
+FLAGS=160 run rs8d 2 2
+FLAGS=192 run rs8d 2 2
+FLAGS=224 run rs8d 2 2
+FLAGS=225 run rs8d 2 2
+FLAGS=224 run rs8d 3 2
+FLAGS=224 run rs8d 3 1
+FLAGS=128 run rs8d 3 1
 ;;
 offload)
 echo "# reference: kernel form rs8d with phase stamps"
@@ -94,7 +101,7 @@ DEC=2 run ss8u 2 2
 ;;
 sass)
 echo "# SASS excerpt: rs8d<2,2,0> and rs8t<2,2,0> main loop (tensor / warpgroup / LDS / branch instructions only)"
-for fn in $(cuobjdump -symbols "$OUT/mb" 2>/dev/null | grep -o "_Z12bench_kernelILi8ELi2ELi2ELi\(0\|96\)EE[A-Za-z0-9_]*" | sort -u); do
+for fn in $(cuobjdump -symbols "$OUT/mb" 2>/dev/null | grep -o "_Z12bench_kernelILi8ELi2ELi2ELi\(128\|224\)EE[A-Za-z0-9_]*" | sort -u); do
   cuobjdump -sass -fun "$fn" "$OUT/mb" > "$OUT/$fn.sass" 2>/dev/null || true
   echo "## $fn: $(grep -c IGMMA "$OUT/$fn.sass") IGMMA, $(grep -c 'WARPGROUP.ARRIVE' "$OUT/$fn.sass") ARRIVE, $(grep -c 'WARPGROUP.DEPBAR' "$OUT/$fn.sass") DEPBAR, $(grep -c 'LDS' "$OUT/$fn.sass") LDS, $(wc -l < "$OUT/$fn.sass") lines"
   echo "   per-block instruction mix in the loop (opcode histogram):"; awk '/WARPGROUP.DEPBAR/{c++} c==2' "$OUT/$fn.sass" | grep -o '^ */\*[0-9a-f]*\*/ *[@!P0-9 ]*[A-Z][A-Z0-9_.]*' | sed 's/.*\*\/ *//; s/^@!*P[0-9] *//' | sort | uniq -c | sort -rn | head -14 | awk '{printf "      %5d %s\n", $1, $2}'
