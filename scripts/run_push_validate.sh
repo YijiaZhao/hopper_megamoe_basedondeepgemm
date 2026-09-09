@@ -51,6 +51,17 @@ if [ "$MODE" = isolate ]; then
   exit 0
 fi
 
+if [ "$MODE" = quick ]; then
+  LOG=push_quick$TAG.log; : > "$LOG"
+  run_corr "mxfp4_mega_moe_fused qoq_mega_moe_fused" "2 16" DG_FP4_PUSH_DISPATCH=1
+  echo ALL_CORR_DONE >> "$LOG"
+  wait_idle; DG_FP4_PUSH_DISPATCH=1 LOG_TAG=_pushON${TAG}3 bash scripts/run_probe.sh mxfp4 2 8 16 > /dev/null 2>&1
+  wait_idle; DG_FP4_PUSH_DISPATCH=0 LOG_TAG=_pushOFF${TAG}2 bash scripts/run_probe.sh mxfp4 8 > /dev/null 2>&1
+  wait_idle; DG_FP4_PUSH_DISPATCH=1 LOG_TAG=_pushON${TAG}2 bash scripts/run_probe.sh qoq 8 > /dev/null 2>&1
+  echo ALL_PERF_DONE >> "$LOG"
+  exit 0
+fi
+
 if [ "$MODE" = build ] || [ "$MODE" = all ]; then
   : > "$LOG"
   echo "--- build" >> "$LOG"

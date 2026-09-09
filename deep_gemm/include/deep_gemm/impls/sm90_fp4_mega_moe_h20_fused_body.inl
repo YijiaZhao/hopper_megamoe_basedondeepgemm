@@ -938,11 +938,13 @@
             // each routed row into the destination pool (16 B per lane per store).
             if (warp_idx < kNumActiveDispatchWarps) {
                 constexpr uint32_t kNumSFFloats = kHidden / 128;
-                constexpr uint32_t kNumTokenChunks = kHidden / 16;
-                DG_STATIC_ASSERT(kHidden % 128 == 0 and kNumSFFloats <= 32, "Invalid SF");
+                constexpr uint32_t kNumTokenChunksPerLane = kHidden / (16 * 32);
+                DG_STATIC_ASSERT(kHidden % 512 == 0 and kNumSFFloats <= 32, "Invalid token / SF shape");
                 for (uint32_t i = (sm_idx * kNumActiveDispatchWarps + warp_idx) * kNumTokensPerWarp;
                      i < num_tokens;
                      i += kNumSMs * kNumActiveDispatchWarps * kNumTokensPerWarp) {
+                    // Lane = (token i + lane / topk, slot lane % topk); tickets first so the
+                    // round trip overlaps the row loads below.
                     int expert_idx = -1;
                     const uint32_t token_topk_idx = i * kNumTopk + lane_idx;
                     if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes)
@@ -956,32 +958,44 @@
                         row_in_expert = static_cast<uint32_t>(ptx::atomic_add_sys(
                             sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                             1ull));
-                    uint32_t active_mask = __ballot_sync(0xffffffff, active);
-                    while (active_mask) {
-                        const uint32_t src_lane = __ffs(active_mask) - 1;
-                        active_mask &= active_mask - 1;
-                        const uint32_t row = __shfl_sync(0xffffffff, row_in_expert, src_lane);
-                        const uint32_t dr  = __shfl_sync(0xffffffff, dst_rank_idx, src_lane);
-                        const uint32_t de  = __shfl_sync(0xffffffff, dst_local_expert_idx, src_lane);
-                        const uint32_t tti = __shfl_sync(0xffffffff, token_topk_idx, src_lane);
-                        DG_DEVICE_ASSERT(row < kPushBlocksPerExpert * BLOCK_M);
-                        const uint32_t src_token_idx = tti / kNumTopk, src_topk_idx = tti % kNumTopk;
-                        const uint32_t pool_token_idx = de * kPushBlocksPerExpert * BLOCK_M + row;
+                    const uint32_t active_mask = __ballot_sync(0xffffffff, active);
+                    #pragma unroll 1
+                    for (uint32_t t = 0; t < kNumTokensPerWarp; ++ t) {
+                        const uint32_t src_token_idx = i + t;
+                        uint32_t token_mask = active_mask & (((1u << kNumTopk) - 1u) << (t * kNumTopk));
+                        if (token_mask == 0)
+                            continue;
+                        // One 3 KB row + SF load per token (registers), then one store per slot
                         const auto* src_token = input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint4>();
-                        auto* dst_token = sym_buffer.map(
-                            l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr<uint4>(), dr);
+                        uint4 row[kNumTokenChunksPerLane];
                         #pragma unroll
-                        for (uint32_t c = lane_idx; c < kNumTokenChunks; c += 32)
-                            dst_token[c] = __ldg(src_token + c);
-                        const auto* src_sf = input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>();
-                        auto* dst_sf = sym_buffer.map(l1_sf_buffer.get_base_ptr<float>(), dr);
-                        if (lane_idx < kNumSFFloats)
-                            dst_sf[lane_idx * kNumPaddedSFPoolTokens + pool_token_idx] = __ldg(src_sf + lane_idx);
-                        if (lane_idx == 0) {
-                            *sym_buffer.map(l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>(), dr) =
-                                __ldg(input_topk_weights_buffer.get_base_ptr<float>() + tti);
-                            *sym_buffer.map(workspace.get_token_src_metadata_ptr(pool_token_idx), dr) =
-                                {static_cast<uint32_t>(sym_buffer.rank_idx), src_token_idx, src_topk_idx};
+                        for (uint32_t c = 0; c < kNumTokenChunksPerLane; ++ c)
+                            row[c] = __ldg(src_token + c * 32 + lane_idx);
+                        const float sf = lane_idx < kNumSFFloats ?
+                            __ldg(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>() + lane_idx) : 0.0f;
+                        while (token_mask) {
+                            const uint32_t src_lane = __ffs(token_mask) - 1;
+                            token_mask &= token_mask - 1;
+                            const uint32_t row_idx = __shfl_sync(0xffffffff, row_in_expert, src_lane);
+                            const uint32_t dr  = __shfl_sync(0xffffffff, dst_rank_idx, src_lane);
+                            const uint32_t de  = __shfl_sync(0xffffffff, dst_local_expert_idx, src_lane);
+                            DG_TRAP_ONLY_DEVICE_ASSERT(row_idx < kPushBlocksPerExpert * BLOCK_M);
+                            const uint32_t pool_token_idx = de * kPushBlocksPerExpert * BLOCK_M + row_idx;
+                            auto* dst_token = sym_buffer.map(
+                                l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr<uint4>(), dr);
+                            #pragma unroll
+                            for (uint32_t c = 0; c < kNumTokenChunksPerLane; ++ c)
+                                dst_token[c * 32 + lane_idx] = row[c];
+                            if (lane_idx < kNumSFFloats)
+                                sym_buffer.map(l1_sf_buffer.get_base_ptr<float>(), dr)
+                                    [lane_idx * kNumPaddedSFPoolTokens + pool_token_idx] = sf;
+                            if (lane_idx == 0) {
+                                const uint32_t tti = src_token_idx * kNumTopk + src_lane % kNumTopk;
+                                *sym_buffer.map(l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>(), dr) =
+                                    __ldg(input_topk_weights_buffer.get_base_ptr<float>() + tti);
+                                *sym_buffer.map(workspace.get_token_src_metadata_ptr(pool_token_idx), dr) =
+                                    {static_cast<uint32_t>(sym_buffer.rank_idx), src_token_idx, src_lane % kNumTopk};
+                            }
                         }
                     }
                     __syncwarp();
