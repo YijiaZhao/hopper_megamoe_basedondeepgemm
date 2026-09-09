@@ -4,7 +4,7 @@
 # DG_FP4_TINYM_MAX_M so the multi-pool-block cases are exercised), then the phase-stamp
 # probe TINYM=1 vs 0, mxfp4 + qoq, M = 2 8 16 global tokens, two interleaved reps.
 # Waits for idle GPUs (no compute apps, no nvcc) before every GPU run.
-# Usage (inside four_api_build container): bash scripts/run_tinym_validate.sh [corr|perf|all] [tag]
+# Usage (inside four_api_build container): [APIS="..."] bash scripts/run_tinym_validate.sh [corr|perf|all] [tag]
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
@@ -40,7 +40,7 @@ run_corr() {  # $1 = api, $2 = T, $3.. = env assignments
 
 if [ "$MODE" = corr ] || [ "$MODE" = all ]; then
   : > "$LOG"
-  for api in mxfp4_mega_moe_fused qoq_mega_moe_fused; do
+  for api in ${APIS:-mxfp4_mega_moe_fused qoq_mega_moe_fused}; do
     for T in 2 8 8 16; do
       run_corr $api $T DG_FP4_TINYM=1 DG_FP4_TINYM_MAX_M=4096
     done

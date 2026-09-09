@@ -36,8 +36,8 @@
     constexpr uint32_t kTMActBytesPerToken = L1_SHAPE_K * (kMXFP4 ? 2u : 1u);  // fp16 or int8
     constexpr uint32_t kTMActBytes = kTMMaxTokens * kTMActBytesPerToken;
     constexpr uint32_t kTMSfOff = kTMActBytes;                                   // [8][24] fp32
-    constexpr uint32_t kTMSumAOff = kTMSfOff + kTMMaxTokens * kTMMaxKBlocks * 4u; // [8][24] int32 (QoQ)
-    constexpr uint32_t kTMLutOff = kTMSumAOff + kTMMaxTokens * kTMMaxKBlocks * 4u; // 16 x uint2 (MXFP4)
+    constexpr uint32_t kTMSumAOff = kTMSfOff + kTMMaxTokens * kTMMaxKBlocks * 4u; // [8][24][4 chunks] int32 (QoQ)
+    constexpr uint32_t kTMLutOff = kTMSumAOff + kTMMaxTokens * kTMMaxKBlocks * 4u * 4u; // 16 x uint2 (MXFP4)
     constexpr uint32_t kTMPbExpertOff = kTMLutOff + 128u;                        // [64] u32
     constexpr uint32_t kTMPbValidOff = kTMPbExpertOff + 64u * 4u;                // [64] u32
     constexpr uint32_t kTMFlagOff = kTMPbValidOff + 64u * 4u;                    // u32
@@ -216,14 +216,20 @@
         }
         tm_bar();
         if constexpr (kQoQ) {
-            for (uint32_t i = tm_tid; i < valid_m * kNKB; i += kNumEpilogueThreads) {
-                const uint32_t t = i / kNKB, kb = i % kNKB;
-                const uint32_t* a = reinterpret_cast<const uint32_t*>(tm_smem + t * kK + kb * BLOCK_K);
+            // Per (token, K128 block, chunk c): the sum of the 32 activations a lane
+            // with chunk c multiplies (K = g*32 + 4c + [0,4) and g*32 + 16 + 4c + [0,4),
+            // g = 0..3), for the per-lane zero-point fold sum((code - z) * a) =
+            // sum(code * a) - z * sum(a) over exactly those K positions.
+            for (uint32_t i = tm_tid; i < valid_m * kNKB * 4u; i += kNumEpilogueThreads) {
+                const uint32_t c = i & 3u, tk = i >> 2, t = tk / kNKB, kb = tk % kNKB;
+                const uint8_t* a = tm_smem + t * kK + kb * BLOCK_K;
                 int32_t s = 0;
                 #pragma unroll
-                for (uint32_t j = 0; j < BLOCK_K / 4; ++ j)
-                    s = tm_dp4a_s8s8(a[j], 0x01010101u, s);
-                tm_sum_a[t * kTMMaxKBlocks + kb] = s;
+                for (uint32_t g = 0; g < 4; ++ g) {
+                    s = tm_dp4a_s8s8(*reinterpret_cast<const uint32_t*>(a + g * 32u + c * 4u), 0x01010101u, s);
+                    s = tm_dp4a_s8s8(*reinterpret_cast<const uint32_t*>(a + g * 32u + 16u + c * 4u), 0x01010101u, s);
+                }
+                tm_sum_a[(t * kTMMaxKBlocks + kb) * 4u + c] = s;
             }
             tm_bar();
         }
@@ -562,7 +568,7 @@
                             a_hi[g] = *reinterpret_cast<const uint32_t*>(a_base + g * 32u + 16u + tm_c * 4u);
                         }
                         const float sf = tm_sf[t * kTMMaxKBlocks + k];
-                        const int32_t sum_a = tm_sum_a[t * kTMMaxKBlocks + k];
+                        const int32_t sum_a = tm_sum_a[(t * kTMMaxKBlocks + k) * 4u + tm_c];
                         #pragma unroll
                         for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
                             int32_t d0 = 0, d1 = 0;
