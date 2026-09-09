@@ -559,7 +559,9 @@ static void sm90_fp4_h20_fused_mega_moe(
         // DG_FP4_RF_PREFETCH_PACKED (default 0): same packed-word prefetch for the generic
         // 2-K-block RF loop (MXFP4 LUT decode / QoQ per-block promote): the k+1 barrier
         // check and the next block-0 packed LDS move ahead of the wait<1> that frees
-        // frag[0]. Numerics unchanged (only the load is hoisted).
+        // frag[0]. Numerics unchanged (only the load is hoisted). H20 MXFP4 probe: neutral
+        // (stage 1314-1324 vs 1319-1321 ns, skew-corrected end M8 42.8 vs 42.7 us, M16
+        // 63.8/64.5 vs 63.8), so off.
         .rf_prefetch_packed = get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0,
         .strided_pool_debug = strided_pool_debug,
         .config = config,
