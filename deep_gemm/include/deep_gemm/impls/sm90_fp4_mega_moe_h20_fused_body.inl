@@ -1776,10 +1776,19 @@
                         for (uint32_t half = 0; half < kWGHalves; ++ half) {
                             float s2_r0 = 1.0f, s2_r1 = 1.0f;
                             if constexpr (kQoQ) {
+                                // s2[row] = byte 64 of the packed row (meta word bytes 64..67):
+                                // one LDS.32 per row and an exact u8 -> float via the 2^23 magic
+                                // constant. The previous generic u8 load + I2F pair (quarter-rate
+                                // XU op right on the promote critical path) measured 475 ns per
+                                // 2-block stage against 151 ns for the MXFP4 promote (slot 30).
                                 const auto* packed_rows =
                                     reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) + kb * kPackedBKBlockBytes;
-                                s2_r0 = static_cast<float>(packed_rows[(wg_n_idx + half * 64u + r_0) * 80u + 64u]);
-                                s2_r1 = static_cast<float>(packed_rows[(wg_n_idx + half * 64u + r_1) * 80u + 64u]);
+                                const uint32_t m0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                    packed_rows + (wg_n_idx + half * 64u + r_0) * 80u + 64u));
+                                const uint32_t m1 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                    packed_rows + (wg_n_idx + half * 64u + r_1) * 80u + 64u));
+                                s2_r0 = __uint_as_float(0x4B000000u | (m0 & 0xffu)) - 8388608.0f;
+                                s2_r1 = __uint_as_float(0x4B000000u | (m1 & 0xffu)) - 8388608.0f;
                             }
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
