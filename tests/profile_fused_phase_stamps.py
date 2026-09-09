@@ -91,7 +91,7 @@ def main():
     kernel = (deep_gemm_fused_kernel(args.quant))
     weights = prepare_weights(args, rank, local_experts)
 
-    stamps = torch.zeros(32, dtype=torch.int64, device="cuda")
+    stamps = torch.zeros(40, dtype=torch.int64, device="cuda")
     try:
         torch.manual_seed(17000 + rank * 1000003 + args.global_tokens)
         x = torch.randn(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
@@ -188,9 +188,9 @@ def main():
             print(f"--- per-task probe (SM0 thread0), us per task: L1 {statistics.median(l1t):.2f} "
                   f"({statistics.median(sr[27] for sr in raw_rows):.0f} tasks)  L2 {statistics.median(l2t):.2f} "
                   f"({statistics.median(sr[28] for sr in raw_rows):.0f} tasks)  inter-task gap {statistics.median(gap):.2f} ---")
-            # 30/31 = K128 blocks (stream-K units) run by SM0 in L1 / L2
-            print(f"--- SM0 K-blocks: L1 {statistics.median(sr[30] for sr in raw_rows):.0f}  "
-                  f"L2 {statistics.median(sr[31] for sr in raw_rows):.0f} ---")
+            # 32/33 = K128 blocks (stream-K units) run by SM0 in L1 / L2
+            print(f"--- SM0 K-blocks: L1 {statistics.median(sr[32] for sr in raw_rows):.0f}  "
+                  f"L2 {statistics.median(sr[33] for sr in raw_rows):.0f} ---")
             v = [r[23] for r in rows]
             print(f"  23 {'k+1 tile NOT ready at wait (%)':<32} {statistics.median(v):>9.1f} {min(v):>9.1f} {max(v):>9.1f}")
             print(f"CUDA-event wall (us): median {statistics.median(wall):.2f}  "

@@ -3218,8 +3218,8 @@
                     atomicAdd(phase_stamps + (kBlockIsL2 ? 26 : 25), kt_task1 - kt_task0);
                     atomicAdd(phase_stamps + (kBlockIsL2 ? 28 : 27), 1ull);
                 }
-                // 30/31 = K-blocks (stream-K units) run by SM0 in L1 / L2
-                atomicAdd(phase_stamps + (kBlockIsL2 ? 31 : 30), static_cast<unsigned long long>(num_k_blocks));
+                // 32/33 = K-blocks (stream-K units) run by SM0 in L1 / L2
+                atomicAdd(phase_stamps + (kBlockIsL2 ? 33 : 32), static_cast<unsigned long long>(num_k_blocks));
                 ktask_prev_end = kt_task1;
             }
         };
