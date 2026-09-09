@@ -1878,30 +1878,32 @@
                             sw[h][1] = *reinterpret_cast<const uint32_t*>(packed_rows + row_1 * 80u + 64u);
                         }
                         if constexpr (kInlineS2) {
-                            // QoQ inline s2: byte = (code - z) * s2 as int8. Per 32-bit word
-                            // (4 codes of one row / K128 group -> one s2, z) the codes are
-                            // split into two 16-bit-lane words (even bytes e, odd bytes o),
-                            // one IMAD per lane word computes code * s2 + (256 - z * s2) in
-                            // every lane (all lanes in [31, 481]: no borrow, no carry), and a
-                            // PRMT gathers the low bytes back: low byte of (x + 256) == the
-                            // two's-complement int8 of x. Verified exhaustively over all
-                            // (code, z, s2) on the host (bit-exact vs (code - z) * s2 & 0xff).
-                            // s2 = byte 64, z = byte 65 of the packed row.
-                            uint32_t s2v[kWGHalves][2], bias[kWGHalves][2];
+                            // QoQ inline s2: byte = (code - z) * s2 as int8, LiquidGEMM form
+                            // (arXiv 2509.01229 Sec. 4 Eq. 9-12): with a = 128 - z * s2,
+                            //   int8 = ((code * s2 + a) mod 256) XOR 0x80
+                            // on all four byte lanes of a word at once (codes already in byte
+                            // lanes after the nibble AND): one IMAD (word * s2 + a * 0x01010101)
+                            // and one LOP3 XOR per 4 weights. Overflow-free by the packer's
+                            // invariants (z = round(-min / s2), |w8| <= 112, s2 <= 15):
+                            // z * s2 <= 112 + s2/2 < 128 so a in [8, 128] (no wrap), and each
+                            // lane holds 128 + (code - z) * s2 in [8, 248] (no carry between
+                            // lanes). Verified exhaustively on the host over every (code, z, s2)
+                            // whose dequant fits int8 (bit-exact vs ((code - z) * s2) & 0xff).
+                            // a is derived in-kernel from the meta bytes (s2 = byte 64,
+                            // z = byte 65): 2 IMAD per row per K-block.
+                            uint32_t s2v[kWGHalves][2], a4[kWGHalves][2];
                             #pragma unroll
                             for (uint32_t h = 0; h < kWGHalves; ++ h) {
                                 #pragma unroll
                                 for (uint32_t r = 0; r < 2; ++ r) {
                                     s2v[h][r] = sw[h][r] & 0xffu;
                                     const uint32_t z = (sw[h][r] >> 8u) & 0xffu;
-                                    bias[h][r] = 0x01000100u - (z * s2v[h][r]) * 0x00010001u;
+                                    a4[h][r] = (0x80u - z * s2v[h][r]) * 0x01010101u;
                                 }
                             }
                             const auto fold = [](const uint32_t& c, const uint32_t& s2,
-                                                 const uint32_t& b) -> uint32_t {
-                                const uint32_t e = c & 0x00ff00ffu;
-                                const uint32_t o = __byte_perm(c, 0u, 0x4341u);  // [c1, 0, c3, 0]
-                                return __byte_perm(e * s2 + b, o * s2 + b, 0x6240u);
+                                                 const uint32_t& a) -> uint32_t {
+                                return (c * s2 + a) ^ 0x80808080u;
                             };
                             #pragma unroll
                             for (uint32_t h = 0; h < kWGHalves; ++ h) {
@@ -1911,10 +1913,10 @@
                                                              k == 2 ? w[h][0].z : w[h][0].w;
                                     const uint32_t word_r1 = k == 0 ? w[h][1].x : k == 1 ? w[h][1].y :
                                                              k == 2 ? w[h][1].z : w[h][1].w;
-                                    f[h][k][0] = fold((word_r0 >> 4) & 0x0f0f0f0fu, s2v[h][0], bias[h][0]);
-                                    f[h][k][1] = fold((word_r1 >> 4) & 0x0f0f0f0fu, s2v[h][1], bias[h][1]);
-                                    f[h][k][2] = fold(word_r0 & 0x0f0f0f0fu, s2v[h][0], bias[h][0]);
-                                    f[h][k][3] = fold(word_r1 & 0x0f0f0f0fu, s2v[h][1], bias[h][1]);
+                                    f[h][k][0] = fold((word_r0 >> 4) & 0x0f0f0f0fu, s2v[h][0], a4[h][0]);
+                                    f[h][k][1] = fold((word_r1 >> 4) & 0x0f0f0f0fu, s2v[h][1], a4[h][1]);
+                                    f[h][k][2] = fold(word_r0 & 0x0f0f0f0fu, s2v[h][0], a4[h][0]);
+                                    f[h][k][3] = fold(word_r1 & 0x0f0f0f0fu, s2v[h][1], a4[h][1]);
                                 }
                             }
                         } else if constexpr (kQoQ) {
