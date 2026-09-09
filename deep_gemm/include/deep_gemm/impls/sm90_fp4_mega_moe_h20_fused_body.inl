@@ -2681,8 +2681,12 @@
                     // the first wait<1>; next blk0: after the k+1 barrier check, before the
                     // second wait<1>); with raw-u8 block b of a stage accumulates into set
                     // b, `compute_colsum_rf` runs right after each stage's full barrier and
-                    // the retired set is folded (`fold_block_rf`) after the wait that
-                    // retired it, always before that stage's empty-barrier arrive.
+                    // both sets are folded (`fold_block_rf`) after a stage-end wait<0>
+                    // (separate loop below): reading a retired set while the other block's
+                    // group is still in flight makes ptxas serialise every wgmma (C7514,
+                    // seen with the fold placed after the wait<1>s), so raw-u8 trades the
+                    // never-drained pipe for the cheaper decode; the next stage's block 0
+                    // is decoded before the drain so only the fold + issue gap is exposed.
                     if constexpr (kQIS2RawU8) {
                         #pragma unroll
                         for (uint32_t h = 0; h < kWGHalves; ++ h) {
@@ -2701,7 +2705,6 @@
                             }
                         }
                     }
-                    constexpr uint32_t kSet1 = kQIS2RawU8 ? 1u : 0u;
                     uint4 pf_w[kWGHalves][2];      // prefetched packed words (kQIS2Prefetch)
                     uint32_t pf_sw[kWGHalves][2];
                     if (num_k_blocks > 0) {
@@ -2715,6 +2718,86 @@
                             compute_colsum_rf(stage_idx);
                         decode_stage_rf(stage_idx, 0, frag[0]);
                     }
+                    if constexpr (kQIS2RawU8) {
+                    // Raw-u8 order (microbench FLAGS 128 "KORDER"): per stage
+                    //   issue G(s,0) [frag 0 -> set 0]; decode blk1 -> frag 1 (free since the
+                    //   stage-end drain); issue G(s,1) [frag 1 -> set 1]; k+1 barrier,
+                    //   colsum(k+1); wait<1> -> G(s,0) retired, frag 0 free; decode k+1 blk0
+                    //   -> frag 0 (overlaps G(s,1)); wait<0>; fold set 0 + set 1 (slot 30);
+                    //   release stage s.
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;) {
+                        const unsigned long long kt_head = clock64();
+                        const uint32_t cur_stage = stage_idx;
+                        kstage_add(21, 1ull);
+                        if (k_block_idx > 0)
+                            kstage_add(22, kt_head - kstage_t_prev);
+                        kstage_t_prev = kt_head;
+                        if (!exp_skip(2u))
+                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
+                        unsigned long long kt_b = clock64();
+                        kstage_add(31, kt_b - kt_head);
+                        if (!exp_skip(1u)) {
+                            if constexpr (kQIS2Prefetch) {
+                                load_packed_rf(cur_stage, 1, pf_w, pf_sw);
+                                decode_words_rf(pf_w, pf_sw, frag[1]);
+                            } else {
+                                decode_stage_rf(cur_stage, 1, frag[1]);
+                            }
+                        }
+                        unsigned long long kt_a = clock64();
+                        kstage_add(18, kt_a - kt_b);
+                        if (!exp_skip(2u))
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1]);
+                        kt_b = clock64();
+                        kstage_add(31, kt_b - kt_a);
+                        const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
+                        const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
+                        const uint32_t next_phase = phase ^ (next_stage == 0);
+                        if (has_next && (kexp & 4u) == 0u) {
+                            if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                kstage_add(23, 1ull);
+                                full_barriers[next_stage]->wait(next_phase);
+                            }
+                        }
+                        kt_a = clock64();
+                        kstage_add(17, kt_a - kt_b);
+                        // Unconditional like the decode (stale slot on the task's last stage).
+                        compute_colsum_rf(next_stage);
+                        if constexpr (kQIS2Prefetch)
+                            load_packed_rf(next_stage, 0, pf_w, pf_sw);
+                        kt_b = clock64();
+                        kstage_add(18, kt_b - kt_a);
+                        fence_accum();
+                        ptx::warpgroup_wait<1>();
+                        fence_frag(frag[0]);
+                        kt_a = clock64();
+                        kstage_add(19, kt_a - kt_b);
+                        if (!exp_skip(1u)) {
+                            if constexpr (kQIS2Prefetch)
+                                decode_words_rf(pf_w, pf_sw, frag[0]);
+                            else
+                                decode_stage_rf(next_stage, 0, frag[0]);
+                        }
+                        kt_b = clock64();
+                        kstage_add(18, kt_b - kt_a);
+                        fence_accum();
+                        ptx::warpgroup_wait<0>();
+                        fence_frag(frag[1]);
+                        kt_a = clock64();
+                        kstage_add(19, kt_a - kt_b);
+                        if (!exp_skip(8u)) {
+                            fold_block_rf(cur_stage, 0, swap_accum[0]);
+                            fold_block_rf(cur_stage, 1, swap_accum[1]);
+                        }
+                        arrive_empty_barrier(cur_stage);
+                        if (!has_next) {
+                            if (!exp_skip(8u))
+                                promote_task_raw_rf();
+                        }
+                        kstage_add(30, clock64() - kt_a);
+                        advance_pipeline(k_block_idx);
+                    }
+                    } else {
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;) {
                         const unsigned long long kt_head = clock64();
                         const uint32_t cur_stage = stage_idx;
@@ -2735,11 +2818,8 @@
                         fence_accum();
                         ptx::warpgroup_wait<1>();
                         fence_frag(frag[1]);
-                        if (k_block_idx > 0) {
-                            if constexpr (kQIS2RawU8)
-                                fold_block_rf(prev_stage, 1, swap_accum[kSet1]);
+                        if (k_block_idx > 0)
                             arrive_empty_barrier(prev_stage);
-                        }
                         unsigned long long kt_a = clock64();
                         kstage_add(19, kt_a - kt_b);
                         if (!exp_skip(1u)) {
@@ -2751,7 +2831,7 @@
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[kSet1]);
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[0]);
                         kt_a = clock64();
                         kstage_add(31, kt_a - kt_b);
                         const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
@@ -2768,8 +2848,6 @@
                             }
                             kt_b = clock64();
                             kstage_add(17, kt_b - kt_a);
-                            if constexpr (kQIS2RawU8)
-                                compute_colsum_rf(next_stage);
                             load_packed_rf(next_stage, 0, pf_w, pf_sw);
                             kt_a = clock64();
                             kstage_add(18, kt_a - kt_b);
@@ -2778,8 +2856,6 @@
                         fence_accum();
                         ptx::warpgroup_wait<1>();
                         fence_frag(frag[0]);
-                        if constexpr (kQIS2RawU8)
-                            fold_block_rf(cur_stage, 0, swap_accum[0]);
                         kt_b = clock64();
                         kstage_add(19, kt_b - kt_a);
                         if constexpr (!kQIS2Prefetch) {
@@ -2791,8 +2867,6 @@
                             }
                             kt_a = clock64();
                             kstage_add(17, kt_a - kt_b);
-                            if constexpr (kQIS2RawU8)
-                                compute_colsum_rf(next_stage);
                         } else {
                             kt_a = kt_b;
                         }
@@ -2812,20 +2886,15 @@
                             fence_accum();
                             ptx::warpgroup_wait<0>();
                             fence_frag(frag[1]);
-                            if constexpr (kQIS2RawU8)
-                                fold_block_rf(cur_stage, 1, swap_accum[kSet1]);
                             arrive_empty_barrier(cur_stage);
                             kt_a = clock64();
                             kstage_add(19, kt_a - kt_b);
-                            if (!exp_skip(8u)) {
-                                if constexpr (kQIS2RawU8)
-                                    promote_task_raw_rf();
-                                else
-                                    promote_task_rf(swap_accum[0]);
-                            }
+                            if (!exp_skip(8u))
+                                promote_task_rf(swap_accum[0]);
                             kstage_add(30, clock64() - kt_a);
                         }
                         advance_pipeline(k_block_idx);
+                    }
                     }
                     // Explicit drain on the K-loop exit path: without it ptxas' CFG analysis
                     // finds a path from an in-flight wgmma to the next task's accumulator
