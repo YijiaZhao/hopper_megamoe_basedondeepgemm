@@ -1508,7 +1508,7 @@
                         128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
                 }
             };
-            // Stage-level probe (SM0 / thread 0 only; phase_stamps slots 17..22, SM cycles):
+            // Stage-level probe (SM0 / thread 0 only; phase_stamps slots 17..22 + 30/31, SM cycles):
             //   17 full-barrier wait | 18 RF decode+LUT (both halves) | 19 wgmma arrive->drain
             //   21 #L1 stages | 22 head-to-head stage total (excl. last stage of a task)
             //   (kKBlocksPerStage == 2: all per *2-K128-block* stage; 18 = both decodes,
@@ -1871,12 +1871,16 @@
                         if ((kexp & 2u) == 0u)
                             issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
                         unsigned long long kt_b = clock64();
+                        kstage_add(31, kt_b - kt_head);
                         if ((kexp & 1u) == 0u)
                             decode_stage_rf(cur_stage, 1, frag[1]);
                         unsigned long long kt_a = clock64();
                         kstage_add(18, kt_a - kt_b);
                         if ((kexp & 2u) == 0u)
                             issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1]);
+                        kt_b = clock64();
+                        kstage_add(31, kt_b - kt_a);
+                        kt_a = kt_b;
                         // Block 0's group was issued before the block-1 decode; retire it
                         // so frag[0] can take the next stage's block 0.
                         fence_accum();
@@ -1905,11 +1909,14 @@
                         fence_accum();
                         ptx::warpgroup_wait<0>();
                         fence_frag(frag[1]);
-                        kstage_add(19, clock64() - kt_b);
+                        kt_a = clock64();
+                        kstage_add(19, kt_a - kt_b);
                         if ((kexp & 8u) == 0u) {
                             promote_stage_rf(cur_stage, ksplit_kb, swap_accum[0]);
                             promote_stage_rf(cur_stage, 1, swap_accum[1]);
                         }
+                        // 30 = both promotes (QoQ: s2 byte loads + int32 -> float + scale).
+                        kstage_add(30, clock64() - kt_a);
                         arrive_empty_barrier(cur_stage);
                         advance_pipeline(k_block_idx);
                     }

@@ -48,8 +48,11 @@ ACCUM = [(13, "SM0: entry->after barrier1"), (16, "SM0: barrier1 wait incl. skew
 # K-loop stage probe (SM0 thread0, SM cycles @1830MHz): per-stage ns = cycles / count / 1.83
 # BM8 MXFP4 (kKBlocksPerStage == 2): one "stage" = two K128 blocks (12 stages per L1
 # task); 18 = both decodes of the stage, 19 = wait<1> + wait<0> drains.
+# 30 = both promotes of the stage (QoQ: s2 loads + int32->float + scale), 31 = both
+# WGMMA issue blocks (kKBlocksPerStage == 2 loop only).
 STAGE = [(17, "L1 stage: exposed k+1 full wait"), (18, "L1 stage: RF decode+LUT"),
-         (19, "L1 stage: exposed wgmma drain"), (22, "L1 stage: head-to-head total")]
+         (19, "L1 stage: exposed wgmma drain"), (31, "L1 stage: wgmma issue (both)"),
+         (30, "L1 stage: promote (both)"), (22, "L1 stage: head-to-head total")]
 SM_GHZ = 1.83
 
 
