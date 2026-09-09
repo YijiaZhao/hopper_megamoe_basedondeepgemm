@@ -30,13 +30,15 @@ wait_idle() {
   done
 }
 
-run_corr() {  # $1 = api list (space separated), $2 = token list, $3.. = env assignments
-  local apis=$1 toks=$2; shift 2
-  wait_idle
-  echo "--- apis=[$apis] tokens=[$toks] ($*)" >> "$LOG"
-  env "$@" timeout 1200 $TR --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
-    --apis $apis --tokens $toks >> "$LOG" 2>&1
-  echo "EXIT=$?" >> "$LOG"
+run_corr() {  # $1 = api list (space separated), $2 = token list (one launch per T), $3.. = env assignments
+  local apis=$1 toks=$2 T; shift 2
+  for T in $toks; do
+    wait_idle
+    echo "--- apis=[$apis] tokens=$T ($*)" >> "$LOG"
+    env "$@" timeout 1200 $TR --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
+      --apis $apis --tokens $T >> "$LOG" 2>&1
+    echo "EXIT=$?" >> "$LOG"
+  done
 }
 
 if [ "$MODE" = build ] || [ "$MODE" = all ]; then
