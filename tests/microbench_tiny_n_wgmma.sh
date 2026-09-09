@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 OUT="${1:-/tmp/mb_tiny_n}"
 mkdir -p "$OUT"
-nvcc -gencode arch=compute_90a,code=sm_90a -O3 -std=c++17 -o "$OUT/mb" microbench_tiny_n_wgmma.cu
+nvcc -gencode arch=compute_90a,code=sm_90a -O3 -std=c++17 -Xptxas -v -o "$OUT/mb" microbench_tiny_n_wgmma.cu 2>&1 | grep -i "C75\|warn\|error" || true
 run() { timeout 300 "$OUT/mb" "$@"; }
 echo "# (a) baseline: 2 WG x 2 halves RS m64n8k32 s8, 1 commit/block, wait<1>"
 run rs8 2 2
@@ -25,6 +25,16 @@ run rs8 3 2
 run rs8 3 1
 run ss8 1 4
 run ss8 3 2
+echo "# (a-faithful) kernel 2-buffer loop with per-block RF decode; ss8d = decode->smem + SS; dec = decode only"
+run rs8d 2 2
+run ss8d 2 2
+run dec 2 2
+DEC=2 run rs8d 2 2
+DEC=2 run ss8d 2 2
+DEC=2 run dec 2 2
+run rs8d 3 2
+run ss8d 3 2
+run rs8d 1 4
 echo "# (e) legacy mma.sync m16n8k32 s8, 8 warps"
 run imma 2 2
 run immal 2 2
