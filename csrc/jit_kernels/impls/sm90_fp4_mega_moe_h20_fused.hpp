@@ -515,9 +515,11 @@ static void sm90_fp4_h20_fused_mega_moe(
         // DG_FP4_QIS2_FRAGS (2|3|4, default 2): A-fragment register buffers of the
         // inline s2 loop (wait_group lag = frags - 1); 3/4 cost +32/+64 regs.
         .qoq_inline_s2_frags = std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4),
-        // DG_FP4_QIS2_ILV (default 1): interleave the next block's per-K32 decode
+        // DG_FP4_QIS2_ILV (default 0): interleave the next block's per-K32 decode
         // between one-K32-step commit groups (two frag buffers, lag 4 groups).
-        .qoq_inline_s2_ilv = qoq && get_env<int>("DG_FP4_QIS2_ILV", 1) != 0,
+        // Off: ptxas still serialises that loop (C7513) so it measured 2675 ns per
+        // stage vs 1250-1290 for the 2-buffer loop (H20 2026-09-09).
+        .qoq_inline_s2_ilv = qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0,
         .strided_pool_debug = strided_pool_debug,
         .config = config,
         .y = y.data_ptr(),
@@ -558,7 +560,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "") +
         ((qoq && std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4) != 2) ?
             fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "") +
-        ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 1) != 0) ? "_ilv" : "");
+        ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }
