@@ -19,7 +19,8 @@ LOG=corr_sk.log
 
 wait_idle() {  # wait (<= 60 min) until no compute process / nvcc is running
   for _ in $(seq 1 360); do
-    if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && ! pgrep -x nvcc > /dev/null; then
+    # (zombie nvcc processes of other sessions do not count)
+    if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && [ -z "$(ps -C nvcc -o stat= | grep -v Z)" ]; then
       return 0
     fi
     sleep 10
