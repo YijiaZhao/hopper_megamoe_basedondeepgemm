@@ -20,7 +20,7 @@
 //   rs8k   :     RS  m64n8k32 s8 but one commit group per k step (2 wgmma/group), wait<4>
 //              (the b304589 inline-s2 loop form)
 //
-// nvcc -arch=sm_90a -O3 -std=c++17 -o microbench_tiny_n_wgmma microbench_tiny_n_wgmma.cu
+// nvcc -gencode arch=compute_90a,code=sm_90a -O3 -std=c++17 -o microbench_tiny_n_wgmma microbench_tiny_n_wgmma.cu
 // ./microbench_tiny_n_wgmma <mode> <num_math_wgs> <halves_per_wg> [iters]
 #include <cuda_runtime.h>
 #include <cstdio>

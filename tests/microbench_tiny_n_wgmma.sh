@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 OUT="${1:-/tmp/mb_tiny_n}"
 mkdir -p "$OUT"
-nvcc -arch=sm_90a -O3 -std=c++17 -o "$OUT/mb" microbench_tiny_n_wgmma.cu
+nvcc -gencode arch=compute_90a,code=sm_90a -O3 -std=c++17 -o "$OUT/mb" microbench_tiny_n_wgmma.cu
 run() { timeout 300 "$OUT/mb" "$@"; }
 echo "# (a) baseline: 2 WG x 2 halves RS m64n8k32 s8, 1 commit/block, wait<1>"
 run rs8 2 2
