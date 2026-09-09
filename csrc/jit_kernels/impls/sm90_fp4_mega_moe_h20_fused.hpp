@@ -234,7 +234,7 @@ static void sm90_fp4_h20_fused_mega_moe(
     // 86.7-88.6 vs 89.2 (L1 phase -4.5 / -12 us at M=8 / 16, partly given back to
     // a longer L2 tail). Default ON for that tier; DG_FP4_SPLITK_L1=0 disables.
     // Exclusive with half-tile tasks. No effect on TMA boxes / SF granularity.
-    const bool split_k_l1 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
+    const bool split_k_l1 = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && plan.use_interleaved_scheduler &&
         get_env<int>("DG_FP4_SPLITK_L1", 1) != 0;
     // L2 half-row tasks (kernel `kL2HalfRowTasks`): the BM8 MXFP4 RF swapAB tier
@@ -343,7 +343,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // DG_FP4_DIST_BCAST defaults ON since the H20 09-09 A/B.
         //   DG_FP4_SWAP_PIPE=1   overlap decode(k+1) with WGMMA(k) in swapAB tiles
         //   DG_FP4_DIST_BCAST=1  spread the dispatch expert-count broadcast over all SMs
-        // MXFP4 swapAB tiers use the RF-decode serial loop (kRFDecode).
+        // MXFP4/QoQ swapAB tiers use the RF-decode serial loop (kRFDecode).
         .swap_pipeline_decode = !qoq && !mxfp4 && get_env<int>("DG_FP4_SWAP_PIPE", 0) != 0,
         // H20 A/B (2026-09-09): spreading the expert-count broadcast over all
         // SMs removes ~10us of SM0-serial sys-scope atomics (M=2: 62->52us).

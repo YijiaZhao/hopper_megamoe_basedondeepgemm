@@ -71,7 +71,9 @@ def transform_mxfp4_weights_for_mega_moe_fused(l1,l2):
 def transform_qoq_weights_for_mega_moe_fused(l1,l2):
     from ..quantization_qoq_fused import qoq_meta_to_tile_major,qoq_fuse_packed_with_meta_tile_major
     def prep(p,s2,z,s1):
-        tm=qoq_meta_to_tile_major(s2,z,block_n=256); return _check_fused_dense(qoq_fuse_packed_with_meta_tile_major(p.contiguous(),tm)),tm,s1.float().contiguous()
+        # RF fragment order + word transpose like MXFP4 (plain nibbles: no `_braid`, the
+        # QoQ decoders shift/mask; meta bytes 64/65 are untouched by both helpers).
+        tm=qoq_meta_to_tile_major(s2,z,block_n=256); return _check_fused_dense(_fused_word_transpose(_mxfp4_rf_fragment_order(qoq_fuse_packed_with_meta_tile_major(p.contiguous(),tm)))),tm,s1.float().contiguous()
     p,s2,z,s1=l1; return prep(_interleave(p),_interleave(s2),_interleave(z),_interleave(s1.unsqueeze(-1)).squeeze(-1)),prep(*l2)
 
 class FusedSymmBuffer:

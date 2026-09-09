@@ -385,8 +385,13 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_braided_lut_window(
 // into 128 int8 bytes = (code - z) in [-15, 15]. "SHIFTXOR": spread nibbles
 // with shift/mask, then per-byte subtract z with a borrow guard
 // ((x | 0x80) - z) ^ 0x80 == (x - z) mod 256 lane-wise. s2 is applied at the
-// per-K128 promote, s1 in the epilogue. Same Marlin byte order as the FP4
-// decoders (word: high nibbles = K[0..3], low nibbles = K[4..7]).
+// per-K128 promote, s1 in the epilogue. QoQ rows are stored in the same RF
+// fragment order + word transpose as MXFP4 (host `_mxfp4_rf_fragment_order`,
+// `_fused_word_transpose`; plain nibbles, no braid): after `transpose_rf_quads`,
+// word c of K32 group g holds K = g*32 + 4c + [0..4) in its high nibbles and
+// K = g*32 + 16 + 4c + [0..4) in its low nibbles, so the decoded high words of
+// c = 0..3 form K[0..16) and the low words K[16..32) of the group. The swapAB
+// tiers decode the same words straight into RS A fragments (`decode_stage_rf`).
 __device__ __forceinline__ void dequant_smem_b_from_packed_qoq_shiftxor(
         uint8_t* __restrict__ smem_b,
         const uint8_t* __restrict__ packed_b,
@@ -396,22 +401,22 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_qoq_shiftxor(
     const uint32_t zz = static_cast<uint32_t>(row_ptr[65]) * 0x01010101u;
     uint8_t* __restrict__ dst = smem_b + row * 128u;
     const uint32_t row_swizzle = (row & 7u) << 4;
+    uint4 quads[4] = {src[0], src[1], src[2], src[3]};
+    transpose_rf_quads(quads);
     #pragma unroll
-    for (uint32_t quad_i = 0; quad_i < 4; ++ quad_i) {
-        const uint4 q = src[quad_i];
+    for (uint32_t g = 0; g < 4; ++ g) {
+        const uint4 q = quads[g];
         const uint32_t w[4] = {q.x, q.y, q.z, q.w};
-        uint32_t out[8];
+        uint32_t hi[4], lo[4];
         #pragma unroll
-        for (uint32_t j = 0; j < 4; ++ j) {
-            const uint32_t hi = ((w[j] >> 4) & 0x0f0f0f0fu) | 0x80808080u;
-            const uint32_t lo = (w[j] & 0x0f0f0f0fu) | 0x80808080u;
-            out[j * 2 + 0] = (hi - zz) ^ 0x80808080u;
-            out[j * 2 + 1] = (lo - zz) ^ 0x80808080u;
+        for (uint32_t c = 0; c < 4; ++ c) {
+            hi[c] = ((((w[c] >> 4) & 0x0f0f0f0fu) | 0x80808080u) - zz) ^ 0x80808080u;
+            lo[c] = (((w[c] & 0x0f0f0f0fu) | 0x80808080u) - zz) ^ 0x80808080u;
         }
-        *reinterpret_cast<uint4*>(dst + ((quad_i * 32u) ^ row_swizzle)) =
-            make_uint4(out[0], out[1], out[2], out[3]);
-        *reinterpret_cast<uint4*>(dst + ((quad_i * 32u + 16u) ^ row_swizzle)) =
-            make_uint4(out[4], out[5], out[6], out[7]);
+        *reinterpret_cast<uint4*>(dst + ((g * 32u) ^ row_swizzle)) =
+            make_uint4(hi[0], hi[1], hi[2], hi[3]);
+        *reinterpret_cast<uint4*>(dst + ((g * 32u + 16u) ^ row_swizzle)) =
+            make_uint4(lo[0], lo[1], lo[2], lo[3]);
     }
 }
 

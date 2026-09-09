@@ -149,7 +149,7 @@
     // notify. The scheduler only splits when the launch's pool
     // block count fits the scratch (kSM90SplitKL1MaxPoolBlocks); L2 is unchanged.
     constexpr bool kSplitKL1 =
-        kSplitKL1Requested && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
+        kSplitKL1Requested && kSwapABRequested && (kMXFP4 || kQoQ) && BLOCK_M == 8 &&
         !kHalfTileTasks && kUseInterleavedScheduler && kDenseWeightTiles && BLOCK_N == 256;
     constexpr uint32_t kNumL1KSplits = kSplitKL1 ? fused_layout::kSM90SplitKL1NumKSplits : 1u;
     // L2 half-row tasks (kL2HalfRowTasks; host env DG_FP4_L2_HALFROW, default OFF;
@@ -242,12 +242,13 @@
     DG_STATIC_ASSERT(!(kQoQ && kSwapPipelineDecode),
                      "QoQ uses the serial swapAB main loop");
     using swap_accum_t = std::conditional_t<kQoQ, int32_t, float>;
-    // RF decode (swapAB MXFP4 tiers): each thread decodes its own WGMMA A
-    // fragment straight from the packed-B rows (host stores MXFP4 rows in RF
+    // RF decode (swapAB MXFP4 and QoQ tiers): each thread decodes its own WGMMA A
+    // fragment straight from the packed-B rows (host stores MXFP4/QoQ rows in RF
     // fragment order, see `store_decoded_quad`) and issues RS-form WGMMAs.
-    // No decoded-FP8 SMEM tile, no per-stage STS, no per-WG decode barrier.
+    // No decoded SMEM tile, no per-stage STS, no per-WG decode barrier. QoQ uses
+    // the int8 RS atoms (int32 accumulators, s2[row] * s_act[token] promote).
     DG_STATIC_ASSERT(!(kMXFP4 && kQoQ), "MXFP4 and QoQ are exclusive");
-    constexpr bool kRFDecode = kSwapABRequested && kMXFP4;
+    constexpr bool kRFDecode = kSwapABRequested && (kMXFP4 || kQoQ);
     DG_STATIC_ASSERT(!(kRFDecode && kSwapPipelineDecode),
                      "RF decode is only implemented for the serial swapAB main loop");
     // K128 blocks per pipeline stage. The tiny-M (BM8) RF swapAB path carries
@@ -1454,9 +1455,10 @@
             // k+1 is decoded while the tensor cores run, then k is waited on,
             // promoted and released. The generic loop below decodes, runs and
             // waits serially per stage.
-            // RF decode (kRFDecode, MXFP4 swapAB): dedicated per-stage loop shared by
-            // L1 and L2 (both promote with the per-token K128 activation SF only; the
-            // MXFP4 row scale is folded into the FP8 fragments by the LUT). Thread
+            // RF decode (kRFDecode, MXFP4/QoQ swapAB): dedicated per-stage loop shared by
+            // L1 and L2 (both promote with the per-token K128 activation SF; the
+            // MXFP4 row scale is folded into the FP8 fragments by the LUT, the QoQ
+            // integer s2[row] (byte 64 of the packed row) rides the promote). Thread
             // (warp w, lane l) owns rows r_0 = 16w + l/4 and r_1 = r_0 + 8 of each
             // 64-row weight half; column c = l % 4 owns K = 4c..4c+3 and 16+4c..16+4c+3
             // of every K32 step, i.e. exactly word c of each 16-byte quad in the
@@ -1466,10 +1468,13 @@
             // then the decode; both halves' eight m64nNk32 RS WGMMAs share ONE commit
             // group and one drain.
             if constexpr (kSwapABRequested && kRFDecode) {
-                DG_STATIC_ASSERT(!kQoQ, "RF decode is MXFP4-only");
                 DG_STATIC_ASSERT(kSwapABWeightHalves == 2, "RF decode expects two 64-row weight halves");
                 auto run_swap_ab_rf = [&]<uint32_t N_SWAP>() {
-                    using SwapRS = typename mma::sm90::FP8MMARSSelector<N_SWAP>::type;
+                    // QoQ: int8 RS atoms have no N=24; pad to 32 like the SS path (extra
+                    // token columns are masked by `token < valid_m`).
+                    using SwapRS = typename std::conditional_t<kQoQ,
+                        mma::sm90::INT8MMARSSelector<(N_SWAP == 24 ? 32 : N_SWAP)>,
+                        mma::sm90::FP8MMARSSelector<N_SWAP>>::type;
                     DG_STATIC_ASSERT(BLOCK_K / SwapRS::K == 4, "Expects 4 K32 steps per K128");
                     constexpr uint32_t kSwapAccum = SwapRS::kNumAccum;
                     // One accumulator set per K-block of a stage: the two K128 blocks
@@ -1491,7 +1496,7 @@
                     // two independent 2-deep chains (tensor-core latency exposed once
                     // less per block); the chains are summed at promote time.
                     constexpr uint32_t kAccChains = 2u;
-                    float swap_accum[kNumAccKBlocks][kSFGroups][kWGHalves][kAccChains][kSwapAccum];
+                    swap_accum_t swap_accum[kNumAccKBlocks][kSFGroups][kWGHalves][kAccChains][kSwapAccum];
                     uint32_t frag[2][kWGHalves][4][4];  // [buffer][half][k32 step][a0..a3]
 
                     const auto fence_accum = [&]() {
@@ -1542,6 +1547,38 @@
                             sw[h][0] = *reinterpret_cast<const uint32_t*>(packed_rows + row_0 * 80u + 64u);
                             sw[h][1] = *reinterpret_cast<const uint32_t*>(packed_rows + row_1 * 80u + 64u);
                         }
+                        if constexpr (kQoQ) {
+                            // QoQ: pure ALU decode, no LUT gather. Word (K32 step k, column c)
+                            // holds K 4c..4c+3 in its high nibbles and K 16+4c..16+4c+3 in its
+                            // low nibbles (host `_mxfp4_rf_fragment_order`, plain nibbles, no
+                            // braid); byte b <-> K +b. Same borrow-guarded per-byte subtract
+                            // as `dequant_smem_b_from_packed_qoq_shiftxor`: (code - z) int8,
+                            // bit-exact vs the SS tile decoder. z = byte 65 of the packed row.
+                            uint32_t zz[kWGHalves][2];
+                            #pragma unroll
+                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                                zz[h][0] = ((sw[h][0] >> 8u) & 0xffu) * 0x01010101u;
+                                zz[h][1] = ((sw[h][1] >> 8u) & 0xffu) * 0x01010101u;
+                            }
+                            const auto zsub = [](const uint32_t& nib, const uint32_t& z) -> uint32_t {
+                                return ((nib | 0x80808080u) - z) ^ 0x80808080u;
+                            };
+                            #pragma unroll
+                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                                #pragma unroll
+                                for (uint32_t k = 0; k < 4; ++ k) {
+                                    const uint32_t word_r0 = k == 0 ? w[h][0].x : k == 1 ? w[h][0].y :
+                                                             k == 2 ? w[h][0].z : w[h][0].w;
+                                    const uint32_t word_r1 = k == 0 ? w[h][1].x : k == 1 ? w[h][1].y :
+                                                             k == 2 ? w[h][1].z : w[h][1].w;
+                                    // a0: (r_0, K 4c..), a1: (r_1, K 4c..), a2: (r_0, K 16+4c..), a3: (r_1, K 16+4c..)
+                                    f[h][k][0] = zsub((word_r0 >> 4) & 0x0f0f0f0fu, zz[h][0]);
+                                    f[h][k][1] = zsub((word_r1 >> 4) & 0x0f0f0f0fu, zz[h][1]);
+                                    f[h][k][2] = zsub(word_r0 & 0x0f0f0f0fu, zz[h][0]);
+                                    f[h][k][3] = zsub(word_r1 & 0x0f0f0f0fu, zz[h][1]);
+                                }
+                            }
+                        } else {
                         uint2 lut[kWGHalves][2][4];
                         #pragma unroll
                         for (uint32_t h = 0; h < kWGHalves; ++ h) {
@@ -1567,13 +1604,14 @@
                                 f[h][k][2] = d0.y; f[h][k][3] = d1.y;
                             }
                         }
+                        }
                     };
                     // One commit group for K-block `kb` of `stage`: 4 K32 steps into
                     // acc[0] with f[0], then into acc[1] with f[1]. The B (activation)
                     // descriptor addresses the kb-th 1 KB swizzled A tile of the stage.
                     const auto issue_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
                                                     uint32_t (&f)[kWGHalves][4][4],
-                                                    float (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                                                    swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
                         fence_accum();
                         fence_frag(f);
                         ptx::warpgroup_arrive();
@@ -1592,34 +1630,45 @@
                         ptx::warpgroup_commit_batch();
                     };
                     // Promote K-block `kb` of `stage` with its per-token K128 activation SF.
+                    // QoQ: also by the per-row/K128 integer s2 (byte 64 of the packed row,
+                    // still resident in this stage); the two int32 chains are summed
+                    // exactly, so the result is bit-exact vs the SS path's
+                    // (scale * s2) * float(acc).
                     const auto promote_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                      const float (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                                                      const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
                         #pragma unroll
                         for (uint32_t g = 0; g < kSFGroups; ++ g) {
                         const float* sfa = smem_sfa[stage] + (kb * kNumL2SFAGroups + g) * kL2SFAHalfStride;
                         #pragma unroll
                         for (uint32_t half = 0; half < kWGHalves; ++ half) {
+                            float s2_r0 = 1.0f, s2_r1 = 1.0f;
+                            if constexpr (kQoQ) {
+                                const auto* packed_rows =
+                                    reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) + kb * kPackedBKBlockBytes;
+                                s2_r0 = static_cast<float>(packed_rows[(wg_n_idx + half * 64u + r_0) * 80u + 64u]);
+                                s2_r1 = static_cast<float>(packed_rows[(wg_n_idx + half * 64u + r_1) * 80u + 64u]);
+                            }
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
                                 const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
                                 const uint32_t token_0 = i * 8 + col_idx * 2;
                                 const uint32_t token_1 = token_0 + 1;
                                 const auto acc_sum = [&](const uint32_t& j) -> float {
-                                    float v = acc[g][half][0][j];
+                                    swap_accum_t v = acc[g][half][0][j];
                                     #pragma unroll
                                     for (uint32_t c = 1; c < kAccChains; ++ c)
                                         v += acc[g][half][c][j];
-                                    return v;
+                                    return static_cast<float>(v);
                                 };
                                 if (token_0 < valid_m) {
                                     const float scale_0 = ptx::ld_shared(sfa + token_0);
-                                    final_accum[accum_offset + 0] += scale_0 * acc_sum(i * 4 + 0);
-                                    final_accum[accum_offset + 2] += scale_0 * acc_sum(i * 4 + 2);
+                                    final_accum[accum_offset + 0] += (scale_0 * s2_r0) * acc_sum(i * 4 + 0);
+                                    final_accum[accum_offset + 2] += (scale_0 * s2_r1) * acc_sum(i * 4 + 2);
                                 }
                                 if (token_1 < valid_m) {
                                     const float scale_1 = ptx::ld_shared(sfa + token_1);
-                                    final_accum[accum_offset + 1] += scale_1 * acc_sum(i * 4 + 1);
-                                    final_accum[accum_offset + 3] += scale_1 * acc_sum(i * 4 + 3);
+                                    final_accum[accum_offset + 1] += (scale_1 * s2_r0) * acc_sum(i * 4 + 1);
+                                    final_accum[accum_offset + 3] += (scale_1 * s2_r1) * acc_sum(i * 4 + 3);
                                 }
                             }
                         }
