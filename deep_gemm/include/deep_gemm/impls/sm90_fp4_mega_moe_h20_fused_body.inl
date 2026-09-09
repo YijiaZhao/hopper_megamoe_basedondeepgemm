@@ -1392,10 +1392,11 @@
                 if constexpr (!kBlockIsL2) {
                     const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                     DG_SPIN_WHILE(ptx::ld_acq(ptr) != valid_m, 1329);
-                    // Push dispatch: the rows are generic-proxy (remote st.global)
-                    // writes read below through TMA (async proxy).
-                    if constexpr (kPushDispatch)
-                        asm volatile("fence.proxy.async.global;" ::: "memory");
+                    // Push dispatch: the rows were written by REMOTE ranks (weak stores
+                    // over NVLink into this GPU's L2/HBM), never by this SM's generic proxy,
+                    // so no proxy fence is needed before the TMA loads; the acquire above
+                    // (release chain: pusher -> barrier #1 -> local publish) orders them.
+                    // (A fence.proxy.async.global here cost ~2 us per L1 task on H20.)
                 }
                 // L2: no up-front wait for all L1 N-blocks; each stage below
                 // waits only for the L1 blocks that produced its K-block(s).
