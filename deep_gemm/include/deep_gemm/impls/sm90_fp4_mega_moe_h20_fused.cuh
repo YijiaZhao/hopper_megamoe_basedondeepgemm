@@ -485,7 +485,17 @@ template <
     // Host-selected tiny-M CUDA-core GEMV math path (replaces the L1/L2 tensor-core
     // task loop; see `kTinyMGemv` in the body and
     // impls/sm90_fp4_mega_moe_h20_tinym_math.inl). Env DG_FP4_TINYM / DG_FP4_TINYM_MAX_M.
-    bool kTinyMGemvRequested = false
+    bool kTinyMGemvRequested = false,
+    // Host-selected push dispatch (tiny M): the source rank writes each routed
+    // token row + SF + weight + metadata straight into the destination rank's
+    // pool over NVLink during routing (row = remote atomic ticket on the
+    // destination's per-expert count), so no pull round trip follows NVLink
+    // barrier #1; see `kPushDispatch` in the body. Env DG_FP4_PUSH_DISPATCH /
+    // DG_FP4_PUSH_DISPATCH_MAX_M. `kPushMaxTokensPerRank` bounds the rows one rank
+    // can send to one expert (== its local token count) and sizes the per-expert
+    // pool stride.
+    bool kPushDispatchRequested = false,
+    uint32_t kPushMaxTokensPerRank = 2
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

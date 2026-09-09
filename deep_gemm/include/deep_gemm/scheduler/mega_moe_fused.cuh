@@ -357,7 +357,14 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           // math loop consumes whole stages, so segments must be stage-aligned.
           uint32_t kStreamKKBlocksPerUnit = 2,
           uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
-          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K>
+          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
+          // Push dispatch (kernel `kPushDispatch`): the token pool is addressed with
+          // a fixed stride of kPushBlocksPerExpert blocks per local expert (the
+          // sender picks the row before the destination knows any total), so a
+          // task's `pool_block_idx` is expert * stride + m_block instead of the
+          // dense prefix-sum block index. Task indices / counts stay dense.
+          // 0 == packed (pull) layout.
+          uint32_t kPushBlocksPerExpert = 0>
 struct InterleavedMegaMoEScheduler {
     DG_STATIC_ASSERT(!kStreamK || (kNumL1BlockKs % kStreamKKBlocksPerUnit == 0 &&
                                    kNumL2BlockKs % kStreamKKBlocksPerUnit == 0),
@@ -578,6 +585,8 @@ struct InterleavedMegaMoEScheduler {
                 result.local_expert_idx = ptx::exchange(expert_idx, owner_lane_idx);
                 result.m_block_idx = ptx::exchange(owner_m_block_idx, owner_lane_idx);
                 result.valid_m = ptx::exchange(owner_valid_m, owner_lane_idx);
+                if constexpr (kPushBlocksPerExpert != 0)
+                    result.pool_block_idx = result.local_expert_idx * kPushBlocksPerExpert + result.m_block_idx;
             }
             block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
         }

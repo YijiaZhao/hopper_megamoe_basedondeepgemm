@@ -42,6 +42,8 @@ public:
         int k_blocks_per_stage;
         bool tinym;
         int tinym_prefetch;
+        bool push_dispatch;
+        int push_max_tokens_per_rank;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -92,7 +94,9 @@ public:
             "        /* kNvlFastEpilogueRequested */ {},\n"
             "        /* kFineCombineRequested */ {},\n"
             "        /* kKBlocksPerStageRequested */ {},\n"
-            "        /* kTinyMGemvRequested */ {}",
+            "        /* kTinyMGemvRequested */ {},\n"
+            "        /* kPushDispatchRequested */ {},\n"
+            "        /* kPushMaxTokensPerRank */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -111,7 +115,9 @@ public:
             args.nvl_fast_epilogue ? "true" : "false",
             args.fine_combine ? "true" : "false",
             args.k_blocks_per_stage,
-            args.tinym ? "true" : "false");
+            args.tinym ? "true" : "false",
+            args.push_dispatch ? "true" : "false",
+            args.push_max_tokens_per_rank);
         return fmt::format(R"(
 {}
 
@@ -320,6 +326,26 @@ static void sm90_fp4_h20_fused_mega_moe(
         get_env<int>("DG_FP4_TINYM", 0) != 0 &&
         num_global_tokens_upper <= get_env<int>("DG_FP4_TINYM_MAX_M", 16);
     const int tinym_prefetch = std::clamp(get_env<int>("DG_FP4_TINYM_PREFETCH", 2), 1, 4);
+    // Push dispatch (kernel `kPushDispatch`): for <= DG_FP4_PUSH_DISPATCH_MAX_M
+    // (default 16) global tokens the source rank pushes each routed row (3 KB token +
+    // per-K128 SF + top-k weight + source metadata) into the destination rank's pool
+    // during routing (row position = remote atomic ticket on the destination's
+    // per-expert count), so the post-barrier-#1 pull round trip disappears and the
+    // first math task starts right after the barrier. The pool is addressed with a
+    // fixed stride of ceil(num_ranks * tokens_per_rank / BLOCK_M) blocks per local
+    // expert (2 at M <= 16), which must fit the token pool and the split-K / tiny-M
+    // slot count (kSM90SplitKL1MaxPoolBlocks); larger launches keep the pull path.
+    // DG_FP4_PUSH_DISPATCH=0 disables.
+    const int push_max_m = get_env<int>("DG_FP4_PUSH_DISPATCH_MAX_M", 16);
+    const int push_max_tokens_per_rank = std::max(1, (push_max_m + num_ranks - 1) / num_ranks);
+    const int push_blocks_per_expert =
+        (num_ranks * push_max_tokens_per_rank + config.block_m - 1) / config.block_m;
+    const bool push_dispatch = plan.use_interleaved_scheduler &&
+        get_env<int>("DG_FP4_PUSH_DISPATCH", 1) != 0 &&
+        num_global_tokens_upper <= push_max_m && num_tokens <= push_max_tokens_per_rank &&
+        num_experts_per_rank * push_blocks_per_expert * config.block_m <= config.num_max_pool_tokens &&
+        num_experts_per_rank * push_blocks_per_expert <=
+            static_cast<int>(fused_layout::kSM90SplitKL1MaxPoolBlocks);
     // Fast NVLink-barrier epilogue (kernel `kNvlFastEpilogue`, needs the
     // distributed expert bcast so the first barrier has a prologue grid sync):
     // the two barriers with an epilogue (before dispatch pull, before combine)
@@ -440,6 +466,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         .k_blocks_per_stage = (mxfp4 || qoq) ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 2,
         .tinym = tinym,
         .tinym_prefetch = tinym_prefetch,
+        .push_dispatch = push_dispatch,
+        .push_max_tokens_per_rank = push_max_tokens_per_rank,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -473,7 +501,7 @@ static void sm90_fp4_h20_fused_mega_moe(
             "_h200_fused_interleaved" :
             (plan.use_mode2_row_decoder ?
                 "_h200_fused_mode2_row" :
-                "_h200_fused_lut_window")) + (tinym ? "_tinym" : "");
+                "_h200_fused_lut_window")) + (tinym ? "_tinym" : "") + (push_dispatch ? "_push" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

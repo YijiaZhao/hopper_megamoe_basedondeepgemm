@@ -236,6 +236,38 @@
     // scattering after every CTA of every rank has entered that launch) and #3
     // (workspace cleanup), exactly as before.
     constexpr bool kFineCombine = kFineCombineRequested;
+    // Push dispatch (kPushDispatch; host env DG_FP4_PUSH_DISPATCH, default 1, gated by
+    // DG_FP4_PUSH_DISPATCH_MAX_M on the global token count, default 16). Pull model
+    // (default for larger M): after NVLink barrier #1 the dispatch warps pull every
+    // received row (TMA over NVLink, ~6.7 us round trip + local store) before the
+    // first math task can start. Push model: during routing the SOURCE rank takes a
+    // remote atomic ticket on the destination's per-expert count (the same
+    // `expert_recv_count_sum` word the broadcast finalises; its low 32 bits now grow
+    // by 1 per row, the broadcast adds only the SM-count high word), so the row's
+    // position inside the expert is known before any total is, and writes the 3 KB
+    // row + per-K128 SF + top-k weight + source metadata straight into the
+    // destination's pool with plain 16 B stores. Since the destination's dense
+    // prefix-sum pool offsets are unknown to the sender, the pool is addressed with a
+    // FIXED stride of kPushBlocksPerExpert blocks per local expert (rows inside an
+    // expert stay packed: block e * stride + row / BLOCK_M); the scheduler keeps
+    // dense task indices and only remaps `pool_block_idx` (see
+    // InterleavedMegaMoEScheduler::create_task). Visibility: the pushes precede the
+    // sender's grid sync + SM0's release.sys barrier signal exactly like the top-k
+    // index writes of the pull model; after barrier #1 each CTA's dispatch warp 0
+    // publishes the arrival counts locally (release.gpu), so the loaders' acquire
+    // wait is unchanged (plus a proxy fence before the TMA loads). Pool reuse: a rank
+    // can only push launch N+1 rows after NVLink barrier #3 of launch N, which every
+    // rank reaches after ALL its math tasks and its workspace cleanup, so no
+    // destination still reads launch N's L1 pool / metadata or has counters pending.
+    constexpr bool kPushDispatch = kPushDispatchRequested && kUseInterleavedScheduler;
+    constexpr uint32_t kPushBlocksPerExpert = kPushDispatch ?
+        math::constexpr_ceil_div(kNumRanks * kPushMaxTokensPerRank, BLOCK_M) : 0u;
+    DG_STATIC_ASSERT(!kPushDispatch ||
+                     kNumExpertsPerRank * kPushBlocksPerExpert * BLOCK_M <= kNumMaxPoolTokens,
+                     "Push dispatch: strided pool must fit the token pool");
+    DG_STATIC_ASSERT(!kPushDispatch ||
+                     kNumExpertsPerRank * kPushBlocksPerExpert <= fused_layout::kSM90SplitKL1MaxPoolBlocks,
+                     "Push dispatch: strided pool block indices must fit the split-K / tiny-M slots");
     constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / TASK_BLOCK_N;
     constexpr uint32_t kNumRoutedL2BlockNs = L2_SHAPE_N / TASK_BLOCK_N_L2;
     using interleaved_scheduler_t = fused_sched::InterleavedMegaMoEScheduler<
@@ -247,7 +279,8 @@
         math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
         /* phase-specific task N: L1 256-row tasks, L2 TASK_BLOCK_N_L2-row tasks */
         kNumRoutedL1BlockNs, kNumRoutedL2BlockNs,
-        kNumL2KSplits, kStreamK, /* stream-K unit == one 2-K-block stage */ 2u>;
+        kNumL2KSplits, kStreamK, /* stream-K unit == one 2-K-block stage */ 2u,
+        L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K, kPushBlocksPerExpert>;
     constexpr bool kSplitMDecodedWeightReuse =
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
     constexpr uint32_t WG_BLOCK_M =
@@ -798,7 +831,8 @@
                 const auto num_recv_tokens = static_cast<uint32_t>(
                     *workspace.get_expert_recv_count_sum_ptr(i));
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
-                const auto cleanup_pool_block_offset = scheduler.get_pool_block_offset(i);
+                const auto cleanup_pool_block_offset = kPushDispatch ?
+                    i * kPushBlocksPerExpert : scheduler.get_pool_block_offset(i);
 
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -872,15 +906,73 @@
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
         if (thread_idx == 0) stamp_max(8);
 
-        // Write source token-topk indices to remote ranks
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-            const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-        });
-        if (thread_idx == 0) stamp_max(9);
+        if constexpr (kPushDispatch) {
+            // Push: one remote ticket per (token, top-k slot) lane (all lanes of the
+            // warp in flight together, one NVLink round trip), then the warp streams
+            // each routed row into the destination pool (16 B per lane per store).
+            if (warp_idx < kNumActiveDispatchWarps) {
+                constexpr uint32_t kNumSFFloats = kHidden / 128;
+                constexpr uint32_t kNumTokenChunks = kHidden / 16;
+                DG_STATIC_ASSERT(kHidden % 128 == 0 and kNumSFFloats <= 32, "Invalid SF");
+                for (uint32_t i = (sm_idx * kNumActiveDispatchWarps + warp_idx) * kNumTokensPerWarp;
+                     i < num_tokens;
+                     i += kNumSMs * kNumActiveDispatchWarps * kNumTokensPerWarp) {
+                    int expert_idx = -1;
+                    const uint32_t token_topk_idx = i * kNumTopk + lane_idx;
+                    if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes)
+                        expert_idx = static_cast<int>(
+                            __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_topk_idx));
+                    const bool active = expert_idx >= 0;
+                    const uint32_t dst_rank_idx = active ? static_cast<uint32_t>(expert_idx) / kNumExpertsPerRank : 0u;
+                    const uint32_t dst_local_expert_idx = active ? static_cast<uint32_t>(expert_idx) % kNumExpertsPerRank : 0u;
+                    uint32_t row_in_expert = 0;
+                    if (active)
+                        row_in_expert = static_cast<uint32_t>(ptx::atomic_add_sys(
+                            sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+                            1ull));
+                    uint32_t active_mask = __ballot_sync(0xffffffff, active);
+                    while (active_mask) {
+                        const uint32_t src_lane = __ffs(active_mask) - 1;
+                        active_mask &= active_mask - 1;
+                        const uint32_t row = __shfl_sync(0xffffffff, row_in_expert, src_lane);
+                        const uint32_t dr  = __shfl_sync(0xffffffff, dst_rank_idx, src_lane);
+                        const uint32_t de  = __shfl_sync(0xffffffff, dst_local_expert_idx, src_lane);
+                        const uint32_t tti = __shfl_sync(0xffffffff, token_topk_idx, src_lane);
+                        DG_DEVICE_ASSERT(row < kPushBlocksPerExpert * BLOCK_M);
+                        const uint32_t src_token_idx = tti / kNumTopk, src_topk_idx = tti % kNumTopk;
+                        const uint32_t pool_token_idx = de * kPushBlocksPerExpert * BLOCK_M + row;
+                        const auto* src_token = input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint4>();
+                        auto* dst_token = sym_buffer.map(
+                            l1_token_buffer.get_data_buffer(pool_token_idx).get_base_ptr<uint4>(), dr);
+                        #pragma unroll
+                        for (uint32_t c = lane_idx; c < kNumTokenChunks; c += 32)
+                            dst_token[c] = __ldg(src_token + c);
+                        const auto* src_sf = input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>();
+                        auto* dst_sf = sym_buffer.map(l1_sf_buffer.get_base_ptr<float>(), dr);
+                        if (lane_idx < kNumSFFloats)
+                            dst_sf[lane_idx * kNumPaddedSFPoolTokens + pool_token_idx] = __ldg(src_sf + lane_idx);
+                        if (lane_idx == 0) {
+                            *sym_buffer.map(l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>(), dr) =
+                                __ldg(input_topk_weights_buffer.get_base_ptr<float>() + tti);
+                            *sym_buffer.map(workspace.get_token_src_metadata_ptr(pool_token_idx), dr) =
+                                {static_cast<uint32_t>(sym_buffer.rank_idx), src_token_idx, src_topk_idx};
+                        }
+                    }
+                    __syncwarp();
+                }
+            }
+            if (thread_idx == 0) stamp_max(9);  // push issued
+        } else {
+            // Write source token-topk indices to remote ranks
+            read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+                const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
+                const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
+                const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
+                    expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+                *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            });
+            if (thread_idx == 0) stamp_max(9);
+        }
 
         fused_comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
@@ -895,9 +987,12 @@
             *sym_buffer.map(
                 workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                 dst_rank_idx) = expert_status & 0xffffffff;
+            // Push mode: the low word (row count) was already added by the per-row
+            // tickets (all returned before this rank's grid sync), so add only the
+            // high word that finalises the count for the destination's scheduler.
             ptx::atomic_add_sys(
                 sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                expert_status);
+                kPushDispatch ? (expert_status & 0xffffffff00000000ull) : expert_status);
         };
         if constexpr (kDistributedExpertBcast) {
             // Spread the per-expert cross-rank count updates over every SM
@@ -938,11 +1033,29 @@
             }
         }
 
+        if constexpr (kPushDispatch) {
+            // Every rank's rows are in the local pool (ordered by barrier #1). SM e
+            // (e < experts per rank) publishes expert e's L1 arrival counts, one block
+            // per lane, with release.gpu: the loaders' acquire on the count then also
+            // covers the remotely written rows (this thread acquired barrier #1).
+            if (warp_idx == 0 and sm_idx < kNumExpertsPerRank) {
+                const auto num_recv_tokens = static_cast<uint32_t>(
+                    ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(sm_idx)));
+                const uint32_t num_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
+                if (lane_idx < num_blocks)
+                    ptx::red_add_rel(
+                        workspace.get_l1_arrival_count_ptr(sm_idx * kPushBlocksPerExpert + lane_idx),
+                        cute::min(num_recv_tokens - lane_idx * BLOCK_M, BLOCK_M));
+                __syncwarp();
+            }
+            if (thread_idx == 0) stamp_max(2);  // pool ready
+        }
+
         // Sync with epilogue warps before pulling tokens
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Token / SF pull loop
-        if (warp_idx < kNumActiveDispatchWarps) {
+        if (!kPushDispatch and warp_idx < kNumActiveDispatchWarps) {
             uint32_t pull_mbarrier_phase = 0;
             const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
             const auto pull_mbarrier = dispatch_barriers[warp_idx];
@@ -1087,7 +1200,7 @@
             }
         }
 
-        if (thread_idx == 0) stamp_max(2);
+        if (!kPushDispatch and thread_idx == 0) stamp_max(2);
         if constexpr (kFineCombine) {
             // Fine-grained combine signaller (dispatch warp 0): consume this CTA's
             // mailbox; for every finished L2 task release-add 1 per scattered token
@@ -1214,6 +1327,10 @@
                 if constexpr (!kBlockIsL2) {
                     const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                     while (ptx::ld_acq(ptr) != valid_m) {}
+                    // Push dispatch: the rows are generic-proxy (remote st.global)
+                    // writes read below through TMA (async proxy).
+                    if constexpr (kPushDispatch)
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
                 }
                 // L2: no up-front wait for all L1 N-blocks; each stage below
                 // waits only for the L1 blocks that produced its K-block(s).

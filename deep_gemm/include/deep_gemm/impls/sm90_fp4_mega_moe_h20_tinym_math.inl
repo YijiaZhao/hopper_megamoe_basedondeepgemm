@@ -40,7 +40,8 @@
     constexpr uint32_t kTMLutOff = kTMSumAOff + kTMMaxTokens * kTMMaxKBlocks * 4u * 4u; // 16 x uint2 (MXFP4)
     constexpr uint32_t kTMPbExpertOff = kTMLutOff + 128u;                        // [64] u32
     constexpr uint32_t kTMPbValidOff = kTMPbExpertOff + 64u * 4u;                // [64] u32
-    constexpr uint32_t kTMFlagOff = kTMPbValidOff + 64u * 4u;                    // u32
+    constexpr uint32_t kTMPbPoolOff = kTMPbValidOff + 64u * 4u;                  // [64] u32 pool block of dense block
+    constexpr uint32_t kTMFlagOff = kTMPbPoolOff + 64u * 4u;                     // u32
     constexpr uint32_t kTMSmemBytes = kTMFlagOff + 16u;
     DG_STATIC_ASSERT(kTMSmemBytes <= kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_PACKED_B_SIZE_PER_STAGE),
                      "TinyM GEMV staging must fit the idle pipeline stages");
@@ -53,6 +54,8 @@
     uint2* tm_lut = reinterpret_cast<uint2*>(tm_smem + kTMLutOff);
     uint32_t* tm_pb_expert = reinterpret_cast<uint32_t*>(tm_smem + kTMPbExpertOff);
     uint32_t* tm_pb_valid = reinterpret_cast<uint32_t*>(tm_smem + kTMPbValidOff);
+    // Pool block index of dense block p (== p unless push dispatch strides the pool)
+    uint32_t* tm_pb_pool = reinterpret_cast<uint32_t*>(tm_smem + kTMPbPoolOff);
     uint32_t* tm_flag = reinterpret_cast<uint32_t*>(tm_smem + kTMFlagOff);
 
     const uint32_t tm_row8 = lane_idx >> 2;   // row within an 8-row group
@@ -130,7 +133,7 @@
     // this for the scheduler); warp 0 then tabulates (expert, valid_m) per pool block.
     interleaved_scheduler.fetch_expert_recv_count();
     const uint32_t tm_num_pool_blocks = interleaved_scheduler.num_total_m_blocks;
-    DG_DEVICE_ASSERT(tm_num_pool_blocks <= fused_layout::kSM90SplitKL1MaxPoolBlocks);
+    DG_DEVICE_ASSERT(tm_num_pool_blocks <= 64u);  // smem tables above
     if (epilogue_warp_idx == 0) {
         for (uint32_t p = 0; p < tm_num_pool_blocks; ++ p) {
             const auto t = interleaved_scheduler.create_task(
@@ -139,6 +142,7 @@
             if (lane_idx == 0) {
                 tm_pb_expert[p] = t.local_expert_idx;
                 tm_pb_valid[p] = t.valid_m;
+                tm_pb_pool[p] = t.pool_block_idx;
             }
         }
     }
@@ -237,14 +241,17 @@
 
     // ---------------- Tile completion: cross-CTA reduce + epilogue ----------------
     // acc[r][t]: this lane's fp32 partial (its K chunk c) for rows tm_row(r), tokens t.
-    const auto tm_flush_tile = [&](const auto& is_l2_tag, const uint32_t& pool_block_idx,
+    // `dense_p` indexes the tables and the partial-sum slots; `pool_block_idx` the
+    // pool memory, arrival counters and the combine mailbox entry.
+    const auto tm_flush_tile = [&](const auto& is_l2_tag, const uint32_t& dense_p,
                                    const uint32_t& n_block_idx, const uint32_t& valid_m,
                                    const uint32_t& k_first, const uint32_t& k_last,
                                    const uint32_t& num_splits, float (&acc)[4][8]) {
         constexpr bool kL2 = std::remove_cv_t<std::remove_reference_t<decltype(is_l2_tag)>>::value;
         constexpr uint32_t kNKB = (kL2 ? L2_SHAPE_K : L1_SHAPE_K) / BLOCK_K;
+        const uint32_t pool_block_idx = tm_pb_pool[dense_p];
         const uint32_t m_idx = pool_block_idx * BLOCK_M;
-        const uint32_t local_expert_idx = tm_pb_expert[pool_block_idx];
+        const uint32_t local_expert_idx = tm_pb_expert[dense_p];
         // 1) the 4 lanes of a row hold K-chunk partials: reduce so all 4 hold the row sum
         #pragma unroll
         for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
@@ -257,10 +264,10 @@
         // 2) cross-CTA fixup unless this CTA covered the whole K range
         const bool full = (k_first == 0u) && (k_last == kNKB - 1u);
         if (!full) {
-            float* slot = kL2 ? workspace.get_splitk_l2_scratch_ptr(pool_block_idx, n_block_idx)
-                              : workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx);
-            uint32_t* ticket = kL2 ? workspace.get_splitk_l2_flag_ptr(pool_block_idx, n_block_idx)
-                                   : workspace.get_splitk_l1_flag_ptr(pool_block_idx, n_block_idx);
+            float* slot = kL2 ? workspace.get_splitk_l2_scratch_ptr(dense_p, n_block_idx)
+                              : workspace.get_splitk_l1_scratch_ptr(dense_p, n_block_idx);
+            uint32_t* ticket = kL2 ? workspace.get_splitk_l2_flag_ptr(dense_p, n_block_idx)
+                                   : workspace.get_splitk_l1_flag_ptr(dense_p, n_block_idx);
             // Lane c owns tokens c and c + 4 of its rows
             #pragma unroll
             for (uint32_t r = 0; r < kTMRowsPerLane; ++ r) {
@@ -626,7 +633,7 @@
                         if (p != cur_pool_block) {
                             cur_pool_block = p;
                             cur_valid_m = tm_pb_valid[p];
-                            tm_stage_acts(is_l2_tag, p, cur_valid_m);
+                            tm_stage_acts(is_l2_tag, tm_pb_pool[p], cur_valid_m);
                         }
                     }
                     consume_unit(raw_q[s], raw_meta[s], k, cur_valid_m);

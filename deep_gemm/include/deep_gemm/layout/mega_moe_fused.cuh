@@ -35,7 +35,11 @@ static constexpr bool kSM90FusedHalfTileTasks = DG_FUSED_HALF_TILE_TASKS != 0;
 // block count is <= kSM90SplitKL1MaxPoolBlocks (M<=16 per rank fits easily; larger
 // launches silently fall back to unsplit tasks). Sizes below are fixed by the
 // tier: 10 BN256 L1 N-blocks, BM8 tokens, 256 weight rows per tile.
-static constexpr uint32_t kSM90SplitKL1MaxPoolBlocks = 64;
+// 96 (was 64): push dispatch (kernel `kPushDispatch`) addresses the pool with a
+// fixed stride of kPushBlocksPerExpert (2 at <= 16 global tokens) blocks per local
+// expert, so the split-K / stream-K / tiny-M slots indexed by pool block must cover
+// kNumExpertsPerRank * 2 = 96 block indices (the dense block count stays <= 96 too).
+static constexpr uint32_t kSM90SplitKL1MaxPoolBlocks = 96;
 static constexpr uint32_t kSM90SplitKL1NumL1BlockNs = 10;
 static constexpr uint32_t kSM90SplitKL1NumKSplits = 2;
 // One partial per (weight row, token): 256 rows x 8 tokens x fp32.
@@ -59,7 +63,7 @@ static constexpr uint32_t kSM90FineCombineMailboxBytes = 32;
 static constexpr uint32_t kSM90FineCombineRingSize = 4;
 static constexpr uint32_t kSM90FineCombineDoneEntry = 0xffffffffu;
 static constexpr uint64_t kSM90SplitKL1ScratchBytes =
-    static_cast<uint64_t>(kSM90SplitKNumSlots) * kSM90SplitKL1PartialBytes;  // 11 MB (L1 5 MB + L2 6 MB)
+    static_cast<uint64_t>(kSM90SplitKNumSlots) * kSM90SplitKL1PartialBytes;  // 16.5 MB (L1 7.5 MB + L2 9 MB)
 // Stream-K (kernel `kStreamK`, host env DG_FP4_STREAMK): all (task, K128 block) units
 // of a phase are split into kNumSMs contiguous near-equal ranges (task-major, K
 // inner); a range that enters or leaves a task mid-K contributes an fp32 partial
