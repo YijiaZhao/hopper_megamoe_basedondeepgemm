@@ -85,3 +85,20 @@ the existing SM0 cleanup also zeroes the ticket words in TinyM mode. Rank-local 
 The stream-K scheduler another agent is adding (`DG_FP4_STREAMK`, scheduler/mega_moe_fused.cuh)
 had not landed when this was written; the partition here is ~20 lines of arithmetic inside
 the new header (`tm_unit_range`, `tm_num_splits`) and can be swapped for the shared one.
+
+## Status (2026-09-09, H20 8 ranks, head 9521b5f)
+* Correctness (DG_FP4_TINYM=1, MAX_M forced): mxfp4 T=2/8/16 per rank cos_min 0.99995-0.99998,
+  qoq 0.99993-0.99994, norm_ratio 1.0000 (tests/test_four_api_correctness.py). Default OFF.
+* Bugs fixed on the way: nvcc 13.0 cicc segfault on lambda array-ref params with constexpr-local
+  bounds (also broke the default path: the header is parsed with kTinyMGemv=false); last arriver
+  double-counted its own partial; QoQ zero-point fold must use the per-chunk (32-K) activation
+  sum; runtime `acc[r][t]` and the s-indexed prefetch ring put 176 B in local memory (now 24 B,
+  no spills, 168 regs); 624 math warps polling the expert counters cost ~35 us of routing.
+* Perf (probe, rank 0, NOT faster yet): per unit (20 KB tile) SM0 consume = 1.55 us (mxfp4 M=2),
+  1.08 us (mxfp4 M=16), 1.0 us (qoq M=2) -> 13-20 GB/s per SM, ~1.0-1.4 TB/s aggregate vs the
+  3.3 TB/s target; staging ~0.2 us and tile flush ~0.35 us amortised per unit. Kernel end
+  (skew-corrected, contaminated by concurrent jobs) mxfp4 M=2/8/16: ON 77/130/214 us vs OFF
+  48/58/98. The per-warp unit is a serial LDS(LUT) -> 11 int ops/word -> HFMA2 chain with 2
+  warps per SMSP, so it is issue/latency bound, not DRAM bound. Next steps: interleave two
+  units per warp (decode u+1 while u's HFMA2 chains drain), 2 fp16x2 chains -> 4, drop the
+  fp16 expand PRMTs (LUT of fp16x2 pairs via prmt selector pairs), QoQ first (3 int ops/word).
