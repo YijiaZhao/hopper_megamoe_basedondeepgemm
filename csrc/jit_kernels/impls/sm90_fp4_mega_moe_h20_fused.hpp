@@ -288,7 +288,16 @@ static void sm90_fp4_h20_fused_mega_moe(
     // replaced by per-token arrival counters (each L2 task red.release.sys-adds 1
     // per scattered token row into the destination rank's counter; the combine
     // warp of a token spins on its own counter), so a rank's combine overlaps the
-    // other ranks' L2 tails. DG_FP4_FINE_COMBINE=0 restores the barrier path.
+    // other ranks' L2 tails. The sys-scope release fence is issued by dispatch warp
+    // 0 through a per-CTA mailbox (a fence.sys in the math warps cost ~1.5-2 us per
+    // L2 task on H20 and pushed the last L2 task end out by 2-4 us at M=8/16).
+    // H20 A/B (2026-09-09, phase stamps rank 0, median us, ON x2 vs OFF, same
+    // session): kernel end M=2 49.9/47.3 vs 47.8, M=8 58.3/58.1 vs 61.6, M=16
+    // 82.9/82.4 vs 88.4; last L2 task end -> kernel end M=8 2.4/2.0 vs 7.8, M=16
+    // 3.9/3.9 vs 8.1; CUDA-event wall M=2 58.7/56.8 vs 56.9, M=8 72.7/73.9 vs 73.2,
+    // M=16 96.0/95.2 vs 97.0. Default ON; DG_FP4_FINE_COMBINE=0 restores the
+    // barrier path (numerics identical: T=2/8/16/128/512 + QoQ, 200-iter graph
+    // replay stress clean).
     const bool fine_combine = get_env<int>("DG_FP4_FINE_COMBINE", 1) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
