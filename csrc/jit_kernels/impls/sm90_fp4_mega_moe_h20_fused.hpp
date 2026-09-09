@@ -45,6 +45,7 @@ public:
         bool push_dispatch;
         int push_max_tokens_per_rank;
         bool lean_routing;
+        bool qoq_inline_s2;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -101,7 +102,8 @@ public:
             "        /* kTinyMGemvRequested */ {},\n"
             "        /* kPushDispatchRequested */ {},\n"
             "        /* kPushMaxTokensPerRank */ {},\n"
-            "        /* kLeanRouting */ {}",
+            "        /* kLeanRouting */ {},\n"
+            "        /* kQoQInlineS2 */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -123,7 +125,8 @@ public:
             args.tinym ? "true" : "false",
             args.push_dispatch ? "true" : "false",
             args.push_max_tokens_per_rank,
-            args.lean_routing ? "true" : "false");
+            args.lean_routing ? "true" : "false",
+            args.qoq_inline_s2 ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -482,6 +485,13 @@ static void sm90_fp4_h20_fused_mega_moe(
         // cross-rank count broadcast disappear entirely (the destination finalises
         // its own counts after NVLink barrier #1). DG_FP4_LEAN_ROUTING=0 = old path.
         .lean_routing = get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0,
+        // QoQ inline s2 (kernel `kQoQInlineS2`, DG_FP4_QOQ_INLINE_S2, default 1): the
+        // BM8 QoQ RF swapAB L1 loop folds the per-(row, K128) integer s2 into the
+        // int8 weight at decode time and accumulates the whole task K range in one
+        // int32 set (one promote by the per-token activation scale at task end)
+        // instead of a per-K128 promote (which forced an accumulator readout /
+        // tensor-pipe drain per block). 0 = the per-block promote path.
+        .qoq_inline_s2 = qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -516,7 +526,8 @@ static void sm90_fp4_h20_fused_mega_moe(
             (plan.use_mode2_row_decoder ?
                 "_h200_fused_mode2_row" :
                 "_h200_fused_lut_window")) + (tinym ? "_tinym" : "") + (push_dispatch ? "_push" : "") +
-        (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "");
+        (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "") +
+        ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

@@ -498,7 +498,11 @@ template <
     uint32_t kPushMaxTokensPerRank = 2,
     // Lean routing (host env DG_FP4_LEAN_ROUTING): see the dispatch prologue in
     // the body (`kLeanRouting` / `kLeanPush`).
-    bool kLeanRouting = true
+    bool kLeanRouting = true,
+    // QoQ inline s2 (host env DG_FP4_QOQ_INLINE_S2, default 1): fold the per-(row,
+    // K128) integer s2 into the int8 weight at RF decode time and accumulate the
+    // whole L1 task K range in one int32 set (see `kInlineS2` in the body).
+    bool kQoQInlineS2 = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
