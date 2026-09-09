@@ -36,7 +36,7 @@ public:
         bool half_tile_tasks;
         bool split_k_l1;
         bool l2_half_row_tasks;
-        bool split_k_l2;
+        uint32_t split_k_l2_ways;  // 0 off, 2 or 3 K ranges per L2 tail task
         bool stream_k;
         bool nvl_fast_epilogue;
         bool fine_combine;
@@ -138,7 +138,7 @@ public:
             args.half_tile_tasks ? "true" : "false",
             args.split_k_l1 ? "true" : "false",
             args.l2_half_row_tasks ? "true" : "false",
-            args.split_k_l2 ? "true" : "false",
+            args.split_k_l2_ways,
             args.stream_k ? "true" : "false",
             args.nvl_fast_epilogue ? "true" : "false",
             args.fine_combine ? "true" : "false",
@@ -323,11 +323,20 @@ static void sm90_fp4_h20_fused_mega_moe(
     // M=16, two full L2 waves gated on the last L1 wave (122 tasks / 78 SMs), and
     // a 2-way K split shortens neither: M=8 tail 4.7 vs 4.9 us (kernel end 63.9 vs
     // 64.4), M=16 11.6 vs 10.7 (88.9 vs 87.3), M=2 7.8 vs 6.6 (50.8 vs 48.2).
-    // Default OFF; DG_FP4_SPLITK_L2=1 enables (numerics verified: T=2/8/16/128/512
-    // + QoQ pass). Exclusive with L2 half-row tasks.
+    // 2026-09-10 per-CTA task log (M=8, rank 0): the tail is NOT the dependency
+    // chain but occupancy: 78 CTAs each run one 18.2 us L1 task, then 96 L2 tasks of
+    // 7.1 us over 78 SMs put a second full L2 task on 22 CTAs (46.8 -> 53.7 us) while
+    // 56 CTAs idle ~7 us; the 2-way split leaves a 3-stage finisher (~4.3 us), hence
+    // ~0.7 us. DG_FP4_SPLITK_L2=3: the tail tasks run as THREE stage-aligned K ranges
+    // (1/2/2 stages, the finisher last and longest, n-1 publisher slots per task),
+    // 66 segments <= 78 SMs at M=8 (M=16: 44 * 3 > 78, unsplit as before).
+    // DG_FP4_SPLITK_L2=1|2 keeps the 2-way split; 0 off. Numerics verified (see the
+    // body / tests); exclusive with L2 half-row tasks.
+    const int split_k_l2_env = get_env<int>("DG_FP4_SPLITK_L2", 0);
     const bool split_k_l2 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
-        dense_weight_tiles && get_env<int>("DG_FP4_SPLITK_L2", 0) != 0;
+        dense_weight_tiles && split_k_l2_env != 0;
+    const uint32_t split_k_l2_ways = split_k_l2_env >= 3 ? 3u : 2u;
     // Stream-K (kernel `kStreamK`): for tiny M the (task, K128 block) units of the
     // L1 and of the L2 phase are split into 78 contiguous near-equal unit ranges (one
     // per SM, task-major) with an n-way cross-CTA fp32 reduction per tile through
@@ -532,7 +541,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         .half_tile_tasks = half_tile_tasks,
         .split_k_l1 = split_k_l1 && !tinym,
         .l2_half_row_tasks = l2_half_row_tasks,
-        .split_k_l2 = split_k_l2 && !tinym,
+        .split_k_l2_ways = (split_k_l2 && !tinym) ? split_k_l2_ways : 0u,
         .stream_k = stream_k && !tinym,
         .nvl_fast_epilogue = nvl_fast_epilogue,
         .fine_combine = fine_combine,

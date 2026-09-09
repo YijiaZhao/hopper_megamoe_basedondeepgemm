@@ -187,11 +187,17 @@
     // Same protocol/scratch format as kSplitKL1 (separate L2 slot index space);
     // the L2 epilogue (BF16 x scale, NVLink scatter) runs on the finisher only.
     // Each half's TMA producer waits only for the L1 bits of its own K-blocks.
+    // kSplitKL2Ways == 3: three stage-aligned K ranges (L2: 1/2/2 stages, blocks [0,2)
+    // / [2,6) / [6,10)); the last range is the finisher, the others publish their fp32
+    // partial to their own slot and red.add the task flag; the finisher waits for
+    // n - 1 arrivals and sums the slots in publisher order (see the epilogue).
     constexpr bool kSplitKL2 =
-        kSplitKL2Requested && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
+        kSplitKL2Ways != 0 && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
         !kHalfTileTasks && !kL2HalfRowTasks && kUseInterleavedScheduler &&
         kDenseWeightTiles && BLOCK_N == 256;
-    constexpr uint32_t kNumL2KSplits = kSplitKL2 ? fused_layout::kSM90SplitKL1NumKSplits : 1u;
+    constexpr uint32_t kNumL2KSplits = kSplitKL2 ? (kSplitKL2Ways >= 3 ? 3u : 2u) : 1u;
+    DG_STATIC_ASSERT(kNumL2KSplits <= 1u + fused_layout::kSM90SplitKL2MaxPublishers,
+                     "L2 split-K needs one partial slot per publisher");
     // Stream-K (kStreamK; host env DG_FP4_STREAMK, gated by DG_FP4_STREAMK_MAX_M on
     // the global token count): for tiny M the L1 phase is ~16 us per wave of
     // (expert, n_block) tasks over the full K (24 K128 blocks) while most of the 78
@@ -800,17 +806,32 @@
         }
     };
 
-    // K-block count of K split `k_split_idx` (of `num_k_splits` in {1, 2}) of a task
-    // with `total_k_blocks` K-blocks: half 0 is the lower whole-stage half (floor to
-    // kKBlocksPerStage; L1 24 -> 12, L2 10 -> 4), half 1 the rest (12 / 6). The
-    // task consumers derive the first absolute K-block as total - count for half 1.
-    const auto get_split_k_num_blocks = [](const uint32_t& total_k_blocks,
+    // K-block range of K split `k_split_idx` (of `num_k_splits`) of a task with
+    // `total_k_blocks` K-blocks: whole stages (kKBlocksPerStage blocks) split as evenly
+    // as possible with the LAST splits taking the extra stages (the finisher never
+    // waits for a longer publisher): 2-way L1 24 -> 12 / 12, L2 10 -> 4 / 6 (as
+    // before), 3-way L2 10 -> 2 / 4 / 4.
+    const auto get_split_k_num_stages = [](const uint32_t& total_stages,
                                            const uint32_t& k_split_idx,
                                            const uint32_t& num_k_splits) -> uint32_t {
+        const uint32_t base = total_stages / num_k_splits, rem = total_stages % num_k_splits;
+        return base + (k_split_idx + rem >= num_k_splits ? 1u : 0u);
+    };
+    const auto get_split_k_num_blocks = [&](const uint32_t& total_k_blocks,
+                                            const uint32_t& k_split_idx,
+                                            const uint32_t& num_k_splits) -> uint32_t {
         if (num_k_splits == 1u)
             return total_k_blocks;
-        const uint32_t half_0 = ((total_k_blocks / 2u) / kKBlocksPerStage) * kKBlocksPerStage;
-        return k_split_idx == 0u ? half_0 : total_k_blocks - half_0;
+        return get_split_k_num_stages(total_k_blocks / kKBlocksPerStage, k_split_idx, num_k_splits) *
+               kKBlocksPerStage;
+    };
+    const auto get_split_k_block_begin = [&](const uint32_t& total_k_blocks,
+                                             const uint32_t& k_split_idx,
+                                             const uint32_t& num_k_splits) -> uint32_t {
+        uint32_t begin = 0;
+        for (uint32_t s = 0; s < k_split_idx; ++ s)
+            begin += get_split_k_num_blocks(total_k_blocks, s, num_k_splits);
+        return begin;
     };
     const auto invoke_interleaved_task = [&](const task_info_t& task_info,
                                               auto&& func) {
@@ -828,7 +849,7 @@
                 task_info.get_k_block_end() - task_info.get_k_block_begin() :
                 get_split_k_num_blocks(L1_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits);
             const uint32_t k_block_begin = is_streamk ? task_info.get_k_block_begin() :
-                (k_split_idx == 0u ? 0u : L1_SHAPE_K / BLOCK_K - num_k_blocks);
+                get_split_k_block_begin(L1_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits);
             func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear1>{},
                  task_info.local_expert_idx, num_k_blocks,
                  task_info.m_block_idx, task_info.n_block_idx,
@@ -842,7 +863,7 @@
                 task_info.get_k_block_end() - task_info.get_k_block_begin() :
                 get_split_k_num_blocks(L2_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits);
             const uint32_t k_block_begin = is_streamk ? task_info.get_k_block_begin() :
-                (k_split_idx == 0u ? 0u : L2_SHAPE_K / BLOCK_K - num_k_blocks);
+                get_split_k_block_begin(L2_SHAPE_K / BLOCK_K, k_split_idx, num_k_splits);
             func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear2>{},
                  task_info.local_expert_idx, num_k_blocks,
                  task_info.m_block_idx, task_info.n_block_idx,
@@ -3865,16 +3886,21 @@
                                      fused_layout::kSM90SplitKL1PartialBytes,
                                      "Split-K partial slot size mismatch");
                     DG_STATIC_ASSERT(fused_layout::kSM90SplitKL1NumKSplits == 2,
-                                     "Split-K handshake assumes one publisher and one finisher half");
+                                     "L1 split-K handshake assumes one publisher and one finisher half");
                     DG_STATIC_ASSERT(!kBlockIsL2 || kWGHalves == kSwapABWeightHalves,
                                      "Split-K L2 expects both weight halves per WG");
-                    float* slot = kBlockIsL2 ?
-                        workspace.get_splitk_l2_scratch_ptr(pool_block_idx, n_block_idx) :
-                        workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx);
+                    // Publisher p (k_split_idx < num_k_splits - 1) owns partial slot p;
+                    // the finisher (last split) sums slots 0 .. num_k_splits - 2.
+                    const auto slot_of = [&](const uint32_t& publisher_idx) -> float* {
+                        return kBlockIsL2 ?
+                            workspace.get_splitk_l2_scratch_ptr(pool_block_idx, n_block_idx, publisher_idx) :
+                            workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx);
+                    };
+                    float* slot = slot_of(k_split_idx);
                     uint32_t* flag = kBlockIsL2 ?
                         workspace.get_splitk_l2_flag_ptr(pool_block_idx, n_block_idx) :
                         workspace.get_splitk_l1_flag_ptr(pool_block_idx, n_block_idx);
-                    if (k_split_idx == 0) {
+                    if (k_split_idx + 1u < num_k_splits) {
                         #pragma unroll
                         for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
                             #pragma unroll
@@ -3891,18 +3917,21 @@
                         return;  // PUBLISHER: the finisher CTA completes this task
                     }
                     if (epilogue_thread_idx == 0) {
-                        DG_SPIN_WHILE(ptx::ld_acq(flag) == 0u, 2827);
+                        DG_SPIN_WHILE(ptx::ld_acq(flag) != num_k_splits - 1u, 2827);
                         *flag = 0u;
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    #pragma unroll
-                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                    for (uint32_t pub = 0; pub + 1u < num_k_splits; ++ pub) {
+                        const float* pslot = slot_of(pub);
                         #pragma unroll
-                        for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                        for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
                             #pragma unroll
-                            for (uint32_t j = 0; j < 4; ++ j)
-                                final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j] +=
-                                    __ldcg(slot + ((h * kSwapABTokenChunks + i) * 4 + j) * kNumEpilogueThreads + epilogue_thread_idx);
+                            for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                                #pragma unroll
+                                for (uint32_t j = 0; j < 4; ++ j)
+                                    final_accum[h * kSwapABHalfAccumPerThread + i * 4 + j] +=
+                                        __ldcg(pslot + ((h * kSwapABTokenChunks + i) * 4 + j) * kNumEpilogueThreads + epilogue_thread_idx);
+                            }
                         }
                     }
                 }

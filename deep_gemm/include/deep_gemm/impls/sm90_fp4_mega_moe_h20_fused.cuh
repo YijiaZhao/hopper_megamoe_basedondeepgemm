@@ -464,7 +464,8 @@ template <
     // as two K ranges on two SMs, same cross-CTA fp32 reduction as kSplitKL1) on
     // the BM8 MXFP4 RF swapAB path; see `kSplitKL2` in the body. Env DG_FP4_SPLITK_L2
     // (default 0: measured neutral/slower on H20, see the host).
-    bool kSplitKL2Requested = false,
+    // 0 off; 2 or 3 = number of K ranges per tail task.
+    uint32_t kSplitKL2Ways = 0,
     // Host-selected stream-K (tiny M: the (task, K128 block) units of a phase are
     // split into kNumSMs contiguous ranges, n-way cross-CTA fp32 reduction per
     // tile) on the BM8 MXFP4/QoQ RF swapAB path; see `kStreamK` in the body. Env

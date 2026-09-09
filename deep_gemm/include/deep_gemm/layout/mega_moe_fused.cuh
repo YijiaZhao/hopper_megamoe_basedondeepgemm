@@ -67,8 +67,10 @@ static constexpr uint32_t kSM90SplitKL1NumSlots =
 // live in their own index space (pool_block x 12 BN256 L2 N-blocks) after the L1
 // slots, so the L1 and L2 handshakes of one pool block never share a slot.
 static constexpr uint32_t kSM90SplitKL2NumL2BlockNs = 12;
+// Up to 3 K ranges per L2 tail task (DG_FP4_SPLITK_L2=3): n - 1 publisher partial slots per task.
+static constexpr uint32_t kSM90SplitKL2MaxPublishers = 2;
 static constexpr uint32_t kSM90SplitKL2NumSlots =
-    kSM90SplitKL1MaxPoolBlocks * kSM90SplitKL2NumL2BlockNs;
+    kSM90SplitKL1MaxPoolBlocks * kSM90SplitKL2NumL2BlockNs * kSM90SplitKL2MaxPublishers;
 // Total (L1 + L2) split-K slots: flags and fp32 partial scratch are sized by this.
 static constexpr uint32_t kSM90SplitKNumSlots = kSM90SplitKL1NumSlots + kSM90SplitKL2NumSlots;
 // Fine-grained combine (kernel `kFineCombine`): per-CTA epilogue -> dispatch mailbox
@@ -78,7 +80,7 @@ static constexpr uint32_t kSM90FineCombineMailboxBytes = 32;
 static constexpr uint32_t kSM90FineCombineRingSize = 4;
 static constexpr uint32_t kSM90FineCombineDoneEntry = 0xffffffffu;
 static constexpr uint64_t kSM90SplitKL1ScratchBytes =
-    static_cast<uint64_t>(kSM90SplitKNumSlots) * kSM90SplitKL1PartialBytes;  // 16.5 MB (L1 7.5 MB + L2 9 MB)
+    static_cast<uint64_t>(kSM90SplitKNumSlots) * kSM90SplitKL1PartialBytes;  // 25.5 MB (L1 7.5 MB + L2 2 x 9 MB)
 // Stream-K (kernel `kStreamK`, host env DG_FP4_STREAMK): all (task, K128 block) units
 // of a phase are split into kNumSMs contiguous near-equal ranges (task-major, K
 // inner); a range that enters or leaves a task mid-K contributes an fp32 partial
@@ -375,12 +377,14 @@ struct Workspace {
                 (kSM90SplitKL1PartialBytes / sizeof(float));
     }
 
-    // Split-K L2: fp32 partial scratch slot (pool_block, L2 n_block), after the L1 slots
+    // Split-K L2: fp32 partial scratch slot (pool_block, L2 n_block, publisher), after the L1 slots
     CUTLASS_DEVICE
-    float* get_splitk_l2_scratch_ptr(const uint32_t& pool_block_idx, const uint32_t& n_block_idx) const {
+    float* get_splitk_l2_scratch_ptr(const uint32_t& pool_block_idx, const uint32_t& n_block_idx,
+                                     const uint32_t& publisher_idx = 0) const {
         return get_splitk_l1_scratch_ptr(0, 0) +
             (static_cast<uint64_t>(kSM90SplitKL1NumSlots) +
-             pool_block_idx * kSM90SplitKL2NumL2BlockNs + n_block_idx) *
+             (pool_block_idx * kSM90SplitKL2NumL2BlockNs + n_block_idx) * kSM90SplitKL2MaxPublishers +
+             publisher_idx) *
                 (kSM90SplitKL1PartialBytes / sizeof(float));
     }
 };
