@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <vector>
 #include <algorithm>
+#include <type_traits>
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
     printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); exit(1); } } while (0)
