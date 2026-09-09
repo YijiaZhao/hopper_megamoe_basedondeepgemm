@@ -25,16 +25,28 @@ run rs8 3 2
 run rs8 3 1
 run ss8 1 4
 run ss8 3 2
-echo "# (a-faithful) kernel 2-buffer loop with per-block RF decode; ss8d = decode->smem + SS; dec = decode only"
+echo "# (a-faithful) kernel 2-buffer loop with per-block RF decode; ss8d = decode->smem + SS; dec = decode only; rs8a = rs8 + independent decode work"
 run rs8d 2 2
-run ss8d 2 2
 run dec 2 2
-DEC=2 run rs8d 2 2
-DEC=2 run ss8d 2 2
 DEC=2 run dec 2 2
-run rs8d 3 2
-run ss8d 3 2
-run rs8d 1 4
+DEC=2 run rs8d 2 2
+FLAGS=1 run rs8d 2 2
+FLAGS=1 run dec 2 2
+run rs8a 2 2
+FLAGS=1 run rs8a 2 2
+echo "# phase offset between the math WGs (FLAGS=8)"
+FLAGS=8 run rs8d 2 2
+FLAGS=8 run rs8d 3 2
+FLAGS=8 run rs8d 3 1
+run rs8d 3 1
+run rs8d 2 1
+FLAGS=8 run rs8d 2 1
+echo "# ss8d decomposition: 2 = no fence.proxy, 4 = conflict-free stores"
+run ss8d 2 2
+FLAGS=2 run ss8d 2 2
+FLAGS=4 run ss8d 2 2
+FLAGS=6 run ss8d 2 2
+FLAGS=12 run ss8d 2 2
 echo "# (e) legacy mma.sync m16n8k32 s8, 8 warps"
 run imma 2 2
 run immal 2 2
