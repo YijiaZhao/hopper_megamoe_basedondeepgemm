@@ -1782,6 +1782,20 @@
             // 1 skip decode | 2 skip wgmma issue | 4 skip k+1 barrier check | 8 skip promote.
             const uint32_t kexp = (phase_stamps != nullptr) ?
                 static_cast<uint32_t>(phase_stamps[24]) : 0u;
+            // Bits 1/2/8 wrap wgmma issues and the writes/reads of wgmma registers in a
+            // runtime (non-uniform to ptxas) branch; ptxas then serialises EVERY wgmma
+            // of the kernel (C7518 "program dependence on compiler-inserted WG.DP in
+            // divergent path": WARPGROUP.DEPBAR.LE gsb0, 0x0 after each IGMMA, measured
+            // on H20 2026-09-09). They are compiled in only with -DDG_FP4_PROBE_EXP_GATES=1
+            // (timing experiments on a serialised pipe); bit 4 (barrier) is always live.
+#ifdef DG_FP4_PROBE_EXP_GATES
+            constexpr bool kExpGates = DG_FP4_PROBE_EXP_GATES != 0;
+#else
+            constexpr bool kExpGates = false;
+#endif
+            const auto exp_skip = [&](const uint32_t& bit) -> bool {
+                return kExpGates && (kexp & bit) != 0u;
+            };
             const auto kstage_add = [&](const uint32_t slot, const unsigned long long& v) {
                 if (kstage_probe_on) atomicAdd(phase_stamps + slot, v);
             };
@@ -2191,7 +2205,7 @@
                                 kstage_add(22, kt_head - kstage_t_prev);
                             kstage_t_prev = kt_head;
                         }
-                        if ((kexp & 2u) == 0u)
+                        if (!exp_skip(2u))
                             issue_stage_rf(cur_stage, ksplit_kb, fcur, swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
@@ -2207,7 +2221,7 @@
                             const unsigned long long kt_a = clock64();
                             if constexpr (!kBlockIsL2)
                                 kstage_add(17, kt_a - kt_b);
-                            if ((kexp & 1u) == 0u)
+                            if (!exp_skip(1u))
                                 decode_stage_rf(next_stage, ksplit_kb, fnext);
                             kt_b = clock64();
                             kstage_add(18, kt_b - kt_a);
@@ -2216,7 +2230,7 @@
                         ptx::warpgroup_wait<0>();
                         fence_frag(fcur);
                         kstage_add(19, clock64() - kt_b);
-                        if ((kexp & 8u) == 0u)
+                        if (!exp_skip(8u))
                             promote_stage_rf(cur_stage, ksplit_kb, swap_accum[0]);
                         arrive_empty_barrier(cur_stage);
                         advance_pipeline(k_block_idx);
@@ -2279,12 +2293,12 @@
                                                     uint32_t (&fcur)[kWGHalves][4][4],
                                                     uint32_t (&fnext)[kWGHalves][4][4],
                                                     const uint32_t& nstage, const uint32_t& nkb,
-                                                    const bool& has_next, const bool& release_prev,
+                                                    const bool& release_prev,
                                                     const uint32_t& prev_stage) {
                         #pragma unroll
                         for (uint32_t k = 0; k < 4; ++ k) {
                             unsigned long long kt_a = clock64();
-                            if ((kexp & 2u) == 0u) {
+                            if (!exp_skip(2u)) {
                                 fence_accum();
                                 fence_frag(fcur);
                                 ptx::warpgroup_arrive();
@@ -2299,19 +2313,20 @@
                             }
                             unsigned long long kt_b = clock64();
                             kstage_add(31, kt_b - kt_a);
-                            if (has_next) {
-                                fence_accum();
-                                ptx::warpgroup_wait<4>();
-                                fence_frag(fnext);
-                                if (release_prev && k == 3)
-                                    arrive_empty_barrier(prev_stage);
-                                kt_a = clock64();
-                                kstage_add(19, kt_a - kt_b);
-                                if ((kexp & 1u) == 0u)
-                                    decode_kstep_rf(nstage, nkb, k, fnext);
-                                kt_b = clock64();
-                                kstage_add(18, kt_b - kt_a);
-                            }
+                            // Unconditional (also on the task's last block, where fnext is
+                            // decoded from a stale slot and never issued): a wgmma-register
+                            // write inside a runtime branch makes ptxas serialise the pipe.
+                            fence_accum();
+                            ptx::warpgroup_wait<4>();
+                            fence_frag(fnext);
+                            if (release_prev && k == 3)
+                                arrive_empty_barrier(prev_stage);
+                            kt_a = clock64();
+                            kstage_add(19, kt_a - kt_b);
+                            if (!exp_skip(1u))
+                                decode_kstep_rf(nstage, nkb, k, fnext);
+                            kt_b = clock64();
+                            kstage_add(18, kt_b - kt_a);
                         }
                     };
                     if (num_k_blocks > 0) {
@@ -2335,7 +2350,7 @@
                             kstage_add(22, kt_head - kstage_t_prev);
                         kstage_t_prev = kt_head;
                         // Block 0: its groups + the decode of block 1 (same stage).
-                        block_step_ilv(cur_stage, 0, frag[0], frag[1], cur_stage, 1, true, k_block_idx > 0, prev_stage);
+                        block_step_ilv(cur_stage, 0, frag[0], frag[1], cur_stage, 1, k_block_idx > 0, prev_stage);
                         if (!last_stage) {
                             const unsigned long long kt_a = clock64();
                             if ((kexp & 4u) == 0u) {
@@ -2347,7 +2362,7 @@
                             kstage_add(17, clock64() - kt_a);
                         }
                         // Block 1: its groups + the decode of the next stage's block 0.
-                        block_step_ilv(cur_stage, 1, frag[1], frag[0], next_stage, 0, !last_stage, false, prev_stage);
+                        block_step_ilv(cur_stage, 1, frag[1], frag[0], next_stage, 0, false, prev_stage);
                         if (last_stage) {
                             const unsigned long long kt_a = clock64();
                             fence_accum();
@@ -2357,7 +2372,7 @@
                             arrive_empty_barrier(cur_stage);
                             const unsigned long long kt_b = clock64();
                             kstage_add(19, kt_b - kt_a);
-                            if ((kexp & 8u) == 0u)
+                            if (!exp_skip(8u))
                                 promote_task_rf(swap_accum[0]);
                             kstage_add(30, clock64() - kt_b);
                         }
@@ -2416,7 +2431,7 @@
                         if (k_block_idx > 0)
                             kstage_add(22, kt_head - kstage_t_prev);
                         kstage_t_prev = kt_head;
-                        if ((kexp & 2u) == 0u)
+                        if (!exp_skip(2u))
                             issue_stage_rf(cur_stage, 0, frag[b0], swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
@@ -2426,11 +2441,11 @@
                         maybe_release(n1);
                         unsigned long long kt_a = clock64();
                         kstage_add(19, kt_a - kt_b);
-                        if ((kexp & 1u) == 0u)
+                        if (!exp_skip(1u))
                             decode_stage_rf(cur_stage, 1, frag[b1]);
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
-                        if ((kexp & 2u) == 0u)
+                        if (!exp_skip(2u))
                             issue_stage_rf(cur_stage, 1, frag[b1], swap_accum[0]);
                         kt_a = clock64();
                         kstage_add(31, kt_a - kt_b);
@@ -2451,7 +2466,7 @@
                             }
                             kt_a = clock64();
                             kstage_add(17, kt_a - kt_b);
-                            if ((kexp & 1u) == 0u)
+                            if (!exp_skip(1u))
                                 decode_stage_rf(next_stage, 0, frag[b2]);
                             kt_b = clock64();
                             kstage_add(18, kt_b - kt_a);
@@ -2465,7 +2480,7 @@
                                 arrive_empty_barrier(slot_of_stage(t));
                             kt_a = clock64();
                             kstage_add(19, kt_a - kt_b);
-                            if ((kexp & 8u) == 0u)
+                            if (!exp_skip(8u))
                                 promote_task_rf(swap_accum[0]);
                             kstage_add(30, clock64() - kt_a);
                         }
@@ -2521,7 +2536,7 @@
                         if (k_block_idx > 0)
                             kstage_add(22, kt_head - kstage_t_prev);
                         kstage_t_prev = kt_head;
-                        if ((kexp & 2u) == 0u)
+                        if (!exp_skip(2u))
                             issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
@@ -2535,11 +2550,11 @@
                             arrive_empty_barrier(prev_stage);
                         unsigned long long kt_a = clock64();
                         kstage_add(19, kt_a - kt_b);
-                        if ((kexp & 1u) == 0u)
+                        if (!exp_skip(1u))
                             decode_stage_rf(cur_stage, 1, frag[1]);
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
-                        if ((kexp & 2u) == 0u)
+                        if (!exp_skip(2u))
                             issue_stage_rf(cur_stage, 1, frag[1], swap_accum[0]);
                         kt_a = clock64();
                         kstage_add(31, kt_a - kt_b);
@@ -2549,22 +2564,25 @@
                         fence_frag(frag[0]);
                         kt_b = clock64();
                         kstage_add(19, kt_b - kt_a);
-                        if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
-                            const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
-                            const uint32_t next_phase = phase ^ (next_stage == 0);
-                            if ((kexp & 4u) == 0u) {
-                                if (!barrier_ready(full_barriers[next_stage], next_phase)) {
-                                    kstage_add(23, 1ull);
-                                    full_barriers[next_stage]->wait(next_phase);
-                                }
+                        const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
+                        const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
+                        const uint32_t next_phase = phase ^ (next_stage == 0);
+                        if (has_next && (kexp & 4u) == 0u) {
+                            if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                kstage_add(23, 1ull);
+                                full_barriers[next_stage]->wait(next_phase);
                             }
-                            kt_a = clock64();
-                            kstage_add(17, kt_a - kt_b);
-                            if ((kexp & 1u) == 0u)
-                                decode_stage_rf(next_stage, 0, frag[0]);
-                            kt_b = clock64();
-                            kstage_add(18, kt_b - kt_a);
-                        } else {
+                        }
+                        kt_a = clock64();
+                        kstage_add(17, kt_a - kt_b);
+                        // Decoded unconditionally (stale slot on the task's last stage, never
+                        // issued): a frag write in a runtime branch serialises the pipe (ptxas
+                        // C7518), see `kExpGates`.
+                        if (!exp_skip(1u))
+                            decode_stage_rf(next_stage, 0, frag[0]);
+                        kt_b = clock64();
+                        kstage_add(18, kt_b - kt_a);
+                        if (!has_next) {
                             // Last stage of the task: drain, release it, promote the task sum.
                             fence_accum();
                             ptx::warpgroup_wait<0>();
@@ -2572,7 +2590,7 @@
                             arrive_empty_barrier(cur_stage);
                             kt_a = clock64();
                             kstage_add(19, kt_a - kt_b);
-                            if ((kexp & 8u) == 0u)
+                            if (!exp_skip(8u))
                                 promote_task_rf(swap_accum[0]);
                             kstage_add(30, clock64() - kt_a);
                         }
@@ -2606,15 +2624,15 @@
                                 kstage_add(22, kt_head - kstage_t_prev);
                             kstage_t_prev = kt_head;
                         }
-                        if ((kexp & 2u) == 0u)
+                        if (!exp_skip(2u))
                             issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
-                        if ((kexp & 1u) == 0u)
+                        if (!exp_skip(1u))
                             decode_stage_rf(cur_stage, 1, frag[1]);
                         unsigned long long kt_a = clock64();
                         kstage_add(18, kt_a - kt_b);
-                        if ((kexp & 2u) == 0u)
+                        if (!exp_skip(2u))
                             issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1]);
                         kt_b = clock64();
                         kstage_add(31, kt_b - kt_a);
@@ -2639,7 +2657,7 @@
                             kt_a = clock64();
                             if constexpr (!kBlockIsL2)
                                 kstage_add(17, kt_a - kt_b);
-                            if ((kexp & 1u) == 0u)
+                            if (!exp_skip(1u))
                                 decode_stage_rf(next_stage, 0, frag[0]);
                             kt_b = clock64();
                             kstage_add(18, kt_b - kt_a);
@@ -2649,7 +2667,7 @@
                         fence_frag(frag[1]);
                         kt_a = clock64();
                         kstage_add(19, kt_a - kt_b);
-                        if ((kexp & 8u) == 0u) {
+                        if (!exp_skip(8u)) {
                             promote_stage_rf(cur_stage, ksplit_kb, swap_accum[0]);
                             promote_stage_rf(cur_stage, 1, swap_accum[1]);
                         }
@@ -2696,25 +2714,25 @@
                                 kstage_add(22, kt_head - kstage_t_prev);
                             kstage_t_prev = kt_head;
                         }
-                        if ((kexp & 2u) == 0u)
+                        if (!exp_skip(2u))
                             issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
                         unsigned long long kt_b = clock64(), kt_a = kt_b;
                         #pragma unroll
                         for (uint32_t b = 0; b + 1 < N; ++ b) {
                             // Not the last block of this stage: decode + issue b+1, retire b
                             // and promote it (frees frag[b&1] / acc[b&1] for block b+2).
-                            if ((kexp & 1u) == 0u)
+                            if (!exp_skip(1u))
                                 decode_stage_rf(cur_stage, b + 1, frag[(b + 1) & 1]);
                             kt_a = clock64();
                             kstage_add(18, kt_a - kt_b);
-                            if ((kexp & 2u) == 0u)
+                            if (!exp_skip(2u))
                                 issue_stage_rf(cur_stage, b + 1, frag[(b + 1) & 1], swap_accum[(b + 1) & 1]);
                             fence_accum();
                             ptx::warpgroup_wait<1>();
                             fence_frag(frag[b & 1]);
                             kt_b = clock64();
                             kstage_add(19, kt_b - kt_a);
-                            if ((kexp & 8u) == 0u)
+                            if (!exp_skip(8u))
                                 promote_stage_rf(cur_stage, b, swap_accum[b & 1]);
                         }
                         // Last block (N-1, odd): prefetch-decode the next stage's block 0
@@ -2732,7 +2750,7 @@
                             kt_a = clock64();
                             if constexpr (!kBlockIsL2)
                                 kstage_add(17, kt_a - kt_b);
-                            if ((kexp & 1u) == 0u)
+                            if (!exp_skip(1u))
                                 decode_stage_rf(next_stage, 0, frag[0]);
                             kt_b = clock64();
                             kstage_add(18, kt_b - kt_a);
@@ -2741,7 +2759,7 @@
                         ptx::warpgroup_wait<0>();
                         fence_frag(frag[(N - 1) & 1]);
                         kstage_add(19, clock64() - kt_b);
-                        if ((kexp & 8u) == 0u)
+                        if (!exp_skip(8u))
                             promote_stage_rf(cur_stage, N - 1, swap_accum[(N - 1) & 1]);
                         arrive_empty_barrier(cur_stage);
                         advance_pipeline(k_block_idx);
