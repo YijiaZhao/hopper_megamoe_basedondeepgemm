@@ -714,14 +714,18 @@ struct InterleavedMegaMoEScheduler {
             // Split-K tail: index = base + (full_idx - base) * splits + k_split
             const bool is_l2_split = task_idx >= num_l2_split_base;
             const uint32_t l2_tail_idx = is_l2_split ? task_idx - num_l2_split_base : 0u;
+            const uint32_t l2_full_task_idx =
+                is_l2_split ? num_l2_split_base + l2_tail_idx / num_l2_k_splits : task_idx;
             auto task_info = create_task(
-                BlockPhase::Linear2,
-                is_l2_split ? num_l2_split_base + l2_tail_idx / num_l2_k_splits : task_idx,
+                BlockPhase::Linear2, l2_full_task_idx,
                 kNumL2BlockNs, L2_SHAPE_N, L2_SHAPE_K);
             if (is_l2_split)
                 task_info.set_k_split(l2_tail_idx % num_l2_k_splits, num_l2_k_splits);
+            // Dependency gate on the DENSE block index (task_info.pool_block_idx is
+            // the strided pool index under push dispatch).
+            const uint32_t dense_pool_block_idx = l2_full_task_idx / kNumL2BlockNs;
             const uint32_t num_required_l1_tasks =
-                get_num_l1_task_indices((task_info.pool_block_idx + 1) * kNumL1BlockNs);
+                get_num_l1_task_indices((dense_pool_block_idx + 1) * kNumL1BlockNs);
             while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) <
                    num_required_l1_tasks) {}
             return task_info;
