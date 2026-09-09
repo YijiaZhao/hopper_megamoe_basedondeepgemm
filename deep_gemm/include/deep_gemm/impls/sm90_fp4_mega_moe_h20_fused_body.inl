@@ -1338,6 +1338,36 @@
         // Sync with dispatch
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+        // Fine-grained combine: the L2 task whose combine arrivals are still to be
+        // signalled (CTA-uniform; valid_m == 0 means none). Signalling needs a
+        // sys-scope release (a NVLink write drain, ~1.5 us on H20), so it is deferred
+        // to the start of the next task's epilogue (the drain then overlaps that
+        // task's K loop) or to the end of the task loop.
+        uint32_t pending_combine_pool_block_idx = 0u, pending_combine_valid_m = 0u;
+        // Row r's signaller (thread r) release-adds 1 to the destination token's
+        // counter; the CTA-wide bar.sync after the scatter made every thread's
+        // stores of that task happen-before the release (cumulativity).
+        const auto signal_combine_arrivals_now = [&](const uint32_t& signal_pool_block_idx,
+                                                     const uint32_t& signal_valid_m) {
+            if constexpr (kFineCombine) {
+                for (uint32_t row = epilogue_thread_idx; row < signal_valid_m; row += kNumEpilogueThreads) {
+                    const auto src_metadata = *workspace.get_token_src_metadata_ptr(
+                        signal_pool_block_idx * BLOCK_M + row);
+                    asm volatile("fence.acq_rel.sys;" ::: "memory");
+                    ptx::red_add_rel_sys(
+                        sym_buffer.map(workspace.get_combine_arrival_count_ptr(src_metadata.token_idx),
+                                       src_metadata.rank_idx), 1);
+                }
+            }
+        };
+        const auto flush_pending_combine_arrivals = [&]() {
+            if constexpr (kFineCombine) {
+                if (pending_combine_valid_m != 0u) {
+                    signal_combine_arrivals_now(pending_combine_pool_block_idx, pending_combine_valid_m);
+                    pending_combine_valid_m = 0u;
+                }
+            }
+        };
         const auto run_math_task_impl = [&](const auto& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1377,16 +1407,12 @@
             // The bar.sync makes every thread's scatter stores of this task
             // happen-before the release (cumulativity), so the acquiring combine warp
             // sees the whole slice.
+            // Called right after the CTA-wide post-scatter sync of an L2 task.
             const auto signal_combine_arrivals = [&]() {
                 if constexpr (kFineCombine) {
-                    for (uint32_t row = epilogue_thread_idx; row < valid_m; row += kNumEpilogueThreads) {
-                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(
-                            pool_block_idx * BLOCK_M + row);
-                        asm volatile("fence.acq_rel.sys;" ::: "memory");
-                        ptx::red_add_rel_sys(
-                            sym_buffer.map(workspace.get_combine_arrival_count_ptr(src_metadata.token_idx),
-                                           src_metadata.rank_idx), 1);
-                    }
+                    flush_pending_combine_arrivals();
+                    pending_combine_pool_block_idx = pool_block_idx;
+                    pending_combine_valid_m = valid_m;
                 }
             };
             const uint32_t row_offset_r0 = row_block_offset + r_0;
@@ -2488,6 +2514,10 @@
                 }
             }
 
+            // Fine-grained combine: the previous L2 task's NVLink stores have drained
+            // during this task's K loop; signal them now (cheap fence).
+            flush_pending_combine_arrivals();
+
             if constexpr (!kBlockIsL2) {
                 const float l1_global_scale = (kPerRowEpilogueScale || l1_global_scales == nullptr) ?
                     1.0f : __ldg(l1_global_scales + local_expert_idx);
@@ -3033,6 +3063,9 @@
             for_each_published_block(run_math_task);
         else
             for_each_static_selected_block(run_math_task);
+
+        // Fine-grained combine: signal the last L2 task of this CTA.
+        flush_pending_combine_arrivals();
 
         // ---------------- COMBINE ----------------
         // Barrier path: NVLink barrier first, signals remote ranks that this rank's
