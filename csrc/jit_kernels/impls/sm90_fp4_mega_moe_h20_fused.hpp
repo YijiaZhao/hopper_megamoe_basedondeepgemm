@@ -576,15 +576,27 @@ static void sm90_fp4_h20_fused_mega_moe(
         .rf_prefetch_packed = get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0,
         .strided_pool_debug = strided_pool_debug,
         // Communication-window L2 weight prefetch (kernel `kL2PrefetchAll`, needs push
-        // dispatch + dense tiles): DG_FP4_L2_PREFETCH_ALL (default 1 for <= 16 global
+        // dispatch + dense tiles): DG_FP4_L2_PREFETCH_ALL=1 (gated on <= 16 global
         // tokens) lets the idle B loader warps warm L2 with every active local expert's
         // W1 (then W2) dense tiles as soon as the remote tickets reveal the expert,
-        // i.e. during the ~10 us routing -> first-math window in which the memory
-        // system is otherwise idle; DG_FP4_L2_PREFETCH_MAX_MB (default 48, H20 L2 =
-        // 60 MB) caps the rank-wide bytes (M2/M8: ~4.9 MB W1 + 2.5 MB W2 per active
-        // expert all fit; M16 (~15 experts, 74 MB of W1) gets the first ~9 experts).
+        // i.e. during the ~10 us routing -> first-math window; DG_FP4_L2_PREFETCH_MAX_MB
+        // (default 48, H20 L2 = 60 MB) caps the rank-wide bytes, DG_FP4_L2_PREFETCH_KBLOCKS
+        // the leading K blocks per W1 task. Default 0: H20 A/B (2026-09-09, probe under
+        // nsys, skew-free min-over-devices kernel us, knob 1 vs 0, 2-5 samples each;
+        // node shared with another job on GPUs 0-2, all cells paired in-session):
+        // mxfp4 M2 42.2-43.4 vs 39.6-41.4, M8 60.5-62.5 vs 53.8-54.1, M16 80.1-82.7 vs
+        // 75.1-76.2; qoq M8 60.1-63.0 vs 53.2-53.7, M16 78.7-81.0 vs 74.2-75.3. 24 MB cap
+        // or 12 K blocks: still +1-4 us (mxfp4 M8 56.1-58.1, M16 76.7-79.5; qoq M8
+        // 57.2-58.1, M16 78.8-79.6). Mechanism (rank-0 stamps): the weights DO land
+        // (46.9 MB issued by ~9-15 us; exposed k+1 wait 430-470 -> 270-380 ns at M8, 260
+        // -> 210-230 at M16) but the per-stage head-to-head time (1.15-1.33 us, decode +
+        // wgmma issue) hardly moves, so the L1 phase gains only ~1-1.5 us (M8 28.6-29.3 ->
+        // 27.6-28.4 mxfp4, 27.4-27.9 -> 25.2-26.4 qoq), while the flood delays the first
+        // math task by 3-9 us (M8 first math 9-11 -> 16-20 us; 13-15 with the 24 MB cap):
+        // barrier-#1 flags, the count finalise and the first stage fills queue behind
+        // the prefetch in L2/HBM. The tiny-M L1 loop is issue-bound, not HBM-bound.
         .l2_prefetch_all = push_dispatch && dense_weight_tiles &&
-            get_env<int>("DG_FP4_L2_PREFETCH_ALL", 1) != 0 &&
+            get_env<int>("DG_FP4_L2_PREFETCH_ALL", 0) != 0 &&
             num_global_tokens_upper <= get_env<int>("DG_FP4_L2_PREFETCH_MAX_M", 16),
         .l2_prefetch_max_mb = std::clamp(get_env<int>("DG_FP4_L2_PREFETCH_MAX_MB", 48), 1, 4096),
         // DG_FP4_L2_PREFETCH_KBLOCKS (default 0 = whole K): leading K128 blocks of each
