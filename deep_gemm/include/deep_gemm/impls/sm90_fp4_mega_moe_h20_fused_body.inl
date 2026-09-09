@@ -2240,6 +2240,10 @@
                         if (k_block_idx < num_k_blocks)
                             stage_step(k_block_idx, frag[1], frag[0]);
                     }
+                    // Explicit drain on the K-loop exit path: without it ptxas' CFG analysis
+                    // finds a path from an in-flight wgmma to the next task's accumulator
+                    // zeroing / first decode and serialises every wgmma (C7518).
+                    ptx::warpgroup_wait<0>();
                     } else if constexpr (kKBlocksPerStage == 2 && kInlineS2 && kQoQInlineS2Ilv) {
                     // QoQ inline s2, interleaved issue. The SASS audit (H20 2026-09-09) showed
                     // the stage is bound by tensor-pipe occupancy: 16 RS m64n8k32 per stage
@@ -2378,6 +2382,10 @@
                         }
                         advance_pipeline(k_block_idx);
                     }
+                    // Explicit drain on the K-loop exit path: without it ptxas' CFG analysis
+                    // finds a path from an in-flight wgmma to the next task's accumulator
+                    // zeroing / first decode and serialises every wgmma (C7518).
+                    ptx::warpgroup_wait<0>();
                     } else if constexpr (kKBlocksPerStage == 2 && kInlineS2 && kFragBufs > 2) {
                     // QoQ inline s2 with kFragBufs (3 or 4) rotating A-fragment buffers:
                     // same schedule as the 2-buffer loop below, but block n decodes into
@@ -2494,6 +2502,10 @@
                                 stage_body(rot, k_block_idx);
                         }
                     }
+                    // Explicit drain on the K-loop exit path: without it ptxas' CFG analysis
+                    // finds a path from an in-flight wgmma to the next task's accumulator
+                    // zeroing / first decode and serialises every wgmma (C7518).
+                    ptx::warpgroup_wait<0>();
                     } else if constexpr (kKBlocksPerStage == 2 && kInlineS2) {
                     // QoQ inline s2, two K128 blocks per stage, ONE int32 accumulator set,
                     // no per-block promote. Commit groups G(s,0), G(s,1) per stage; the
@@ -2596,6 +2608,10 @@
                         }
                         advance_pipeline(k_block_idx);
                     }
+                    // Explicit drain on the K-loop exit path: without it ptxas' CFG analysis
+                    // finds a path from an in-flight wgmma to the next task's accumulator
+                    // zeroing / first decode and serialises every wgmma (C7518).
+                    ptx::warpgroup_wait<0>();
                     } else if constexpr (kKBlocksPerStage == 2) {
                     // Two K128 blocks per stage, one commit group each, frag buffers at
                     // K-block granularity (frag[0] always holds block 0, frag[1] block 1):
@@ -2676,6 +2692,7 @@
                         arrive_empty_barrier(cur_stage);
                         advance_pipeline(k_block_idx);
                     }
+                    ptx::warpgroup_wait<0>();  // explicit drain on the loop exit path (ptxas C7518, see above)
                     } else {
                     // N (= kKBlocksPerStage > 2) K128 blocks per stage, one commit group
                     // each, frag buffers frag[b & 1] and accumulator sets acc[b & 1]:
