@@ -51,6 +51,7 @@ public:
         bool qoq_inline_s2_ilv;
         bool qoq_inline_s2_prefetch_packed;
         bool qoq_inline_s2_rawu8;
+        bool rf_prefetch_packed;
         bool strided_pool_debug;
         SM90FP4H20FusedConfig config;
 
@@ -114,6 +115,7 @@ public:
             "        /* kQoQInlineS2Ilv */ {},\n"
             "        /* kQoQInlineS2PrefetchPacked */ {},\n"
             "        /* kQoQInlineS2RawU8 */ {},\n"
+            "        /* kRFPrefetchPacked */ {},\n"
             "        /* kStridedPoolDebug */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
@@ -142,6 +144,7 @@ public:
             args.qoq_inline_s2_ilv ? "true" : "false",
             args.qoq_inline_s2_prefetch_packed ? "true" : "false",
             args.qoq_inline_s2_rawu8 ? "true" : "false",
+            args.rf_prefetch_packed ? "true" : "false",
             args.strided_pool_debug ? "true" : "false");
         return fmt::format(R"(
 {}
@@ -553,6 +556,11 @@ static void sm90_fp4_h20_fused_mega_moe(
         // 1136-1244, skew-corrected end M8 44.3-45.0 vs 40.5-42.1 us, M16 65.0-65.6 vs
         // 61.5-64.6 with prefetch). Kept as an experiment knob.
         .qoq_inline_s2_rawu8 = qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0,
+        // DG_FP4_RF_PREFETCH_PACKED (default 0): same packed-word prefetch for the generic
+        // 2-K-block RF loop (MXFP4 LUT decode / QoQ per-block promote): the k+1 barrier
+        // check and the next block-0 packed LDS move ahead of the wait<1> that frees
+        // frag[0]. Numerics unchanged (only the load is hoisted).
+        .rf_prefetch_packed = get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0,
         .strided_pool_debug = strided_pool_debug,
         .config = config,
         .y = y.data_ptr(),
@@ -595,7 +603,8 @@ static void sm90_fp4_h20_fused_mega_moe(
             fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
-        ((qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0) ? "_rawu8" : "");
+        ((qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0) ? "_rawu8" : "") +
+        (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

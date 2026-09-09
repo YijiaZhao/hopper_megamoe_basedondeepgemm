@@ -518,6 +518,9 @@ template <
     // nibble decode, s32.u8.s8 RS wgmma into per-block int32 sets, exact int32
     // deferred affine after a stage-end drain (see `kQIS2RawU8` in the body).
     bool kQoQInlineS2RawU8 = false,
+    // Generic 2-K-block RF loop (host env DG_FP4_RF_PREFETCH_PACKED): k+1 barrier check
+    // and next block-0 packed LDS before the wait<1> that frees frag[0].
+    bool kRFPrefetchPacked = false,
     // Debug (host env DG_FP4_POOL_STRIDE_DEBUG, pull dispatch only): address the
     // token pool with the push-dispatch fixed per-expert stride while keeping the
     // pull protocol; see `kStridedPool` in the body.

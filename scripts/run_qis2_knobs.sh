@@ -94,4 +94,30 @@ if [ "$MODE" = perf2 ]; then
   run_probe pf0raw0 "16 8" DG_FP4_QIS2_PREFETCH_PACKED=0 DG_FP4_QIS2_RAWU8=0
   echo ALL_PERF2_DONE >> "$LOG"
 fi
+if [ "$MODE" = final ]; then
+  # final defaults (pf=1, raw=0) correctness + MXFP4 generic-loop prefetch knob (task 4)
+  : > "$LOG"
+  for T in 2 8 8 16; do
+    run_corr qoq_mega_moe_fused $T DG_JIT_PTXAS_VERBOSE=1
+  done
+  run_corr mxfp4_mega_moe_fused 8 DG_JIT_PTXAS_VERBOSE=1
+  run_corr mxfp4_mega_moe_fused 8 DG_JIT_PTXAS_VERBOSE=1 DG_FP4_RF_PREFETCH_PACKED=1
+  run_corr mxfp4_mega_moe_fused 16 DG_FP4_RF_PREFETCH_PACKED=1
+  echo ALL_CORR_DONE >> "$LOG"
+  run_probe_q() {  # $1 quant, $2 tag, $3 M list, rest env
+    local q=$1 tag=$2 ms=$3; shift 3
+    for M in $ms; do
+      wait_idle
+      env "$@" LOG_TAG="_$tag$TAG" timeout 300 bash scripts/run_probe.sh "$q" "$M" > /dev/null 2>&1
+      echo "--- PROBE $q M=$M ($tag: $*)" >> "$LOG"
+      grep -E "^ *(3|4|7|16|17|18|19|22|30|31) |PROBE_EXIT" "probe_${q}_m${M}_$tag$TAG.log" | cut -c1-72 >> "$LOG"
+    done
+  }
+  run_probe_q mxfp4 rfpf0 "8 16" DG_FP4_RF_PREFETCH_PACKED=0
+  run_probe_q mxfp4 rfpf1 "8 16" DG_FP4_RF_PREFETCH_PACKED=1
+  run_probe_q mxfp4 rfpf1 "16 8" DG_FP4_RF_PREFETCH_PACKED=1
+  run_probe_q mxfp4 rfpf0 "16 8" DG_FP4_RF_PREFETCH_PACKED=0
+  run_probe_q qoq final "2" 
+  echo ALL_FINAL_DONE >> "$LOG"
+fi
 echo ALL_DONE >> "$LOG"

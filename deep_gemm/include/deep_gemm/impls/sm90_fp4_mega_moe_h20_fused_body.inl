@@ -2943,6 +2943,29 @@
                         kt_b = clock64();
                         kstage_add(31, kt_b - kt_a);
                         kt_a = kt_b;
+                        const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
+                        const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
+                        const uint32_t next_phase = phase ^ (next_stage == 0);
+                        uint4 pf_w[kWGHalves][2];      // kRFPrefetchPacked: next block-0 packed words
+                        uint32_t pf_sw[kWGHalves][2];
+                        if constexpr (kRFPrefetchPacked) {
+                            // k+1 barrier and the next block-0 packed LDS ahead of the wait<1>
+                            // so the smem latency overlaps block 0's retirement.
+                            if (has_next) {
+                                if ((kexp & 4u) == 0u) {
+                                    if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                        if constexpr (!kBlockIsL2)
+                                            kstage_add(23, 1ull);
+                                        full_barriers[next_stage]->wait(next_phase);
+                                    }
+                                }
+                                kt_b = clock64();
+                                if constexpr (!kBlockIsL2)
+                                    kstage_add(17, kt_b - kt_a);
+                                load_packed_rf(next_stage, 0, pf_w, pf_sw);
+                                kt_a = kt_b;
+                            }
+                        }
                         // Block 0's group was issued before the block-1 decode; retire it
                         // so frag[0] can take the next stage's block 0.
                         fence_accum();
@@ -2950,21 +2973,27 @@
                         fence_frag(frag[0]);
                         kt_b = clock64();
                         kstage_add(19, kt_b - kt_a);
-                        if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
-                            const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
-                            const uint32_t next_phase = phase ^ (next_stage == 0);
-                            if ((kexp & 4u) == 0u) {
-                                if (!barrier_ready(full_barriers[next_stage], next_phase)) {
-                                    if constexpr (!kBlockIsL2)
-                                        kstage_add(23, 1ull);
-                                    full_barriers[next_stage]->wait(next_phase);
+                        if (has_next) {
+                            if constexpr (!kRFPrefetchPacked) {
+                                if ((kexp & 4u) == 0u) {
+                                    if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                        if constexpr (!kBlockIsL2)
+                                            kstage_add(23, 1ull);
+                                        full_barriers[next_stage]->wait(next_phase);
+                                    }
                                 }
+                                kt_a = clock64();
+                                if constexpr (!kBlockIsL2)
+                                    kstage_add(17, kt_a - kt_b);
+                            } else {
+                                kt_a = kt_b;
                             }
-                            kt_a = clock64();
-                            if constexpr (!kBlockIsL2)
-                                kstage_add(17, kt_a - kt_b);
-                            if (!exp_skip(1u))
-                                decode_stage_rf(next_stage, 0, frag[0]);
+                            if (!exp_skip(1u)) {
+                                if constexpr (kRFPrefetchPacked)
+                                    decode_words_rf(pf_w, pf_sw, frag[0]);
+                                else
+                                    decode_stage_rf(next_stage, 0, frag[0]);
+                            }
                             kt_b = clock64();
                             kstage_add(18, kt_b - kt_a);
                         }
