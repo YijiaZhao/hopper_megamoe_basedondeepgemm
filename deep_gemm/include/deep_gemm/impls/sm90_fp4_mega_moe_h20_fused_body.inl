@@ -285,6 +285,17 @@
     // the int8 RS atoms (int32 accumulators, s2[row] * s_act[token] promote).
     DG_STATIC_ASSERT(!(kMXFP4 && kQoQ), "MXFP4 and QoQ are exclusive");
     constexpr bool kRFDecode = kSwapABRequested && (kMXFP4 || kQoQ);
+    // Tiny-M CUDA-core GEMV (kTinyMGemv; host env DG_FP4_TINYM, gated by
+    // DG_FP4_TINYM_MAX_M): the math warps stream the dense weight tiles with plain
+    // 16 B loads and HFMA2 (MXFP4) / DP4A (QoQ) instead of the TMA + RS-WGMMA task
+    // pipeline; the loader warps and the task scheduler idle. Stream-K partition per
+    // phase, cross-CTA fp32 fixup through the split-K scratch slots. Communication
+    // and epilogue contracts are unchanged (docs/tinym_gemv_design.md).
+    constexpr bool kTinyMGemv =
+        kTinyMGemvRequested && kRFDecode && BLOCK_M == 8 && BLOCK_N == 256 &&
+        kDenseWeightTiles && kUseInterleavedScheduler && !kHalfTileTasks && !kL2HalfRowTasks;
+    DG_STATIC_ASSERT(!kTinyMGemv || (!kSplitKL1 && !kSplitKL2 && !kStreamK),
+                     "TinyM GEMV owns the split-K scratch; the host disables split-K / stream-K");
     DG_STATIC_ASSERT(!(kRFDecode && kSwapPipelineDecode),
                      "RF decode is only implemented for the serial swapAB main loop");
     // K128 blocks per pipeline stage. The tiny-M (BM8) RF swapAB path carries
@@ -774,7 +785,7 @@
                     *workspace.get_l1_task_count_ptr() = 0;
                     *workspace.get_l2_task_count_ptr() = 0;
                 }
-                if constexpr (kSplitKL1 || kSplitKL2 || kStreamK) {
+                if constexpr (kSplitKL1 || kSplitKL2 || kStreamK || kTinyMGemv) {
                     // L1 and L2 flag slots are contiguous (L1 first)
                     for (uint32_t i = thread_idx; i < fused_layout::kSM90SplitKNumSlots; i += kNumDispatchThreads)
                         *workspace.get_splitk_l1_flag_ptr(0, i) = 0;
@@ -1289,10 +1300,13 @@
                 __syncwarp();
             }
         };
-        if constexpr (kUseInterleavedScheduler)
+        if constexpr (kTinyMGemv) {
+            // TinyM GEMV: the math warps read weights and activations themselves
+        } else if constexpr (kUseInterleavedScheduler) {
             for_each_published_block(load_a_task);
-        else
+        } else {
             for_each_static_selected_block(load_a_task);
+        }
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1376,10 +1390,13 @@
                 __syncwarp();
             }
         };
-        if constexpr (kUseInterleavedScheduler)
+        if constexpr (kTinyMGemv) {
+            // TinyM GEMV: no task pipeline (see above)
+        } else if constexpr (kUseInterleavedScheduler) {
             produce_interleaved_blocks(load_b_task);
-        else
+        } else {
             for_each_static_selected_block(load_b_task);
+        }
 
     } else {
         // =====================================================================
@@ -3232,10 +3249,13 @@
                 ktask_prev_end = kt_task1;
             }
         };
-        if constexpr (kUseInterleavedScheduler)
+        if constexpr (kTinyMGemv) {
+#include <deep_gemm/impls/sm90_fp4_mega_moe_h20_tinym_math.inl>
+        } else if constexpr (kUseInterleavedScheduler) {
             for_each_published_block(run_math_task);
-        else
+        } else {
             for_each_static_selected_block(run_math_task);
+        }
 
         // Fine-grained combine: tell the dispatch warps that this CTA's math tasks
         // are done (replaces the epilogue/dispatch pairing below).

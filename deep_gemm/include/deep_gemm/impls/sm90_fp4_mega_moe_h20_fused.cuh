@@ -481,7 +481,11 @@ template <
     // Host-selected K128 blocks per pipeline stage for the BM8 MXFP4 RF swapAB
     // path (2 or 4; see `kKBlocksPerStage` in the body). Ignored by every other
     // tier (one K-block per stage). Env DG_FP4_KBLOCKS_PER_STAGE (see the heuristic).
-    uint32_t kKBlocksPerStageRequested = 2
+    uint32_t kKBlocksPerStageRequested = 2,
+    // Host-selected tiny-M CUDA-core GEMV math path (replaces the L1/L2 tensor-core
+    // task loop; see `kTinyMGemv` in the body and
+    // impls/sm90_fp4_mega_moe_h20_tinym_math.inl). Env DG_FP4_TINYM / DG_FP4_TINYM_MAX_M.
+    bool kTinyMGemvRequested = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

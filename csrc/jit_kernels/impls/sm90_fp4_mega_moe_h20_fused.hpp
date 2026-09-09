@@ -40,6 +40,8 @@ public:
         bool nvl_fast_epilogue;
         bool fine_combine;
         int k_blocks_per_stage;
+        bool tinym;
+        int tinym_prefetch;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -67,9 +69,10 @@ public:
                           "sm90_nvfp4_mega_moe_h200_fused_impl");
         const std::string kernel_header = fmt::format(
             "#define DG_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT 1\n"
+            "#define DG_FP4_TINYM_PREFETCH {}\n"
             "#define sm90_nvfp4_mega_moe_h200_fused_impl {}\n"
             "#include <deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh>",
-            kernel_symbol);
+            args.tinym_prefetch, kernel_symbol);
         const std::string policy_template_args = fmt::format(
             "/* kSwapABRequested */ {},\n"
             "        /* kSingleActiveDispatchWarp */ {},\n"
@@ -88,7 +91,8 @@ public:
             "        /* kStreamKRequested */ {},\n"
             "        /* kNvlFastEpilogueRequested */ {},\n"
             "        /* kFineCombineRequested */ {},\n"
-            "        /* kKBlocksPerStageRequested */ {}",
+            "        /* kKBlocksPerStageRequested */ {},\n"
+            "        /* kTinyMGemvRequested */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -106,7 +110,8 @@ public:
             args.stream_k ? "true" : "false",
             args.nvl_fast_epilogue ? "true" : "false",
             args.fine_combine ? "true" : "false",
-            args.k_blocks_per_stage);
+            args.k_blocks_per_stage,
+            args.tinym ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -289,6 +294,18 @@ static void sm90_fp4_h20_fused_mega_moe(
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
         dense_weight_tiles && get_env<int>("DG_FP4_STREAMK", 0) != 0 &&
         num_global_tokens_upper <= get_env<int>("DG_FP4_STREAMK_MAX_M", 16);
+    // Tiny-M CUDA-core GEMV (kernel `kTinyMGemv`, impls/sm90_fp4_mega_moe_h20_tinym_math.inl):
+    // for <= DG_FP4_TINYM_MAX_M (default 16) global tokens the L1/L2 math is a
+    // bandwidth-shaped weight-streaming GEMV on the CUDA cores (stream-K unit
+    // ranges, fp32 fixup through the split-K scratch); the TMA/WGMMA task pipeline,
+    // split-K tails and stream-K scheduler are off for that launch. DG_FP4_TINYM=0
+    // disables; DG_FP4_TINYM_PREFETCH (1..4, default 2) sets the units in flight.
+    const bool tinym = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
+        config.block_n == 256 && !half_tile_tasks && !l2_half_row_tasks &&
+        plan.use_interleaved_scheduler && dense_weight_tiles &&
+        get_env<int>("DG_FP4_TINYM", 1) != 0 &&
+        num_global_tokens_upper <= get_env<int>("DG_FP4_TINYM_MAX_M", 16);
+    const int tinym_prefetch = std::clamp(get_env<int>("DG_FP4_TINYM_PREFETCH", 2), 1, 4);
     // Fast NVLink-barrier epilogue (kernel `kNvlFastEpilogue`, needs the
     // distributed expert bcast so the first barrier has a prologue grid sync):
     // the two barriers with an epilogue (before dispatch pull, before combine)
@@ -388,10 +405,10 @@ static void sm90_fp4_h20_fused_mega_moe(
         // NVFP4 keeps the row-major fused layout + 2D TMA.
         .dense_weight_tiles = dense_weight_tiles,
         .half_tile_tasks = half_tile_tasks,
-        .split_k_l1 = split_k_l1,
+        .split_k_l1 = split_k_l1 && !tinym,
         .l2_half_row_tasks = l2_half_row_tasks,
-        .split_k_l2 = split_k_l2,
-        .stream_k = stream_k,
+        .split_k_l2 = split_k_l2 && !tinym,
+        .stream_k = stream_k && !tinym,
         .nvl_fast_epilogue = nvl_fast_epilogue,
         .fine_combine = fine_combine,
         // K128 blocks per pipeline stage on the BM8 RF swapAB tiers (MXFP4 and QoQ,
@@ -407,6 +424,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         // phases lose 5-6 us / 2-5 us. Default 2 (the 4-block kernel also carries
         // 16 B of ptxas spill at 168 regs; the 2-block one has none).
         .k_blocks_per_stage = (mxfp4 || qoq) ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 2,
+        .tinym = tinym,
+        .tinym_prefetch = tinym_prefetch,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -440,7 +459,7 @@ static void sm90_fp4_h20_fused_mega_moe(
             "_h200_fused_interleaved" :
             (plan.use_mode2_row_decoder ?
                 "_h200_fused_mode2_row" :
-                "_h200_fused_lut_window"));
+                "_h200_fused_lut_window")) + (tinym ? "_tinym" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }
