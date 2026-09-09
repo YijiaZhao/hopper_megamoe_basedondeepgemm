@@ -27,13 +27,13 @@ TR=(/usr/local/bin/torchrun --standalone --nproc_per_node=8)
 NSYS=(/usr/local/bin/nsys profile --trace=cuda,nvtx --cuda-graph-trace=node --sample=none
       --cpuctxsw=none --force-overwrite=true)
 
-wait_idle() {
+wait_idle() {  # never run on top of someone else's GPU job; give up after WAIT_MAX_S (default 3 h)
   local i
-  for i in $(seq 1 150); do
+  for i in $(seq 1 $(( ${WAIT_MAX_S:-10800} / 5 ))); do
     [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && return 0
-    sleep 2
+    sleep 5
   done
-  echo "GPUs still busy after 300 s" >&2; return 1
+  echo "GPUs still busy after ${WAIT_MAX_S:-10800} s, aborting" >> "$LOG"; echo L2PF_AB_ABORTED >> "$LOG"; exit 1
 }
 
 echo "=== build $(git rev-parse --short HEAD) $(date) clocks: $(nvidia-smi --query-gpu=clocks.current.sm --format=csv,noheader,nounits | tr '\n' ' ')" >> "$LOG"
