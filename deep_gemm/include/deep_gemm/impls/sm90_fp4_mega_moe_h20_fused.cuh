@@ -506,7 +506,11 @@ template <
     // QoQ inline s2 A-fragment register buffers (host env DG_FP4_QIS2_FRAGS, 2|3|4,
     // default 2): the wgmma.wait_group lag before a fragment buffer is re-decoded
     // is kQoQInlineS2Frags - 1 groups (+32 regs per extra buffer).
-    uint32_t kQoQInlineS2Frags = 2
+    uint32_t kQoQInlineS2Frags = 2,
+    // QoQ inline s2 interleaved issue (host env DG_FP4_QIS2_ILV): one commit group per
+    // K32 step (2 wgmma) and the next block's K32-step decode between the groups, so
+    // the ALU decode runs while the tensor pipe drains instead of after it.
+    bool kQoQInlineS2Ilv = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

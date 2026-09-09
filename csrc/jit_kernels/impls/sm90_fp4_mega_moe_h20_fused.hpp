@@ -48,6 +48,7 @@ public:
         bool lean_routing;
         bool qoq_inline_s2;
         int qoq_inline_s2_frags;
+        bool qoq_inline_s2_ilv;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -106,7 +107,8 @@ public:
             "        /* kPushMaxTokensPerRank */ {},\n"
             "        /* kLeanRouting */ {},\n"
             "        /* kQoQInlineS2 */ {},\n"
-            "        /* kQoQInlineS2Frags */ {}",
+            "        /* kQoQInlineS2Frags */ {},\n"
+            "        /* kQoQInlineS2Ilv */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -130,7 +132,8 @@ public:
             args.push_max_tokens_per_rank,
             args.lean_routing ? "true" : "false",
             args.qoq_inline_s2 ? "true" : "false",
-            args.qoq_inline_s2_frags);
+            args.qoq_inline_s2_frags,
+            args.qoq_inline_s2_ilv ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -499,6 +502,9 @@ static void sm90_fp4_h20_fused_mega_moe(
         // DG_FP4_QIS2_FRAGS (2|3|4, default 2): A-fragment register buffers of the
         // inline s2 loop (wait_group lag = frags - 1); 3/4 cost +32/+64 regs.
         .qoq_inline_s2_frags = std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4),
+        // DG_FP4_QIS2_ILV (default 1): interleave the next block's per-K32 decode
+        // between one-K32-step commit groups (two frag buffers, lag 4 groups).
+        .qoq_inline_s2_ilv = qoq && get_env<int>("DG_FP4_QIS2_ILV", 1) != 0,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -536,7 +542,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "") +
         ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "") +
         ((qoq && std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4) != 2) ?
-            fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "");
+            fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "") +
+        ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 1) != 0) ? "_ilv" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

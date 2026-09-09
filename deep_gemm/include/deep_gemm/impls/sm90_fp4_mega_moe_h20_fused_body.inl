@@ -1848,7 +1848,7 @@
                     swap_accum_t swap_accum[kNumAccKBlocks][kSFGroups][kWGHalves][kAccChains][kSwapAccum];
                     // Inline s2 may rotate 3 or 4 A-fragment buffers (kQoQInlineS2Frags,
                     // DG_FP4_QIS2_FRAGS); every other loop uses exactly two.
-                    constexpr uint32_t kFragBufs = kInlineS2 ? kQoQInlineS2Frags : 2u;
+                    constexpr uint32_t kFragBufs = (kInlineS2 && !kQoQInlineS2Ilv) ? kQoQInlineS2Frags : 2u;
                     uint32_t frag[kFragBufs][kWGHalves][4][4];  // [buffer][half][k32 step][a0..a3]
 
                     const auto fence_accum = [&]() {
@@ -2207,6 +2207,143 @@
                         stage_step(k_block_idx, frag[0], frag[1]);
                         if (k_block_idx < num_k_blocks)
                             stage_step(k_block_idx, frag[1], frag[0]);
+                    }
+                    } else if constexpr (kKBlocksPerStage == 2 && kInlineS2 && kQoQInlineS2Ilv) {
+                    // QoQ inline s2, interleaved issue. The SASS audit (H20 2026-09-09) showed
+                    // the stage is bound by tensor-pipe occupancy: 16 RS m64n8k32 per stage
+                    // cost ~110 clk each per WG (two WGs share the pipe), and a wgmma issue
+                    // blocks the warp while the pipe queue is full, so the block decode that
+                    // followed a whole-block issue ran with the pipe idle. Here each K32 step
+                    // is its own commit group G(n, k) (2 wgmma: both 64-row halves) and the
+                    // K32 step k of the NEXT block is decoded right after G(n, k) is issued:
+                    //   pending before wait = G(n-1, k..3) + G(n, 0..k) = 5 groups, so
+                    //   wait<4> retires exactly G(n-1, k), the last reader of fnext[.][k].
+                    // Stage s-1 is released after G(2s-1, 3) retired (block 2s, step 3).
+                    // Slots: 31 issue windows, 19 wait<4>/wait<0>, 18 per-step decodes,
+                    // 17 k+1 barrier check, 30 task promote, 22 head-to-head, 21 stages.
+                    #pragma unroll
+                    for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        #pragma unroll
+                        for (uint32_t c = 0; c < kAccChains; ++ c) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                swap_accum[0][0][h][c][i] = 0;
+                        }
+                    }
+                    // Decode K32 step `k` of K-block `kb` of `stage` into f[.][k] (one LDS.32
+                    // per row for the 4 codes x 2 nibble planes, meta reloaded per step).
+                    const auto decode_kstep_rf = [&](const uint32_t& stage, const uint32_t& kb,
+                                                     const uint32_t& k, uint32_t (&f)[kWGHalves][4][4]) {
+                        const auto* packed_rows =
+                            reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) + kb * kPackedBKBlockBytes;
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            const uint32_t row_0 = wg_n_idx + h * 64u + r_0;
+                            const uint32_t row_1 = row_0 + 8u;
+                            const uint32_t word_r0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                packed_rows + row_0 * 80u + col_idx * 16u + k * 4u));
+                            const uint32_t word_r1 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                packed_rows + row_1 * 80u + col_idx * 16u + k * 4u));
+                            const uint32_t sw0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(packed_rows + row_0 * 80u + 64u));
+                            const uint32_t sw1 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(packed_rows + row_1 * 80u + 64u));
+                            const uint32_t s2_0 = sw0 & 0xffu, s2_1 = sw1 & 0xffu;
+                            const uint32_t a4_0 = (0x80u - ((sw0 >> 8u) & 0xffu) * s2_0) * 0x01010101u;
+                            const uint32_t a4_1 = (0x80u - ((sw1 >> 8u) & 0xffu) * s2_1) * 0x01010101u;
+                            f[h][k][0] = (((word_r0 >> 4) & 0x0f0f0f0fu) * s2_0 + a4_0) ^ 0x80808080u;
+                            f[h][k][1] = (((word_r1 >> 4) & 0x0f0f0f0fu) * s2_1 + a4_1) ^ 0x80808080u;
+                            f[h][k][2] = ((word_r0 & 0x0f0f0f0fu) * s2_0 + a4_0) ^ 0x80808080u;
+                            f[h][k][3] = ((word_r1 & 0x0f0f0f0fu) * s2_1 + a4_1) ^ 0x80808080u;
+                        }
+                    };
+                    // Issue the 4 K32-step groups of block (stage, kb) from fcur, decoding
+                    // block (nstage, nkb) step by step into fnext behind wait<4>.
+                    const auto block_step_ilv = [&](const uint32_t& stage, const uint32_t& kb,
+                                                    uint32_t (&fcur)[kWGHalves][4][4],
+                                                    uint32_t (&fnext)[kWGHalves][4][4],
+                                                    const uint32_t& nstage, const uint32_t& nkb,
+                                                    const bool& has_next, const bool& release_prev,
+                                                    const uint32_t& prev_stage) {
+                        #pragma unroll
+                        for (uint32_t k = 0; k < 4; ++ k) {
+                            unsigned long long kt_a = clock64();
+                            if ((kexp & 2u) == 0u) {
+                                fence_accum();
+                                fence_frag(fcur);
+                                ptx::warpgroup_arrive();
+                                #pragma unroll
+                                for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                                    auto desc_b = mma::sm90::make_smem_desc(
+                                        smem_a[stage] + kb * (SMEM_A_SIZE_PER_KBLOCK / sizeof(a_dtype_t)) +
+                                        k * SwapRS::K, 1);
+                                    SwapRS::wgmma(fcur[h][k], desc_b, swap_accum[0][0][h][k % kAccChains], true);
+                                }
+                                ptx::warpgroup_commit_batch();
+                            }
+                            unsigned long long kt_b = clock64();
+                            kstage_add(31, kt_b - kt_a);
+                            if (has_next) {
+                                fence_accum();
+                                ptx::warpgroup_wait<4>();
+                                fence_frag(fnext);
+                                if (release_prev && k == 3)
+                                    arrive_empty_barrier(prev_stage);
+                                kt_a = clock64();
+                                kstage_add(19, kt_a - kt_b);
+                                if ((kexp & 1u) == 0u)
+                                    decode_kstep_rf(nstage, nkb, k, fnext);
+                                kt_b = clock64();
+                                kstage_add(18, kt_b - kt_a);
+                            }
+                        }
+                    };
+                    if (num_k_blocks > 0) {
+                        const unsigned long long kt_head = clock64();
+                        full_barriers[stage_idx]->wait(phase);
+                        kstage_add(17, clock64() - kt_head);
+                        if constexpr (kUseInterleavedScheduler)
+                            interleaved_scheduler.release_task_info(lane_idx);
+                        capture_act_scale(stage_idx);
+                        decode_stage_rf(stage_idx, 0, frag[0]);
+                    }
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;) {
+                        const unsigned long long kt_head = clock64();
+                        const uint32_t cur_stage = stage_idx;
+                        const uint32_t prev_stage = cur_stage == 0 ? kNumStages - 1 : cur_stage - 1;
+                        const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
+                        const uint32_t next_phase = phase ^ (next_stage == 0);
+                        const bool last_stage = k_block_idx + kKBlocksPerStage >= num_k_blocks;
+                        kstage_add(21, 1ull);
+                        if (k_block_idx > 0)
+                            kstage_add(22, kt_head - kstage_t_prev);
+                        kstage_t_prev = kt_head;
+                        // Block 0: its groups + the decode of block 1 (same stage).
+                        block_step_ilv(cur_stage, 0, frag[0], frag[1], cur_stage, 1, true, k_block_idx > 0, prev_stage);
+                        if (!last_stage) {
+                            const unsigned long long kt_a = clock64();
+                            if ((kexp & 4u) == 0u) {
+                                if (!barrier_ready(full_barriers[next_stage], next_phase)) {
+                                    kstage_add(23, 1ull);
+                                    full_barriers[next_stage]->wait(next_phase);
+                                }
+                            }
+                            kstage_add(17, clock64() - kt_a);
+                        }
+                        // Block 1: its groups + the decode of the next stage's block 0.
+                        block_step_ilv(cur_stage, 1, frag[1], frag[0], next_stage, 0, !last_stage, false, prev_stage);
+                        if (last_stage) {
+                            const unsigned long long kt_a = clock64();
+                            fence_accum();
+                            ptx::warpgroup_wait<0>();
+                            fence_frag(frag[0]);
+                            fence_frag(frag[1]);
+                            arrive_empty_barrier(cur_stage);
+                            const unsigned long long kt_b = clock64();
+                            kstage_add(19, kt_b - kt_a);
+                            if ((kexp & 8u) == 0u)
+                                promote_task_rf(swap_accum[0]);
+                            kstage_add(30, clock64() - kt_b);
+                        }
+                        advance_pipeline(k_block_idx);
                     }
                     } else if constexpr (kKBlocksPerStage == 2 && kInlineS2 && kFragBufs > 2) {
                     // QoQ inline s2 with kFragBufs (3 or 4) rotating A-fragment buffers:
