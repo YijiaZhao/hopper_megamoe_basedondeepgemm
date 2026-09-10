@@ -266,18 +266,18 @@ the customer comparison column (targets M2 < 53, M8 < 61, M16 < 85: all met).
 
 | Precision | M | FE Fused | E2E Fused (FE + Mega) | Mega-only Fused |
 |---|---:|---:|---:|---:|
-| MXFP4 | 2  | 13.7 | 74.5–96.8   | **42.9** |
-| MXFP4 | 4  | 13.6 | 85.6–88.3   | **~49** |
-| MXFP4 | 8  | 13.7 | 75.5–89.2   | **56.4–59.1** |
-| MXFP4 | 16 | 13.6 | 108.5       | **74.0–83.4** |
-| QOQ   | 2  | 14.4 | 74.0–94.3   | **44.1** |
-| QOQ   | 4  | 14.4 | 124.6–125.3† | **48.0** |
-| QOQ   | 8  | 14.3 | 90.3        | **54.9–59.3** |
-| QOQ   | 16 | 14.6 | 105.6–109.3 | **74.0** |
+| MXFP4 | 2  | 8.3 (13.9 legacy) | 74.5–96.8   | **42.9** |
+| MXFP4 | 4  | 8.3 (13.8 legacy) | 81.5–88.3   | **~49** |
+| MXFP4 | 8  | 8.3 (13.9 legacy) | 75.5–89.2   | **56.4–59.1** |
+| MXFP4 | 16 | 8.7 (14.0 legacy) | 108.5–117.0 | **74.0–83.4** |
+| QOQ   | 2  | 8.7 (14.5 legacy) | 73.5–94.3   | **44.1** |
+| QOQ   | 4  | 8.5 (14.6 legacy) | 84.9–87.1   | **48.0** |
+| QOQ   | 8  | 8.6 (14.8 legacy) | 80.2–90.3   | **54.9–59.3** |
+| QOQ   | 16 | 8.7 (14.9 legacy) | 94.9–109.3  | **74.0** |
 
-† both QoQ M4 E2E captures carried 50–214 us of host launch skew; the in-graph
-fused kernel measured ~60 us in those runs.  FE Fused is the legacy frontend;
-the tiny-M frontend (`DG_FE_TINYM`, 6.9 us kernel time) is being validated.
+FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16;
+kernel time 6.9 us, nsys span 8.3–8.7 us); the legacy frontend value is in
+parentheses.  E2E ranges span captures with different host launch skew.
 
 M2/M4 values are medians over five independent captures (branch tip with
 `DG_FP4_STREAMK` default on); M8/M16 are the range over the r4/r5 captures
@@ -336,7 +336,7 @@ has an env override documented in `csrc/jit_kernels/impls/sm90_fp4_mega_moe_h20_
 | Per-rank DONE flags replace NVLink barrier #1 (push path) | `DG_FP4_PUSH_DONE_FLAGS` | -1 us |
 | QoQ packed-word prefetch inside the RF loop | `DG_FP4_QIS2_PREFETCH_PACKED` | M16 -3..-6 us (probe) |
 | stream-K for M <= 4 (units spread over all 78 SMs) | `DG_FP4_STREAMK` (`_MAX_M`) | MXFP4 M2 49.7 -> 42.9 |
-| Tiny-M Fable frontend (router + top-8 + quant) | `DG_FE_TINYM` | FE kernel 13.7 -> 6.9 us (in progress) |
+| Tiny-M Fable frontend (3 smem stages -> 3 CTAs/SM single wave; 256-thread partial fetch; warp-0 32-bit-key top-8) | `DG_FE_TINYM` | FE 13.8–14.9 -> 8.3–8.7 us (nsys span), bit-identical outputs |
 
 Measured and kept off (documented negative results): 4 K-blocks per stage,
 per-M knob sweep, tiny-M CUDA-core GEMV path (`DG_FP4_TINYM`), whole-expert L2
