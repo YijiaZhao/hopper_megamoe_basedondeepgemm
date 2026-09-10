@@ -18,7 +18,10 @@ OUT=${OUT:-/raid/kimi/results/pdf}
 POINTS=${POINTS:-"mxfp4:2 mxfp4:8 mxfp4:16 qoq:8"}
 # perf cells: tag:ENV=V[,ENV=V...]
 CONFIGS=${CONFIGS:-"k1:DG_FP4_PUSH_DONE_FLAGS=1 k0:DG_FP4_PUSH_DONE_FLAGS=0"}
-MARK=/raid/kimi/results/pdf_RUNNING
+# Knob(s) applied to the bringup / corr / stress runs (reused for later knob A/Bs, e.g.
+# KNOBS="DG_FP4_PUSH_DET_SLOTS=1" OUT=/raid/kimi/results/slots MARK=.../CAPTURE_SLOTS_RUNNING)
+KNOBS=${KNOBS:-DG_FP4_PUSH_DONE_FLAGS=1}
+MARK=${MARK:-/raid/kimi/results/pdf_RUNNING}
 export PYTHONPATH="$ROOT"
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:/usr/local/bin:$PATH"
@@ -43,7 +46,7 @@ wait_idle() {
     local apps nvcc others
     apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)
     nvcc=$(ps -C nvcc -o stat= 2>/dev/null | grep -v '^Z' | grep -c .)
-    others=$(ls /raid/kimi/results/*_RUNNING 2>/dev/null | grep -v pdf_RUNNING | grep -c .)
+    others=$(ls /raid/kimi/results/*_RUNNING 2>/dev/null | grep -v "$(basename "$MARK")" | grep -c .)
     if [ "$apps" = 0 ] && [ "$nvcc" = 0 ] && [ "$others" = 0 ]; then touch "$MARK"; return 0; fi
     sleep 2
   done
@@ -64,29 +67,32 @@ run_corr() {  # api T env...
 }
 
 if [ "$MODE" = bringup ]; then
-  run_corr mxfp4_mega_moe_fused 2 DG_FP4_PUSH_DONE_FLAGS=1 DG_FP4_SPIN_TIMEOUT=1
-  run_corr "mxfp4_mega_moe_fused qoq_mega_moe_fused" 16 DG_FP4_PUSH_DONE_FLAGS=1 DG_FP4_SPIN_TIMEOUT=1
+  run_corr mxfp4_mega_moe_fused 2 $KNOBS DG_FP4_SPIN_TIMEOUT=1
+  run_corr "mxfp4_mega_moe_fused qoq_mega_moe_fused" 16 $KNOBS DG_FP4_SPIN_TIMEOUT=1
 fi
 
 if [ "$MODE" = corr ]; then
   for rep in 1 2; do
     for T in 2 8 8 16; do
-      run_corr "mxfp4_mega_moe_fused qoq_mega_moe_fused" $T DG_FP4_PUSH_DONE_FLAGS=1
+      run_corr "mxfp4_mega_moe_fused qoq_mega_moe_fused" $T $KNOBS
     done
   done
-  run_corr mxfp4_mega_moe_fused 128 DG_FP4_PUSH_DONE_FLAGS=1
-  run_corr mxfp4_mega_moe_fused 512 DG_FP4_PUSH_DONE_FLAGS=1
+  run_corr mxfp4_mega_moe_fused 128 $KNOBS
+  run_corr mxfp4_mega_moe_fused 512 $KNOBS
 fi
 
 if [ "$MODE" = stress ]; then
   wait_idle
-  echo "--- STRESS mxfp4 M=8 iters=200 knob 1" >> "$LOG"
-  DG_FP4_PUSH_DONE_FLAGS=1 timeout 900 "${TR[@]}" tests/profile_fused_phase_stamps.py \
-    --quant mxfp4 --global-tokens 8 --iters 200 > "$OUT/stress_m8.log" 2>&1
-  echo "STRESS_EXIT=$?" >> "$LOG"
-  sed -n '/=== fused/,$p' "$OUT/stress_m8.log" | grep -v "PROBE_ITER\|Warning\|warn" | head -30 >> "$LOG"
+  for SM in ${STRESS_MS:-8}; do
+    wait_idle
+    echo "--- STRESS mxfp4 M=$SM iters=200 ($KNOBS)" >> "$LOG"
+    env $KNOBS DG_FP4_SPIN_TIMEOUT=${STRESS_SPIN_TIMEOUT:-0} timeout 900 "${TR[@]}" tests/profile_fused_phase_stamps.py \
+      --quant mxfp4 --global-tokens $SM --iters 200 > "$OUT/stress_m$SM.log" 2>&1
+    echo "STRESS_EXIT=$?" >> "$LOG"
+    sed -n '/=== fused/,$p' "$OUT/stress_m$SM.log" | grep -v "PROBE_ITER\|Warning\|warn" | head -30 >> "$LOG"
+  done
   for T in 2 8 8 16; do
-    run_corr "mxfp4_mega_moe_fused qoq_mega_moe_fused" $T DG_FP4_PUSH_DONE_FLAGS=1
+    run_corr "mxfp4_mega_moe_fused qoq_mega_moe_fused" $T $KNOBS
   done
 fi
 
