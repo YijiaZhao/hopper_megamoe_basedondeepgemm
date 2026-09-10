@@ -3070,6 +3070,12 @@
                     DG_STATIC_ASSERT(kNumAccKBlocks == 2 && kFragBufs == 2 && kWGHalves == 2 && !kQIS2RawU8 &&
                                      kKBlocksPerStage == 2 && kNumStages >= 3,
                                      "Third math WG loop: two frag buffers / accumulator sets, two halves per unit, ring >= 3");
+                    // Packed-word prefetch (the two-WG inline-s2 loop's kQIS2Prefetch) is OFF
+                    // here: its 12 live registers (uint4 x 2 + meta x 2 per half) do not fit the
+                    // 152-register budget next to the second accumulator set + final_accum_g1
+                    // (ptxas: 34 spill sites inside the IGMMA range with it on), and the LDS
+                    // latency it hid is now covered by the other two WGs' groups.
+                    constexpr bool kWG3Prefetch = false;
                     const uint32_t g_first = epilogue_wg_idx;
                     const auto ring_slot = [&](const uint32_t& g) -> uint32_t {
                         return (stage_idx + g / kKBlocksPerStage) % kNumStages;
@@ -3105,7 +3111,7 @@
                         for (uint32_t i = 0; i < kSwapAccum / 4; ++ i)
                             act_scale[i][0] = act_scale[i][1] = 0.0f;
                     }
-                    uint4 pf_w[kWGHalves][2];      // prefetched packed words (kQIS2Prefetch)
+                    uint4 pf_w[kWGHalves][2];      // prefetched packed words (kWG3Prefetch)
                     uint32_t pf_sw[kWGHalves][2];
                     if (g_first < num_k_blocks) {
                         const unsigned long long kt_head = clock64();
@@ -3143,7 +3149,7 @@
                         kstage_add(31, kt_b - kt_head);
                         if constexpr (kInlineS2) {
                             set_row_group(1);
-                            if constexpr (kQIS2Prefetch)
+                            if constexpr (kWG3Prefetch)
                                 load_packed_rf(cur_slot, kb, pf_w, pf_sw);
                             // Retire (g_prev, 1): frag[1] free, g_prev's stage fully read by this WG.
                             fence_accum();
@@ -3153,7 +3159,7 @@
                                 arrive_empty_barrier(ring_slot(g - kNumMathWarpgroups));
                             unsigned long long kt_a = clock64();
                             kstage_add(19, kt_a - kt_b);
-                            if constexpr (kQIS2Prefetch)
+                            if constexpr (kWG3Prefetch)
                                 decode_words_rf(pf_w, pf_sw, frag[1]);
                             else
                                 decode_stage_rf(cur_slot, kb, frag[1]);
@@ -3164,7 +3170,7 @@
                             kt_a = clock64();
                             kstage_add(31, kt_a - kt_b);
                             set_row_group(0);
-                            if constexpr (kQIS2Prefetch) {
+                            if constexpr (kWG3Prefetch) {
                                 if (has_next)
                                     wait_full_block(g_next);
                                 kt_b = clock64();
@@ -3179,7 +3185,7 @@
                             fence_frag(frag[0]);
                             kt_b = clock64();
                             kstage_add(19, kt_b - kt_a);
-                            if constexpr (!kQIS2Prefetch) {
+                            if constexpr (!kWG3Prefetch) {
                                 if (has_next)
                                     wait_full_block(g_next);
                                 kt_a = clock64();
@@ -3188,7 +3194,7 @@
                                 kt_a = kt_b;
                             }
                             // Decoded unconditionally (stale slot after the last owned block).
-                            if constexpr (kQIS2Prefetch)
+                            if constexpr (kWG3Prefetch)
                                 decode_words_rf(pf_w, pf_sw, frag[0]);
                             else
                                 decode_stage_rf(next_slot, next_kb, frag[0]);
