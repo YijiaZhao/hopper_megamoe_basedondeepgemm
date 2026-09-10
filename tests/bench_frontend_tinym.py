@@ -112,9 +112,13 @@ def main():
             s.synchronize(); graphs[name] = g
             dist.barrier(group=group)
 
+        # Phase-sequential (all FE iterations, then all Mega, then all FE+Mega): the fused
+        # MegaMoE's cross-rank flag protocol is captured per graph, so the two graphs that
+        # contain it are never interleaved.
         times = {k: [] for k in graphs}
-        for it in range(args.warmup + args.iters):
-            for name, g in graphs.items():
+        for name, g in graphs.items():
+            torch.cuda.synchronize(); dist.barrier(group=group)
+            for it in range(args.warmup + args.iters):
                 flush_l2_cache()
                 torch.cuda.synchronize()
                 dist.barrier(group=group)
