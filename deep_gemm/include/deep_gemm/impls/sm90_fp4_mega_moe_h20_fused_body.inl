@@ -830,13 +830,30 @@
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag   = 3;
 
     // Register reconfiguration counts (chosen to fit in 64512 reg budget).
+    // Compile-time overrides (register-budget experiments, -D on the nvcc line):
+    // DG_FP4_DISPATCH_REGS / DG_FP4_NONEPI_REGS / DG_FP4_EPI_REGS. With
+    // DG_FP4_MATH_WGS=3 the budget is 128 producer + 384 math threads, so the math
+    // WGs get at most 144 (non-epilogue 64) or 152 (non-epilogue 40).
+    constexpr uint32_t kNumMathWarpGroupsLaunch = DG_FP4_MATH_WGS;
+#ifdef DG_FP4_DISPATCH_REGS
+    constexpr uint32_t kNumDispatchRegisters    = DG_FP4_DISPATCH_REGS;
+#else
     constexpr uint32_t kNumDispatchRegisters    = 48;
+#endif
+#ifdef DG_FP4_NONEPI_REGS
+    constexpr uint32_t kNumNonEpilogueRegisters = DG_FP4_NONEPI_REGS;
+#else
     constexpr uint32_t kNumNonEpilogueRegisters =
         kUseInterleavedScheduler ? 64 : 40;
-    constexpr uint32_t kNumEpilogueRegisters    = 208;
+#endif
+#ifdef DG_FP4_EPI_REGS
+    constexpr uint32_t kNumEpilogueRegisters    = DG_FP4_EPI_REGS;
+#else
+    constexpr uint32_t kNumEpilogueRegisters    = kNumMathWarpGroupsLaunch == 2 ? 208 : 144;
+#endif
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
-                     kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
+                     kNumEpilogueRegisters * (128 * kNumMathWarpGroupsLaunch) <= 64512,
                      "Too many registers");
 
     constexpr uint32_t kDispatchGridSyncIndex = 0;

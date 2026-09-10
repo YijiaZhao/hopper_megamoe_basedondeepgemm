@@ -560,7 +560,13 @@ template <
     bool kSplitKL1All = false,
     bool kSplitKL2All = false
 >
-CUTLASS_GLOBAL __launch_bounds__(384, 1) void
+// Math warpgroups per CTA (2 = shipped; 3 = third math WG feasibility, see
+// docs/third_math_wg.md). Sets the launch bound (128 producer threads + 128 per
+// math WG) and, in the body, the setmaxnreg budget split.
+#ifndef DG_FP4_MATH_WGS
+#define DG_FP4_MATH_WGS 2
+#endif
+CUTLASS_GLOBAL __launch_bounds__(128 + 128 * DG_FP4_MATH_WGS, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
         void* y,
         int* cumulative_local_expert_recv_stats,
