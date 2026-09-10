@@ -2992,7 +2992,7 @@
                     const auto compute_colsum_rf = [&](const uint32_t& stage) {
                         constexpr uint32_t kChunksPerBlock = N_SWAP * 8u;
                         constexpr uint32_t kChunks = kKBlocksPerStage * kChunksPerBlock;
-                        DG_STATIC_ASSERT(kChunks % 128u == 0, "colsum expects whole passes over the WG");
+                        DG_STATIC_ASSERT(!kQIS2RawU8 || kChunks % 128u == 0, "colsum expects whole passes over the WG");
                         DG_STATIC_ASSERT(N_SWAP <= kQIS2ColsumStride, "colsum slot too small");
                         const uint32_t wg_tid = warp_idx_in_wg * 32u + lane_idx;
                         const auto* tile = reinterpret_cast<const uint8_t*>(smem_a[stage]);
@@ -3823,7 +3823,9 @@
                     // Stage body for a compile-time block count N (kKBlocksPerStage for
                     // full stages, 2 for the even partial tail) so every frag / acc index
                     // folds to a constant (a runtime block count spilled 16 B).
-                    DG_STATIC_ASSERT(kKBlocksPerStage % 2 == 0, "Partial tail stages hold 2 blocks");
+                    // (Not value-dependent on N_SWAP, so checked even when this branch is discarded:
+                    // the 1-block-per-stage configurations never reach it.)
+                    DG_STATIC_ASSERT(kKBlocksPerStage % 2 == 0 || kKBlocksPerStage == 1, "Partial tail stages hold 2 blocks");
                     auto stage_step_n = [&]<uint32_t N>(uint32_t& k_block_idx) {
                         const unsigned long long kt_head = clock64();
                         const uint32_t cur_stage = stage_idx;
