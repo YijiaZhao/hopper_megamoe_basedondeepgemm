@@ -91,3 +91,29 @@ longer tail is exactly what the A/B measures; M=2 (one wave, no tail) is the cle
 Slot 4 = last L1 task end (now includes the W2 slice); slot 5 = last finisher epilogue end;
 slot 41 = finisher epilogue count, 42 = finisher epilogue SM cycles (SM0), 43 = W2 slice
 count, 44 = W2 slice SM cycles (SM0, first W2 full-barrier wait to last ticket).
+
+## Result (H20, 8 ranks, tip b323af2, 2026-09-10)
+Correctness (DG_FP4_FUSE_L1L2=1, DG_FP4_SPIN_TIMEOUT=1): MXFP4 T=2 cos_min 0.99999, T=8 x3
+0.99999 (bit-identical runs), T=16 x2 0.99998, norm_ratio 0.99994-0.99997; T=128/512 (knob
+inactive, untouched path) 0.99959/0.99989 as before; QoQ T=8 0.99993, T=16 0.99993, norm_ratio
+1.00003-1.00004. 200-iteration graph-replay stress at M=8 (MXFP4 + QoQ): no trap / hang.
+Mechanism (probe task log, M=8 MXFP4): 78 CTAs, 74 x 1 task + 4 x 2 (78 full + 4 split
+halves), zero L2 tasks, 96 finisher epilogues = 8 pool blocks x 12.
+
+Timing: it LOSES at every M, by 2x at M >= 8. Skew-free min-over-devices (host barrier, nsys,
+2 passes, knob 0 -> 1, us): MXFP4 M2 41.1/41.4 -> 51.6/52.3, M8 55.2/55.4 -> 105.0/106.9,
+M16 77.5/78.7 -> 146.8/139.6; QoQ M8 54.1/54.7 -> 101.6/103.8, M16 75.5/75.7 -> 151.1/144.8.
+Why (per-CTA task log + slots 41-44, M=8 MXFP4): a fused L1 task takes 36 us p50 / 44.6 p100
+instead of 19.4 (L1) + 7.7 (a whole L2 task): SM0's W2 slice costs 21.8 us, of which 8.8 us
+are its finisher epilogues (slot read + bf16 + scatter + mailbox, ~1.5-2 us each) and ~13 us
+the 12 tiles (1.08 us per tile vs 0.77 per L2 K-block: red.add of 8 KB per tile, the
+per-stage CTA barrier + tickets, no cross-stage decode overlap). The split-K tail finisher
+half then runs 45 us (70.5 -> 115.3): 6 L1 stages + SwiGLU + the W2 slice + ALL 12
+finisher epilogues, because it is by construction the last arriver of its pool block (the
+j-rotation only spreads finishers when the 10 contributors finish within ~12 tile times).
+At M=2 every task is a split half, so the tail is the whole phase (43.7 vs 25.5 us last L1).
+The structural point: the unfused scheduler overlaps the L2 tasks of finished pool blocks with
+other CTAs' L1 tasks and leaves only ~5-7 us of L2 after the last L1, while fusion puts the
+whole L2-equivalent work (plus the reduction protocol) on every L1 task's critical path and
+concentrates the epilogues on the stragglers. Default stays 0; the knob is kept as a
+documented negative result (see the host comment for the customer-method numbers).

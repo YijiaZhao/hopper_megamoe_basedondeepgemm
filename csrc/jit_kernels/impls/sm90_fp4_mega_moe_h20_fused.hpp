@@ -496,6 +496,14 @@ static void sm90_fp4_h20_fused_mega_moe(
     // global tokens; BM8 RF swapAB (MXFP4 / QoQ), 2 K-blocks per stage, dense tiles,
     // interleaved scheduler; exclusive with half-tile / L2 half-row / split-K L2 /
     // stream-K / tiny-M (forced off below).
+    // H20 2026-09-10 (tip b323af2, numerics verified T=2/8/16 + QoQ, 200-iter stress OK):
+    // a LOSS at every M. Skew-free min-over-devices, 2 passes, 0 -> 1 (us): MXFP4 M2
+    // 41.1/41.4 -> 51.6/52.3, M8 55.2/55.4 -> 105.0/106.9, M16 77.5/78.7 -> 146.8/139.6;
+    // QoQ M8 54.1/54.7 -> 101.6/103.8, M16 75.5/75.7 -> 151.1/144.8. The fused L1 task
+    // takes 36 us (p50) instead of 19.4 + a 7.7 us L2 task: the 12 W2 tiles cost ~13 us
+    // (red.add + per-stage tickets, no cross-stage overlap) and the finisher epilogues
+    // ~1.5-2 us each land on the last arriver of the pool block (the split-K tail half
+    // runs 45 us). See docs/fuse_l1l2_design.md "Result". Kept as a documented knob.
     const bool fuse_l1l2 = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
         config.block_n == 256 && !half_tile_tasks && !l2_half_row_tasks && !tinym &&
         plan.use_interleaved_scheduler && dense_weight_tiles &&
