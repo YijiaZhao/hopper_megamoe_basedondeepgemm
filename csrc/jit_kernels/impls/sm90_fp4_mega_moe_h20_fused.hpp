@@ -374,13 +374,18 @@ static void sm90_fp4_h20_fused_mega_moe(
     // Stream-K (kernel `kStreamK`): for tiny M the (task, K128 block) units of the
     // L1 and of the L2 phase are split into 78 contiguous near-equal unit ranges (one
     // per SM, task-major) with an n-way cross-CTA fp32 reduction per tile through
-    // the split-K scratch, replacing the wave scheduler and both tail splits. Only
-    // when the launch's global token count (num_tokens per rank x ranks, an upper
-    // bound: 1 token/rank == M <= 8 global) is <= DG_FP4_STREAMK_MAX_M (default 16),
-    // so M=128/512 launches are untouched. DG_FP4_STREAMK=1 enables (default 0).
-    // The scheduler additionally activates it only when the launch has fewer L1
-    // tasks than SMs (idle SMs to fill): H20 A/B (2026-09-09, 8 ranks, rank-0 phase
-    // stamps, skew-corrected kernel end = slot 7 - slot 16, ON x2 / OFF, TINYM off):
+    // the split-K scratch, replacing the wave scheduler and both tail splits.
+    // DG_FP4_STREAMK=1 (default 1 since 2026-09-10, see below) requests it when the
+    // launch's global token count upper bound (num_tokens per rank x ranks; every
+    // 1-token/rank launch, i.e. the customer's M=2 and M=4 as well as M=8, gives 8)
+    // is <= DG_FP4_STREAMK_MAX_M (default 8), so M=128/512 launches are untouched.
+    // The host cannot tell M=2/4 from M=8 (a MAX_M of 4 would switch stream-K off
+    // exactly where it wins); the scheduler's in-kernel gate does that: it activates
+    // stream-K only when the launch has fewer L1 tasks than SMs (idle SMs to fill),
+    // which holds for M=2 (16-20 tasks) and M=4 (~40) but not for M=8 (80 tasks) or
+    // M=16, which stay on the wave scheduler + tail split-K even with the knob on.
+    // H20 A/B (2026-09-09, 8 ranks, rank-0 phase stamps, skew-corrected kernel end =
+    // slot 7 - slot 16, ON x2 / OFF, TINYM off):
     //   M=2  L1 phase 13.4/12.7 vs 15.6 us, L2 tail 6.9/7.0 vs 8.1, end 36.4/35.8 vs 38.7
     //   M=8  L1 25.7/25.2 vs 29.5, L2 14.0/14.2 vs 7.1, end 55.6/55.8 vs 45.6 (worse)
     //   M=16 L1 52.3/52.1 vs 46.7, L2 23.7/23.3 vs 12.7, end 88.1/86.9 vs 67.2 (worse)
@@ -388,14 +393,40 @@ static void sm90_fp4_h20_fused_mega_moe(
     // us/block), a full 24-block task 23-25 us, so with >= 1 full L1 wave the L1
     // phase is bounded by the per-SM stage chain (~1 us/K-block incl. fills), not
     // by idle SMs, and running every CTA's L1 range before its L2 range removes the
-    // L1/L2 overlap of the wave scheduler (L2 tail doubles). Hence the in-kernel
-    // fewer-L1-tasks-than-SMs gate; M=8 (80 tasks) and M=16 fall back to the wave
-    // scheduler + tail split-K even with the knob on.
+    // L1/L2 overlap of the wave scheduler (L2 tail doubles). Hence the in-kernel gate.
+    // Re-validated on the push-dispatch-default tip (2026-09-10, 780a9f1): corr T=2/8/8/16
+    // mxfp4 0.99998 / qoq 0.99993, owner-rank M=2/M=4 launches (stream-K active) mxfp4
+    // 0.999997 / qoq 0.99994 (== knob 0 to 1e-7), 200-iter graph-replay stress M=2/M=4 clean.
+    // CUSTOMER METHOD (official capture, GPU0 median of the last 3 spans, 1830 MHz),
+    // 5 independent captures per knob, median [min..max] across captures, us; a
+    // capture's number is kept even when its last-3 start skew is > 20 us (the median
+    // absorbs it; both knobs had 1-2 such captures per point):
+    //   Mega-only fused          knob 0                     knob 1
+    //     MXFP4 M2   49.70 [47.62..89.41]   42.94 [39.17..96.54]   -6.75
+    //     MXFP4 M4   60.77 [48.22..83.14]   57.41 [49.38..98.40]   -3.36
+    //     QoQ   M2   45.12 [44.54..47.20]   44.06 [37.66..99.39]   -1.06
+    //     QoQ   M4   48.26 [46.53..93.28]   48.03 [46.82..58.72]   -0.22
+    //   E2E fused (frontend + mega, graph)
+    //     MXFP4 M2   84.51 [75.36..175.58]  87.87 [84.29..90.46]   +3.36
+    //     MXFP4 M4   85.41 [76.93..91.20]   90.56 [77.15..94.37]   +5.15
+    //     QoQ   M2   84.22 [74.27..86.88]   88.90 [76.32..108.29]  +4.67
+    //     QoQ   M4   83.10 [75.30..84.83]   84.45 [76.74..132.45]  +1.34
+    //   M=8 gate check (wave path), knob 1 x3 captures (p1/p2/p3, median) vs the two
+    //   official knob-0 matrices on the same kernel (fuse_customer_k0_p1/p2):
+    //     Mega MXFP4 101.9(skew 48)/58.6/68.96 -> 68.96  vs 62.3/62.9
+    //     Mega QoQ    62.1/54.7/56.96          -> 56.96  vs 72.2/60.4
+    //     E2E  MXFP4  78.8/89.8/78.8           -> 78.8   vs 92.4/78.3
+    //     E2E  QoQ    86.3/77.8/82.9           -> 82.9   vs 87.8/81.2
+    //   i.e. within the capture-to-capture spread: M=8 is unchanged by the knob.
+    // Default flipped to 1 on the Mega-only medians (wins at both M for both quants);
+    // note the E2E fused medians moved the other way (+1.3..+5.2 us, 4/4 points) with
+    // the same captures -- to be understood before the E2E number is quoted with the
+    // knob on. DG_FP4_STREAMK=0 restores the wave scheduler at every M.
     const int num_global_tokens_upper = num_tokens * num_ranks;
     const bool stream_k = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
-        dense_weight_tiles && get_env<int>("DG_FP4_STREAMK", 0) != 0 &&
-        num_global_tokens_upper <= get_env<int>("DG_FP4_STREAMK_MAX_M", 16);
+        dense_weight_tiles && get_env<int>("DG_FP4_STREAMK", 1) != 0 &&
+        num_global_tokens_upper <= get_env<int>("DG_FP4_STREAMK_MAX_M", 8);
     // Tiny-M CUDA-core GEMV (kernel `kTinyMGemv`, impls/sm90_fp4_mega_moe_h20_tinym_math.inl):
     // for <= DG_FP4_TINYM_MAX_M (default 16) global tokens the L1/L2 math is a
     // bandwidth-shaped weight-streaming GEMV on the CUDA cores (stream-K unit
