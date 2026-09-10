@@ -57,7 +57,10 @@ check_idle_gpus() {
   return 1
 }
 
-if find "$OUT" -maxdepth 1 -name '*.nsys-rep' -print -quit 2>/dev/null | grep -q .; then
+# RESUME=1: keep the existing reports and capture only the missing cases (a case whose
+# post-capture idle check fails is deleted, so kept reports are always clean).
+RESUME=${RESUME:-0}
+if [ "$RESUME" != 1 ] && find "$OUT" -maxdepth 1 -name '*.nsys-rep' -print -quit 2>/dev/null | grep -q .; then
   if [ "$FORCE" != 1 ]; then
     echo "output contains existing .nsys-rep files: $OUT (set FORCE=1 to replace)" >&2
     exit 3
@@ -104,13 +107,21 @@ COMMON=(--trace=cuda,nvtx --cuda-graph-trace=node --sample=none
         --cpuctxsw=none --force-overwrite=true)
 run_case() {
   local name=$1 scope=$2 backend=$3 quant=$4 tokens=$5
+  if [ "$RESUME" = 1 ] && [ -f "$OUT/$name.nsys-rep" ]; then
+    echo "=== $name === (kept)"
+    return 0
+  fi
   check_idle_gpus
   echo "=== $name ==="
   nsys profile "${COMMON[@]}" --output="$OUT/$name" \
     torchrun --standalone --nproc_per_node=8 tests/profile_four_api_h20.py \
       --scope "$scope" --backend "$backend" --quant "$quant" \
       --global-tokens "$tokens"
-  check_idle_gpus
+  # Another job appearing mid-case contaminates it: drop the report before failing
+  if ! check_idle_gpus; then
+    rm -f "$OUT/$name.nsys-rep"
+    return 1
+  fi
 }
 
 for scope in e2e mega; do

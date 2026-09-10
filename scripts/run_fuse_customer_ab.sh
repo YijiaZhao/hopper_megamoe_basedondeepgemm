@@ -29,16 +29,17 @@ trap 'rm -f "$RES/CAPTURE_FUSE_RUNNING"' EXIT
 other_markers() {
   ls "$RES"/*_RUNNING 2>/dev/null | grep -v "/CAPTURE_FUSE_RUNNING$"
 }
+gpus_free() {
+  [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && [ -z "$(other_markers)" ]
+}
+# Start only after 60 s of continuous emptiness (a restarting server leaves short gaps)
 wait_idle() {
-  local i
-  for i in $(seq 1 5400); do
-    if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && [ -z "$(other_markers)" ]; then
-      sleep 10
-      if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && [ -z "$(other_markers)" ]; then return 0; fi
-    fi
-    sleep 2
+  local i quiet=0
+  for i in $(seq 1 10800); do
+    if gpus_free; then quiet=$((quiet + 1)); [ "$quiet" -ge 6 ] && return 0; else quiet=0; fi
+    sleep 10
   done
-  echo "GPUs busy after 3 h" >&2; return 1
+  echo "GPUs busy after 30 h" >&2; return 1
 }
 echo "build $(git rev-parse --short HEAD) $(date)"
 [ "$MODE" = skewfree ] || for pass in $(seq 1 "$PASSES"); do
@@ -49,14 +50,18 @@ echo "build $(git rev-parse --short HEAD) $(date)"
       echo "=== customer capture knob=$knob pass=$pass -> $OUT already complete, kept"
       cat "$OUT/TIMELINE_LAST3.csv"; continue
     fi
-    for attempt in 1 2 3; do
+    # Resumable: every kept report passed the capture script's per-case idle checks
+    # (a case interrupted by another job is deleted there); retry until the matrix is
+    # complete or the deadline passes.
+    attempt=0; deadline=$(( $(date +%s) + ${DEADLINE_H:-12} * 3600 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      attempt=$((attempt + 1))
       wait_idle || exit 1
       echo "=== customer capture knob=$knob pass=$pass attempt=$attempt -> $OUT $(date)"
-      OUT="$OUT" FORCE=1 DG_FP4_FUSE_L1L2=$knob timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
+      OUT="$OUT" RESUME=1 DG_FP4_FUSE_L1L2=$knob timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
       rc=$?
-      echo "CAPTURE_EXIT=$rc $(date)"
+      echo "CAPTURE_EXIT=$rc $(date) (clean reports so far: $(ls "$OUT"/*.nsys-rep 2>/dev/null | wc -l))"
       [ "$rc" -eq 0 ] && break
-      echo "discarding $OUT (another job appeared or the capture failed)"; rm -rf "$OUT"
     done
     [ -f "$OUT/TIMELINE_LAST3.csv" ] || continue
     python3 scripts/reconcile_nsys_devices.py --last 3 "$OUT"/*_fused_*.nsys-rep > "$OUT/reconcile_fused.txt" 2>&1
