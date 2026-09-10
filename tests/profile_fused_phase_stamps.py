@@ -88,6 +88,8 @@ def print_tasklog(s, t0):
         print("TASKLOG: empty (kernel built without the task log?)")
         return
     def pct(v, q):
+        if not v:
+            return float("nan")  # e.g. no L2 tasks under DG_FP4_FUSE_L1L2
         v = sorted(v); return v[min(len(v) - 1, int(q * len(v)))]
     first = [c[1][0]['start'] for c in ctas]
     l1_end = [max(t['end'] for t in c[1] if not t['l2']) for c in ctas if any(not t['l2'] for t in c[1])]
@@ -105,7 +107,7 @@ def print_tasklog(s, t0):
           f"L2 start p0/p50/p90/p100 {pct(l2_start,0):.1f}/{pct(l2_start,.5):.1f}/{pct(l2_start,.9):.1f}/{pct(l2_start,1):.1f} | "
           f"L2 end p50/p100 {pct(l2_end,.5):.1f}/{pct(l2_end,1):.1f}")
     if l1_dur:
-        print(f"TASKLOG: full L1 task dur p50/p100 {pct(l1_dur,.5):.2f}/{pct(l1_dur,1):.2f}  "
+        print(f"TASKLOG: full L1 task dur (incl. the W2 slice under DG_FP4_FUSE_L1L2) p50/p100 {pct(l1_dur,.5):.2f}/{pct(l1_dur,1):.2f}  "
               f"full L2 task dur p50/p100 {pct(l2_dur,.5):.2f}/{pct(l2_dur,1):.2f}  "
               f"idle per CTA (gaps + wait for kernel-wide last L2 end) p50/p100 {pct(idle,.5):.1f}/{pct(idle,1):.1f} "
               f"sum {sum(idle):.0f} us")
