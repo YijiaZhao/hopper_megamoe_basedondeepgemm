@@ -6,7 +6,7 @@
 # $RES; then reconcile_nsys_devices.py on the fused reports (start skew per point: > 20 us
 # means re-capture that point). Finally the skew-free min-over-devices A/B
 # (run_knob_nsys_ab.sh, mega fused only) as the footnote.
-# Usage (inside four_api_build, GPUs idle, clocks lockable): bash scripts/run_fuse_customer_ab.sh [tag]
+# Usage (inside four_api_build, GPUs idle, clocks locked): [MODE=customer|skewfree|all] bash scripts/run_fuse_customer_ab.sh [tag]
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
@@ -14,7 +14,9 @@ TAG=${1:-}
 RES=${RES:-/raid/kimi/results}
 PASSES=${PASSES:-2}
 export TOKENS_LIST=${TOKENS_LIST:-"2 8 16"}
-export CLOCK_LOCK_MODE=${CLOCK_LOCK_MODE:-set}
+# verify (default): the H20 boxes are locked at 1830 MHz on the host; the container cannot -lgc
+export CLOCK_LOCK_MODE=${CLOCK_LOCK_MODE:-verify}
+MODE=${MODE:-all}  # customer | skewfree | all
 export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PYTHONPATH="$ROOT"
 mkdir -p "$RES"
@@ -30,7 +32,7 @@ wait_idle() {
   echo "GPUs busy after 1 h" >&2; return 1
 }
 echo "build $(git rev-parse --short HEAD) $(date)"
-for pass in $(seq 1 "$PASSES"); do
+[ "$MODE" = skewfree ] || for pass in $(seq 1 "$PASSES"); do
   knobs="0 1"; [ $((pass % 2)) -eq 0 ] && knobs="1 0"
   for knob in $knobs; do
     OUT="$RES/fuse_customer${TAG}_k${knob}_p${pass}"
@@ -44,6 +46,7 @@ for pass in $(seq 1 "$PASSES"); do
   done
 done
 echo CUSTOMER_AB_DONE
+[ "$MODE" = customer ] && exit 0
 # Footnote: skew-free (host barrier) min-over-devices, mega fused only
 wait_idle || exit 1
 KNOB=DG_FP4_FUSE_L1L2 OFF=0 ON=1 PASSES="$PASSES" bash scripts/run_knob_nsys_ab.sh \
