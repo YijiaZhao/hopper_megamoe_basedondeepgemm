@@ -364,7 +364,16 @@ static void sm90_fp4_h20_fused_mega_moe(
     // 4-task straggler wave today -> ~320 half tasks (4.1 waves) with the existing
     // publisher/finisher protocol. DG_FP4_SPLITK_L2_ALL=1 does the same for the L2
     // tasks (~180 -> ~360 halves; MXFP4 only, like kSplitKL2; implies the 2-way L2
-    // split for the launch). Both default 0; see the H20 .8 A/B in the report.
+    // split for the launch). Both default 0: H20 .7 A/B (2026-09-10, official capture, GPU0
+    // last-3 median, median of 5 independent captures, M=16): Mega-only fused mxfp4 83.6 ->
+    // L1_ALL 87.3 / L2_ALL 90.2 / both 108.7 us, qoq 78.9 -> 86.2 / 80.8 / 85.1; E2E fused
+    // mxfp4 105.9 -> 112.4 / 126.1 / 134.4, qoq 93.1 -> 110.9 / 98.0 / 103.6. Host-barrier
+    // (skew-free) Mega-only, 2 captures: mxfp4 78.5-85.9 -> L1_ALL 92.4 (+1 skewed 315.8) /
+    // L2_ALL 89.7-92.4 / both 105.9-108.5; qoq 82.5-103.1 -> 83.4-85.2 / 83.5-86.8 / 86.0-88.0.
+    // A half task keeps ~4 us of fixed cost (pool wait, first stage fill, publish/acquire,
+    // epilogue), so 4.1 waves of halves lose to 2 waves + a split straggler wave; the
+    // all-split L2 additionally doubles the L2 tail. Numerics identical (T=2/8/8/16 both
+    // quants, mxfp4 128/512: same cos_min digits as knob off).
     const bool m16_rows = num_tokens == 2 && num_ranks == 8;
     const bool split_k_l1_all = split_k_l1 && m16_rows &&
         get_env<int>("DG_FP4_SPLITK_L1_ALL", 0) != 0;
