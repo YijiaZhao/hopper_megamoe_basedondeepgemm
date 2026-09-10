@@ -46,16 +46,24 @@ def attribution(stamps_list, num_router_ctas, m):
     r, q = torch.cat(rs), torch.cat(qs)
 
     def line(tag, col):
-        return (f"    {tag:<22} median {col.median():6.2f}  min {col.min():6.2f}  max {col.max():6.2f} us")
+        col = col[col > 0] if (col > 0).any() else col
+        return (f"    {tag:<30} median {col.median():6.2f}  min {col.min():6.2f}  max {col.max():6.2f} us  (n={col.numel()})")
     print(f"  stamps over {len(stamps_list)} launches (us rel. earliest CTA start of each launch; "
           f"router CTAs={num_router_ctas}, quant CTAs={m}):")
     print(line("router start", r[:, 0])); print(line("router chunk0 landed", r[:, 1]))
-    print(line("router mma done", r[:, 2])); print(line("router ticket bumped", r[:, 3]))
+    print(line("router mma done", r[:, 2]))
     print(line("quant start", q[:, 0])); print(line("quant done", q[:, 1]))
-    print(line("ticket seen (topk go)", q[:, 2]))
-    if q[:, 4].max() > 0:
-        print(line("  partials loaded", q[:, 4])); print(line("  8 rounds done", q[:, 5]))
-    print(line("topk done (kernel end)", q[:, 3]))
+    if r[:, 4].max() > 0:   # tiny-M v5: group sum + final CTA top-k inside router CTAs
+        print(line("router end (all)", r[:, 3]))
+        print(line("group keys written (24 CTAs)", r[:, 4]))
+        print(line("final CTA: keys loaded", r[:, 5])); print(line("final CTA: 8 rounds done", r[:, 6]))
+        print(line("final CTA end (kernel end)", r[:, 3].max().reshape(1)))
+    else:
+        print(line("router ticket bumped", r[:, 3]))
+        print(line("ticket seen (topk go)", q[:, 2]))
+        if q[:, 4].max() > 0:
+            print(line("  partials loaded", q[:, 4])); print(line("  8 rounds done", q[:, 5]))
+        print(line("topk done (kernel end)", q[:, 3]))
     late = int((r[:, 0] > r[:, 3].min()).sum())
     print(f"    router CTAs that started after the first router CTA finished (2nd wave): {late}")
 
