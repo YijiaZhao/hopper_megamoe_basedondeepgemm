@@ -576,8 +576,11 @@ static void sm90_fp4_h20_fused_mega_moe(
     // spill at that budget and keep two WGs. Exclusive with the experiment knobs the
     // rotation loop does not implement (RF / QIS2 variants other than the shipped
     // 2-fragment inline-s2 + packed prefetch, half-tile / half-row tasks, tiny-M
-    // GEMV, fused L1+L2).
+    // GEMV, fused L1+L2). Like the other tiny-M knobs it is gated on the global token
+    // count (DG_FP4_MATH_WGS_MAX_M, default 16): the 128 / 512-token launches keep
+    // today's two-WG kernel.
     const int math_wgs = ((mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
+        num_global_tokens_upper <= get_env<int>("DG_FP4_MATH_WGS_MAX_M", 16) &&
         config.block_n == 256 && config.num_stages >= 3 && !half_tile_tasks &&
         !l2_half_row_tasks && !tinym && !fuse_l1l2 &&
         plan.use_interleaved_scheduler && dense_weight_tiles &&

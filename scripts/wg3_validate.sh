@@ -77,9 +77,13 @@ if [ "$MODE" = corr ] || [ "$MODE" = all ]; then
   # large-M tiers: host must keep two WGs (kernel name without _wg3)
   run_corr mxfp4_mega_moe_fused 16 0.99 "mxfp4_w3env_T16_largeM" $W3
   run_corr mxfp4_mega_moe_fused 64 0.99 "mxfp4_w3env_T64_largeM" $W3
-  # WGS=2 reference numerics (same seed): cos_min must match today's kernel
-  run_corr mxfp4_mega_moe_fused 8 0.99998 "mxfp4_w2_T8" DG_FP4_MATH_WGS=2 DG_JIT_PTXAS_VERBOSE=1
-  run_corr qoq_mega_moe_fused 8 0.99993 "qoq_w2_T8" DG_FP4_MATH_WGS=2 DG_JIT_PTXAS_VERBOSE=1
+  # WGS=2 reference numerics (same seed) at the same points, plus the two-WG QoQ
+  # per-block promote (DG_FP4_QOQ_INLINE_S2=0: the arithmetic the 3-WG QoQ loop uses)
+  for T in 2 8 16 g2; do
+    run_corr mxfp4_mega_moe_fused $T 0.99 "mxfp4_w2_T$T" DG_FP4_MATH_WGS=2 DG_JIT_PTXAS_VERBOSE=1
+    run_corr qoq_mega_moe_fused $T 0.99 "qoq_w2_T$T" DG_FP4_MATH_WGS=2 DG_JIT_PTXAS_VERBOSE=1
+    run_corr qoq_mega_moe_fused $T 0.99 "qoq_w2_noqis2_T$T" DG_FP4_MATH_WGS=2 DG_FP4_QOQ_INLINE_S2=0 DG_JIT_PTXAS_VERBOSE=1
+  done
   echo "kernels built: $(ls "$CACHE" 2>/dev/null | grep -c kernel)" >> "$LOG"
   ls "$CACHE" 2>/dev/null | grep kernel | sed 's/\.[0-9a-f]*$//' | sort -u >> "$LOG"
   echo ALL_CORR_DONE >> "$LOG"
