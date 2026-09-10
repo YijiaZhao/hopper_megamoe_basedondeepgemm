@@ -1395,13 +1395,14 @@
                     // acquire poll of this word then also covers the remotely written
                     // rows (this CTA acquired barrier #1), so the lean-push L1 loaders
                     // skip the per-task arrival-count spin (see the A loader).
+                    // (warp 0 only: warp 1 of this CTA also reaches here now)
                     uint32_t low = 0;
-                    if (lane_idx == 0)
+                    if (warp_idx == 0 and lane_idx == 0)
                         low = static_cast<uint32_t>(ptx::atomic_add_rel_gpu(
                             workspace.get_expert_recv_count_sum_ptr(sm_idx),
                             static_cast<uint64_t>(kNumSMs * kNumRanks) << 32));
                     num_recv_tokens = __shfl_sync(0xffffffff, low, 0);
-                } else {
+                } else if (warp_idx == 0) {
                     num_recv_tokens = static_cast<uint32_t>(
                         ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(sm_idx)));
                 }
