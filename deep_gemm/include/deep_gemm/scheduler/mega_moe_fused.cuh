@@ -502,8 +502,12 @@ struct InterleavedMegaMoEScheduler {
     // `push_done_target` (acquire.sys: every source rank's rows and tickets of this
     // launch are then visible) and take the final low words directly, instead of
     // polling the per-expert completeness high word published by SM e.
+    // `det_slots` (kernel `kPushDetSlots`, with `push_done_ptr`): the per-expert count is
+    // the popcount of the expert's push slot mask (final once DONE is acquired; the
+    // count words are only published later by SM e after the row compaction).
     CUTLASS_DEVICE void fetch_expert_recv_count(const int* push_done_ptr = nullptr,
-                                                const int& push_done_target = 0) {
+                                                const int& push_done_target = 0,
+                                                const bool& det_slots = false) {
         if (push_done_ptr != nullptr) {
             // Lane 0 spins with relaxed loads (one poller per warp, no sys-scope acquire
             // per poll), then one acquire.sys load establishes the ordering; bar.warp.sync
@@ -521,7 +525,9 @@ struct InterleavedMegaMoEScheduler {
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
                 if (push_done_ptr != nullptr) {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    value = det_slots ?
+                        static_cast<uint64_t>(__popc(ptx::ld_volatile(workspace.get_push_slot_mask_ptr(expert_idx)))) :
+                        ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
                 } else {
                     DG_SPIN_WHILE(static_cast<uint32_t>(
                         (value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=

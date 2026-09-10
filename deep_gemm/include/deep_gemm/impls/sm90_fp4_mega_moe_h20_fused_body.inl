@@ -338,14 +338,17 @@
     // round in increasing slot order, load -> CTA barrier -> store; a row moves to
     // popc(mask below its slot) < slot, whose previous occupant (if any) moved out in
     // this or an earlier round; typically <= 1 row per expert at M <= 16, and the
-    // rounds without a move are skipped) and publishes `(kNumSMs * kNumRanks) << 32 |
-    // popc(mask)` with release.gpu (bar.sync orders both warps' compaction stores
-    // before it; the remotely written rows were acquired through DONE by the same CTA),
-    // so the task producers poll the completeness high word again (the pre-DONE-flags
-    // scheduler path) and the lean-push loaders' acquire chain is unchanged. The B
-    // loader's comm-window prefetch discovers active experts from the masks instead
-    // of the low words. Pool reuse: as for push (barrier #3 of launch N precedes any
-    // launch N+1 push), and the masks are zeroed in the cleanup before that barrier.
+    // rounds without a move are skipped), then release-adds the per-block L1 arrival
+    // counts and the count word `(kNumSMs * kNumRanks) << 32 | popc(mask)` (bar.sync
+    // orders both warps' compaction stores before them; the remotely written rows were
+    // acquired through DONE by the same CTA; both adds are non-returning). The task
+    // producers do NOT wait for that: after their own DONE acquire they take the counts
+    // as popc(mask) (final at DONE), so the first task claim and its B stage fills
+    // overlap the compaction; the A loader spins on the per-block arrival count again
+    // (acquire; released after the compaction stores). The B loader's comm-window
+    // prefetch discovers active experts from the masks instead of the low words. Pool
+    // reuse: as for push (barrier #3 of launch N precedes any launch N+1 push), and
+    // the masks are zeroed in the cleanup before that barrier.
     constexpr bool kPushDetSlots = kPushDetSlotsRequested && kPushDoneFlags;
     // Strided pool layout: implied by push dispatch; `kStridedPoolDebug` (host env
     // DG_FP4_POOL_STRIDE_DEBUG=1, pull dispatch only) forces the same fixed-stride
@@ -968,13 +971,14 @@
     };
 
     const auto produce_interleaved_blocks = [&](auto&& func) {
-        if constexpr (kPushDoneFlags && !kPushDetSlots) {
+        if constexpr (kPushDoneFlags) {
+            // Deterministic slots: counts = popcount of the slot masks (final at DONE),
+            // so the task producers do not wait for SM e's compaction / publish.
             interleaved_scheduler.fetch_expert_recv_count(
                 workspace.get_push_done_count_ptr(),
-                static_cast<int>(kNumRanks * (ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u)));
+                static_cast<int>(kNumRanks * (ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u)),
+                kPushDetSlots);
         } else {
-            // Deterministic slots: the counts exist only once SM e compacted and
-            // published (release.gpu); poll the completeness high word (acquire.gpu).
             interleaved_scheduler.fetch_expert_recv_count();
         }
         while (true) {
@@ -1380,13 +1384,23 @@
                             }
                         }
                     }
-                    // Both warps' stores precede the publish (bar.sync + release.gpu)
+                    // Both warps' stores precede the publishes (bar.sync + release.gpu).
+                    // The L1 arrival counts (spun on by the A loaders) go first; the count
+                    // word (high word: B-loader prefetch `all_final`, cleanup) follows.
+                    // Both non-returning: the count is known (popc), nothing waits here.
                     ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-                    if (warp_idx == 0 and lane_idx == 0)
-                        ptx::atomic_add_rel_gpu(
-                            workspace.get_expert_recv_count_sum_ptr(sm_idx),
-                            (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) | static_cast<uint64_t>(num_recv_tokens));
-                    __syncwarp();
+                    if (warp_idx == 0) {
+                        const uint32_t num_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
+                        if (lane_idx < num_blocks)
+                            ptx::red_add_rel(
+                                workspace.get_l1_arrival_count_ptr(sm_idx * kPushBlocksPerExpert + lane_idx),
+                                cute::min(num_recv_tokens - lane_idx * BLOCK_M, BLOCK_M));
+                        if (lane_idx == 0)
+                            ptx::red_add_rel_gpu(
+                                workspace.get_expert_recv_count_sum_ptr(sm_idx),
+                                (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) | static_cast<uint64_t>(num_recv_tokens));
+                        __syncwarp();
+                    }
                 } else if constexpr (kLeanPush) {
                     // Finalise expert `sm_idx`'s count: every rank's row tickets landed
                     // before its barrier #1 signal (acquired by this CTA), so add the
@@ -1406,7 +1420,7 @@
                     num_recv_tokens = static_cast<uint32_t>(
                         ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(sm_idx)));
                 }
-                if (warp_idx == 0) {
+                if (!kPushDetSlots and warp_idx == 0) {
                     const uint32_t num_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
                     if (lane_idx < num_blocks)
                         ptx::red_add_rel(
@@ -1706,7 +1720,10 @@
                     // scheduler's acquire of the expert count's completeness word (released
                     // by the publishing CTA after it acquired NVLink barrier #1), so the
                     // per-task arrival spin (1.3-2.6 us on the first task, H20) is skipped.
-                    if constexpr (!kLeanPush)
+                    // Deterministic slots: the rows are compacted by SM e after DONE, so
+                    // the spin is back (the arrival count is released after the compaction
+                    // stores); the task claim and the B stage fills overlap the compaction.
+                    if constexpr (!kLeanPush || kPushDetSlots)
                         DG_SPIN_WHILE(ptx::ld_acq(ptr) != valid_m, 1329);
                     if (arrival_probe_on) {
                         atomicAdd(phase_stamps + 34, clock64() - arrival_t0);

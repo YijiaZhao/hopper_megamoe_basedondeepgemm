@@ -50,7 +50,7 @@ for pass in $(seq 1 "$PASSES"); do
       env $envs timeout 900 "${TR[@]}" tests/bench_frontend_tinym.py --quant "$Q" --global-tokens "$M" \
         --iters "$ITERS" > "$OUT/events_$name.log" 2>&1
       rc=$?
-      echo "--- $name ($envs) EXIT=$rc :: $(grep -m1 '^ *Mega ' "$OUT/events_$name.log" | sed 's/^ *//')" >> "$LOG"
+      echo "--- $name ($envs) EXIT=$rc :: $(grep -m1 '^ *Mega:' "$OUT/events_$name.log" | sed 's/^ *//')" >> "$LOG"
     done
   done
 done
