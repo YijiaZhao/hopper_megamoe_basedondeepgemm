@@ -29,6 +29,9 @@
 #include <deep_gemm/quantization/fp4_fused_dequant.cuh>
 
 namespace deep_gemm {
+#ifdef DG_FP4_PRINT_SMEM_END
+template <uint32_t kEnd, uint32_t kBeforeBarrier, uint32_t kStages, uint32_t kCD> struct PrintSmemEnd;
+#endif
 namespace nvfp4 {
 
 __device__ __forceinline__ uint2 dequant_mode2_nibble_word(

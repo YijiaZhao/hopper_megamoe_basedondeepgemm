@@ -715,6 +715,13 @@
                      "Multi-K-block pipeline exceeds the SM90 shared-memory capacity");
     DG_STATIC_ASSERT(kQIS2ColsumBytes == 0 || kInterleavedSMEMEnd + kQIS2ColsumBytes <= 232448,
                      "QoQ inline-s2 colsum slots exceed the SM90 shared-memory capacity");
+#ifdef DG_FP4_PRINT_SMEM_END
+    // Budget probe: fails to compile on purpose, the error names the values
+    // (scripts/regbudget_compile.sh ... -DDG_FP4_PRINT_SMEM_END=1).
+    { typename PrintSmemEnd<kInterleavedSMEMEnd, SMEM_BEFORE_BARRIER_SIZE,
+                            kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_PACKED_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE),
+                            SMEM_CD_SIZE>::type smem_end_probe; (void) smem_end_probe; }
+#endif
 
     // =====================================================================
     // Initialization
