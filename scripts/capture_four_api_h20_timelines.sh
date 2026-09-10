@@ -13,7 +13,13 @@ LOCK_SM_CLOCK_MHZ=${LOCK_SM_CLOCK_MHZ:-1830}
 CLOCK_LOCK_MODE=${CLOCK_LOCK_MODE:-verify}
 TOKENS_LIST=${TOKENS_LIST:-"2 8 16"}
 read -r -a TOKENS <<< "$TOKENS_LIST"
-EXPECTED_COUNT=$((8 * ${#TOKENS[@]}))
+# Optional sub-matrix (default = full customer matrix): SCOPES="e2e" BACKENDS="fused"
+SCOPES=${SCOPES:-"e2e mega"}
+BACKENDS=${BACKENDS:-"split fused"}
+QUANTS=${QUANTS:-"mxfp4 qoq"}
+read -r -a _SC <<< "$SCOPES"; read -r -a _BK <<< "$BACKENDS"; read -r -a _QU <<< "$QUANTS"
+EXPECTED_COUNT=$((${#_SC[@]} * ${#_BK[@]} * ${#_QU[@]} * ${#TOKENS[@]}))
+export EXPECTED_PER_M=$((${#_SC[@]} * ${#_BK[@]} * ${#_QU[@]}))
 
 cd "$ROOT"
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
@@ -124,9 +130,9 @@ run_case() {
   fi
 }
 
-for scope in e2e mega; do
-  for backend in split fused; do
-    for quant in mxfp4 qoq; do
+for scope in $SCOPES; do
+  for backend in $BACKENDS; do
+    for quant in $QUANTS; do
       for tokens in "${TOKENS[@]}"; do
         run_case "${scope}_${backend}_${quant}_M${tokens}" \
           "$scope" "$backend" "$quant" "$tokens"

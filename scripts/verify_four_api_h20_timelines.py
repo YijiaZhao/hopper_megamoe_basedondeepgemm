@@ -5,6 +5,7 @@ The expected count is derived from the M values present: 8 reports per M
 (2 scopes x 2 backends x 2 quants); the customer method (M=2,8,16) gives 24."""
 import argparse
 import json
+import os
 import pathlib
 import re
 import sqlite3
@@ -70,11 +71,12 @@ def main():
             "nccl_outside_graph": nccl_outside_graph,
             "ok": ok,
         })
+    per_m = int(os.environ.get("EXPECTED_PER_M", "8"))  # capture script sub-matrix (SCOPES/BACKENDS/QUANTS)
     summary = {
         "count": len(reports),
         "m_values": sorted(m_values),
-        "expected_count": 8 * len(m_values),
-        "all_ok": (len(reports) > 0 and len(reports) == 8 * len(m_values)
+        "expected_count": per_m * len(m_values),
+        "all_ok": (len(reports) > 0 and len(reports) == per_m * len(m_values)
                    and all(item["ok"] for item in results)),
         "results": results,
     }
