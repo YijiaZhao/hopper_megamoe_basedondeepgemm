@@ -591,8 +591,7 @@ _FRONTEND_STAMPS_BYTES = 256 * 8 * 8
 
 
 def fable_frontend_workspace_bytes(e: int) -> int:
-    # counters | 4 K-split partial logit slices [64, e] f32 | keys [64, e] u32 | stamps
-    return 256 + 4 * 64 * e * 4 + 64 * e * 4 + _FRONTEND_STAMPS_BYTES
+    return 256 + 4 * 64 * e * 4 + _FRONTEND_STAMPS_BYTES
 
 
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
@@ -630,10 +629,9 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
 def fable_frontend_stamps(sym_buffer, e: int) -> torch.Tensor:
     """[num_ctas, 8] int64 ns %globaltimer stamps of the last DG_FE_STAMPS=1 launch.
 
-    Router CTAs (first 96 for E=384, m <= 16): start / chunk0 landed / mma done / end
-      [tiny: 4 = group keys written (last K-part of each group), 5 = keys loaded, 6 = rounds done (final CTA)].
-    Quant CTAs (next m): start / quant done / [legacy: ticket seen] / end.
+    Router CTAs (first 96 for E=384, m <= 16): start / chunk0 landed / mma done / ticket bumped.
+    Quant CTAs (next m): start / quant done / ticket seen / top-k done / [tiny: partials loaded / rounds done].
     """
     workspace = sym_buffer._fable_frontend_cache["workspace"]
-    off = 256 + 4 * 64 * e * 4 + 64 * e * 4
+    off = 256 + 4 * 64 * e * 4
     return workspace[off:off + _FRONTEND_STAMPS_BYTES].view(torch.int64).view(-1, 8).clone()

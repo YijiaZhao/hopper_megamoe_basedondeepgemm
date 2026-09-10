@@ -754,7 +754,7 @@ static void fable_router_quant_topk_frontend(
     DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64 and topk_idx.size(0) >= m);
     DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32 and topk_weights.sizes() == topk_idx.sizes());
     DG_HOST_ASSERT(x.is_contiguous() and x_sf.is_contiguous() and topk_idx.is_contiguous() and topk_weights.is_contiguous());
-    DG_HOST_ASSERT(workspace.nbytes() >= router_quant_topk_frontend_stamps_offset(static_cast<int>(e)));
+    DG_HOST_ASSERT(workspace.nbytes() >= static_cast<size_t>(256 + 4 * 64 * e * 4));
     DG_HOST_ASSERT(not stamps or workspace.nbytes() >= router_quant_topk_frontend_workspace_bytes(static_cast<int>(e)));
     DG_HOST_ASSERT(mode == 0 or mode == 1);
     launch_router_quant_topk_frontend(

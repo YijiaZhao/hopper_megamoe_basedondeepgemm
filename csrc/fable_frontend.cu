@@ -19,8 +19,6 @@ constexpr int kExpertsPerCTA = 16;
 constexpr int kThreads = 256;
 constexpr int kMaxTopK = 8;
 constexpr int kMaxExperts = 512;
-constexpr int kMaxGroups = kMaxExperts / kExpertsPerCTA;   // 32
-constexpr int kGroupCntBase = 8;   // ints [8, 8+kMaxGroups] of the 256-byte counter block: per-group + groups-done
 
 __device__ __forceinline__ float warp_max(float v) {
     #pragma unroll
@@ -333,59 +331,6 @@ __device__ __forceinline__ void topk_softmax_token_tiny(
     }
 }
 
-// Tiny-M v5 top-k over a row of e precomputed keys (written by the last-of-group
-// router CTAs): one warp per token; each lane loads its kPerLane keys (one L2
-// round trip), sorts them descending in registers, and each of the kTopK rounds
-// is a single warp max over the lane heads (5 shuffles) + a head shift.
-template <int kPerLane, int kTopK>
-__device__ __forceinline__ void topk_select_keys(
-        const uint32_t* __restrict__ keys_row, int e,
-        int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
-        unsigned long long* stamps, int t) {
-    const int lane = threadIdx.x & 31;
-    uint32_t key[kPerLane];
-    #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-        const int ex = lane + 32 * i;
-        key[i] = ex < e ? __ldcg(keys_row + ex) : 0u;
-    }
-    stamp(stamps, 5);
-    #pragma unroll
-    for (int i = 1; i < kPerLane; ++i) {          // insertion network, registers only
-        #pragma unroll
-        for (int j = i; j > 0; --j) {
-            const uint32_t lo = min(key[j - 1], key[j]), hi = max(key[j - 1], key[j]);
-            key[j - 1] = hi; key[j] = lo;
-        }
-    }
-    float sel_v[kTopK];
-    int sel_i[kTopK];
-    #pragma unroll
-    for (int k = 0; k < kTopK; ++k) {
-        const uint32_t best = warp_max_u32(key[0]);
-        sel_v[k] = topk_key_value(best); sel_i[k] = topk_key_index(best);
-        if (key[0] == best) {
-            #pragma unroll
-            for (int i = 0; i + 1 < kPerLane; ++i) key[i] = key[i + 1];
-            key[kPerLane - 1] = 0u;
-        }
-    }
-    stamp(stamps, 6);
-    float mx = sel_v[0];
-    #pragma unroll
-    for (int k = 1; k < kTopK; ++k) mx = fmaxf(mx, sel_v[k]);
-    float sum = 0.0f, ex_v[kTopK];
-    #pragma unroll
-    for (int k = 0; k < kTopK; ++k) { ex_v[k] = expf(sel_v[k] - mx); sum += ex_v[k]; }
-    int my_i = 0; float my_w = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < kTopK; ++k) if (lane == k) { my_i = sel_i[k]; my_w = ex_v[k] / sum; }
-    if (lane < kTopK) {
-        topk_idx[static_cast<int64_t>(t) * kTopK + lane] = my_i;
-        topk_weights[static_cast<int64_t>(t) * kTopK + lane] = my_w;
-    }
-}
-
 // ----------------------------------------------------------------- quant CTA
 // mode 0: FP8 E4M3 per K128 group (16 lanes x 8 values), sf = amax / 448.
 // mode 1: INT8 whole row, sf = amax / 127 replicated into every K128 slot.
@@ -457,63 +402,10 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
         const __nv_bfloat16* __restrict__ router_weight,
         uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
         int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
-        int* __restrict__ ticket, float* __restrict__ logits, uint32_t* __restrict__ keys,
+        int* __restrict__ ticket, float* __restrict__ logits,
         unsigned long long* stamps,
         int m, int h, int e, int topk, int num_router_ctas) {
     stamp(stamps, 0);
-    if constexpr (kTiny) {
-        // v5 structure: no waiting CTA. Quant CTAs only quantize. Every router CTA
-        // bumps its 16-expert group's counter; the last K-part of a group sums the
-        // 4 partials (legacy order), rounds to bf16 and writes the group's keys;
-        // the last group to finish runs top-k + softmax for all m tokens.
-        constexpr int kKS = RouterCfg<kMTiles, kTiny>::kKSplitCTAs;
-        if (static_cast<int>(blockIdx.x) >= num_router_ctas) {
-            quant_role<kMode>(hidden, x_bytes, x_sf, blockIdx.x - num_router_ctas, h);
-            stamp(stamps, 1);
-            stamp(stamps, 3);
-            return;
-        }
-        __shared__ int s_flag;
-        const int group = blockIdx.x / kKS, num_groups = num_router_ctas / kKS;
-        int* group_cnt = ticket + kGroupCntBase;
-        router_role<kMTiles, kTiny>(hidden, router_weight, logits, stamps, m, h, e);
-        __threadfence();
-        __syncthreads();
-        if (threadIdx.x == 0) s_flag = atomicAdd(group_cnt + group, 1) == kKS - 1;
-        __syncthreads();
-        if (!s_flag) { stamp(stamps, 3); return; }
-        __threadfence();
-        for (int i = threadIdx.x; i < m * kExpertsPerCTA; i += kThreads) {
-            const int t = i / kExpertsPerCTA, ex = group * kExpertsPerCTA + i % kExpertsPerCTA;
-            float acc = 0.0f;
-            if (ex < e) {
-                float p[kKS];
-                #pragma unroll
-                for (int ks = 0; ks < kKS; ++ks) p[ks] = __ldcg(logits + (static_cast<int64_t>(ks) * m + t) * e + ex);
-                #pragma unroll
-                for (int ks = 0; ks < kKS; ++ks) acc += p[ks];      // legacy order
-                keys[static_cast<int64_t>(t) * e + ex] = topk_key(round_bf16(acc), ex);
-            }
-        }
-        __threadfence();
-        __syncthreads();
-        stamp(stamps, 4);
-        if (threadIdx.x == 0) s_flag = atomicAdd(group_cnt + kMaxGroups, 1) == num_groups - 1;
-        __syncthreads();
-        if (!s_flag) { stamp(stamps, 3); return; }
-        __threadfence();
-        for (int t = threadIdx.x >> 5; t < m; t += kThreads / 32) {
-            if (e <= 384)
-                topk_select_keys<12, kMaxTopK>(keys + static_cast<int64_t>(t) * e, e, topk_idx, topk_weights, stamps, t);
-            else
-                topk_select_keys<kMaxExperts / 32, kMaxTopK>(keys + static_cast<int64_t>(t) * e, e, topk_idx, topk_weights, stamps, t);
-        }
-        __syncthreads();
-        // Everyone has passed both counters: reset them for the next launch.
-        for (int i = threadIdx.x; i <= kMaxGroups; i += kThreads) group_cnt[i] = 0;
-        stamp(stamps, 3);
-        return;
-    }
     if (static_cast<int>(blockIdx.x) >= num_router_ctas) {
         // Quant CTA: quantize this token, then wait for all router CTAs (they must
         // be co-resident: kTiny keeps 96 + m CTAs within 78 SMs x 3 CTAs) and run
@@ -521,6 +413,27 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
         const int token = blockIdx.x - num_router_ctas;
         quant_role<kMode>(hidden, x_bytes, x_sf, token, h);
         stamp(stamps, 1);
+        if constexpr (kTiny) {
+            if (threadIdx.x == 0) {
+                while (*reinterpret_cast<volatile int*>(ticket) < num_router_ctas) { }
+                __threadfence();
+            }
+            __syncthreads();
+            stamp(stamps, 2);
+            constexpr int kKS = RouterCfg<kMTiles, kTiny>::kKSplitCTAs;
+            if (e <= 384)   // E=384 -> 12 experts per lane
+                topk_softmax_token_tiny<kKS, 12, kMaxTopK>(logits, topk_idx, topk_weights, stamps, token, m, e);
+            else
+                topk_softmax_token_tiny<kKS, kMaxExperts / 32, kMaxTopK>(logits, topk_idx, topk_weights, stamps, token, m, e);
+            // warps 1..7 returned inside topk_softmax_token_tiny; warp 0 continues
+            stamp(stamps, 3);
+            if (threadIdx.x == 0 && atomicAdd(ticket + 1, 1) == m - 1) {
+                ticket[1] = 0;
+                __threadfence();
+                ticket[0] = 0;
+            }
+            return;
+        }
         if (threadIdx.x < 32) {
             if (threadIdx.x == 0) {
                 while (*reinterpret_cast<volatile int*>(ticket) < num_router_ctas) __nanosleep(200);
@@ -548,7 +461,7 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
 
 template <int kMTiles, int kMode, bool kTiny>
 void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
-            int64_t* idx, float* wts, int* ticket, float* logits, uint32_t* keys, unsigned long long* stamps,
+            int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
             int m, int h, int e, int topk, cudaStream_t stream) {
     using Cfg = RouterCfg<kMTiles, kTiny>;
     const int router_ctas = ((e + kExpertsPerCTA - 1) / kExpertsPerCTA) * Cfg::kKSplitCTAs;
@@ -559,29 +472,23 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         attr_set = true;
     }
     router_quant_topk_kernel<kMTiles, kMode, kTiny><<<router_ctas + m, kThreads, Cfg::kDynSmemBytes, stream>>>(
-        hidden, w, x, sf, idx, wts, ticket, logits, keys, stamps, m, h, e, topk, router_ctas);
+        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas);
 }
 
 template <int kMode>
 void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
-                 int64_t* idx, float* wts, int* ticket, float* logits, uint32_t* keys, unsigned long long* stamps,
+                 int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
                  int m, int h, int e, int topk, bool tiny, cudaStream_t stream) {
-    if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true>(hidden, w, x, sf, idx, wts, ticket, logits, keys, stamps, m, h, e, topk, stream);
-    else if (m <= 16) launch<1, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, keys, stamps, m, h, e, topk, stream);
-    else if (m <= 32) launch<2, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, keys, stamps, m, h, e, topk, stream);
-    else launch<4, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, keys, stamps, m, h, e, topk, stream);
+    if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
+    else if (m <= 16) launch<1, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
+    else if (m <= 32) launch<2, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
+    else launch<4, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
 }
 
 }  // namespace
 
-size_t router_quant_topk_frontend_keys_offset(int e) {
-    return kFrontendStampsOffsetBase + static_cast<size_t>(4) * 64 * e * 4;
-}
-size_t router_quant_topk_frontend_stamps_offset(int e) {
-    return router_quant_topk_frontend_keys_offset(e) + static_cast<size_t>(64) * e * 4;
-}
 size_t router_quant_topk_frontend_workspace_bytes(int e) {
-    return router_quant_topk_frontend_stamps_offset(e) + kFrontendStampsBytes;
+    return kFrontendStampsOffsetBase + static_cast<size_t>(4) * 64 * e * 4 + kFrontendStampsBytes;
 }
 
 void launch_router_quant_topk_frontend(
@@ -591,19 +498,19 @@ void launch_router_quant_topk_frontend(
         int tiny, int stamps_on, cudaStream_t stream) {
     int* ticket = static_cast<int*>(workspace);
     float* logits = reinterpret_cast<float*>(static_cast<char*>(workspace) + kFrontendStampsOffsetBase);
-    uint32_t* keys = reinterpret_cast<uint32_t*>(static_cast<char*>(workspace) + router_quant_topk_frontend_keys_offset(e));
     unsigned long long* stamps = nullptr;
     if (stamps_on && workspace_bytes >= router_quant_topk_frontend_workspace_bytes(e))
-        stamps = reinterpret_cast<unsigned long long*>(static_cast<char*>(workspace) + router_quant_topk_frontend_stamps_offset(e));
+        stamps = reinterpret_cast<unsigned long long*>(
+            static_cast<char*>(workspace) + kFrontendStampsOffsetBase + static_cast<size_t>(4) * 64 * e * 4);
     const auto* hp = static_cast<const __nv_bfloat16*>(hidden);
     const auto* wp = static_cast<const __nv_bfloat16*>(router_weight);
     const bool use_tiny = tiny != 0;
     if (mode == 0)
         launch_mode<0>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, keys, stamps, m, h, e, topk, use_tiny, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, stream);
     else
         launch_mode<1>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, keys, stamps, m, h, e, topk, use_tiny, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, stream);
 }
