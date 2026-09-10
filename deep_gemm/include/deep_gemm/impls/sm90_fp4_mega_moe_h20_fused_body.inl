@@ -4955,9 +4955,15 @@
         uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
         const auto next_combine_token = [&]() {
             if constexpr (kCombineDynamic) {
+                // Cheap exit for the (many) warps that free up after every token has
+                // been claimed: a plain load is served by L2 without the same-address
+                // atomic serialisation (~1000 warps free up within a few us at tiny M).
                 uint32_t ticket = 0;
-                if (lane_idx == 0)
-                    ticket = ptx::atomic_add(combine_ticket_ptr, 1u);
+                if (lane_idx == 0) {
+                    ticket = ptx::ld_volatile(combine_ticket_ptr);
+                    if (ticket < num_tokens)
+                        ticket = ptx::atomic_add(combine_ticket_ptr, 1u);
+                }
                 token_idx = __shfl_sync(0xffffffff, ticket, 0);
             } else {
                 token_idx += kNumSMs * kNumEpilogueWarps;
