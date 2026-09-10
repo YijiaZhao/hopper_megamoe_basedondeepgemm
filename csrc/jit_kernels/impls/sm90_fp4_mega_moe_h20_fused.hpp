@@ -40,6 +40,7 @@ public:
         bool stream_k;
         bool nvl_fast_epilogue;
         bool fine_combine;
+        bool combine_dynamic;
         int k_blocks_per_stage;
         bool tinym;
         int tinym_prefetch;
@@ -109,6 +110,7 @@ public:
             "        /* kStreamKRequested */ {},\n"
             "        /* kNvlFastEpilogueRequested */ {},\n"
             "        /* kFineCombineRequested */ {},\n"
+            "        /* kCombineDynamicRequested */ {},\n"
             "        /* kKBlocksPerStageRequested */ {},\n"
             "        /* kTinyMGemvRequested */ {},\n"
             "        /* kPushDispatchRequested */ {},\n"
@@ -142,6 +144,7 @@ public:
             args.stream_k ? "true" : "false",
             args.nvl_fast_epilogue ? "true" : "false",
             args.fine_combine ? "true" : "false",
+            args.combine_dynamic ? "true" : "false",
             args.k_blocks_per_stage,
             args.tinym ? "true" : "false",
             args.push_dispatch ? "true" : "false",
@@ -471,6 +474,14 @@ static void sm90_fp4_h20_fused_mega_moe(
     // barrier path (numerics identical: T=2/8/16/128/512 + QoQ, 200-iter graph
     // replay stress clean).
     const bool fine_combine = get_env<int>("DG_FP4_FINE_COMBINE", 1) != 0;
+    // Dynamic combine token claim (kernel `kCombineDynamic`, fine combine only): the
+    // combine warps take local tokens from a per-launch ticket (one atom.add per
+    // claim) instead of the static token -> (SM, warp) map. With <= 16 local tokens
+    // the static map put every token on SM0's warps, which are the last CTA to leave
+    // its math tasks (M8 MXFP4: SM0 math until ~48-49 us vs ~46.6 us elsewhere), so
+    // the first warps grid-wide that become free now spin on the arrival counters.
+    // DG_FP4_COMBINE_DYNAMIC=0 restores the static map.
+    const bool combine_dynamic = fine_combine && get_env<int>("DG_FP4_COMBINE_DYNAMIC", 1) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;
@@ -554,6 +565,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         .stream_k = stream_k && !tinym,
         .nvl_fast_epilogue = nvl_fast_epilogue,
         .fine_combine = fine_combine,
+        .combine_dynamic = combine_dynamic,
         // K128 blocks per pipeline stage on the BM8 RF swapAB tiers (MXFP4 and QoQ,
         // kernel `kKBlocksPerStage`; other tiers ignore it). DG_FP4_KBLOCKS_PER_STAGE in
         // {2, 4}: 2 blocks x 4 stages (default) or 4 blocks x 2 stages (same 173 KB

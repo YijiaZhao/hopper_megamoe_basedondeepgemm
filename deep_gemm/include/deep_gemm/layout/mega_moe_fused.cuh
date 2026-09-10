@@ -214,7 +214,13 @@ struct Workspace {
     //           (SM0 increments it in the workspace cleanup); DONE target = ranks * (epoch + 1)
     // [48..51]: `uint32_t` push CTA arrival count (the last CTA of a launch signals DONE
     //           to every rank and resets it)
-    // [52..127]: padding to isolate hot schedule and expert counters
+    // [52..55]: `uint32_t` combine epoch (kernel `kCombineDynamic`): dynamic-combine
+    //           launches completed on this rank (SM0 increments it in the workspace
+    //           cleanup); selects the ticket word of the launch (parity)
+    // [56..63]: 2 x `uint32_t` combine token ticket (kCombineDynamic), one per launch
+    //           parity: combine warps atomically claim tokens; SM0's cleanup of launch
+    //           N zeroes the word of parity N+1 (last used by launch N-1, complete)
+    // [64..127]: padding to isolate hot schedule and expert counters
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
     template <uint32_t kIndex = 0>
@@ -263,6 +269,18 @@ struct Workspace {
     CUTLASS_DEVICE
     uint32_t* get_push_cta_arrival_ptr() const {
         return math::advance_ptr<uint32_t>(base, 48u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_combine_epoch_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 52u);
+    }
+
+    // Dynamic fine-grained combine (kernel `kCombineDynamic`): per-launch token ticket,
+    // double-buffered by launch parity (see the byte map above).
+    CUTLASS_DEVICE
+    uint32_t* get_combine_ticket_ptr(const uint32_t& parity) const {
+        return math::advance_ptr<uint32_t>(base, 56u) + (parity & 1u);
     }
 
     CUTLASS_DEVICE

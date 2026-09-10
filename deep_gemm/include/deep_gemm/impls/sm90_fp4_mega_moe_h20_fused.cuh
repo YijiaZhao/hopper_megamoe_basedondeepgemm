@@ -479,6 +479,11 @@ template <
     // the combine NVLink barrier); see `kFineCombine` in the body. Env
     // DG_FP4_FINE_COMBINE (default 1).
     bool kFineCombineRequested = true,
+    // Host-selected dynamic combine token claim (fine combine only): combine warps
+    // take tokens from a per-launch ticket instead of the static (SM, warp) map, so
+    // the first CTAs to finish their math take the tokens; see `kCombineDynamic`
+    // in the body. Env DG_FP4_COMBINE_DYNAMIC (default 1).
+    bool kCombineDynamicRequested = true,
     // Host-selected K128 blocks per pipeline stage for the BM8 MXFP4 RF swapAB
     // path (2 or 4; see `kKBlocksPerStage` in the body). Ignored by every other
     // tier (one K-block per stage). Env DG_FP4_KBLOCKS_PER_STAGE (see the heuristic).

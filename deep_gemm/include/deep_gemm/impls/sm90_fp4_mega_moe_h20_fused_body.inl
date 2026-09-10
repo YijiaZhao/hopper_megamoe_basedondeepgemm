@@ -242,6 +242,19 @@
     // scattering after every CTA of every rank has entered that launch) and #3
     // (workspace cleanup), exactly as before.
     constexpr bool kFineCombine = kFineCombineRequested;
+    // Dynamic combine token claim (host env DG_FP4_COMBINE_DYNAMIC, default 1; fine
+    // combine only): instead of the static map token -> (sm_idx * warps + warp), a
+    // combine warp that has finished its CTA's math tasks claims tokens from a
+    // per-launch ticket (`Workspace::get_combine_ticket_ptr`, atom.add.gpu by lane 0)
+    // until it draws a ticket >= num_tokens. The ticket is double-buffered by launch
+    // parity (`get_combine_epoch_ptr`, read once by every combine warp at role
+    // start): SM0's cleanup of launch N (after the dispatch grid sync, i.e. after
+    // every CTA's epilogue warps posted DONE, hence after their epoch read) zeroes
+    // the word of parity N+1 and bumps the epoch. The zeroed word was last used by
+    // launch N-1, whose kernel completed before N started on this rank (same
+    // stream), so no late claimer of N-1 can observe the reset; launch N's own word
+    // is only zeroed by the cleanup of N+1, after N completed.
+    constexpr bool kCombineDynamic = kFineCombine && kCombineDynamicRequested;
     // Push dispatch (kPushDispatch; host env DG_FP4_PUSH_DISPATCH, see the host for
     // the default, gated by DG_FP4_PUSH_DISPATCH_MAX_M on the global token count,
     // default 16). Pull model
@@ -907,6 +920,14 @@
                 // Next launch's DONE target (see `kPushDoneFlags`)
                 if (thread_idx == 0)
                     *workspace.get_push_epoch_ptr() = ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u;
+            }
+            if constexpr (kCombineDynamic) {
+                // Next dynamic-combine launch's ticket word (see `kCombineDynamic`)
+                if (thread_idx == 0) {
+                    const auto epoch = ptx::ld_volatile(workspace.get_combine_epoch_ptr());
+                    *workspace.get_combine_ticket_ptr(epoch + 1u) = 0u;
+                    *workspace.get_combine_epoch_ptr() = epoch + 1u;
+                }
             }
             if constexpr (kUseInterleavedScheduler) {
                 if (thread_idx == 0) {
@@ -1848,6 +1869,11 @@
         // previous launch (ordered by the kernel boundary; the consumer reads the
         // same baseline from its own word).
         uint32_t combine_mailbox_seq = 0u;
+        // Dynamic combine: this launch's ticket word (parity of the epoch, read before
+        // any math task so SM0's cleanup bump cannot be observed by this launch)
+        uint32_t combine_ticket_parity = 0u;
+        if constexpr (kCombineDynamic)
+            combine_ticket_parity = ptx::ld_volatile(workspace.get_combine_epoch_ptr()) & 1u;
         if constexpr (kFineCombine)
             combine_mailbox_seq = *workspace.get_combine_mailbox_ptr(sm_idx);
         const auto run_math_task_impl = [&](const auto& block_phase,
@@ -4587,9 +4613,22 @@
 
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
-        for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
-             token_idx < num_tokens;
-             token_idx += kNumSMs * kNumEpilogueWarps) {
+        // Token assignment: dynamic ticket (kCombineDynamic) or static (SM, warp) stride
+        const auto combine_ticket_ptr = workspace.get_combine_ticket_ptr(combine_ticket_parity);
+        uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
+        const auto next_combine_token = [&]() {
+            if constexpr (kCombineDynamic) {
+                uint32_t ticket = 0;
+                if (lane_idx == 0)
+                    ticket = ptx::atomic_add(combine_ticket_ptr, 1u);
+                token_idx = __shfl_sync(0xffffffff, ticket, 0);
+            } else {
+                token_idx += kNumSMs * kNumEpilogueWarps;
+            }
+        };
+        if constexpr (kCombineDynamic)
+            next_combine_token();
+        for (; token_idx < num_tokens; next_combine_token()) {
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
