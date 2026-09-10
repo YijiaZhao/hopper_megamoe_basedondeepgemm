@@ -244,6 +244,80 @@ __device__ __forceinline__ void topk_softmax_token(
     }
 }
 
+// Tiny-M top-k (kTiny): same selection rule and same fp32 math as
+// topk_softmax_token, restructured for latency:
+//   * the kKSplit x 16 partial-logit loads are all issued before the first use
+//     (compile-time K-split, no serial dependent loop) -> one L2 round trip;
+//   * each candidate is a 32-bit key = orderable(bf16 logit) << 16 | (0xFFFF - id);
+//     the logits are bf16-rounded so the key order is exactly (value desc, id asc)
+//     and a round is one 32-bit warp max (5 shuffles) instead of paired
+//     value/index shuffles + branches. -0.0 is canonicalised to +0.0 first
+//     (float compare treats them equal; the legacy path tie-breaks them by id).
+__device__ __forceinline__ uint32_t topk_key(float v, int ex) {
+    v = v + 0.0f;                                                 // -0.0 -> +0.0
+    const uint32_t b = __bfloat16_as_ushort(__float2bfloat16_rn(v));   // exact: v is bf16
+    const uint32_t o = (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u);
+    return (o << 16) | (0xFFFFu - static_cast<uint32_t>(ex));
+}
+__device__ __forceinline__ float topk_key_value(uint32_t key) {
+    const uint32_t o = key >> 16;
+    const uint32_t b = (o & 0x8000u) ? (o & 0x7FFFu) : (~o & 0xFFFFu);
+    return __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(b)));
+}
+__device__ __forceinline__ int topk_key_index(uint32_t key) {
+    return static_cast<int>(0xFFFFu - (key & 0xFFFFu));
+}
+__device__ __forceinline__ uint32_t warp_max_u32(uint32_t v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = max(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+template <int kKSplit>
+__device__ __forceinline__ void topk_softmax_token_tiny(
+        const float* __restrict__ logits, int64_t* __restrict__ topk_idx,
+        float* __restrict__ topk_weights, int t, int m, int e, int topk) {
+    const int lane = threadIdx.x & 31;
+    constexpr int kPerLane = kMaxExperts / 32;
+    float part[kKSplit][kPerLane];
+    #pragma unroll
+    for (int ks = 0; ks < kKSplit; ++ks) {
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+            const int ex = lane + 32 * i;
+            part[ks][i] = ex < e ? __ldcg(logits + (static_cast<int64_t>(ks) * m + t) * e + ex) : 0.0f;
+        }
+    }
+    uint32_t key[kPerLane];
+    #pragma unroll
+    for (int i = 0; i < kPerLane; ++i) {
+        const int ex = lane + 32 * i;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int ks = 0; ks < kKSplit; ++ks) acc += part[ks][i];     // same order as legacy
+        key[i] = topk_key(ex < e ? round_bf16(acc) : -INFINITY, ex);
+    }
+    float sel_v[kMaxTopK];
+    int sel_i[kMaxTopK];
+    for (int k = 0; k < topk; ++k) {
+        uint32_t best = 0;
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) best = max(best, key[i]);
+        best = warp_max_u32(best);
+        sel_v[k] = topk_key_value(best); sel_i[k] = topk_key_index(best);
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) key[i] = key[i] == best ? 0u : key[i];
+    }
+    float mx = sel_v[0];
+    for (int k = 1; k < topk; ++k) mx = fmaxf(mx, sel_v[k]);
+    float sum = 0.0f, ex_v[kMaxTopK];
+    for (int k = 0; k < topk; ++k) { ex_v[k] = expf(sel_v[k] - mx); sum += ex_v[k]; }
+    if (lane < topk) {
+        topk_idx[static_cast<int64_t>(t) * topk + lane] = sel_i[lane];
+        topk_weights[static_cast<int64_t>(t) * topk + lane] = ex_v[lane] / sum;
+    }
+}
+
 // ----------------------------------------------------------------- quant CTA
 // mode 0: FP8 E4M3 per K128 group (16 lanes x 8 values), sf = amax / 448.
 // mode 1: INT8 whole row, sf = amax / 127 replicated into every K128 slot.
@@ -336,7 +410,10 @@ __global__ void __launch_bounds__(kThreads, 1) router_quant_topk_kernel(
             }
             __syncwarp();
             stamp(stamps, 2);
-            topk_softmax_token(logits, topk_idx, topk_weights, token, m, e, topk, RouterCfg<kMTiles, kTiny>::kKSplitCTAs);
+            if constexpr (kTiny)
+                topk_softmax_token_tiny<RouterCfg<kMTiles, kTiny>::kKSplitCTAs>(logits, topk_idx, topk_weights, token, m, e, topk);
+            else
+                topk_softmax_token(logits, topk_idx, topk_weights, token, m, e, topk, RouterCfg<kMTiles, kTiny>::kKSplitCTAs);
             stamp(stamps, 3);
             // Last token CTA resets the counters for the next launch.
             if (threadIdx.x == 0 && atomicAdd(ticket + 1, 1) == m - 1) {
