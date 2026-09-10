@@ -415,7 +415,9 @@
     constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
     // Rows per WG of an L2 task: 64 (one weight half) with L2 half-row tasks,
     // otherwise half the L2 task N (two halves; four with wide L2 tasks).
-    constexpr uint32_t L2_WG_BLOCK_N = kL2HalfRowTasks ? 64u : TASK_BLOCK_N_L2 / 2;
+    // (BM128 split-M: each WG covers the whole BN128 tile, as for L1.)
+    constexpr uint32_t L2_WG_BLOCK_N = kL2HalfRowTasks ? 64u :
+        (kSplitMDecodedWeightReuse ? BLOCK_N : TASK_BLOCK_N_L2 / 2);
     // Capacity of the swapAB accumulator layout (64-row halves per WG, max over the
     // two phases); each phase uses its own kWGHalves <= this.
     constexpr uint32_t kSwapABWeightHalves = (WG_BLOCK_N > L2_WG_BLOCK_N ? WG_BLOCK_N : L2_WG_BLOCK_N) / 64;
