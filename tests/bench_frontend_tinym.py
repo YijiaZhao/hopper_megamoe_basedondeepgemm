@@ -13,6 +13,10 @@ flush) with per-CTA %globaltimer stamps and prints the phase attribution, and
 replays a stamped FE+Mega graph (stamps taken inside the graph, i.e. after the
 previous replay's Mega streamed its weights through L2).
 Knobs echoed: DG_FE_ROUTER_L2_PERSIST (router weights pinned in L2), DG_FE_PDL.
+DG_BENCH_HOT_HIDDEN=1: re-touch the hidden rows after every L2 flush (in the real
+pipeline the attention output is written right before the FE and is L2-hot; the
+flush would otherwise put both the hidden rows and the router weights in HBM and
+the first-chunk latency is the same whichever of the two is resident).
 """
 import argparse
 import os
@@ -81,6 +85,7 @@ def main():
     stamps = int(os.environ.get("DG_FE_STAMPS", "0"))
     l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
     pdl = int(os.environ.get("DG_FE_PDL", "0"))
+    hot_hidden = int(os.environ.get("DG_BENCH_HOT_HIDDEN", "0"))
     buffer, launch_moe = prepare_backend(args, rank, local_rows, group)
     try:
         torch.manual_seed(20260805)
@@ -88,6 +93,11 @@ def main():
         torch.manual_seed(17000 + rank * 1000003)
         x = torch.randn(local_rows, HIDDEN, device="cuda", dtype=torch.bfloat16)
         y = torch.empty_like(x)
+
+        def flush():
+            flush_l2_cache()
+            if hot_hidden:
+                x.add_(0)
 
         def fe(st=0):
             deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant,
@@ -124,7 +134,7 @@ def main():
             g = graphs[name]
             torch.cuda.synchronize(); dist.barrier(group=group)
             for it in range(args.warmup + args.iters):
-                flush_l2_cache()
+                flush()
                 torch.cuda.synchronize()
                 dist.barrier(group=group)
                 e0 = torch.cuda.Event(enable_timing=True); e1 = torch.cuda.Event(enable_timing=True)
@@ -136,13 +146,14 @@ def main():
         if rank == 0:
             print(f"== frontend direct timing: quant={args.quant} M={args.global_tokens} "
                   f"(rows/rank={local_rows}) backend={args.backend} DG_FE_TINYM={tinym} "
-                  f"DG_FE_ROUTER_L2_PERSIST={l2_persist} DG_FE_PDL={pdl} iters={args.iters} GPU0 ==")
+                  f"DG_FE_ROUTER_L2_PERSIST={l2_persist} DG_FE_PDL={pdl} DG_BENCH_HOT_HIDDEN={hot_hidden} "
+                  f"iters={args.iters} GPU0 ==")
             for name in timed:
                 print(fmt_stats(name, times[name]))
         if stamps:
             collected = []
             for _ in range(5):
-                flush_l2_cache(); torch.cuda.synchronize(); dist.barrier(group=group)
+                flush(); torch.cuda.synchronize(); dist.barrier(group=group)
                 deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant,
                                                            tinym=tinym, stamps=1)
                 torch.cuda.synchronize()
@@ -153,7 +164,7 @@ def main():
             collected = []
             g = graphs["FE+Mega/st"]
             for _ in range(5):
-                flush_l2_cache(); torch.cuda.synchronize(); dist.barrier(group=group)
+                flush(); torch.cuda.synchronize(); dist.barrier(group=group)
                 g.replay(); torch.cuda.synchronize()
                 collected.append(deep_gemm.fable_frontend_stamps(buffer, EXPERTS))
             if rank == 0:

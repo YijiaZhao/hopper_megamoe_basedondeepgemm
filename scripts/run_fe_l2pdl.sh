@@ -7,7 +7,7 @@
 #           stamps (eager after flush, and inside the FE+Mega graph)
 #   corr  : test_four_api_correctness mxfp4+qoq fused, T=2 8 8 16 with DG_FE_PDL=1 (+ L2P=CORR_L2P)
 # GPU discipline as run_fe_tinym.sh; our marker is CAPTURE_FE2_RUNNING.
-# Usage (inside four_api_build): [MODE=all] [TOKENS_LIST="2 8"] [STATES="0:0 1:0 2:0 0:1 1:1"] bash scripts/run_fe_l2pdl.sh
+# Usage (inside four_api_build): [MODE=all] [TOKENS_LIST="2 8"] [STATES="0:0 1:0 2:0 0:1 1:1"] [HOT_HIDDEN=1] bash scripts/run_fe_l2pdl.sh
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
@@ -67,8 +67,8 @@ if [ "$MODE" = bench ] || [ "$MODE" = all ]; then
     for Q in mxfp4 qoq; do
       for S in $STATES; do
         L2P=${S%%:*}; PDL=${S##*:}
-        echo "--- bench M=$M quant=$Q DG_FE_ROUTER_L2_PERSIST=$L2P DG_FE_PDL=$PDL" >> "$LOG"
-        DG_FE_ROUTER_L2_PERSIST=$L2P DG_FE_ROUTER_L2_PERSIST_VERBOSE=1 DG_FE_PDL=$PDL DG_FE_STAMPS=1 \
+        echo "--- bench M=$M quant=$Q DG_FE_ROUTER_L2_PERSIST=$L2P DG_FE_PDL=$PDL HOT_HIDDEN=${HOT_HIDDEN:-0}" >> "$LOG"
+        DG_FE_ROUTER_L2_PERSIST=$L2P DG_FE_ROUTER_L2_PERSIST_VERBOSE=1 DG_FE_PDL=$PDL DG_FE_STAMPS=1 DG_BENCH_HOT_HIDDEN=${HOT_HIDDEN:-0} \
           run_gpu "bench M=$M $Q l2p$L2P pdl$PDL" timeout 600 "$TR" --standalone --nproc_per_node=8 \
           tests/bench_frontend_tinym.py --quant "$Q" --global-tokens "$M" --iters "$ITERS" >> "$LOG" 2>&1
       done
