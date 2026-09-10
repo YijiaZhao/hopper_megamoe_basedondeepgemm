@@ -117,3 +117,24 @@ other CTAs' L1 tasks and leaves only ~5-7 us of L2 after the last L1, while fusi
 whole L2-equivalent work (plus the reduction protocol) on every L1 task's critical path and
 concentrates the epilogues on the stragglers. Default stays 0; the knob is kept as a
 documented negative result (see the host comment for the customer-method numbers).
+
+### Customer method (primary): official capture, GPU0 median of the last 3, us, knob 0 -> 1
+scripts/capture_four_api_h20_timelines.sh (TOKENS_LIST "2 8 16", full 24-report matrix per
+side, 4 matrices, clocks 1830 MHz verified, every fused point with last-3 start skew > 20 us
+re-captured with scripts/recapture_skewed_points.sh until <= 20; matrices that overlapped
+another agent's capture were discarded and re-run). Mega-only Fused (pass 1 / pass 2):
+
+| quant | M  | knob 0 (p1 / p2) | knob 1 (p1 / p2) |
+|-------|----|------------------|------------------|
+| MXFP4 | 2  | 43.1 / 54.9      | 56.6 / 56.9      |
+| MXFP4 | 8  | 62.3 / 62.9      | 108.7 / 108.1    |
+| MXFP4 | 16 | 78.0 / 83.8      | 150.9 / 152.2    |
+| QoQ   | 2  | 44.1 / 43.1      | 58.2 / 53.2      |
+| QoQ   | 8  | 72.2 / 60.4      | 109.2 / 107.6    |
+| QoQ   | 16 | 81.4 / 81.3      | 149.4 / 145.2    |
+
+E2E Fused target span (same method): MXFP4 M2 83.9/89.7 -> 142.9/140.6, M8 92.4/78.3 ->
+119.6/129.7, M16 109.6/99.7 -> 187.3/178.7; QoQ M2 81.4/79.9 -> 134.9/132.0, M8 87.8/81.2 ->
+122.9/131.5, M16 109.7/107.1 -> 183.5/177.7.
+Footnote (skew-free min-over-devices, DG_PROFILE_HOST_BARRIER=1, run_knob_nsys_ab.sh): see above.
+Decision: default stays 0 (loses at every M in both passes by far more than 1 us).

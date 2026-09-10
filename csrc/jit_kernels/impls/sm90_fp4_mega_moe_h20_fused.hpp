@@ -503,7 +503,11 @@ static void sm90_fp4_h20_fused_mega_moe(
     // takes 36 us (p50) instead of 19.4 + a 7.7 us L2 task: the 12 W2 tiles cost ~13 us
     // (red.add + per-stage tickets, no cross-stage overlap) and the finisher epilogues
     // ~1.5-2 us each land on the last arriver of the pool block (the split-K tail half
-    // runs 45 us). See docs/fuse_l1l2_design.md "Result". Kept as a documented knob.
+    // runs 45 us). Customer method (official capture, GPU0 last-3 median, 2 passes,
+    // skew <= 20 us, Mega-only Fused, 0 -> 1): MXFP4 M2 43.1/54.9 -> 56.6/56.9, M8
+    // 62.3/62.9 -> 108.7/108.1, M16 78.0/83.8 -> 150.9/152.2; QoQ M2 44.1/43.1 -> 58.2/53.2,
+    // M8 72.2/60.4 -> 109.2/107.6, M16 81.4/81.3 -> 149.4/145.2. See
+    // docs/fuse_l1l2_design.md "Result". Kept as a documented negative-result knob.
     const bool fuse_l1l2 = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
         config.block_n == 256 && !half_tile_tasks && !l2_half_row_tasks && !tinym &&
         plan.use_interleaved_scheduler && dense_weight_tiles &&
