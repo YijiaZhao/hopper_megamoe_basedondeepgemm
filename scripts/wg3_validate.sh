@@ -63,7 +63,7 @@ hold
 run_corr() {  # $1 api, $2 tokens, $3 cos min, $4 label, rest: env
   local api=$1 T=$2 cmin=$3 label=$4; shift 4
   local extra=""
-  case "$T" in g2) extra="--tokens 1 --global-tokens 2" ;; *) extra="--tokens $T" ;; esac
+  case "$T" in g2) extra="--tokens 1 --global-tokens 2" ;; g4) extra="--tokens 1 --global-tokens 4" ;; *) extra="--tokens $T" ;; esac
   wait_idle || return 1
   echo "--- CORR $label $api T=$T cos>=$cmin ($*)" >> "$LOG"
   env "$@" timeout 600 $TR --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
@@ -108,6 +108,23 @@ if [ "$MODE" = corrq ]; then
   run_corr qoq_mega_moe_fused 16 0.99 "q_qoq_w2_T16" DG_FP4_MATH_WGS=2 DG_JIT_PTXAS_VERBOSE=1
   run_corr qoq_mega_moe_fused 16 0.99 "q_qoq_w2_noqis2_T16" DG_FP4_MATH_WGS=2 DG_FP4_QOQ_INLINE_S2=0 DG_JIT_PTXAS_VERBOSE=1
   echo ALL_CORRQ_DONE >> "$LOG"
+fi
+
+if [ "$MODE" = corr3 ]; then
+  # Points where the host gate (DG_FP4_MATH_WGS_MAX_M = 16 global tokens) really selects
+  # the 3-WG kernel: 8 and 4 global tokens (one token on 8 / 4 ranks), plus 16 (T=2 / rank).
+  echo "=== CORR3 build $(git rev-parse --short HEAD) $(date -u +%FT%TZ)" >> "$LOG"
+  for w in 3 2; do
+    run_corr mxfp4_mega_moe_fused 1 0.99 "c3_mxfp4_w${w}_g8" DG_FP4_MATH_WGS=$w DG_JIT_PTXAS_VERBOSE=1
+    run_corr qoq_mega_moe_fused 1 0.99 "c3_qoq_w${w}_g8" DG_FP4_MATH_WGS=$w DG_JIT_PTXAS_VERBOSE=1
+    run_corr mxfp4_mega_moe_fused g4 0.99 "c3_mxfp4_w${w}_g4" DG_FP4_MATH_WGS=$w DG_JIT_PTXAS_VERBOSE=1
+    run_corr qoq_mega_moe_fused g4 0.99 "c3_qoq_w${w}_g4" DG_FP4_MATH_WGS=$w DG_JIT_PTXAS_VERBOSE=1
+    run_corr mxfp4_mega_moe_fused 2 0.99 "c3_mxfp4_w${w}_g16" DG_FP4_MATH_WGS=$w DG_JIT_PTXAS_VERBOSE=1
+    run_corr qoq_mega_moe_fused 2 0.99 "c3_qoq_w${w}_g16" DG_FP4_MATH_WGS=$w DG_JIT_PTXAS_VERBOSE=1
+  done
+  echo "wg3 kernels in the JIT cache: $(ls /root/.deep_gemm/cache 2>/dev/null | grep -c _wg3)" >> "$LOG"
+  ls /root/.deep_gemm/cache 2>/dev/null | grep _wg3 | sed 's/\.[0-9a-f]*$//' | sort | uniq -c >> "$LOG"
+  echo ALL_CORR3_DONE >> "$LOG"
 fi
 
 if [ "$MODE" = stress ] || [ "$MODE" = all ]; then
