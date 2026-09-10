@@ -22,24 +22,43 @@ export PYTHONPATH="$ROOT"
 mkdir -p "$RES"
 echo "$$ $(date)" > "$RES/CAPTURE_FUSE_RUNNING"
 trap 'rm -f "$RES/CAPTURE_FUSE_RUNNING"' EXIT
+# Strict coordination: no other *_RUNNING marker of any kind (ours excepted) and no
+# compute process on any GPU, re-checked 10 s later, before every matrix; a matrix whose
+# capture exits non-zero (the capture script's own per-case idle checks fail when another
+# job appears mid-matrix) is discarded and re-captured (up to 3 attempts).
+other_markers() {
+  ls "$RES"/*_RUNNING 2>/dev/null | grep -v "/CAPTURE_FUSE_RUNNING$"
+}
 wait_idle() {
   local i
-  for i in $(seq 1 1800); do
-    if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] &&
-       ! ls "$RES"/OFFICIAL_*_RUNNING "$RES"/CAPTURE_RUNNING "$RES"/CAPTURE_M*_RUNNING >/dev/null 2>&1; then return 0; fi
+  for i in $(seq 1 5400); do
+    if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && [ -z "$(other_markers)" ]; then
+      sleep 10
+      if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && [ -z "$(other_markers)" ]; then return 0; fi
+    fi
     sleep 2
   done
-  echo "GPUs busy after 1 h" >&2; return 1
+  echo "GPUs busy after 3 h" >&2; return 1
 }
 echo "build $(git rev-parse --short HEAD) $(date)"
 [ "$MODE" = skewfree ] || for pass in $(seq 1 "$PASSES"); do
   knobs="0 1"; [ $((pass % 2)) -eq 0 ] && knobs="1 0"
   for knob in $knobs; do
     OUT="$RES/fuse_customer${TAG}_k${knob}_p${pass}"
-    wait_idle || exit 1
-    echo "=== customer capture knob=$knob pass=$pass -> $OUT $(date)"
-    OUT="$OUT" FORCE=1 DG_FP4_FUSE_L1L2=$knob timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
-    echo "CAPTURE_EXIT=$?"
+    if [ "${SKIP_DONE:-0}" = 1 ] && [ -f "$OUT/TIMELINE_LAST3.csv" ]; then
+      echo "=== customer capture knob=$knob pass=$pass -> $OUT already complete, kept"
+      cat "$OUT/TIMELINE_LAST3.csv"; continue
+    fi
+    for attempt in 1 2 3; do
+      wait_idle || exit 1
+      echo "=== customer capture knob=$knob pass=$pass attempt=$attempt -> $OUT $(date)"
+      OUT="$OUT" FORCE=1 DG_FP4_FUSE_L1L2=$knob timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
+      rc=$?
+      echo "CAPTURE_EXIT=$rc $(date)"
+      [ "$rc" -eq 0 ] && break
+      echo "discarding $OUT (another job appeared or the capture failed)"; rm -rf "$OUT"
+    done
+    [ -f "$OUT/TIMELINE_LAST3.csv" ] || continue
     python3 scripts/reconcile_nsys_devices.py --last 3 "$OUT"/*_fused_*.nsys-rep > "$OUT/reconcile_fused.txt" 2>&1
     grep -E "^##|last3|skew" "$OUT/reconcile_fused.txt" | head -40
     cat "$OUT/TIMELINE_LAST3.csv" 2>/dev/null
