@@ -6,13 +6,13 @@ usage: summarize_m16_passes.py <pass_dir>... [--skew-us 20]
 Each pass dir is one capture_four_api_h20_timelines.sh OUT (TIMELINE_LAST3.json + *.nsys-rep).
 """
 import argparse
-import json
 import pathlib
 import statistics
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from reconcile_nsys_devices import load  # noqa: E402
+from summarize_four_api_h20_timelines import extract_final_three  # noqa: E402
 
 
 def report_skew(report):
@@ -39,18 +39,19 @@ def main():
     per_key = {}      # (scope, quant, M, backend) -> list of (pass, gpu0_target, mega, skew_med, skew_max, dmin)
     n_reports = n_skewed = 0
     for pdir in args.passes:
-        js = pdir / "TIMELINE_LAST3.json"
-        if not js.exists():
-            print(f"(skip {pdir}: no TIMELINE_LAST3.json)", file=sys.stderr)
+        reports = sorted(pdir.glob("*.nsys-rep"))
+        if not reports:
+            print(f"(skip {pdir}: no reports)", file=sys.stderr)
             continue
-        for row in json.loads(js.read_text()):
-            key = (row["scope"], row["precision"], row["M"], row["backend"])
-            rep = pdir / row["report"] if not row["report"].endswith(".nsys-rep") else pdir / row["report"]
-            if not rep.exists():
-                cands = list(pdir.glob(f"{row['scope']}_{row['backend']}_{row['precision']}_M{row['M']}.nsys-rep"))
-                rep = cands[0] if cands else None
+        for rep in reports:
+            # GPU0 last-3 medians straight from the report (sub-matrix captures have no
+            # TIMELINE_LAST3.json: the matrix summarizers require the full 2x2x2 matrix).
+            metadata, final_three = extract_final_three(rep, 0)
+            key = (metadata["scope"], metadata["quant"], metadata["M"], metadata["backend"])
+            target = statistics.median(c["target_span_us"] for c in final_three)
+            mega = statistics.median(c["mega_span_us"] for c in final_three)
             skew_med = skew_max = dmin = None
-            if rep is not None and row["backend"] == "fused":
+            if metadata["backend"] == "fused":
                 try:
                     skew_med, skew_max, dmin = report_skew(rep)
                 except Exception as exc:  # noqa: BLE001
@@ -58,8 +59,7 @@ def main():
                 n_reports += 1
                 if skew_max is not None and skew_max > args.skew_us:
                     n_skewed += 1
-            per_key.setdefault(key, []).append(
-                (pdir.name, row["target_median_us"], row["mega_median_us"], skew_med, skew_max, dmin))
+            per_key.setdefault(key, []).append((pdir.name, target, mega, skew_med, skew_max, dmin))
 
     def med(vals):
         vals = [v for v in vals if v is not None]

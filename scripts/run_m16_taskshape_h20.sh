@@ -17,12 +17,13 @@ export PYTHONUNBUFFERED=1
 TR=$(command -v torchrun)
 MODE=${1:-}; shift || true
 
-wait_idle() {
-  for _ in $(seq 1 360); do
-    if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then return 0; fi
+wait_idle() {  # other containers' processes are invisible here: gate on memory.used (<= 64 MiB on all 8 GPUs)
+  for _ in $(seq 1 4320); do
+    busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk '$1 > 64 {n++} END {print n+0}')
+    if [ "$busy" = 0 ] && [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then return 0; fi
     sleep 10
   done
-  echo "GPUs busy for 60 min, giving up" >&2; return 1
+  echo "GPUs busy for 12 h, giving up" >&2; return 1
 }
 
 case "$MODE" in
