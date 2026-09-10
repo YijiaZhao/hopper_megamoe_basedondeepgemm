@@ -46,6 +46,7 @@ public:
         bool tinym;
         int tinym_prefetch;
         bool push_dispatch;
+        bool push_det_slots;
         int push_max_tokens_per_rank;
         bool lean_routing;
         bool push_done_flags;
@@ -121,6 +122,7 @@ public:
             "        /* kPushMaxTokensPerRank */ {},\n"
             "        /* kLeanRouting */ {},\n"
             "        /* kPushDoneFlagsRequested */ {},\n"
+            "        /* kPushDetSlotsRequested */ {},\n"
             "        /* kQoQInlineS2 */ {},\n"
             "        /* kQoQInlineS2Frags */ {},\n"
             "        /* kQoQInlineS2Ilv */ {},\n"
@@ -158,6 +160,7 @@ public:
             args.push_max_tokens_per_rank,
             args.lean_routing ? "true" : "false",
             args.push_done_flags ? "true" : "false",
+            args.push_det_slots ? "true" : "false",
             args.qoq_inline_s2 ? "true" : "false",
             args.qoq_inline_s2_frags,
             args.qoq_inline_s2_ilv ? "true" : "false",
@@ -502,6 +505,18 @@ static void sm90_fp4_h20_fused_mega_moe(
     const bool push_done_flags = push_dispatch &&
         get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 &&
         get_env<int>("DG_FP4_PUSH_DONE_FLAGS", 1) != 0;
+    // Push deterministic slots (kernel `kPushDetSlots`, DG_FP4_PUSH_DET_SLOTS, push
+    // DONE flags only): the sender takes no remote ticket (a ~2 us NVLink round trip
+    // that gated every pushed row); its row goes to slot src_rank * tokens_per_rank +
+    // local_token_idx of the expert's fixed pool region (8 x 2 = 16 slots = the 2 pool
+    // blocks) and one red.or.sys sets the slot's bit in the destination's per-expert
+    // mask (ordered by the same DONE release as the row). After DONE, SM e's two
+    // dispatch warps compact the sparse rows in place (usually <= 1 row per expert at
+    // M <= 16) and publish the count + completeness word; the task producers poll
+    // that word (as before DONE flags) instead of reading the ticket totals.
+    // Downstream (packed rows, valid_m) is untouched. Default: see the H20 A/B below.
+    const bool push_det_slots = push_done_flags &&
+        get_env<int>("DG_FP4_PUSH_DET_SLOTS", 0) != 0;
     // Fast NVLink-barrier epilogue (kernel `kNvlFastEpilogue`, needs the
     // distributed expert bcast so the first barrier has a prologue grid sync):
     // the two barriers with an epilogue (before dispatch pull, before combine)
@@ -676,6 +691,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // its own counts after NVLink barrier #1). DG_FP4_LEAN_ROUTING=0 = old path.
         .lean_routing = get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0,
         .push_done_flags = push_done_flags,
+        .push_det_slots = push_det_slots,
         // QoQ inline s2 (kernel `kQoQInlineS2`, DG_FP4_QOQ_INLINE_S2, default 1): the
         // BM8 QoQ RF swapAB L1 loop folds the per-(row, K128) integer s2 into the
         // int8 weight at decode time and accumulates the whole task K range in one
@@ -783,6 +799,7 @@ static void sm90_fp4_h20_fused_mega_moe(
                 "_h200_fused_mode2_row" :
                 "_h200_fused_lut_window")) + (tinym ? "_tinym" : "") + (push_dispatch ? "_push" : "") +
         (push_done_flags ? "_pdf" : "") +
+        (push_det_slots ? "_slots" : "") +
         (strided_pool_debug ? "_stridedbg" : "") +
         (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "") +
         ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "") +

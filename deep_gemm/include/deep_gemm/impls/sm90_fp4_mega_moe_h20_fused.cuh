@@ -515,6 +515,12 @@ template <
     // NVLink barrier #1 is replaced by one release.sys DONE signal per source rank
     // into every destination's DONE count; see `kPushDoneFlags` in the body.
     bool kPushDoneFlagsRequested = true,
+    // Push deterministic slots (host env DG_FP4_PUSH_DET_SLOTS; push DONE flags only):
+    // no remote row ticket; the sender writes slot src_rank * kPushMaxTokensPerRank +
+    // src_token_idx of the expert's fixed pool region and sets its bit in the
+    // destination's per-expert slot mask; SM e compacts the sparse rows after DONE.
+    // See `kPushDetSlots` in the body.
+    bool kPushDetSlotsRequested = false,
     // QoQ inline s2 (host env DG_FP4_QOQ_INLINE_S2, default 1): fold the per-(row,
     // K128) integer s2 into the int8 weight at RF decode time and accumulate the
     // whole L1 task K range in one int32 set (see `kInlineS2` in the body).

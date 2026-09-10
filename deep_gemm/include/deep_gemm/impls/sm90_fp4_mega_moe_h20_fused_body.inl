@@ -321,6 +321,32 @@
     // issued by a rank that passed barrier #3 of launch N, i.e. after every rank read
     // launch N's target, so early (skewed) arrivals for N+1 are counted correctly.
     constexpr bool kPushDoneFlags = kPushDoneFlagsRequested && kLeanPush;
+    // Push deterministic slots (kPushDetSlots; host env DG_FP4_PUSH_DET_SLOTS, push
+    // DONE flags only). Ticket push: every routed row's position is a returning
+    // `atom.add.sys` on the destination's count, i.e. a ~2 us NVLink round trip that
+    // gates the row's stores (rank-0 slot 8 -> 9 = 2.0-2.9 us at M=8, ~2 us of it the
+    // ticket). Deterministic slots: a source rank sends at most kPushMaxTokensPerRank
+    // (== its local token count, host-checked) rows to one expert, one per local
+    // token, so the sender's row goes to slot src_rank * kPushMaxTokensPerRank +
+    // src_token_idx of the expert's fixed pool region (kNumRanks * kPushMaxTokensPerRank
+    // <= kPushBlocksPerExpert * BLOCK_M slots, 16 = the 2 pool blocks at M <= 16)
+    // without any communication, and one non-returning `red.or.sys` sets the slot's
+    // bit in the destination's per-expert slot mask (workspace, ordered before the
+    // sender's DONE release exactly like the row). The destination's count words no
+    // longer grow during routing: after DONE, SM e (e < experts per rank) reads the
+    // mask, compacts the sparse rows in place (both dispatch warps, one slot each per
+    // round in increasing slot order, load -> CTA barrier -> store; a row moves to
+    // popc(mask below its slot) < slot, whose previous occupant (if any) moved out in
+    // this or an earlier round; typically <= 1 row per expert at M <= 16, and the
+    // rounds without a move are skipped) and publishes `(kNumSMs * kNumRanks) << 32 |
+    // popc(mask)` with release.gpu (bar.sync orders both warps' compaction stores
+    // before it; the remotely written rows were acquired through DONE by the same CTA),
+    // so the task producers poll the completeness high word again (the pre-DONE-flags
+    // scheduler path) and the lean-push loaders' acquire chain is unchanged. The B
+    // loader's comm-window prefetch discovers active experts from the masks instead
+    // of the low words. Pool reuse: as for push (barrier #3 of launch N precedes any
+    // launch N+1 push), and the masks are zeroed in the cleanup before that barrier.
+    constexpr bool kPushDetSlots = kPushDetSlotsRequested && kPushDoneFlags;
     // Strided pool layout: implied by push dispatch; `kStridedPoolDebug` (host env
     // DG_FP4_POOL_STRIDE_DEBUG=1, pull dispatch only) forces the same fixed-stride
     // pool addressing under the PULL protocol, to separate the layout's cost from
@@ -355,6 +381,10 @@
     DG_STATIC_ASSERT(!kStridedPool ||
                      kNumExpertsPerRank * kPushBlocksPerExpert <= fused_layout::kSM90SplitKL1MaxPoolBlocks,
                      "Push dispatch: strided pool block indices must fit the split-K / tiny-M slots");
+    constexpr uint32_t kNumPushSlots = kPushBlocksPerExpert * BLOCK_M;
+    DG_STATIC_ASSERT(!kPushDetSlots || (kNumRanks * kPushMaxTokensPerRank <= kNumPushSlots &&
+                                        kNumPushSlots <= 32 && kNumDispatchWarps >= 1),
+                     "Push deterministic slots: (rank, token) slots must fit the expert's pool region and a 32-bit mask");
     constexpr uint32_t kNumRoutedL1BlockNs = L1_SHAPE_N / TASK_BLOCK_N;
     constexpr uint32_t kNumRoutedL2BlockNs = L2_SHAPE_N / TASK_BLOCK_N_L2;
     using interleaved_scheduler_t = fused_sched::InterleavedMegaMoEScheduler<
@@ -938,11 +968,13 @@
     };
 
     const auto produce_interleaved_blocks = [&](auto&& func) {
-        if constexpr (kPushDoneFlags) {
+        if constexpr (kPushDoneFlags && !kPushDetSlots) {
             interleaved_scheduler.fetch_expert_recv_count(
                 workspace.get_push_done_count_ptr(),
                 static_cast<int>(kNumRanks * (ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u)));
         } else {
+            // Deterministic slots: the counts exist only once SM e compacted and
+            // published (release.gpu); poll the completeness high word (acquire.gpu).
             interleaved_scheduler.fetch_expert_recv_count();
         }
         while (true) {
@@ -998,6 +1030,8 @@
                 DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
                 if (warp_idx == 0) {
                     *workspace.get_expert_recv_count_sum_ptr(i) = 0;
+                    if constexpr (kPushDetSlots)
+                        *workspace.get_push_slot_mask_ptr(i) = 0;
                 } else if (warp_idx == 1) {
                     if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
                         ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
@@ -1113,9 +1147,17 @@
                     const uint32_t dr = static_cast<uint32_t>(expert_idx) / kNumExpertsPerRank;
                     const uint32_t de = static_cast<uint32_t>(expert_idx) % kNumExpertsPerRank;
                     uint32_t row_idx = 0;
-                    if (lane_idx == 0)
+                    if constexpr (kPushDetSlots) {
+                        // Deterministic slot (see `kPushDetSlots`): no ticket; set the
+                        // slot's bit in the destination's per-expert mask.
+                        DG_TRAP_ONLY_DEVICE_ASSERT(src_token_idx < kPushMaxTokensPerRank);
+                        row_idx = static_cast<uint32_t>(sym_buffer.rank_idx) * kPushMaxTokensPerRank + src_token_idx;
+                        if (lane_idx == 0)
+                            ptx::red_or_sys(sym_buffer.map(workspace.get_push_slot_mask_ptr(de), dr), 1u << row_idx);
+                    } else if (lane_idx == 0) {
                         row_idx = static_cast<uint32_t>(ptx::atomic_add_sys(
                             sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(de), dr), 1ull));
+                    }
                     const auto* src_token = input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint4>();
                     uint4 row[kNumTokenChunksPerLane];
                     #pragma unroll
@@ -1255,8 +1297,8 @@
             // (e < experts per rank) publishes expert e's L1 arrival counts, one block
             // per lane, with release.gpu: the loaders' acquire on the count then also
             // covers the remotely written rows (this thread acquired barrier #1).
-            if (warp_idx == 0 and sm_idx < kNumExpertsPerRank) {
-                if constexpr (kPushDoneFlags) {
+            if (sm_idx < kNumExpertsPerRank) {
+                if (kPushDoneFlags and warp_idx == 0) {
                     // Wait for every rank's DONE (replaces barrier #1 for this publisher;
                     // slots 1 / 13 / 14 / 16 keep their meaning: SM0's wait incl. skew).
                     if (lane_idx == 0) {
@@ -1277,8 +1319,75 @@
                     }
                     __syncwarp();
                 }
-                uint32_t num_recv_tokens;
-                if constexpr (kLeanPush) {
+                uint32_t num_recv_tokens = 0;
+                if constexpr (kPushDetSlots) {
+                    // Deterministic slots (see `kPushDetSlots`): CTA barrier extends warp
+                    // 0 lane 0's DONE acquire to both warps; read the final slot mask,
+                    // compact the sparse rows in place, publish the count.
+                    ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+                    uint32_t slot_mask = 0;
+                    if (lane_idx == 0)
+                        slot_mask = ptx::ld_volatile(workspace.get_push_slot_mask_ptr(sm_idx));
+                    slot_mask = __shfl_sync(0xffffffff, slot_mask, 0);
+                    num_recv_tokens = __popc(slot_mask);
+                    if (slot_mask != ((1u << num_recv_tokens) - 1u)) {
+                        constexpr uint32_t kNumSFFloats = kHidden / 128;
+                        constexpr uint32_t kNumTokenChunksPerLane = kHidden / (16 * 32);
+                        const uint32_t pool_base = sm_idx * kNumPushSlots;
+                        const auto needs_move = [&](const uint32_t& slot) -> bool {
+                            return ((slot_mask >> slot) & 1u) != 0 &&
+                                   static_cast<uint32_t>(__popc(slot_mask & ((1u << slot) - 1u))) != slot;
+                        };
+                        #pragma unroll 1
+                        for (uint32_t round_begin = 0; round_begin < kNumPushSlots; round_begin += kNumDispatchWarps) {
+                            bool any_move = false;  // CTA-uniform (same mask in every thread)
+                            #pragma unroll
+                            for (uint32_t w = 0; w < kNumDispatchWarps; ++ w)
+                                any_move |= round_begin + w < kNumPushSlots and needs_move(round_begin + w);
+                            if (!any_move)
+                                continue;
+                            const uint32_t slot = round_begin + warp_idx;
+                            const bool move = slot < kNumPushSlots and needs_move(slot);
+                            const uint32_t src_idx = pool_base + slot;
+                            const uint32_t dst_idx = pool_base + __popc(slot_mask & ((1u << slot) - 1u));
+                            uint4 row[kNumTokenChunksPerLane];
+                            float sf = 0.0f, weight = 0.0f;
+                            fused_layout::TokenSrcMetadata meta = {};
+                            if (move) {
+                                const auto* src_token = l1_token_buffer.get_data_buffer(src_idx).get_base_ptr<uint4>();
+                                #pragma unroll
+                                for (uint32_t c = 0; c < kNumTokenChunksPerLane; ++ c)
+                                    row[c] = src_token[c * 32 + lane_idx];  // plain (coherent) loads, ordered by the DONE acquire
+                                if (lane_idx < kNumSFFloats)
+                                    sf = l1_sf_buffer.get_base_ptr<float>()[lane_idx * kNumPaddedSFPoolTokens + src_idx];
+                                if (lane_idx == 0) {
+                                    weight = *l1_topk_weights_buffer.get_data_buffer(src_idx).get_base_ptr<float>();
+                                    meta = *workspace.get_token_src_metadata_ptr(src_idx);
+                                }
+                            }
+                            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+                            if (move) {
+                                auto* dst_token = l1_token_buffer.get_data_buffer(dst_idx).get_base_ptr<uint4>();
+                                #pragma unroll
+                                for (uint32_t c = 0; c < kNumTokenChunksPerLane; ++ c)
+                                    dst_token[c * 32 + lane_idx] = row[c];
+                                if (lane_idx < kNumSFFloats)
+                                    l1_sf_buffer.get_base_ptr<float>()[lane_idx * kNumPaddedSFPoolTokens + dst_idx] = sf;
+                                if (lane_idx == 0) {
+                                    *l1_topk_weights_buffer.get_data_buffer(dst_idx).get_base_ptr<float>() = weight;
+                                    *workspace.get_token_src_metadata_ptr(dst_idx) = meta;
+                                }
+                            }
+                        }
+                    }
+                    // Both warps' stores precede the publish (bar.sync + release.gpu)
+                    ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+                    if (warp_idx == 0 and lane_idx == 0)
+                        ptx::atomic_add_rel_gpu(
+                            workspace.get_expert_recv_count_sum_ptr(sm_idx),
+                            (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) | static_cast<uint64_t>(num_recv_tokens));
+                    __syncwarp();
+                } else if constexpr (kLeanPush) {
                     // Finalise expert `sm_idx`'s count: every rank's row tickets landed
                     // before its barrier #1 signal (acquired by this CTA), so add the
                     // completeness high word the scheduler polls for and take the
@@ -1296,12 +1405,14 @@
                     num_recv_tokens = static_cast<uint32_t>(
                         ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(sm_idx)));
                 }
-                const uint32_t num_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
-                if (lane_idx < num_blocks)
-                    ptx::red_add_rel(
-                        workspace.get_l1_arrival_count_ptr(sm_idx * kPushBlocksPerExpert + lane_idx),
-                        cute::min(num_recv_tokens - lane_idx * BLOCK_M, BLOCK_M));
-                __syncwarp();
+                if (warp_idx == 0) {
+                    const uint32_t num_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
+                    if (lane_idx < num_blocks)
+                        ptx::red_add_rel(
+                            workspace.get_l1_arrival_count_ptr(sm_idx * kPushBlocksPerExpert + lane_idx),
+                            cute::min(num_recv_tokens - lane_idx * BLOCK_M, BLOCK_M));
+                    __syncwarp();
+                }
             }
             if (thread_idx == 0) stamp_max(2);  // pool ready
         }
@@ -1864,7 +1975,14 @@
                     if (e < kNumExpertsPerRank)
                         v = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(e));
                     all_final &= (static_cast<uint32_t>(v >> 32) == kFinalHigh);
-                    const bool need = e < kNumExpertsPerRank && static_cast<uint32_t>(v) != 0 &&
+                    // Deterministic slots: the low word only appears with the publish;
+                    // the slot mask grows during the senders' routing instead.
+                    uint32_t active = static_cast<uint32_t>(v);
+                    if constexpr (kPushDetSlots) {
+                        if (e < kNumExpertsPerRank)
+                            active |= ptx::ld_volatile(workspace.get_push_slot_mask_ptr(e));
+                    }
+                    const bool need = e < kNumExpertsPerRank && active != 0 &&
                                       ((issued_flags >> i) & 1u) == 0;
                     uint32_t mask = __ballot_sync(0xffffffff, need);
                     while (mask != 0 && issued_bytes + kL1BytesPerExpert <= kBudgetBytes) {

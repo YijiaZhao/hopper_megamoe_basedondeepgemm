@@ -165,6 +165,10 @@ struct Workspace {
         // Expert recv count sum
         num_bytes += num_experts_per_rank * sizeof(uint64_t);
 
+        // Push deterministic-slot masks (kernel `kPushDetSlots`), one `uint32_t` per
+        // local expert (padded to even entry count for `uint64_t` alignment)
+        num_bytes += math::align(num_experts_per_rank, 2u) * sizeof(uint32_t);
+
         // L1 arrival count (padded to even entry count for `uint64_t` alignment of L2 mask)
         num_bytes += math::align(num_max_pool_blocks, 2u) * sizeof(uint32_t);
 
@@ -299,10 +303,21 @@ struct Workspace {
         return get_expert_send_count_ptr(num_experts * 2) + expert_idx;
     }
 
+    // Push deterministic slots (kernel `kPushDetSlots`): per local expert, bit s set
+    // when pool slot s (= src_rank * kPushMaxTokensPerRank + src_token_idx) of the
+    // expert's fixed pool region holds a pushed row of this launch. Set remotely by
+    // the senders (red.or.sys, ordered by their DONE release), read by SM e after
+    // DONE, zeroed in the workspace cleanup (before NVLink barrier #3).
+    CUTLASS_DEVICE
+    uint32_t* get_push_slot_mask_ptr(const uint32_t& expert_idx = 0) const {
+        const auto base = get_expert_recv_count_sum_ptr(num_experts_per_rank);
+        return reinterpret_cast<uint32_t*>(base) + expert_idx;
+    }
+
     CUTLASS_DEVICE
     uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
-        const auto base = get_expert_recv_count_sum_ptr(num_experts_per_rank);
-        return reinterpret_cast<uint32_t*>(base) + pool_block_idx;
+        const auto base = get_push_slot_mask_ptr(math::align(num_experts_per_rank, 2u));
+        return base + pool_block_idx;
     }
 
     CUTLASS_DEVICE
