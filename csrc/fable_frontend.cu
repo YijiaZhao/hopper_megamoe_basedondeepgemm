@@ -58,6 +58,11 @@ constexpr int kStampSlots = 8;
 __device__ __forceinline__ void stamp(unsigned long long* stamps, int slot) {
     if (stamps != nullptr && threadIdx.x == 0) stamps[blockIdx.x * kStampSlots + slot] = globaltimer_ns();
 }
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
+}
 __device__ __forceinline__ float round_bf16(float x) {
     return __bfloat162float(__float2bfloat16_rn(x));
 }
@@ -422,15 +427,14 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
         int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
         int* __restrict__ ticket, float* __restrict__ logits,
         unsigned long long* stamps,
-        int m, int h, int e, int topk, int num_router_ctas, int w_hint) {
+        int m, int h, int e, int topk, int num_router_ctas, int w_hint, int pdl_mode) {
     stamp(stamps, 0);
-    // PDL (DG_FE_PDL): let the dependent MegaMoE grid be scheduled as soon as every
-    // FE CTA is resident (the trigger fires once all CTAs passed this point). Its
+    // PDL (DG_FE_PDL): 1 = trigger at CTA start (the dependent MegaMoE grid is
+    // scheduled as soon as every FE CTA is resident), 2 = trigger after this CTA's
+    // last store (only the launch latency overlaps). The dependent's
     // griddepcontrol.wait still blocks until this grid has fully completed and
     // flushed, so nothing it reads can be early. No-op without a PDL dependent.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-#endif
+    if (pdl_mode == 1) pdl_trigger();
     if (static_cast<int>(blockIdx.x) >= num_router_ctas) {
         // Quant CTA: quantize this token, then wait for all router CTAs (they must
         // be co-resident: kTiny keeps 96 + m CTAs within 78 SMs x 3 CTAs) and run
@@ -452,6 +456,7 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
                 topk_softmax_token_tiny<kKS, kMaxExperts / 32, kMaxTopK>(logits, topk_idx, topk_weights, stamps, token, m, e);
             // warps 1..7 returned inside topk_softmax_token_tiny; warp 0 continues
             stamp(stamps, 3);
+            if (pdl_mode == 2) pdl_trigger();
             if (threadIdx.x == 0 && atomicAdd(ticket + 1, 1) == m - 1) {
                 ticket[1] = 0;
                 __threadfence();
@@ -468,6 +473,7 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
             stamp(stamps, 2);
             topk_softmax_token(logits, topk_idx, topk_weights, token, m, e, topk, RouterCfg<kMTiles, kTiny>::kKSplitCTAs);
             stamp(stamps, 3);
+            if (pdl_mode == 2) pdl_trigger();
             // Last token CTA resets the counters for the next launch.
             if (threadIdx.x == 0 && atomicAdd(ticket + 1, 1) == m - 1) {
                 ticket[1] = 0;
@@ -482,6 +488,7 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
     __syncthreads();
     if (threadIdx.x == 0) atomicAdd(ticket, 1);
     stamp(stamps, 3);
+    if (pdl_mode == 2) pdl_trigger();
 }
 
 // DG_FE_ROUTER_L2_PERSIST=1: CUDA persisting-L2 set-aside for the router weights.
@@ -510,7 +517,7 @@ static void set_persisting_l2_once(size_t bytes) {
 template <int kMTiles, int kMode, bool kTiny>
 void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
             int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-            int m, int h, int e, int topk, int l2_persist, cudaStream_t stream) {
+            int m, int h, int e, int topk, int l2_persist, int pdl_mode, cudaStream_t stream) {
     using Cfg = RouterCfg<kMTiles, kTiny>;
     const int router_ctas = ((e + kExpertsPerCTA - 1) / kExpertsPerCTA) * Cfg::kKSplitCTAs;
     static bool attr_set = false;
@@ -543,17 +550,17 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     }
     const int w_hint = l2_persist == 2 ? 1 : 0;
     cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny>,
-                       hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint);
+                       hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode);
 }
 
 template <int kMode>
 void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
                  int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-                 int m, int h, int e, int topk, bool tiny, int l2_persist, cudaStream_t stream) {
-    if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, stream);
-    else if (m <= 16) launch<1, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, stream);
-    else if (m <= 32) launch<2, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, stream);
-    else launch<4, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, stream);
+                 int m, int h, int e, int topk, bool tiny, int l2_persist, int pdl_mode, cudaStream_t stream) {
+    if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, stream);
+    else if (m <= 16) launch<1, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, stream);
+    else if (m <= 32) launch<2, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, stream);
+    else launch<4, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, stream);
 }
 
 }  // namespace
@@ -566,7 +573,7 @@ void launch_router_quant_topk_frontend(
         const void* hidden, const void* router_weight,
         void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
         void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-        int tiny, int stamps_on, int l2_persist, cudaStream_t stream) {
+        int tiny, int stamps_on, int l2_persist, int pdl_mode, cudaStream_t stream) {
     int* ticket = static_cast<int*>(workspace);
     float* logits = reinterpret_cast<float*>(static_cast<char*>(workspace) + kFrontendStampsOffsetBase);
     unsigned long long* stamps = nullptr;
@@ -579,9 +586,9 @@ void launch_router_quant_topk_frontend(
     if (mode == 0)
         launch_mode<0>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, stream);
     else
         launch_mode<1>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, stream);
 }

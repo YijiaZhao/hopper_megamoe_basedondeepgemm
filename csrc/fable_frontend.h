@@ -15,7 +15,9 @@
 // `l2_persist` (DG_FE_ROUTER_L2_PERSIST): 0 off; 1 = persisting-L2 set-aside +
 // access-policy-window launch attribute over the router weights; 2 = PTX
 // L2::evict_last cache hint on the router weight cp.async (no host set-aside).
-// The FE always issues griddepcontrol.launch_dependents (PDL, DG_FE_PDL).
+// `pdl_mode` (DG_FE_PDL): 0 none; 1 = griddepcontrol.launch_dependents at CTA
+// start; 2 = after each CTA's last store (the fused Mega is launched with
+// programmatic stream serialization by the host when DG_FE_PDL != 0).
 constexpr size_t kFrontendStampsOffsetBase = 256;
 constexpr size_t kFrontendMaxCTAs = 256;
 constexpr size_t kFrontendStampsBytes = kFrontendMaxCTAs * 8 * sizeof(unsigned long long);
@@ -24,4 +26,4 @@ void launch_router_quant_topk_frontend(
     const void* hidden, const void* router_weight,
     void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
     void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-    int tiny, int stamps_on, int l2_persist, cudaStream_t stream);
+    int tiny, int stamps_on, int l2_persist, int pdl_mode, cudaStream_t stream);

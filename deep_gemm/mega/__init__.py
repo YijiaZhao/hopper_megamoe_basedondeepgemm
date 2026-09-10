@@ -596,7 +596,7 @@ def fable_frontend_workspace_bytes(e: int) -> int:
 
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
                                      sym_buffer, quant: str = "mxfp4", tinym=None, stamps=None,
-                                     l2_persist=None):
+                                     l2_persist=None, pdl=None):
     """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend.
 
     ``tinym`` (env ``DG_FE_TINYM``, default 1): for m <= 16 use the single-wave
@@ -606,6 +606,8 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     ``l2_persist`` (env ``DG_FE_ROUTER_L2_PERSIST``, default 0): 1 = pin the router
     weights in L2 with the persisting-L2 set-aside (access policy window launch
     attribute), 2 = PTX ``L2::evict_last`` hint on the router weight loads.
+    ``pdl`` (env ``DG_FE_PDL``, default 0): programmatic-dependent-launch trigger for
+    the fused Mega that follows: 1 = at CTA start, 2 = after the CTA's last store.
     """
     assert quant in ("mxfp4", "qoq")
     m = hidden.size(0)
@@ -616,6 +618,8 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
         stamps = int(os.environ.get("DG_FE_STAMPS", "0"))
     if l2_persist is None:
         l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
+    if pdl is None:
+        pdl = int(os.environ.get("DG_FE_PDL", "0"))
     cache = getattr(sym_buffer, "_fable_frontend_cache", None)
     if cache is None:
         cache = sym_buffer._fable_frontend_cache = {}
@@ -629,7 +633,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
                             sym_buffer.topk_idx[:m], sym_buffer.topk_weights[:m])
     _C.fable_router_quant_topk_frontend(
         hidden, router_weight, views[0], views[1], views[2], views[3], workspace,
-        0 if quant == "mxfp4" else 1, int(bool(tinym)), int(bool(stamps)), int(l2_persist))
+        0 if quant == "mxfp4" else 1, int(bool(tinym)), int(bool(stamps)), int(l2_persist), int(pdl))
 
 
 def fable_frontend_stamps(sym_buffer, e: int) -> torch.Tensor:
