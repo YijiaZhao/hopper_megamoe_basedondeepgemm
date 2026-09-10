@@ -253,7 +253,15 @@ def main():
                 pf_t = statistics.median((sr[38] - sr[0]) / 1000.0 for sr in raw_rows if sr[38] > 0)
                 pf_mb = statistics.median(sr[39] / 1048576.0 for sr in raw_rows)
                 print(f"--- L2 weight prefetch (slots 38/39): issue done at {pf_t:.2f} us, {pf_mb:.1f} MB issued ---")
-            # per-task probe: slots 25/27 L1, 26/28 L2, 29 inter-task gap (cycles @1.83GHz)
+            # 41..44 = fused L1+L2 (kFuseL1L2): 41 finisher epilogues (all SMs), 42 their SM0 cycles,
+            # 43 W2 slices on SM0, 44 their cycles (first W2 stage wait -> last ticket handled)
+            if any(sr[43] > 0 for sr in raw_rows):
+                fin_n = statistics.median(sr[41] for sr in raw_rows)
+                w2_n = statistics.median(sr[43] for sr in raw_rows)
+                w2_us = statistics.median(sr[44] / max(sr[43], 1) / SM_GHZ / 1000.0 for sr in raw_rows)
+                fin_us = statistics.median(sr[42] / SM_GHZ / 1000.0 for sr in raw_rows)
+                print(f"--- fused L1+L2 (slots 41-44): {fin_n:.0f} finisher epilogues rank-wide; SM0: "
+                      f"{w2_n:.0f} W2 slices of {w2_us:.2f} us (incl. its finisher epilogues, {fin_us:.2f} us total) ---")
             def _task_us(sl, cnt):
                 return [ (sr[sl] / max(sr[cnt], 1) / SM_GHZ / 1000.0) for sr in raw_rows ]
             l1t = _task_us(25, 27); l2t = _task_us(26, 28)
