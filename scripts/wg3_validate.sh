@@ -182,8 +182,11 @@ if [ "$MODE" = nsys ] || [ "$MODE" = all ]; then
   for w in 2 3; do
     wait_idle || exit 1
     echo "--- NSYS customer method WGS=$w TOKENS 2 4 8 16 e2e+mega fused" >> "$LOG"
-    env DG_FP4_MATH_WGS=$w TOKENS_LIST="2 4 8 16" SCOPES="e2e mega" BACKENDS=fused FORCE=1 \
-      OUT="$OUTD/nsys_wg$w" timeout 3000 bash scripts/capture_four_api_h20_timelines.sh > "$OUTD/nsys_wg$w.log" 2>&1
+    # RESUME=1 keeps reports of an earlier attempt; the GPU teardown after torchrun can
+    # take > 45 s here (the capture script's default idle wait), so allow 300 s.
+    env DG_FP4_MATH_WGS=$w TOKENS_LIST="2 4 8 16" SCOPES="e2e mega" BACKENDS=fused RESUME=1 \
+      GPU_IDLE_RETRIES=${GPU_IDLE_RETRIES:-300} \
+      OUT="$OUTD/nsys_wg$w" timeout 3600 bash scripts/capture_four_api_h20_timelines.sh >> "$OUTD/nsys_wg$w.log" 2>&1
     echo "EXIT=$?" >> "$LOG"
     tail -3 "$OUTD/nsys_wg$w.log" >> "$LOG"
   done

@@ -182,7 +182,24 @@ longer first-block wait. Keep `DG_FP4_MATH_WGS=2` as the default; the knob stays
 documented negative result. The lever for this loop is fewer LDS bytes per K-block
 (LUT-free / packed-LUT decode, wider per-thread rows), not more warps.
 
-EVENT_NSYS_PLACEHOLDER
+### Perf — CUDA-event method (tests/bench_frontend_tinym.py --iters 100, GPU0 median / min us, Mega graph; two passes)
+
+| quant | M | WGS=2 pass 1 / 2 | WGS=3 pass 1 / 2 |
+|---|---|---|---|
+| mxfp4 | 8 | 72.4 (min 69.0) / 88.0 (min 71.4, bimodal) | 73.5 (71.7) / 72.3 (70.5) |
+| mxfp4 | 16 | 110.8 (95.5) / 97.0 (94.9) | 96.9 (94.9) / 96.5 (94.8) |
+| qoq | 8 | 69.8 (68.0) / 69.6 (67.6) | 69.0 (66.4) / 68.7 (67.1) |
+| qoq | 16 | 107.6 (103.6) / 92.2 (90.1) | 93.1 (90.9) / 93.3 (91.3) |
+
+The pass-1 M16 WGS=2 medians (and the pass-2 mxfp4 M8 one) carry a slow mode the
+min-over-iterations does not; on the clean cells the knob is within +-1 us of the two-WG
+kernel, as the probe says.
+
+Stress: 200 FE+Mega graph replays at M=8 with WGS=3 (spin timeout on): mxfp4 and qoq exit 0,
+Mega median 81.4 / 74.6 us (n=200), no hang, no timeout trap.
+
+NSYS_PLACEHOLDER
+
 
 
 ## Phase 2 sketch (original, superseded by the implementation above)
