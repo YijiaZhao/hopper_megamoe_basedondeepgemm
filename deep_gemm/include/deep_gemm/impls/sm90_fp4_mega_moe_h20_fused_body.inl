@@ -128,9 +128,34 @@
     // default (DG_FP4_HALF_TILE=1 enables it).
     constexpr bool kHalfTileTasks =
         fused_layout::kSM90FusedHalfTileTasks && kHalfTileTasksRequested &&
-        kSwapABRequested && kMXFP4 && BLOCK_M == 8;
-    // N extent of one scheduled task (== the weight tile N unless half-tile tasks).
-    constexpr uint32_t TASK_BLOCK_N = kHalfTileTasks ? BLOCK_N / 2 : BLOCK_N;
+        kSwapABRequested && kMXFP4 && BLOCK_M == 8 && kL1TaskTiles == 1 && kL2TaskTiles == 1;
+    // Wide tasks (kWideTiles; host env DG_FP4_L1_BN / DG_FP4_L2_BN = 512, gated by
+    // DG_FP4_BN512_MIN_M / _MAX_M on the global token count, default 16..16): an L1
+    // (resp. L2) task covers kL1TaskTiles (kL2TaskTiles) ADJACENT packed 256-row
+    // weight tiles (2 -> 512 rows) over the whole K, so the task count of the phase
+    // halves (M=16: L1 ~160 -> ~80 tasks = one wave on 78 SMs instead of 2.05, L2
+    // ~180 -> ~90). WG w owns packed tile 2n + w (4 x 64-row halves): for L1 that is
+    // 128 SwiGLU columns == exactly one L2 activation-scale group (own per-token
+    // amax, no cross-WG share), for L2 256 hidden columns. The pipeline carries ONE
+    // K128 block per stage (kKBlocksPerStage == 1: 1 KB A + 2 x 20 KB B, 4 stages ==
+    // the same 8 K-block bytes in flight as 2 blocks x 4 stages of BN256) and the RF
+    // loop's unit is (K-block, 64-row half PAIR) instead of (K-block), so the 2-unit
+    // loops, the fragment buffers (frag[2][2 halves]) and the accumulator sets are
+    // exactly those of today's 2-K-block stage: same registers, same per-(K128, 256
+    // rows) work per stage, same per-K128 promote (numerics identical). Only the BM8
+    // MXFP4 / QoQ RF swapAB tier with dense tiles supports it; every other tier keeps
+    // one packed tile per task.
+    constexpr bool kWideTiles = (kL1TaskTiles > 1 || kL2TaskTiles > 1) &&
+        kSwapABRequested && (kMXFP4 || kQoQ) && BLOCK_M == 8 && BLOCK_N == 256 &&
+        kUseInterleavedScheduler && kDenseWeightTiles && kNumEpilogueWarpgroups == 2;
+    DG_STATIC_ASSERT(kL1TaskTiles == 1 || (kWideTiles && kL1TaskTiles == 2),
+                     "Wide L1 tasks: 2 packed tiles per task on the BM8 RF swapAB dense tier only");
+    DG_STATIC_ASSERT(kL2TaskTiles == 1 || (kWideTiles && kL2TaskTiles == 2),
+                     "Wide L2 tasks: 2 packed tiles per task on the BM8 RF swapAB dense tier only");
+    constexpr uint32_t kL1Tiles = kWideTiles ? kL1TaskTiles : 1u;
+    constexpr uint32_t kL2Tiles = kWideTiles ? kL2TaskTiles : 1u;
+    // N extent of one scheduled task (== the weight tile N unless half-tile / wide tasks).
+    constexpr uint32_t TASK_BLOCK_N = kHalfTileTasks ? BLOCK_N / 2 : BLOCK_N * kL1Tiles;
     // L1 split-K tasks (kSplitKL1; host env DG_FP4_SPLITK_L1, default ON for the BM8
     // MXFP4 RF swapAB tier == the 2-K-block-per-stage path; every other tier is
     // untouched). The L1 (expert, n_block) tasks of the last partial L1 wave (the
@@ -174,10 +199,11 @@
     // verified); see the host for the numbers.
     constexpr bool kL2HalfRowTasks =
         kL2HalfRowTasksRequested && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
-        !kHalfTileTasks && kUseInterleavedScheduler && kDenseWeightTiles &&
+        !kHalfTileTasks && !kWideTiles && kUseInterleavedScheduler && kDenseWeightTiles &&
         BLOCK_N == 256 && kNumEpilogueWarpgroups == 2;
     // N extent of one scheduled L2 task (L1 tasks use TASK_BLOCK_N).
-    constexpr uint32_t TASK_BLOCK_N_L2 = kL2HalfRowTasks ? BLOCK_N / 2 : TASK_BLOCK_N;
+    constexpr uint32_t TASK_BLOCK_N_L2 = kL2HalfRowTasks ? BLOCK_N / 2 :
+        (kHalfTileTasks ? TASK_BLOCK_N : BLOCK_N * kL2Tiles);
     // L2 split-K tasks (kSplitKL2; host env DG_FP4_SPLITK_L2): the L2 (expert,
     // n_block) tasks of the last partial L2 wave (`num_l2_tasks % kNumSMs`
     // stragglers; M=8: 18 of 96, M=16: 36 of 192) are each scheduled as two
@@ -193,7 +219,7 @@
     // n - 1 arrivals and sums the slots in publisher order (see the epilogue).
     constexpr bool kSplitKL2 =
         kSplitKL2Ways != 0 && kSwapABRequested && kMXFP4 && BLOCK_M == 8 &&
-        !kHalfTileTasks && !kL2HalfRowTasks && kUseInterleavedScheduler &&
+        !kHalfTileTasks && !kL2HalfRowTasks && !kWideTiles && kUseInterleavedScheduler &&
         kDenseWeightTiles && BLOCK_N == 256;
     constexpr uint32_t kNumL2KSplits = kSplitKL2 ? (kSplitKL2Ways >= 3 ? 3u : 2u) : 1u;
     DG_STATIC_ASSERT(kNumL2KSplits <= 1u + fused_layout::kSM90SplitKL2MaxPublishers,
@@ -220,7 +246,7 @@
     // splits) remains the fallback when the pool block count exceeds the scratch.
     constexpr bool kStreamK =
         kStreamKRequested && kSwapABRequested && (kMXFP4 || kQoQ) && BLOCK_M == 8 &&
-        !kHalfTileTasks && !kL2HalfRowTasks && kUseInterleavedScheduler &&
+        !kHalfTileTasks && !kL2HalfRowTasks && !kWideTiles && kUseInterleavedScheduler &&
         kDenseWeightTiles && BLOCK_N == 256 && kKBlocksPerStageRequested == 2;
     // Two-layer fusion for tiny M (kFuseL1L2; host env DG_FP4_FUSE_L1L2, gated by
     // DG_FP4_FUSE_L1L2_MAX_M; docs/fuse_l1l2_design.md). Every L1 task keeps its 128
@@ -235,7 +261,7 @@
     // with split-K L2 and with the tiny-M GEMV: the host forces those off).
     constexpr bool kFuseL1L2 =
         kFuseL1L2Requested && kSwapABRequested && (kMXFP4 || kQoQ) && BLOCK_M == 8 &&
-        !kHalfTileTasks && !kL2HalfRowTasks && kSplitKL2Ways == 0 && !kStreamKRequested &&
+        !kHalfTileTasks && !kL2HalfRowTasks && !kWideTiles && kSplitKL2Ways == 0 && !kStreamKRequested &&
         !kTinyMGemvRequested && kUseInterleavedScheduler && kDenseWeightTiles &&
         BLOCK_N == 256 && kKBlocksPerStageRequested == 2 && kNumEpilogueWarpgroups == 2;
     // Fast NVLink-barrier epilogue (kNvlFastEpilogue; host env DG_FP4_NVL_FAST_EPI):
@@ -373,18 +399,22 @@
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
     constexpr uint32_t WG_BLOCK_M =
         kSplitMDecodedWeightReuse ? BLOCK_M / 2 : BLOCK_M;
+    // Per-WG L1 rows: the WGs split the task N (wide L1 tasks: WG w owns packed tile
+    // 2n + w, i.e. 256 rows = 4 halves).
     constexpr uint32_t WG_BLOCK_N =
-        kSplitMDecodedWeightReuse ? BLOCK_N : BLOCK_N / 2;
+        kSplitMDecodedWeightReuse ? BLOCK_N : (kHalfTileTasks ? BLOCK_N / 2 : TASK_BLOCK_N / 2);
     constexpr uint32_t L1_OUT_BLOCK_N = TASK_BLOCK_N / 2;  // post-SwiGLU task N
     constexpr uint32_t WG_L1_OUT_BLOCK_N = WG_BLOCK_N / 2; // post-SwiGLU per-WG N
     constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
-    constexpr uint32_t kSwapABWeightHalves = WG_BLOCK_N / 64;
-    constexpr uint32_t kSwapABHalfAccumPerThread = 64 * 64 / 128;
     // Rows per WG of an L2 task: 64 (one weight half) with L2 half-row tasks,
-    // otherwise WG_BLOCK_N (two halves). L1 always uses WG_BLOCK_N.
-    constexpr uint32_t L2_WG_BLOCK_N = kL2HalfRowTasks ? 64u : WG_BLOCK_N;
-    DG_STATIC_ASSERT(!kSwapABRequested || WG_L1_OUT_BLOCK_N == 64,
-                     "swapAB expects BN256 split-N with 64 L1 output columns per WG");
+    // otherwise half the L2 task N (two halves; four with wide L2 tasks).
+    constexpr uint32_t L2_WG_BLOCK_N = kL2HalfRowTasks ? 64u : TASK_BLOCK_N_L2 / 2;
+    // Capacity of the swapAB accumulator layout (64-row halves per WG, max over the
+    // two phases); each phase uses its own kWGHalves <= this.
+    constexpr uint32_t kSwapABWeightHalves = (WG_BLOCK_N > L2_WG_BLOCK_N ? WG_BLOCK_N : L2_WG_BLOCK_N) / 64;
+    constexpr uint32_t kSwapABHalfAccumPerThread = 64 * 64 / 128;
+    DG_STATIC_ASSERT(!kSwapABRequested || WG_L1_OUT_BLOCK_N == 64 || (kWideTiles && WG_L1_OUT_BLOCK_N == 128),
+                     "swapAB expects 64 (or, wide tasks, 128) L1 output columns per WG");
     // Both dispatch warps participate in CTA-wide barriers. Selected plans may
     // use one warp for routing and token pulls, leaving the other warp's send
     // buffer available for an additional GEMM stage.
@@ -415,7 +445,7 @@
     // phase, cross-CTA fp32 fixup through the split-K scratch slots. Communication
     // and epilogue contracts are unchanged (docs/tinym_gemv_design.md).
     constexpr bool kTinyMGemv =
-        kTinyMGemvRequested && kRFDecode && BLOCK_M == 8 && BLOCK_N == 256 &&
+        kTinyMGemvRequested && kRFDecode && BLOCK_M == 8 && BLOCK_N == 256 && !kWideTiles &&
         kDenseWeightTiles && kUseInterleavedScheduler && !kHalfTileTasks && !kL2HalfRowTasks;
     DG_STATIC_ASSERT(!kTinyMGemv || (!kSplitKL1 && !kSplitKL2 && !kStreamK),
                      "TinyM GEMV owns the split-K scratch; the host disables split-K / stream-K");
@@ -427,8 +457,11 @@
     // at ~540 ns of a ~740 ns single-block stage, so amortising it over more
     // K-blocks per stage cuts the per-K128 cost (1 -> 2 blocks: 741 -> ~620 ns).
     // Every other path keeps one K128 block per stage.
-    DG_STATIC_ASSERT(kKBlocksPerStageRequested == 2 || kKBlocksPerStageRequested == 4,
-                     "BM8 RF path supports 2 or 4 K128 blocks per stage");
+    DG_STATIC_ASSERT(kKBlocksPerStageRequested == 2 || kKBlocksPerStageRequested == 4 ||
+                     (kKBlocksPerStageRequested == 1 && kWideTiles),
+                     "BM8 RF path supports 2 or 4 K128 blocks per stage (1 with wide tasks)");
+    DG_STATIC_ASSERT(!kWideTiles || kKBlocksPerStageRequested == 1,
+                     "Wide tasks carry one K128 block per stage (2 x 20 KB packed B)");
     constexpr uint32_t kKBlocksPerStage = (kRFDecode && BLOCK_M == 8) ? kKBlocksPerStageRequested : 1u;
     DG_STATIC_ASSERT(BLOCK_M != 8 ||
                      (kKBlocksPerStage == 4 ? (kNumStages == 2) :
@@ -454,10 +487,10 @@
                       L2_SHAPE_N % TASK_BLOCK_N_L2 == 0 && L2_WG_BLOCK_N == 64),
                      "L2 half-row tasks: RF decode, 2 K-blocks per stage, full-tile L1 tasks, 128-row L2 tasks");
     DG_STATIC_ASSERT(!kSplitKL1 ||
-                     (kRFDecode && kKBlocksPerStage >= 2 && kNumEpilogueWarpgroups == 2 &&
+                     (kRFDecode && (kKBlocksPerStage >= 2 || kWideTiles) && kNumEpilogueWarpgroups == 2 &&
                       ((L1_SHAPE_K / BLOCK_K) % (kNumL1KSplits * kKBlocksPerStage)) == 0 &&
-                      L1_SHAPE_N / TASK_BLOCK_N == fused_layout::kSM90SplitKL1NumL1BlockNs),
-                     "Split-K L1: RF decode, multi-K-block stages, K halves of whole stages, 10 L1 N-blocks");
+                      (L1_SHAPE_N / TASK_BLOCK_N) * kL1Tiles == fused_layout::kSM90SplitKL1NumL1BlockNs),
+                     "Split-K L1: RF decode, multi-K-block stages, K halves of whole stages, 10 L1 N-blocks (5 wide)");
     DG_STATIC_ASSERT(!kSplitKL2 ||
                      (kRFDecode && kKBlocksPerStage >= 2 && kNumEpilogueWarpgroups == 2 &&
                       (L2_SHAPE_K / BLOCK_K) >= 2 * kKBlocksPerStage &&
@@ -476,17 +509,23 @@
     constexpr uint32_t kL2ActsSFGranK =
         (kSplitMDecodedWeightReuse || kHalfTileTasks) ? 64u : 128u;
     DG_STATIC_ASSERT(kSplitMDecodedWeightReuse || kHalfTileTasks ||
-                     WG_L1_OUT_BLOCK_N < kL2ActsSFGranK,
-                     "split-N warpgroups must share one L2 activation scale");
+                     WG_L1_OUT_BLOCK_N < kL2ActsSFGranK || WG_L1_OUT_BLOCK_N == kL2ActsSFGranK,
+                     "split-N warpgroups must share one L2 activation scale or own whole groups");
+    // L2 activation-scale groups per L1 task (1; wide L1 tasks: 2, one per WG).
+    constexpr uint32_t kL1SFGroups = L1_OUT_BLOCK_N / kL2ActsSFGranK;
+    DG_STATIC_ASSERT(kL1SFGroups == 1 || (kL1SFGroups == 2 && WG_L1_OUT_BLOCK_N == kL2ActsSFGranK),
+                     "L1 task SF groups: one shared by both WGs, or one per WG");
     // L1 -> L2 data dependency is per block: L1 N-block `n` (gate/up
     // interleaved) publishes L1-output columns [n * L1_OUT_BLOCK_N, +L1_OUT_BLOCK_N)
     // plus the matching per-token activation scales, which is exactly what L2
-    // K-block `n / kNumL1BlocksPerL2KBlock` consumes. The L2 A-loader waits per
-    // K-block on the readiness bits of only those L1 N-blocks.
+    // K-block(s) `n * kNumL2KBlocksPerL1Block / kNumL1BlocksPerL2KBlock` consume
+    // (wide L1 tasks: one L1 N-block feeds two L2 K128 blocks). The L2 A-loader
+    // waits per K-block on the readiness bits of only those L1 N-blocks.
     constexpr uint32_t kNumL2KBlocks = L2_SHAPE_K / BLOCK_K;
-    constexpr uint32_t kNumL1BlocksPerL2KBlock = BLOCK_K / L1_OUT_BLOCK_N;
-    DG_STATIC_ASSERT(BLOCK_K % L1_OUT_BLOCK_N == 0 &&
-                     kNumRoutedL1BlockNs == kNumL2KBlocks * kNumL1BlocksPerL2KBlock &&
+    constexpr uint32_t kNumL1BlocksPerL2KBlock = L1_OUT_BLOCK_N >= BLOCK_K ? 1u : BLOCK_K / L1_OUT_BLOCK_N;
+    constexpr uint32_t kNumL2KBlocksPerL1Block = L1_OUT_BLOCK_N >= BLOCK_K ? L1_OUT_BLOCK_N / BLOCK_K : 1u;
+    DG_STATIC_ASSERT((BLOCK_K % L1_OUT_BLOCK_N == 0 || L1_OUT_BLOCK_N % BLOCK_K == 0) &&
+                     kNumRoutedL1BlockNs * kNumL2KBlocksPerL1Block == kNumL2KBlocks * kNumL1BlocksPerL2KBlock &&
                      kNumRoutedL1BlockNs <= 64,
                      "L1 output N-blocks must tile the L2 K dimension exactly");
     DG_STATIC_ASSERT(L1_OUT_BLOCK_N % kL2ActsSFGranK == 0,
@@ -541,9 +580,14 @@
     constexpr uint32_t kNumDecodedBStages =
         kDoubleBufferDecodedB ? 2u : kNumStages;
     constexpr uint32_t B_LOAD_BYTES_PER_ROW = 80u;
-    // Half-tile tasks: a K-block of a task is one 128-row (10 KB) sub-tile.
-    constexpr uint32_t SMEM_PACKED_B_SIZE_PER_KBLOCK =
+    // Half-tile tasks: a K-block of a task is one 128-row (10 KB) sub-tile; wide
+    // tasks: two adjacent packed tiles (40 KB). The stage slot is sized for the
+    // larger of the L1 and L2 task K-blocks (they differ only when exactly one
+    // phase runs wide tasks); each phase addresses its K-blocks with its own size.
+    constexpr uint32_t SMEM_PACKED_B_L1_SIZE_PER_KBLOCK =
         TASK_BLOCK_N * B_LOAD_BYTES_PER_ROW * sizeof(b_dtype_t);
+    constexpr uint32_t SMEM_PACKED_B_SIZE_PER_KBLOCK =
+        (TASK_BLOCK_N > TASK_BLOCK_N_L2 ? TASK_BLOCK_N : TASK_BLOCK_N_L2) * B_LOAD_BYTES_PER_ROW * sizeof(b_dtype_t);
     constexpr uint32_t SMEM_PACKED_B_SIZE_PER_STAGE =
         kKBlocksPerStage * SMEM_PACKED_B_SIZE_PER_KBLOCK;
     // Dense weight tiles: one (BLOCK_N x 80 B) tile == exactly one packed-B stage,
@@ -551,17 +595,21 @@
     DG_STATIC_ASSERT(!kDenseWeightTiles || (kMXFP4 || kQoQ),
                      "Dense weight tiles are only packed by the MXFP4/QoQ hosts");
     DG_STATIC_ASSERT(SMEM_PACKED_B_SIZE_PER_STAGE % 16 == 0, "Bulk copy size must be 16 B aligned");
-    DG_STATIC_ASSERT(SMEM_PACKED_B_SIZE_PER_KBLOCK == TASK_BLOCK_N * 80u, "Unexpected packed-B K-block size");
+    DG_STATIC_ASSERT(SMEM_PACKED_B_L1_SIZE_PER_KBLOCK == TASK_BLOCK_N * 80u, "Unexpected packed-B K-block size");
     // Host packer tile height (rows); a BLOCK_N < 256 kernel tile is a contiguous
-    // BLOCK_N*80 B slice of the 256*80 B packed tile.
+    // BLOCK_N*80 B slice of the 256*80 B packed tile, a wide task spans kL1Tiles
+    // (kL2Tiles) whole packed tiles (adjacent tile rows of the dense layout).
     constexpr uint32_t kPackedTileN = 256u;
     constexpr uint32_t kPackedTileBytes = kPackedTileN * B_LOAD_BYTES_PER_ROW;
-    DG_STATIC_ASSERT(kPackedTileN % TASK_BLOCK_N == 0, "Task BLOCK_N must divide the packed tile height");
-    constexpr uint32_t kSubTilesPerPacked = kPackedTileN / TASK_BLOCK_N;
+    DG_STATIC_ASSERT(kPackedTileN % TASK_BLOCK_N == 0 || TASK_BLOCK_N == kPackedTileN * kL1Tiles,
+                     "Task BLOCK_N must divide the packed tile height or span whole packed tiles");
+    constexpr uint32_t kSubTilesPerPacked = TASK_BLOCK_N >= kPackedTileN ? 1u : kPackedTileN / TASK_BLOCK_N;
     // L2 tasks: with L2 half-row tasks a K-block is one 128-row (10 KB) sub-tile
     // (the upper/lower half of the 20 KB packed tile); the stage slot is sized for
     // L1 (2 x 20 KB) and L2 simply uses its first 2 x 10 KB.
-    constexpr uint32_t kL2SubTilesPerPacked = kPackedTileN / TASK_BLOCK_N_L2;
+    DG_STATIC_ASSERT(kPackedTileN % TASK_BLOCK_N_L2 == 0 || TASK_BLOCK_N_L2 == kPackedTileN * kL2Tiles,
+                     "L2 task BLOCK_N must divide the packed tile height or span whole packed tiles");
+    constexpr uint32_t kL2SubTilesPerPacked = TASK_BLOCK_N_L2 >= kPackedTileN ? 1u : kPackedTileN / TASK_BLOCK_N_L2;
     constexpr uint32_t SMEM_PACKED_B_L2_SIZE_PER_KBLOCK = TASK_BLOCK_N_L2 * B_LOAD_BYTES_PER_ROW;
     DG_STATIC_ASSERT(SMEM_PACKED_B_L2_SIZE_PER_KBLOCK <= SMEM_PACKED_B_SIZE_PER_KBLOCK &&
                      SMEM_PACKED_B_L2_SIZE_PER_KBLOCK % 16 == 0,
@@ -586,7 +634,7 @@
     constexpr uint32_t SMEM_CD_L1_SIZE =
         kNumEpilogueWarpgroups * WG_BLOCK_M * WG_L1_OUT_BLOCK_N * sizeof(cutlass::float_e4m3_t);
     constexpr uint32_t SMEM_CD_L2_SIZE = kSwapABRequested ?
-        BLOCK_M * BLOCK_N * sizeof(nv_bfloat16) : 0u;
+        BLOCK_M * TASK_BLOCK_N_L2 * sizeof(nv_bfloat16) : 0u;
     constexpr uint32_t SMEM_CD_OUTPUT_BASE_SIZE =
         SMEM_CD_L1_SIZE > SMEM_CD_L2_SIZE ? SMEM_CD_L1_SIZE : SMEM_CD_L2_SIZE;
     constexpr uint32_t SMEM_CD_L1_SHARED_SF_SLOTS =
@@ -1562,16 +1610,23 @@
                                 kBlockIsL2 ? l2_weights_ptr : l1_weights_ptr);
                             constexpr uint32_t kPhaseSubTiles =
                                 kBlockIsL2 ? kL2SubTilesPerPacked : kSubTilesPerPacked;
+                            constexpr uint32_t kPhaseTiles = kBlockIsL2 ? kL2Tiles : kL1Tiles;
                             constexpr uint32_t kPhaseKBlockBytes =
-                                kBlockIsL2 ? SMEM_PACKED_B_L2_SIZE_PER_KBLOCK : SMEM_PACKED_B_SIZE_PER_KBLOCK;
+                                kBlockIsL2 ? SMEM_PACKED_B_L2_SIZE_PER_KBLOCK : SMEM_PACKED_B_L1_SIZE_PER_KBLOCK;
                             const uint32_t tile_row = local_expert_idx * (shape_n / kPackedTileN) +
-                                                      n_block_idx / kPhaseSubTiles;
+                                                      n_block_idx * kPhaseTiles / kPhaseSubTiles;
                             const auto* tiles = weights_base +
                                 static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * kPackedTileBytes +
                                 (n_block_idx % kPhaseSubTiles) * kPhaseKBlockBytes;
-                            for (uint32_t kb = kInFlightKBlocks; kb < k_end; ++ kb)
-                                ptx::tma_prefetch_1d(tiles + static_cast<size_t>(k_block_begin + kb) * kPackedTileBytes,
-                                                     kPhaseKBlockBytes);
+                            // Wide tasks: the kPhaseTiles packed tiles of a task are adjacent
+                            // tile rows (one K range of tiles each).
+                            for (uint32_t kb = kInFlightKBlocks; kb < k_end; ++ kb) {
+                                #pragma unroll
+                                for (uint32_t t = 0; t < kPhaseTiles; ++ t)
+                                    ptx::tma_prefetch_1d(tiles + (static_cast<size_t>(t) * (shape_k / BLOCK_K) +
+                                                                  (k_block_begin + kb)) * kPackedTileBytes,
+                                                         kPhaseKBlockBytes / kPhaseTiles);
+                            }
                         } else {
                             const auto tensor_map_b_ptr = kBlockIsL2 ?
                                 &tensor_map_l2_weights : &tensor_map_l1_weights;
@@ -1620,10 +1675,14 @@
                         // [k_block_begin + k_block_idx, + blocks in this stage).
                         constexpr uint32_t kBitsPerStage = kKBlocksPerStage * kNumL1BlocksPerL2KBlock;
                         DG_STATIC_ASSERT(kBitsPerStage < 64, "Stage readiness mask overflow");
-                        const uint32_t stage_bits = cute::min(kKBlocksPerStage, num_k_blocks - k_block_idx) *
-                                                    kNumL1BlocksPerL2KBlock;
-                        const uint64_t need = ((1ull << stage_bits) - 1ull)
-                                              << ((k_block_begin + k_block_idx) * kNumL1BlocksPerL2KBlock);
+                        // Wide L1 tasks (kNumL2KBlocksPerL1Block == 2): K-blocks k .. k+n-1 need the
+                        // L1 N-blocks k/2 .. (k+n-1)/2.
+                        const uint32_t first_kb = k_block_begin + k_block_idx;
+                        const uint32_t last_kb = first_kb + cute::min(kKBlocksPerStage, num_k_blocks - k_block_idx) - 1u;
+                        const uint32_t first_bit = (first_kb / kNumL2KBlocksPerL1Block) * kNumL1BlocksPerL2KBlock;
+                        const uint32_t num_bits = (last_kb / kNumL2KBlocksPerL1Block) * kNumL1BlocksPerL2KBlock +
+                                                  kNumL1BlocksPerL2KBlock - first_bit;
+                        const uint64_t need = ((1ull << num_bits) - 1ull) << first_bit;
                         if ((l1_ready_mask & need) != need) {
                             const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
                             DG_SPIN_WHILE(((l1_ready_mask = ptx::ld_acq_gpu(ptr)) & need) != need, 1357);
@@ -1741,16 +1800,22 @@
             // Per-phase sub-tile geometry (L2 half-row tasks: 128-row L2 sub-tiles).
             constexpr uint32_t kPhaseSubTiles =
                 kBlockIsL2 ? kL2SubTilesPerPacked : kSubTilesPerPacked;
+            // Wide tasks: packed tiles per task (adjacent tile rows, each a contiguous
+            // K range of 20 KB tiles); tile t of a stage's K-block lands at +t * 20 KB.
+            constexpr uint32_t kPhaseTiles = kBlockIsL2 ? kL2Tiles : kL1Tiles;
             constexpr uint32_t kPhaseKBlockBytes =
-                kBlockIsL2 ? SMEM_PACKED_B_L2_SIZE_PER_KBLOCK : SMEM_PACKED_B_SIZE_PER_KBLOCK;
+                kBlockIsL2 ? SMEM_PACKED_B_L2_SIZE_PER_KBLOCK : SMEM_PACKED_B_L1_SIZE_PER_KBLOCK;
+            DG_STATIC_ASSERT(kPhaseTiles == 1 || kPhaseKBlockBytes == kPhaseTiles * kPackedTileBytes,
+                             "Wide task K-block == kPhaseTiles whole packed tiles");
             const uint8_t* dense_tiles = nullptr;
             if constexpr (kDenseWeightTiles) {
                 const uint32_t tile_row = local_expert_idx * (shape_n / kPackedTileN) +
-                                          n_block_idx / kPhaseSubTiles;
+                                          n_block_idx * kPhaseTiles / kPhaseSubTiles;
                 dense_tiles = reinterpret_cast<const uint8_t*>(kBlockIsL2 ? l2_weights_ptr : l1_weights_ptr) +
                     static_cast<size_t>(tile_row) * (shape_k / BLOCK_K) * kPackedTileBytes +
                     (n_block_idx % kPhaseSubTiles) * kPhaseKBlockBytes;
             }
+            constexpr size_t kTileRowStrideBytes = static_cast<size_t>(shape_k / BLOCK_K) * kPackedTileBytes;
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 empty_barriers[stage_idx]->wait(phase ^ 1);
@@ -1764,7 +1829,20 @@
                         // One 1D bulk copy per stage (20 KB per K-block for BN256;
                         // 40 / 80 KB when kKBlocksPerStage == 2 / 4, tiles k..k+3 are
                         // adjacent in the dense layout); decoders see 80 B rows at row * 80.
-                        if constexpr (kKBlocksPerStage == 1 || kPhaseSubTiles == 1) {
+                        if constexpr (kPhaseTiles > 1) {
+                            // Wide tasks (one K-block per stage): one 20 KB bulk copy per
+                            // packed tile of the task, tile t at +t * 20 KB of the stage slot.
+                            DG_STATIC_ASSERT(kPhaseTiles == 1 || kKBlocksPerStage == 1,
+                                             "Wide tasks: one K-block per stage");
+                            #pragma unroll
+                            for (uint32_t t = 0; t < kPhaseTiles; ++ t) {
+                                ptx::tma_load_1d(
+                                    reinterpret_cast<uint8_t*>(smem_packed_b[stage_idx]) + t * kPackedTileBytes,
+                                    dense_tiles + t * kTileRowStrideBytes +
+                                        static_cast<size_t>(k_block_begin + k_block_idx) * kPackedTileBytes,
+                                    full_barriers[stage_idx], kPackedTileBytes);
+                            }
+                        } else if constexpr (kKBlocksPerStage == 1 || kPhaseSubTiles == 1) {
                             ptx::tma_load_1d(smem_packed_b[stage_idx],
                                         dense_tiles + static_cast<size_t>(k_block_begin + k_block_idx) * kPackedTileBytes,
                                         full_barriers[stage_idx], stage_bytes);
@@ -1984,9 +2062,12 @@
             constexpr uint32_t kWGBlockN = kBlockIsL2 ? L2_WG_BLOCK_N : WG_BLOCK_N;
             constexpr uint32_t kWGHalves = kWGBlockN / 64;
             constexpr uint32_t kPackedBKBlockBytes =
-                kBlockIsL2 ? SMEM_PACKED_B_L2_SIZE_PER_KBLOCK : SMEM_PACKED_B_SIZE_PER_KBLOCK;
+                kBlockIsL2 ? SMEM_PACKED_B_L2_SIZE_PER_KBLOCK : SMEM_PACKED_B_L1_SIZE_PER_KBLOCK;
             DG_STATIC_ASSERT(kWGHalves >= 1 && kWGHalves <= kSwapABWeightHalves,
                              "Per-WG weight halves must fit the swapAB accumulator layout");
+            // Packed tiles per task of this phase (wide tasks: 2) and the L2 SF groups
+            // an L1 task publishes (wide L1 tasks: 2, one per WG).
+            constexpr uint32_t kPhaseTiles = kBlockIsL2 ? kL2Tiles : kL1Tiles;
             const uint32_t m_idx = pool_block_idx * BLOCK_M;
             // Half-tile tasks: both WGs work on the task's 128 rows (K-split), so
             // the per-WG N offsets are zero and only WG0 owns the epilogue.
@@ -2046,7 +2127,11 @@
 
             // ---------------- GEMM ----------------
             using WGMMA = L1WGMMA;
-            constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum;  // 64 for M=64,N=128
+            // 64 for M=64,N=128; the swapAB layout needs kSwapABHalfAccumPerThread per
+            // 64-row half (wide tasks: 4 halves -> 128; only token chunk 0 is live at BM8).
+            constexpr uint32_t kAccumPerThread =
+                WGMMA::kNumAccum > kWGHalves * kSwapABHalfAccumPerThread ?
+                WGMMA::kNumAccum : kWGHalves * kSwapABHalfAccumPerThread;
             float final_accum[kAccumPerThread] = {};
 
             // L2 swapAB epilogue for L2 N-block `l2_n_block_idx` from `final_accum`: BF16 x
@@ -2070,7 +2155,7 @@
                         BLOCK_M == 8 ? 4u : 8u;
                     auto store_swap_bf16 = [&](const uint32_t& token, const uint32_t& col, const float& value) {
                         if (token < valid_m)
-                            smem_cd_l2[token * BLOCK_N + wg_n_idx + col] =
+                            smem_cd_l2[token * TASK_BLOCK_N_L2 + wg_n_idx + col] =
                                 __float2bfloat16_rn(value * scale_at(col));
                     };
 
@@ -2109,8 +2194,8 @@
                     constexpr uint32_t kColsPerScatterLane = kWGBlockN / 16;
                     DG_STATIC_ASSERT(kWGBlockN % 16 == 0,
                                      "SwapAB L2 scatter expects an even lane partition");
-                    DG_STATIC_ASSERT(kColsPerScatterLane == 4 || kColsPerScatterLane == 8,
-                                     "SwapAB L2 scatter supports WG_BLOCK_N=64 or 128");
+                    DG_STATIC_ASSERT(kColsPerScatterLane == 4 || kColsPerScatterLane == 8 || kColsPerScatterLane == 16,
+                                     "SwapAB L2 scatter supports WG_BLOCK_N=64, 128 or 256");
 
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
@@ -2125,10 +2210,19 @@
                         const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
                                                .get_data_buffer(dst_token_idx);
                         auto smem_ptr = smem_cd_l2
-                            + token * BLOCK_N
+                            + token * TASK_BLOCK_N_L2
                             + wg_n_idx
                             + lane_in_row * kColsPerScatterLane;
-                        if constexpr (kColsPerScatterLane == 8) {
+                        if constexpr (kColsPerScatterLane == 16) {
+                            // Wide L2 tasks: 32 B per lane (two 16 B stores)
+                            const auto packed_0 = *reinterpret_cast<uint4*>(smem_ptr);
+                            const auto packed_1 = *reinterpret_cast<uint4*>(smem_ptr + 8);
+                            auto dst_ptr = math::advance_ptr<uint4>(
+                                dst_token.get_base_ptr(),
+                                l2_n_idx * sizeof(nv_bfloat16) + lane_in_row * 2u * sizeof(uint4));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed_0;
+                            *sym_buffer.map(dst_ptr + 1, dst_rank_idx) = packed_1;
+                        } else if constexpr (kColsPerScatterLane == 8) {
                             const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
                             auto dst_ptr = math::advance_ptr<uint4>(
                                 dst_token.get_base_ptr(),
@@ -2478,8 +2572,19 @@
             // then the decode; both halves' eight m64nNk32 RS WGMMAs share ONE commit
             // group and one drain.
             if constexpr (kSwapABRequested && kRFDecode) {
-                DG_STATIC_ASSERT(kSwapABWeightHalves == 2, "RF decode expects two 64-row weight halves");
+                // RF loop unit: (K128 block, PAIR of 64-row halves). A WG with two halves
+                // (BN256 tasks) has one pair, so unit == K-block; a wide-task WG (four
+                // halves) has two pairs per K-block and one K-block per stage, so the
+                // 2-unit loops below run unchanged with the same fragment / accumulator
+                // registers (unit u: K-block u / kHalfPairs, half pair u % kHalfPairs).
                 auto run_swap_ab_rf = [&]<uint32_t N_SWAP>() {
+                    constexpr uint32_t kUnitHalves = kWGHalves >= 2u ? 2u : kWGHalves;
+                    constexpr uint32_t kHalfPairs = kWGHalves / kUnitHalves;
+                    constexpr uint32_t kUnitsPerStage = kKBlocksPerStage * kHalfPairs;
+                    constexpr bool kWideUnits = kHalfPairs > 1u;
+                    DG_STATIC_ASSERT(kWGHalves == kUnitHalves * kHalfPairs, "Halves must form whole pairs");
+                    DG_STATIC_ASSERT(!kWideUnits || (kKBlocksPerStage == 1 && kHalfPairs == 2 && !kHalfTileTasks),
+                                     "Wide tasks: one K-block per stage, two half pairs, no half-tile tasks");
                     // QoQ: int8 RS atoms have no N=24; pad to 32 like the SS path (extra
                     // token columns are masked by `token < valid_m`).
                     // QoQ inline s2 (kQoQInlineS2, host env DG_FP4_QOQ_INLINE_S2): L1 only
@@ -2492,8 +2597,10 @@
                     // the per-token activation scale is applied once at task end, so no
                     // per-K128 accumulator readout / tensor-pipe drain sits in the loop.
                     // 2-K-block stages only (the 1-/4-block loops keep the promote path).
+                    // (Also the 1-unit loop of wide-L2-only launches, so the QoQ L1 numerics
+                    // do not depend on the L2 task shape.)
                     constexpr bool kInlineS2 = kQoQ && kQoQInlineS2 && !kBlockIsL2 &&
-                                               !kHalfTileTasks && kKBlocksPerStage == 2;
+                                               !kHalfTileTasks && kUnitsPerStage <= 2;
                     // The plain 2-fragment-buffer inline-s2 loop takes two knobs
                     // (host env DG_FP4_QIS2_PREFETCH_PACKED / DG_FP4_QIS2_RAWU8):
                     //  * prefetch: the next block's packed words are loaded (LDS) before
@@ -2509,9 +2616,13 @@
                     //    A word. Measured a loss on H20 (see the host knob comment): the
                     //    stage-end drain it needs (below) plus the fold on the critical
                     //    path outweigh the decode savings; default off.
-                    constexpr bool kQIS2Plain = kInlineS2 && !kQoQInlineS2Ilv && kQoQInlineS2Frags == 2;
+                    // Wide units: only the plain 2-buffer inline-s2 loop is implemented
+                    // (its per-unit accumulator sets are per half pair); ILV / 3-4 frag
+                    // buffers / raw-u8 fall back to it.
+                    constexpr bool kQIS2Plain = kInlineS2 && kUnitsPerStage == 2 &&
+                                                (kWideUnits || (!kQoQInlineS2Ilv && kQoQInlineS2Frags == 2));
                     constexpr bool kQIS2Prefetch = kQIS2Plain && kQoQInlineS2PrefetchPacked;
-                    constexpr bool kQIS2RawU8 = kQIS2Plain && kQoQInlineS2RawU8;
+                    constexpr bool kQIS2RawU8 = kQIS2Plain && kQoQInlineS2RawU8 && !kWideUnits;
                     using SwapRS = typename std::conditional_t<kQoQ,
                         std::conditional_t<kQIS2RawU8,
                             mma::sm90::INT8U8MMARSSelector<(N_SWAP == 24 ? 32 : N_SWAP)>,
@@ -2526,8 +2637,9 @@
                     // >2 K-blocks per stage: two accumulator sets alternate (acc[b & 1]);
                     // block b is promoted right after wait<1> following issue(b+1), which
                     // frees its set for block b+2 (4 sets = +32 regs would spill).
+                    // Wide units: one set per half pair (inline s2: both accumulate the task).
                     constexpr uint32_t kNumAccKBlocks =
-                        (kHalfTileTasks || (kInlineS2 && !kQIS2RawU8)) ? 1u : cute::min(kKBlocksPerStage, 2u);
+                        (kHalfTileTasks || (kInlineS2 && !kQIS2RawU8)) ? kHalfPairs : cute::min(kUnitsPerStage, 2u);
                     // Per-64 L2 activation scales (kHalfTileTasks): K32 steps {0,1} and
                     // {2,3} of a K128 block accumulate separately (same commit group)
                     // and are promoted with their own SF row.
@@ -2542,13 +2654,14 @@
                     // 1381/1501 ns per stage, M16 1558 vs 1547/1487), so the dependent
                     // RS-wgmma chain is not the stage floor; 2 chains kept.
                     constexpr uint32_t kAccChains = 2u;
-                    swap_accum_t swap_accum[kNumAccKBlocks][kSFGroups][kWGHalves][kAccChains][kSwapAccum];
+                    swap_accum_t swap_accum[kNumAccKBlocks][kSFGroups][kUnitHalves][kAccChains][kSwapAccum];
                     // Inline s2 may rotate 3 or 4 A-fragment buffers (kQoQInlineS2Frags,
                     // DG_FP4_QIS2_FRAGS); every other loop uses exactly two.
-                    constexpr uint32_t kFragBufs = (kInlineS2 && !kQoQInlineS2Ilv) ? kQoQInlineS2Frags : 2u;
-                    uint32_t frag[kFragBufs][kWGHalves][4][4];  // [buffer][half][k32 step][a0..a3]
+                    constexpr uint32_t kFragBufs =
+                        (kInlineS2 && !kQoQInlineS2Ilv && !kWideUnits && kUnitsPerStage == 2) ? kQoQInlineS2Frags : 2u;
+                    uint32_t frag[kFragBufs][kUnitHalves][4][4];  // [buffer][half][k32 step][a0..a3]
                     // Raw-u8: the exact int32 task sum (plain registers, not a wgmma operand).
-                    int32_t qis2_task_acc[kWGHalves][kSwapAccum];
+                    int32_t qis2_task_acc[kUnitHalves][kSwapAccum];
 
                     const auto fence_accum = [&]() {
                         #pragma unroll
@@ -2556,7 +2669,7 @@
                             #pragma unroll
                             for (uint32_t g = 0; g < kSFGroups; ++ g) {
                                 #pragma unroll
-                                for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                                for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                                     #pragma unroll
                                     for (uint32_t c = 0; c < kAccChains; ++ c) {
                                         #pragma unroll
@@ -2567,9 +2680,9 @@
                             }
                         }
                     };
-                    const auto fence_frag = [&](uint32_t (&f)[kWGHalves][4][4]) {
+                    const auto fence_frag = [&](uint32_t (&f)[kUnitHalves][4][4]) {
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t k = 0; k < 4; ++ k) {
                                 #pragma unroll
@@ -2582,14 +2695,15 @@
                     // thread's A fragments for the 4 K32 steps x 2 halves).
                     // Split in two so the plain inline-s2 loop can issue the loads before a
                     // wgmma wait (kQIS2Prefetch) and decode after it.
-                    const auto load_packed_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                    uint4 (&w)[kWGHalves][2], uint32_t (&sw)[kWGHalves][2]) {
+                    const auto load_packed_rf = [&](const uint32_t& stage, const uint32_t& unit,
+                                                    uint4 (&w)[kUnitHalves][2], uint32_t (&sw)[kUnitHalves][2]) {
+                        const uint32_t kb = unit / kHalfPairs, hp = unit % kHalfPairs;
                         const auto* packed_rows =
                             reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) +
                             kb * kPackedBKBlockBytes;
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
-                            const uint32_t row_0 = wg_n_idx + h * 64u + r_0;
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
+                            const uint32_t row_0 = wg_n_idx + (hp * kUnitHalves + h) * 64u + r_0;
                             const uint32_t row_1 = row_0 + 8u;
                             w[h][0] = *reinterpret_cast<const uint4*>(
                                 packed_rows + row_0 * 80u + col_idx * 16u);
@@ -2599,13 +2713,13 @@
                             sw[h][1] = *reinterpret_cast<const uint32_t*>(packed_rows + row_1 * 80u + 64u);
                         }
                     };
-                    const auto decode_words_rf = [&](const uint4 (&w)[kWGHalves][2], const uint32_t (&sw)[kWGHalves][2],
-                                                     uint32_t (&f)[kWGHalves][4][4]) {
+                    const auto decode_words_rf = [&](const uint4 (&w)[kUnitHalves][2], const uint32_t (&sw)[kUnitHalves][2],
+                                                     uint32_t (&f)[kUnitHalves][4][4]) {
                         if constexpr (kQIS2RawU8) {
                             // Raw codes only: byte lane = 4-bit code (0..15) as u8; the
                             // per-row affine is applied to the int32 block sum at retire.
                             #pragma unroll
-                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                                 #pragma unroll
                                 for (uint32_t k = 0; k < 4; ++ k) {
                                     const uint32_t word_r0 = k == 0 ? w[h][0].x : k == 1 ? w[h][0].y :
@@ -2632,9 +2746,9 @@
                             // whose dequant fits int8 (bit-exact vs ((code - z) * s2) & 0xff).
                             // a is derived in-kernel from the meta bytes (s2 = byte 64,
                             // z = byte 65): 2 IMAD per row per K-block.
-                            uint32_t s2v[kWGHalves][2], a4[kWGHalves][2];
+                            uint32_t s2v[kUnitHalves][2], a4[kUnitHalves][2];
                             #pragma unroll
-                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                                 #pragma unroll
                                 for (uint32_t r = 0; r < 2; ++ r) {
                                     s2v[h][r] = sw[h][r] & 0xffu;
@@ -2647,7 +2761,7 @@
                                 return (c * s2 + a) ^ 0x80808080u;
                             };
                             #pragma unroll
-                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                                 #pragma unroll
                                 for (uint32_t k = 0; k < 4; ++ k) {
                                     const uint32_t word_r0 = k == 0 ? w[h][0].x : k == 1 ? w[h][0].y :
@@ -2667,9 +2781,9 @@
                             // braid); byte b <-> K +b. Same borrow-guarded per-byte subtract
                             // as `dequant_smem_b_from_packed_qoq_shiftxor`: (code - z) int8,
                             // bit-exact vs the SS tile decoder. z = byte 65 of the packed row.
-                            uint32_t zz[kWGHalves][2];
+                            uint32_t zz[kUnitHalves][2];
                             #pragma unroll
-                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                                 zz[h][0] = ((sw[h][0] >> 8u) & 0xffu) * 0x01010101u;
                                 zz[h][1] = ((sw[h][1] >> 8u) & 0xffu) * 0x01010101u;
                             }
@@ -2677,7 +2791,7 @@
                                 return ((nib | 0x80808080u) - z) ^ 0x80808080u;
                             };
                             #pragma unroll
-                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                                 #pragma unroll
                                 for (uint32_t k = 0; k < 4; ++ k) {
                                     const uint32_t word_r0 = k == 0 ? w[h][0].x : k == 1 ? w[h][0].y :
@@ -2692,9 +2806,9 @@
                                 }
                             }
                         } else {
-                        uint2 lut[kWGHalves][2][4];
+                        uint2 lut[kUnitHalves][2][4];
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t r = 0; r < 2; ++ r) {
                                 #pragma unroll
@@ -2703,7 +2817,7 @@
                             }
                         }
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t k = 0; k < 4; ++ k) {
                                 const uint32_t word_r0 = k == 0 ? w[h][0].x : k == 1 ? w[h][0].y :
@@ -2719,24 +2833,25 @@
                         }
                         }
                     };
-                    const auto decode_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                     uint32_t (&f)[kWGHalves][4][4]) {
-                        uint4 w[kWGHalves][2];
-                        uint32_t sw[kWGHalves][2];
-                        load_packed_rf(stage, kb, w, sw);
+                    const auto decode_stage_rf = [&](const uint32_t& stage, const uint32_t& unit,
+                                                     uint32_t (&f)[kUnitHalves][4][4]) {
+                        uint4 w[kUnitHalves][2];
+                        uint32_t sw[kUnitHalves][2];
+                        load_packed_rf(stage, unit, w, sw);
                         decode_words_rf(w, sw, f);
                     };
                     // One commit group for K-block `kb` of `stage`: 4 K32 steps into
                     // acc[0] with f[0], then into acc[1] with f[1]. The B (activation)
                     // descriptor addresses the kb-th 1 KB swizzled A tile of the stage.
-                    const auto issue_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                    uint32_t (&f)[kWGHalves][4][4],
-                                                    swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                    const auto issue_stage_rf = [&](const uint32_t& stage, const uint32_t& unit,
+                                                    uint32_t (&f)[kUnitHalves][4][4],
+                                                    swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum]) {
+                        const uint32_t kb = unit / kHalfPairs;
                         fence_accum();
                         fence_frag(f);
                         ptx::warpgroup_arrive();
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t k = 0; k < 4; ++ k) {
                                 auto desc_b = mma::sm90::make_smem_desc(
@@ -2757,13 +2872,14 @@
                     // still resident in this stage); the two int32 chains are summed
                     // exactly, so the result is bit-exact vs the SS path's
                     // (scale * s2) * float(acc).
-                    const auto promote_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                      const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                    const auto promote_stage_rf = [&](const uint32_t& stage, const uint32_t& unit,
+                                                      const swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum]) {
+                        const uint32_t kb = unit / kHalfPairs, hp = unit % kHalfPairs;
                         #pragma unroll
                         for (uint32_t g = 0; g < kSFGroups; ++ g) {
                         const float* sfa = smem_sfa[stage] + (kb * kNumL2SFAGroups + g) * kL2SFAHalfStride;
                         #pragma unroll
-                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
+                        for (uint32_t half = 0; half < kUnitHalves; ++ half) {
                             float s2_r0 = 1.0f, s2_r1 = 1.0f;
                             if constexpr (kQoQ) {
                                 // s2[row] = byte 64 of the packed row (meta word bytes 64..67):
@@ -2774,15 +2890,15 @@
                                 const auto* packed_rows =
                                     reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) + kb * kPackedBKBlockBytes;
                                 const uint32_t m0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                    packed_rows + (wg_n_idx + half * 64u + r_0) * 80u + 64u));
+                                    packed_rows + (wg_n_idx + (hp * kUnitHalves + half) * 64u + r_0) * 80u + 64u));
                                 const uint32_t m1 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                    packed_rows + (wg_n_idx + half * 64u + r_1) * 80u + 64u));
+                                    packed_rows + (wg_n_idx + (hp * kUnitHalves + half) * 64u + r_1) * 80u + 64u));
                                 s2_r0 = __uint_as_float(0x4B000000u | (m0 & 0xffu)) - 8388608.0f;
                                 s2_r1 = __uint_as_float(0x4B000000u | (m1 & 0xffu)) - 8388608.0f;
                             }
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
-                                const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
+                                const uint32_t accum_offset = (hp * kUnitHalves + half) * kSwapABHalfAccumPerThread + i * 4;
                                 const uint32_t token_0 = i * 8 + col_idx * 2;
                                 const uint32_t token_1 = token_0 + 1;
                                 const auto acc_sum = [&](const uint32_t& j) -> float {
@@ -2847,12 +2963,13 @@
                             act_scale[i][1] = token_0 + 1 < valid_m ? raw_1 : 0.0f;
                         }
                     };
-                    const auto promote_task_rf = [&](const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                    const auto promote_task_rf = [&](const swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum],
+                                                     const uint32_t& hp) {
                         #pragma unroll
-                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
+                        for (uint32_t half = 0; half < kUnitHalves; ++ half) {
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
-                                const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
+                                const uint32_t accum_offset = (hp * kUnitHalves + half) * kSwapABHalfAccumPerThread + i * 4;
                                 #pragma unroll
                                 for (uint32_t j = 0; j < 4; ++ j) {
                                     swap_accum_t v = acc[0][half][0][j];
@@ -2906,13 +3023,13 @@
                     // s2 / z = bytes 64 / 65 of the packed row (stage still resident: called
                     // before the stage's empty-barrier arrive), colsum from this stage's slot.
                     const auto fold_block_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                   const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                                                   const swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum]) {
                         const auto* packed_rows =
                             reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) + kb * kPackedBKBlockBytes;
                         const uint32_t* cs = reinterpret_cast<const uint32_t*>(
                             smem_qis2_colsum + (stage * kKBlocksPerStage + kb) * kQIS2ColsumStride);
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                             const uint32_t m0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
                                 packed_rows + (wg_n_idx + h * 64u + r_0) * 80u + 64u));
                             const uint32_t m1 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
@@ -2943,7 +3060,7 @@
                     // Raw-u8 task-end promote: same as `promote_task_rf` on the int32 task sum.
                     const auto promote_task_raw_rf = [&]() {
                         #pragma unroll
-                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
+                        for (uint32_t half = 0; half < kUnitHalves; ++ half) {
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
                                 const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
@@ -2957,7 +3074,19 @@
 
                     // Half-tile tasks use this one-K-block-per-WG loop too: WG w takes
                     // K-block ksplit_kb = w of every (2-K-block) stage.
-                    if constexpr (kKBlocksPerStage == 1 || kHalfTileTasks) {
+                    if constexpr (kUnitsPerStage == 1 || kHalfTileTasks) {
+                    if constexpr (kInlineS2) {
+                        // One int32 set for the whole task (see the 2-unit inline-s2 loop).
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
+                            #pragma unroll
+                            for (uint32_t c = 0; c < kAccChains; ++ c) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    swap_accum[0][0][h][c][i] = 0;
+                            }
+                        }
+                    }
                     // Software pipeline: the 8 WGMMAs of stage k are issued
                     // asynchronously; while the tensor cores run, the math warps wait
                     // for stage k+1's full barrier (the loader runs kNumStages ahead)
@@ -2974,11 +3103,13 @@
                             { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
                         if constexpr (kUseInterleavedScheduler)
                             interleaved_scheduler.release_task_info(lane_idx);
+                        if constexpr (kInlineS2)
+                            capture_act_scale(stage_idx);
                         decode_stage_rf(stage_idx, ksplit_kb, frag[0]);
                     }
                     const auto stage_step = [&](uint32_t& k_block_idx,
-                                                uint32_t (&fcur)[kWGHalves][4][4],
-                                                uint32_t (&fnext)[kWGHalves][4][4]) {
+                                                uint32_t (&fcur)[kUnitHalves][4][4],
+                                                uint32_t (&fnext)[kUnitHalves][4][4]) {
                         const unsigned long long kt_head = clock64();
                         const uint32_t cur_stage = stage_idx;
                         if constexpr (!kBlockIsL2) {
@@ -3012,8 +3143,10 @@
                         ptx::warpgroup_wait<0>();
                         fence_frag(fcur);
                         kstage_add(19, clock64() - kt_b);
-                        if (!exp_skip(8u))
-                            promote_stage_rf(cur_stage, ksplit_kb, swap_accum[0]);
+                        if constexpr (!kInlineS2) {
+                            if (!exp_skip(8u))
+                                promote_stage_rf(cur_stage, ksplit_kb, swap_accum[0]);
+                        }
                         arrive_empty_barrier(cur_stage);
                         advance_pipeline(k_block_idx);
                     };
@@ -3026,7 +3159,11 @@
                     // finds a path from an in-flight wgmma to the next task's accumulator
                     // zeroing / first decode and serialises every wgmma (C7518).
                     ptx::warpgroup_wait<0>();
-                    } else if constexpr (kKBlocksPerStage == 2 && kInlineS2 && kQoQInlineS2Ilv) {
+                    if constexpr (kInlineS2) {
+                        if (num_k_blocks > 0 && !exp_skip(8u))
+                            promote_task_rf(swap_accum[0], 0u);
+                    }
+                    } else if constexpr (kUnitsPerStage == 2 && kInlineS2 && kQoQInlineS2Ilv && !kWideUnits) {
                     // QoQ inline s2, interleaved issue. The SASS audit (H20 2026-09-09) showed
                     // the stage is bound by tensor-pipe occupancy: 16 RS m64n8k32 per stage
                     // cost ~110 clk each per WG (two WGs share the pipe), and a wgmma issue
@@ -3040,7 +3177,7 @@
                     // Slots: 31 issue windows, 19 wait<4>/wait<0>, 18 per-step decodes,
                     // 17 k+1 barrier check, 30 task promote, 22 head-to-head, 21 stages.
                     #pragma unroll
-                    for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                    for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                         #pragma unroll
                         for (uint32_t c = 0; c < kAccChains; ++ c) {
                             #pragma unroll
@@ -3051,11 +3188,11 @@
                     // Decode K32 step `k` of K-block `kb` of `stage` into f[.][k] (one LDS.32
                     // per row for the 4 codes x 2 nibble planes, meta reloaded per step).
                     const auto decode_kstep_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                     const uint32_t& k, uint32_t (&f)[kWGHalves][4][4]) {
+                                                     const uint32_t& k, uint32_t (&f)[kUnitHalves][4][4]) {
                         const auto* packed_rows =
                             reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) + kb * kPackedBKBlockBytes;
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                             const uint32_t row_0 = wg_n_idx + h * 64u + r_0;
                             const uint32_t row_1 = row_0 + 8u;
                             const uint32_t word_r0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
@@ -3078,9 +3215,9 @@
                     // operand, i.e. a definition to ptxas) on a register an in-flight wgmma
                     // reads serialises the pipe (C7513 "non wgmma instructions defining input
                     // registers of a wgmma between start and end of the pipeline stage").
-                    const auto fence_frag_k = [&](uint32_t (&f)[kWGHalves][4][4], const uint32_t& k) {
+                    const auto fence_frag_k = [&](uint32_t (&f)[kUnitHalves][4][4], const uint32_t& k) {
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t i = 0; i < 4; ++ i)
                                 ptx::warpgroup_fence_operand(reinterpret_cast<float&>(f[h][k][i]));
@@ -3089,8 +3226,8 @@
                     // Issue the 4 K32-step groups of block (stage, kb) from fcur, decoding
                     // block (nstage, nkb) step by step into fnext behind wait<4>.
                     const auto block_step_ilv = [&](const uint32_t& stage, const uint32_t& kb,
-                                                    uint32_t (&fcur)[kWGHalves][4][4],
-                                                    uint32_t (&fnext)[kWGHalves][4][4],
+                                                    uint32_t (&fcur)[kUnitHalves][4][4],
+                                                    uint32_t (&fnext)[kUnitHalves][4][4],
                                                     const uint32_t& nstage, const uint32_t& nkb,
                                                     const bool& release_prev,
                                                     const uint32_t& prev_stage) {
@@ -3102,7 +3239,7 @@
                                 fence_frag_k(fcur, k);
                                 ptx::warpgroup_arrive();
                                 #pragma unroll
-                                for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                                for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                                     auto desc_b = mma::sm90::make_smem_desc(
                                         smem_a[stage] + kb * (SMEM_A_SIZE_PER_KBLOCK / sizeof(a_dtype_t)) +
                                         k * SwapRS::K, 1);
@@ -3172,7 +3309,7 @@
                             const unsigned long long kt_b = clock64();
                             kstage_add(19, kt_b - kt_a);
                             if (!exp_skip(8u))
-                                promote_task_rf(swap_accum[0]);
+                                promote_task_rf(swap_accum[0], 0u);
                             kstage_add(30, clock64() - kt_b);
                         }
                         advance_pipeline(k_block_idx);
@@ -3181,7 +3318,7 @@
                     // finds a path from an in-flight wgmma to the next task's accumulator
                     // zeroing / first decode and serialises every wgmma (C7518).
                     ptx::warpgroup_wait<0>();
-                    } else if constexpr (kKBlocksPerStage == 2 && kInlineS2 && kFragBufs > 2) {
+                    } else if constexpr (kUnitsPerStage == 2 && kInlineS2 && kFragBufs > 2) {
                     // QoQ inline s2 with kFragBufs (3 or 4) rotating A-fragment buffers:
                     // same schedule as the 2-buffer loop below, but block n decodes into
                     // frag[n % NF] and the group that last read that buffer is G(n - NF),
@@ -3194,7 +3331,7 @@
                     constexpr uint32_t NF = kFragBufs;
                     constexpr uint32_t kRot = (NF % 2u == 0u) ? NF / 2u : NF;
                     #pragma unroll
-                    for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                    for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                         #pragma unroll
                         for (uint32_t c = 0; c < kAccChains; ++ c) {
                             #pragma unroll
@@ -3284,7 +3421,7 @@
                             kt_a = clock64();
                             kstage_add(19, kt_a - kt_b);
                             if (!exp_skip(8u))
-                                promote_task_rf(swap_accum[0]);
+                                promote_task_rf(swap_accum[0], 0u);
                             kstage_add(30, clock64() - kt_a);
                         }
                         advance_pipeline(k_block_idx);
@@ -3301,7 +3438,7 @@
                     // finds a path from an in-flight wgmma to the next task's accumulator
                     // zeroing / first decode and serialises every wgmma (C7518).
                     ptx::warpgroup_wait<0>();
-                    } else if constexpr (kKBlocksPerStage == 2 && kInlineS2) {
+                    } else if constexpr (kUnitsPerStage == 2 && kInlineS2) {
                     // QoQ inline s2, two K128 blocks per stage, ONE int32 accumulator set,
                     // no per-block promote. Commit groups G(s,0), G(s,1) per stage; the
                     // tensor pipe is never drained inside the task, only lagged by one
@@ -3331,24 +3468,27 @@
                     // is decoded before the drain so only the fold + issue gap is exposed.
                     if constexpr (kQIS2RawU8) {
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                 qis2_task_acc[h][i] = 0;
                         }
                     } else {
                         #pragma unroll
-                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                        for (uint32_t u = 0; u < kNumAccKBlocks; ++ u) {
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kUnitHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t c = 0; c < kAccChains; ++ c) {
                                 #pragma unroll
                                 for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                    swap_accum[0][0][h][c][i] = 0;
+                                    swap_accum[u][0][h][c][i] = 0;
                             }
                         }
+                        }
                     }
-                    uint4 pf_w[kWGHalves][2];      // prefetched packed words (kQIS2Prefetch)
-                    uint32_t pf_sw[kWGHalves][2];
+                    uint4 pf_w[kUnitHalves][2];      // prefetched packed words (kQIS2Prefetch)
+                    uint32_t pf_sw[kUnitHalves][2];
                     if (num_k_blocks > 0) {
                         const unsigned long long kt_head = clock64();
                         full_barriers[stage_idx]->wait(phase);
@@ -3473,7 +3613,7 @@
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[0]);
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1u % kNumAccKBlocks]);
                         kt_a = clock64();
                         kstage_add(31, kt_a - kt_b);
                         const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
@@ -3531,8 +3671,11 @@
                             arrive_empty_barrier(cur_stage);
                             kt_a = clock64();
                             kstage_add(19, kt_a - kt_b);
-                            if (!exp_skip(8u))
-                                promote_task_rf(swap_accum[0]);
+                            if (!exp_skip(8u)) {
+                                #pragma unroll
+                                for (uint32_t u = 0; u < kNumAccKBlocks; ++ u)
+                                    promote_task_rf(swap_accum[u], u);
+                            }
                             kstage_add(30, clock64() - kt_a);
                         }
                         advance_pipeline(k_block_idx);
@@ -3542,7 +3685,7 @@
                     // finds a path from an in-flight wgmma to the next task's accumulator
                     // zeroing / first decode and serialises every wgmma (C7518).
                     ptx::warpgroup_wait<0>();
-                    } else if constexpr (kKBlocksPerStage == 2) {
+                    } else if constexpr (kUnitsPerStage == 2) {
                     // Two K128 blocks per stage, one commit group each, frag buffers at
                     // K-block granularity (frag[0] always holds block 0, frag[1] block 1):
                     //   issue(blk0 -> acc0); decode blk1 -> frag[1]; issue(blk1 -> acc1);
@@ -3586,8 +3729,8 @@
                         const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
                         const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
                         const uint32_t next_phase = phase ^ (next_stage == 0);
-                        uint4 pf_w[kWGHalves][2];      // kRFPrefetchPacked: next block-0 packed words
-                        uint32_t pf_sw[kWGHalves][2];
+                        uint4 pf_w[kUnitHalves][2];      // kRFPrefetchPacked: next block-0 packed words
+                        uint32_t pf_sw[kUnitHalves][2];
                         if constexpr (kRFPrefetchPacked) {
                             // k+1 barrier and the next block-0 packed LDS ahead of the wait<1>
                             // so the smem latency overlaps block 0's retirement.
@@ -3771,7 +3914,7 @@
                 auto run_swap_ab_pipelined = [&]<uint32_t N_SWAP>() {
                     using SwapWGMMA = typename mma::sm90::FP8MMASelector<N_SWAP>::type;
                     constexpr uint32_t kSwapAccum = SwapWGMMA::kNumAccum;
-                    float swap_accum[kSwapABWeightHalves][kSwapAccum];
+                    float swap_accum[kWGHalves][kSwapAccum];
 
                     if (num_k_blocks > 0) {
                         full_barriers[stage_idx]->wait(phase);
@@ -3784,14 +3927,14 @@
                          advance_pipeline(k_block_idx)) {
                         const uint32_t cur_stage = stage_idx;
                         #pragma unroll
-                        for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                 ptx::warpgroup_fence_operand(swap_accum[half][i]);
                         }
                         ptx::warpgroup_arrive();
                         #pragma unroll
-                        for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
                             #pragma unroll
                             for (uint32_t k = 0; k < BLOCK_K / SwapWGMMA::K; ++ k) {
                                 auto desc_a = mma::sm90::make_smem_desc(
@@ -3812,7 +3955,7 @@
                         }
 
                         #pragma unroll
-                        for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                 ptx::warpgroup_fence_operand(swap_accum[half][i]);
@@ -3820,7 +3963,7 @@
                         ptx::warpgroup_wait<0>();
 
                         #pragma unroll
-                        for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapAccum / 4; ++ i) {
                                 const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
@@ -3910,7 +4053,7 @@
                             swap_accum_t swap_accum[kSwapAccum];
 
                             #pragma unroll
-                            for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                            for (uint32_t half = 0; half < kWGHalves; ++ half) {
                                 {
                                 #pragma unroll
                                 for (uint32_t i = 0; i < kSwapAccum; ++ i)
@@ -4026,7 +4169,7 @@
                             swap_accum_t swap_accum[kSwapAccum];
 
                             #pragma unroll
-                            for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                            for (uint32_t half = 0; half < kWGHalves; ++ half) {
                                 {
                                 #pragma unroll
                                 for (uint32_t i = 0; i < kSwapAccum; ++ i)
@@ -4185,7 +4328,7 @@
                 const uint32_t tid_in_wg = epilogue_thread_idx & 127u;
                 if (epilogue_wg_idx == 1) {
                     #pragma unroll
-                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                    for (uint32_t h = 0; h < kWGHalves; ++ h) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
                             #pragma unroll
@@ -4199,7 +4342,7 @@
                              "n"(kKSplitReduceBarrierIdx), "n"(kNumEpilogueThreads) : "memory");
                 if (epilogue_wg_idx == 0) {
                     #pragma unroll
-                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                    for (uint32_t h = 0; h < kWGHalves; ++ h) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
                             #pragma unroll
@@ -4246,15 +4389,13 @@
             if (kBlockIsL2 && epilogue_thread_idx == 0) stamp_max(40);
             if constexpr (kStreamK) {
                 if (num_k_splits > 1) {
-                    constexpr uint32_t kNumPartialElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
+                    constexpr uint32_t kNumPartialElems = kWGHalves * kSwapABTokenChunks * 4u;
                     DG_STATIC_ASSERT(!kStreamK ||
                                      kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
                                      fused_layout::kSM90SplitKL1PartialBytes,
                                      "Stream-K partial slot size mismatch");
                     DG_STATIC_ASSERT(!kStreamK || kNumSMs <= fused_layout::kSM90StreamKMaxSMs,
                                      "Stream-K per-worker slots do not cover the grid");
-                    DG_STATIC_ASSERT(!kBlockIsL2 || kWGHalves == kSwapABWeightHalves,
-                                     "Stream-K L2 expects both weight halves per WG");
                     const uint32_t worker_idx = first_worker_idx + k_split_idx;
                     float* my_slot = workspace.get_streamk_scratch_ptr(
                         kBlockIsL2, worker_idx, k_split_idx == 0u ? 0u : 1u);
@@ -4262,7 +4403,7 @@
                         workspace.get_splitk_l2_flag_ptr(pool_block_idx, n_block_idx) :
                         workspace.get_splitk_l1_flag_ptr(pool_block_idx, n_block_idx);
                     #pragma unroll
-                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                    for (uint32_t h = 0; h < kWGHalves; ++ h) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
                             #pragma unroll
@@ -4289,7 +4430,7 @@
                     for (uint32_t c = 0; c < num_k_splits; ++ c) {
                         if (c == k_split_idx) {
                             #pragma unroll
-                            for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
                                 #pragma unroll
                                 for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
                                     #pragma unroll
@@ -4307,7 +4448,7 @@
                         }
                     }
                     #pragma unroll
-                    for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                    for (uint32_t h = 0; h < kWGHalves; ++ h) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
                             #pragma unroll
@@ -4319,22 +4460,22 @@
                 }
             } else if constexpr ((kSplitKL1 && !kBlockIsL2) || (kSplitKL2 && kBlockIsL2)) {
                 if (num_k_splits > 1) {
-                    constexpr uint32_t kNumPartialElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
+                    constexpr uint32_t kNumPartialElems = kWGHalves * kSwapABTokenChunks * 4u;
                     // (Guarded: this discarded branch is not template-dependent.)
+                    // Wide tasks: the partial spans kPhaseTiles adjacent 8 KB slots (the
+                    // slot index space is per packed tile: n_block * kPhaseTiles).
                     DG_STATIC_ASSERT(!(kSplitKL1 || kSplitKL2) ||
                                      kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
-                                     fused_layout::kSM90SplitKL1PartialBytes,
+                                     fused_layout::kSM90SplitKL1PartialBytes * kPhaseTiles,
                                      "Split-K partial slot size mismatch");
                     DG_STATIC_ASSERT(fused_layout::kSM90SplitKL1NumKSplits == 2,
                                      "L1 split-K handshake assumes one publisher and one finisher half");
-                    DG_STATIC_ASSERT(!kBlockIsL2 || kWGHalves == kSwapABWeightHalves,
-                                     "Split-K L2 expects both weight halves per WG");
                     // Publisher p (k_split_idx < num_k_splits - 1) owns partial slot p;
                     // the finisher (last split) sums slots 0 .. num_k_splits - 2.
                     const auto slot_of = [&](const uint32_t& publisher_idx) -> float* {
                         return kBlockIsL2 ?
                             workspace.get_splitk_l2_scratch_ptr(pool_block_idx, n_block_idx, publisher_idx) :
-                            workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx);
+                            workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx * kPhaseTiles);
                     };
                     float* slot = slot_of(k_split_idx);
                     uint32_t* flag = kBlockIsL2 ?
@@ -4342,7 +4483,7 @@
                         workspace.get_splitk_l1_flag_ptr(pool_block_idx, n_block_idx);
                     if (k_split_idx + 1u < num_k_splits) {
                         #pragma unroll
-                        for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
                                 #pragma unroll
@@ -4364,7 +4505,7 @@
                     for (uint32_t pub = 0; pub + 1u < num_k_splits; ++ pub) {
                         const float* pslot = slot_of(pub);
                         #pragma unroll
-                        for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
                             #pragma unroll
                             for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
                                 #pragma unroll
@@ -4419,12 +4560,19 @@
                     // Half-tile tasks: only WG0's warps hold the reduced accumulators.
                     constexpr uint32_t reduce_warp_count =
                         kHalfTileTasks ? kNumEpilogueWarps / 2 : kNumEpilogueWarps;
+                    // L2 SF groups of this task (wide L1 tasks: 2, WG w owns group w): the
+                    // per-token amax is reduced over the kWarpsPerSFGroup warps of a group.
+                    constexpr uint32_t kWarpsPerSFGroup = reduce_warp_count / kL1SFGroups;
+                    DG_STATIC_ASSERT(kL1SFGroups == 1 || kWarpsPerSFGroup == 4,
+                                     "Wide L1 tasks: one SF group per WG (4 warps)");
+                    const uint32_t sf_group_of_warp =
+                        kL1SFGroups == 1 ? 0u : (epilogue_warp_idx - reduce_warp_start) / kWarpsPerSFGroup;
                     const uint32_t scale_token_thread = epilogue_thread_idx;
                     constexpr uint32_t scale_token_stride = kNumEpilogueThreads;
                     const uint32_t sf_base_k_idx =
                         n_block_idx * L1_OUT_BLOCK_N / kL2ActsSFGranK;
-                    float swap_v0[kSwapABWeightHalves][kSwapABTokenChunks] = {};
-                    float swap_v1[kSwapABWeightHalves][kSwapABTokenChunks] = {};
+                    float swap_v0[kWGHalves][kSwapABTokenChunks] = {};
+                    float swap_v1[kWGHalves][kSwapABTokenChunks] = {};
 
                     auto store_l1_swap_chunk = [&](const uint32_t& i) {
                         const uint32_t token_0 = i * 8 + col_idx * 2;
@@ -4433,7 +4581,7 @@
                         float v0_amax = 0.0f;
                         float v1_amax = 0.0f;
                         #pragma unroll
-                        for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
                             const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
                             // swapAB: WGMMA rows are weight rows; r_0 = gate, r_1 = up.
                             const float gate_scale = l1_scale_at(half * 64u + r_0);
@@ -4493,14 +4641,17 @@
 
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
-                    for (uint32_t token = scale_token_thread;
-                         token < valid_m;
-                         token += scale_token_stride) {
+                    for (uint32_t token_group = scale_token_thread;
+                         token_group < valid_m * kL1SFGroups;
+                         token_group += scale_token_stride) {
+                        const uint32_t token = token_group / kL1SFGroups;
+                        const uint32_t sf_group = token_group % kL1SFGroups;
+                        const uint32_t group_warp_start = reduce_warp_start + sf_group * kWarpsPerSFGroup;
                         float amax = 0.0f;
                         #pragma unroll
-                        for (uint32_t w = 0; w < reduce_warp_count; ++ w)
+                        for (uint32_t w = 0; w < kWarpsPerSFGroup; ++ w)
                             amax = cute::max(
-                                amax, smem_cd_l1_shared_sf[token * kNumEpilogueWarps + reduce_warp_start + w]);
+                                amax, smem_cd_l1_shared_sf[token * kNumEpilogueWarps + group_warp_start + w]);
                         float2 amax_pair = {amax, amax};
                         float2 sf_pair, sf_inv_pair;
                         if constexpr (kQoQ) {
@@ -4523,10 +4674,10 @@
                         } else {
                             auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
                             const uint32_t token_idx = m_idx + token;
-                            sf_base_ptr[sf_base_k_idx * kNumPaddedSFPoolTokens + token_idx] =
+                            sf_base_ptr[(sf_base_k_idx + sf_group) * kNumPaddedSFPoolTokens + token_idx] =
                                 sf_pair.x;
                         }
-                        smem_cd_l1_shared_sf[token * kNumEpilogueWarps + reduce_warp_start] = sf_inv_pair.x;
+                        smem_cd_l1_shared_sf[token * kNumEpilogueWarps + group_warp_start] = sf_inv_pair.x;
                     }
 
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
@@ -4537,18 +4688,19 @@
                         const uint32_t token_0 = i * 8 + col_idx * 2;
                         const uint32_t token_1 = token_0 + 1;
                         #pragma unroll
-                        for (uint32_t half = 0; half < kSwapABWeightHalves; ++ half) {
+                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
                             const uint32_t out_col_base =
                                 wg_l1_out_n_idx + half * 32u + warp_idx_in_wg * 8 + row_idx;
+                            const uint32_t sf_inv_slot = reduce_warp_start + sf_group_of_warp * kWarpsPerSFGroup;
                             if (token_0 < valid_m) {
                                 const float sf_inv =
-                                    smem_cd_l1_shared_sf[token_0 * kNumEpilogueWarps + reduce_warp_start];
+                                    smem_cd_l1_shared_sf[token_0 * kNumEpilogueWarps + sf_inv_slot];
                                 reinterpret_cast<uint8_t*>(smem_cd_l1)[token_0 * L1_OUT_BLOCK_N + out_col_base] =
                                     quantize_l1_out_byte(swap_v0[half][i] * sf_inv);
                             }
                             if (token_1 < valid_m) {
                                 const float sf_inv =
-                                    smem_cd_l1_shared_sf[token_1 * kNumEpilogueWarps + reduce_warp_start];
+                                    smem_cd_l1_shared_sf[token_1 * kNumEpilogueWarps + sf_inv_slot];
                                 reinterpret_cast<uint8_t*>(smem_cd_l1)[token_1 * L1_OUT_BLOCK_N + out_col_base] =
                                     quantize_l1_out_byte(swap_v1[half][i] * sf_inv);
                             }

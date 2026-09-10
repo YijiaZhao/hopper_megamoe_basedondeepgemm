@@ -416,11 +416,10 @@ struct InterleavedMegaMoEScheduler {
     DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid L1 K shape");
     DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid L2 K shape");
     DG_STATIC_ASSERT(kNumL1BlockNs <= 64, "L1 readiness mask is too small");
-    DG_STATIC_ASSERT(kNumL2BlockNs >= kNumL1BlockNs,
-                     "Alternating scheduler requires at least as many L2 tasks as L1 tasks");
-    // With split-K the L1 task count per M block (kNumL1BlockNs * kNumL1KSplits)
-    // exceeds the L2 count; `get_num_l1_warmup_waves` accounts for the surplus
-    // through its per-M-block task difference term.
+    // More L1 than L2 tasks per M block (split-K L1 all-task splits, or wide L2 tasks
+    // with BN256 L1 tasks: 10 vs 6) is handled by `get_num_l1_warmup_waves` through
+    // its per-M-block task difference term (extra L1-first waves), so no L2-claim
+    // can outrun the L1 indices it depends on.
     DG_STATIC_ASSERT(kNumL1KSplits >= 1 && kNumL1KSplits <= 255, "Invalid L1 K-split count");
     DG_STATIC_ASSERT(kNumL2KSplits >= 1 && kNumL2KSplits <= 255, "Invalid L2 K-split count");
     DG_STATIC_ASSERT(L2_SHAPE_K <= 0xffffu, "L2 K extent must fit the TaskInfo shape_k field");

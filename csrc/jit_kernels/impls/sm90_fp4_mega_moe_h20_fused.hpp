@@ -61,6 +61,8 @@ public:
         int l2_prefetch_k_blocks;
         bool split_k_l1_all;
         bool split_k_l2_all;
+        int l1_task_tiles;
+        int l2_task_tiles;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -132,7 +134,9 @@ public:
             "        /* kL2PrefetchMaxMB */ {},\n"
             "        /* kL2PrefetchKBlocks */ {},\n"
             "        /* kSplitKL1All */ {},\n"
-            "        /* kSplitKL2All */ {}",
+            "        /* kSplitKL2All */ {},\n"
+            "        /* kL1TaskTiles */ {},\n"
+            "        /* kL2TaskTiles */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -169,7 +173,9 @@ public:
             args.l2_prefetch_max_mb,
             args.l2_prefetch_k_blocks,
             args.split_k_l1_all ? "true" : "false",
-            args.split_k_l2_all ? "true" : "false");
+            args.split_k_l2_all ? "true" : "false",
+            args.l1_task_tiles,
+            args.l2_task_tiles);
         return fmt::format(R"(
 {}
 
@@ -250,12 +256,33 @@ static void sm90_fp4_h20_fused_mega_moe(
     const int num_experts = num_experts_per_rank * num_ranks;
     const int num_sms = device_runtime->get_num_sms();
     const int num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
+    // Wide (512-row, two packed tiles) L1 / L2 tasks (kernel `kWideTiles`, template
+    // kL1TaskTiles / kL2TaskTiles): DG_FP4_L1_BN / DG_FP4_L2_BN in {256, 512} (default
+    // 256), applied only to launches whose global token upper bound (tokens per rank
+    // x ranks) lies in [DG_FP4_BN512_MIN_M, DG_FP4_BN512_MAX_M] (default 16..16: the
+    // customer's M=16 = 2 rows per rank; M=2/4/8 (1 row per rank -> bound 8) and
+    // M=128/512 are untouched) and to the BM8 MXFP4/QoQ RF swapAB dense tier (checked
+    // below). At M=16 the BN256 L1 phase is ~160 tasks on 78 SMs (2.05 waves + tail
+    // split-K) and L2 ~180 (2.3 waves); a wide task does twice the work per stage
+    // chain (4 x 64-row halves per WG, one K128 block per stage) so the L1 phase
+    // becomes ~80 tasks == one wave. See the kernel body for the design and the
+    // report for the H20 A/B.
+    const int wide_bn_l1_env = get_env<int>("DG_FP4_L1_BN", 256);
+    const int wide_bn_l2_env = get_env<int>("DG_FP4_L2_BN", 256);
+    DG_HOST_ASSERT((wide_bn_l1_env == 256 || wide_bn_l1_env == 512) &&
+                   (wide_bn_l2_env == 256 || wide_bn_l2_env == 512));
+    const int num_global_tokens_upper = num_tokens * num_ranks;
+    const bool wide_m_ok = num_global_tokens_upper >= get_env<int>("DG_FP4_BN512_MIN_M", 16) &&
+                           num_global_tokens_upper <= get_env<int>("DG_FP4_BN512_MAX_M", 16);
+    const bool wide_request = (mxfp4 || qoq) && wide_m_ok &&
+                              (wide_bn_l1_env == 512 || wide_bn_l2_env == 512);
     const SM90FP4H20FusedInput heuristic_input {
         num_sms,
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden, num_padded_sf_pool_tokens,
         /* rf_decode */ mxfp4 || qoq,
+        /* wide_tiles */ wide_request,
     };
     const auto plan = select_sm90_nvfp4_h200_fused(heuristic_input);
     const auto& config = plan.config;
@@ -280,6 +307,16 @@ static void sm90_fp4_h20_fused_mega_moe(
     }
     // QoQ W4A8 is implemented for the swapAB tiers only (<= 64 tokens per rank).
     DG_HOST_ASSERT(!qoq || plan.swap_ab);
+    // Wide tasks: BM8 RF swapAB dense tier only (the heuristic already chose one
+    // K-block per stage for this launch when `wide_request`).
+    const bool wide_tier = wide_request && plan.swap_ab && config.block_m == 8 &&
+        config.block_n == 256 && plan.use_interleaved_scheduler && dense_weight_tiles;
+    const int l1_task_tiles = (wide_tier && wide_bn_l1_env == 512) ? 2 : 1;
+    const int l2_task_tiles = (wide_tier && wide_bn_l2_env == 512) ? 2 : 1;
+    const bool wide_tiles = l1_task_tiles > 1 || l2_task_tiles > 1;
+    // A wide request only changes the heuristic's BM8 stage depth, so a non-BM8 plan
+    // (larger M) simply ignores it; a BM8 plan of a MXFP4/QoQ host always qualifies.
+    DG_HOST_ASSERT(!wide_request || wide_tier || config.block_m != 8);
 
     // Half-tile tasks (kernel `kHalfTileTasks`, master gate
     // fused_layout::kSM90FusedHalfTileTasks): the BM8 MXFP4 RF swapAB tier
@@ -291,7 +328,7 @@ static void sm90_fp4_h20_fused_mega_moe(
     // count per rank cannot tell M=2 from M=8 (both 1 token/rank), so this is an
     // explicit knob rather than a tier rule.
     const bool half_tile_tasks = fused_layout::kSM90FusedHalfTileTasks &&
-        mxfp4 && plan.swap_ab && config.block_m == 8 &&
+        mxfp4 && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
         get_env<int>("DG_FP4_HALF_TILE", 0) != 0;
     // L1 split-K tasks (kernel `kSplitKL1`): the BM8 MXFP4 RF swapAB tier claims
     // the L1 tasks of the last partial L1 wave as two K halves on two SMs (cross-CTA fp32
@@ -321,7 +358,7 @@ static void sm90_fp4_h20_fused_mega_moe(
     // task (29 vs 22.7 us; one ON cubin spills, STACK 56). Kernel end M8 73.3-73.9
     // vs 62.9-63.8, M16 115.8-116.0 vs 87.1-99.9. Default OFF; DG_FP4_L2_HALFROW=1
     // enables it (numerics verified: T=2/8/16/128/512 + QoQ pass).
-    const bool l2_half_row_tasks = mxfp4 && plan.swap_ab && config.block_m == 8 &&
+    const bool l2_half_row_tasks = mxfp4 && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
         !half_tile_tasks && plan.use_interleaved_scheduler && dense_weight_tiles &&
         get_env<int>("DG_FP4_L2_HALFROW", 0) != 0;
     // L2 split-K tasks (kernel `kSplitKL2`): the L2 tasks of the last L2 claim
@@ -354,7 +391,7 @@ static void sm90_fp4_h20_fused_mega_moe(
     // 3-way reduce lengthens the finisher epilogue (1.8 -> 2.6 us) without moving
     // the combine end. Default stays 0. Exclusive with L2 half-row tasks.
     const int split_k_l2_env = get_env<int>("DG_FP4_SPLITK_L2", 0);
-    const bool split_k_l2 = mxfp4 && plan.swap_ab && config.block_m == 8 &&
+    const bool split_k_l2 = mxfp4 && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
         dense_weight_tiles && split_k_l2_env != 0;
     const uint32_t split_k_l2_ways = split_k_l2_env >= 3 ? 3u : 2u;
@@ -377,7 +414,7 @@ static void sm90_fp4_h20_fused_mega_moe(
     const bool m16_rows = num_tokens == 2 && num_ranks == 8;
     const bool split_k_l1_all = split_k_l1 && m16_rows &&
         get_env<int>("DG_FP4_SPLITK_L1_ALL", 0) != 0;
-    const bool split_k_l2_all = mxfp4 && plan.swap_ab && config.block_m == 8 &&
+    const bool split_k_l2_all = mxfp4 && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
         dense_weight_tiles && m16_rows && get_env<int>("DG_FP4_SPLITK_L2_ALL", 0) != 0;
     // Stream-K (kernel `kStreamK`): for tiny M the (task, K128 block) units of the
@@ -431,8 +468,7 @@ static void sm90_fp4_h20_fused_mega_moe(
     // note the E2E fused medians moved the other way (+1.3..+5.2 us, 4/4 points) with
     // the same captures -- to be understood before the E2E number is quoted with the
     // knob on. DG_FP4_STREAMK=0 restores the wave scheduler at every M.
-    const int num_global_tokens_upper = num_tokens * num_ranks;
-    const bool stream_k = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
+    const bool stream_k = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
         dense_weight_tiles && get_env<int>("DG_FP4_STREAMK", 1) != 0 &&
         num_global_tokens_upper <= get_env<int>("DG_FP4_STREAMK_MAX_M", 8);
@@ -443,7 +479,7 @@ static void sm90_fp4_h20_fused_mega_moe(
     // split-K tails and stream-K scheduler are off for that launch. DG_FP4_TINYM=1
     // enables (default 0 until the path is validated and measured; see the tinym
     // design note); DG_FP4_TINYM_PREFETCH (1..4, default 2) sets the units in flight.
-    const bool tinym = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
+    const bool tinym = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
         config.block_n == 256 && !half_tile_tasks && !l2_half_row_tasks &&
         plan.use_interleaved_scheduler && dense_weight_tiles &&
         get_env<int>("DG_FP4_TINYM", 0) != 0 &&
@@ -567,15 +603,17 @@ static void sm90_fp4_h20_fused_mega_moe(
     // 62.3/62.9 -> 108.7/108.1, M16 78.0/83.8 -> 150.9/152.2; QoQ M2 44.1/43.1 -> 58.2/53.2,
     // M8 72.2/60.4 -> 109.2/107.6, M16 81.4/81.3 -> 149.4/145.2. See
     // docs/fuse_l1l2_design.md "Result". Kept as a documented negative-result knob.
-    const bool fuse_l1l2 = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
+    const bool fuse_l1l2 = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
         config.block_n == 256 && !half_tile_tasks && !l2_half_row_tasks && !tinym &&
         plan.use_interleaved_scheduler && dense_weight_tiles &&
         get_sm90_fp4_h20_bm8_k_blocks_per_stage() == 2 &&
         get_env<int>("DG_FP4_FUSE_L1L2", 0) != 0 &&
         num_global_tokens_upper <= get_env<int>("DG_FP4_FUSE_L1L2_MAX_M", 16);
-    const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
+    const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n * l1_task_tiles;
     constexpr int kL1ScaleGranK = 128;
-    const int l2_scale_gran_k = task_block_n / 2;
+    // L2 activation scale granularity: one per L1 output K128 (per 64 with half-tile
+    // tasks); a wide L1 task publishes two such groups (one per WG).
+    const int l2_scale_gran_k = half_tile_tasks ? task_block_n / 2 : 128;
     const auto tensor_map_l1_acts = make_tma_2d_desc(
         l1_acts, hidden, config.num_max_pool_tokens,
         KernelConfig::kBlockK, config.block_m,
@@ -671,7 +709,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         // be in flight while the other is consumed (vs 3 x 40 KB), so the L1 and L2
         // phases lose 5-6 us / 2-5 us. Default 2 (the 4-block kernel also carries
         // 16 B of ptxas spill at 168 regs; the 2-block one has none).
-        .k_blocks_per_stage = (mxfp4 || qoq) ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 2,
+        .k_blocks_per_stage = wide_tiles ? 1 :
+            ((mxfp4 || qoq) ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 2),
         .tinym = tinym,
         .tinym_prefetch = tinym_prefetch,
         .push_dispatch = push_dispatch,
@@ -755,6 +794,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l2_prefetch_k_blocks = std::clamp(get_env<int>("DG_FP4_L2_PREFETCH_KBLOCKS", 0), 0, 24),
         .split_k_l1_all = split_k_l1_all && !tinym && !stream_k,
         .split_k_l2_all = split_k_l2_all && !tinym && !stream_k && !fuse_l1l2,
+        .l1_task_tiles = l1_task_tiles,
+        .l2_task_tiles = l2_task_tiles,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -800,7 +841,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0) ? "_rawu8" : "") +
-        (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "");
+        (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "") +
+        (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

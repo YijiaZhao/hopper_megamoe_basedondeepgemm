@@ -75,6 +75,10 @@ struct SM90FP4H20FusedInput {
     // RF-decode swapAB hosts (MXFP4, QoQ; kernel `kRFDecode`) run multi-K-block
     // BM8 stages; NVFP4 keeps one K-block per stage (>= 4 stages).
     bool rf_decode = false;
+    // Wide (2 packed tiles == 512-row) L1 and/or L2 tasks requested for this launch
+    // (host env DG_FP4_L1_BN / DG_FP4_L2_BN, see the host): the BM8 RF tier then
+    // carries ONE K128 block per stage (1 KB A + 40 KB B) in >= 4 stages.
+    bool wide_tiles = false;
 
     SM90FP4H20FusedShape shape() const noexcept {
         return {
@@ -122,7 +126,7 @@ select_sm90_nvfp4_h200_fused(
     // stages = 173056 B) or 4 (4 KB + 80 KB + 4 slots, 2 stages = 173056 B); both
     // keep 8 K-blocks in flight at the smem capacity. DG_FP4_BM8_STAGES overrides
     // the depth (kernel static-asserts 2..4 for 2 blocks, exactly 2 for 4 blocks).
-    const int bm8_k_blocks = input.rf_decode ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 1;
+    const int bm8_k_blocks = (input.rf_decode && !input.wide_tiles) ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 1;
     const int bm8_stages = bm8_k_blocks == 4 ? 2 :
         std::clamp(get_env<int>("DG_FP4_BM8_STAGES", 4), bm8_k_blocks == 2 ? 2 : 4, bm8_k_blocks == 2 ? 4 : 7);
     if (input.num_tokens <= 1)

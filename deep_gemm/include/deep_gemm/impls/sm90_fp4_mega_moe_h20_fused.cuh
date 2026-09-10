@@ -558,7 +558,12 @@ template <
     // rows == 2 only): every L1 / L2 task of the launch is claimed as K-split halves
     // (scheduler `kSplitL1All` / `kSplitL2All`) instead of only the last partial wave.
     bool kSplitKL1All = false,
-    bool kSplitKL2All = false
+    bool kSplitKL2All = false,
+    // Wide tasks (host env DG_FP4_L1_BN / DG_FP4_L2_BN = 512, gated by
+    // DG_FP4_BN512_MIN_M / DG_FP4_BN512_MAX_M on the global token count): packed
+    // 256-row weight tiles per L1 / L2 task (1 or 2). See `kWideTiles` in the body.
+    uint32_t kL1TaskTiles = 1,
+    uint32_t kL2TaskTiles = 1
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
