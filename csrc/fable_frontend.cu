@@ -298,77 +298,24 @@ __device__ __forceinline__ void topk_softmax_token_tiny(
     }
     __syncthreads();
     stamp(stamps, 4);
-    // CTA-wide radix select of the kTopK-th largest key (4 passes x 8 bits, 256-bin
-    // smem histogram; keys are unique so the final bin holds exactly one key). Then
-    // the <= kTopK keys >= threshold are gathered and ranked by warp 0. Same result as
-    // kTopK rounds of (value desc, id asc) argmax; ~half the latency (no 40-deep
-    // shuffle chain).
-    __shared__ int hist[256];
-    __shared__ int s_bin, s_need, s_cnt;
-    __shared__ uint32_t s_sel[kTopK];
-    const uint32_t k0 = key_s[threadIdx.x];
-    const uint32_t k1 = threadIdx.x + kThreads < kPerLane * 32 ? key_s[threadIdx.x + kThreads] : 0u;
-    static_assert(kPerLane * 32 <= 2 * kThreads, "two keys per thread");
-    uint32_t prefix = 0, mask = 0;
-    int need = kTopK;
-    if (threadIdx.x == 0) s_cnt = 0;
-    #pragma unroll
-    for (int pass = 0; pass < 4; ++pass) {
-        const int shift = 24 - 8 * pass;
-        hist[threadIdx.x] = 0;
-        __syncthreads();
-        if ((k0 & mask) == prefix) atomicAdd(&hist[(k0 >> shift) & 255], 1);
-        if (k1 != 0u && (k1 & mask) == prefix) atomicAdd(&hist[(k1 >> shift) & 255], 1);
-        __syncthreads();
-        if (threadIdx.x < 32) {
-            int local[8], lsum = 0;
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) { local[j] = hist[8 * lane + j]; lsum += local[j]; }
-            int run = lsum;                          // inclusive suffix sum over lanes >= lane
-            #pragma unroll
-            for (int o = 1; o < 32; o <<= 1) {
-                const int v = __shfl_down_sync(0xffffffffu, run, o);
-                if (lane + o < 32) run += v;
-            }
-            const int above = run - lsum;            // keys in bins above this lane's 8 bins
-            if (above < need && above + lsum >= need) {
-                int cum = above;
-                #pragma unroll
-                for (int j = 7; j >= 0; --j) {
-                    if (cum + local[j] >= need) { s_bin = 8 * lane + j; s_need = need - cum; break; }
-                    cum += local[j];
-                }
-            }
-        }
-        __syncthreads();
-        prefix |= static_cast<uint32_t>(s_bin) << shift;
-        mask |= 255u << shift;
-        need = s_need;
-        __syncthreads();
-    }
-    const uint32_t thresh = prefix;                  // exact key of the kTopK-th largest
-    if (k0 >= thresh) s_sel[atomicAdd(&s_cnt, 1)] = k0;
-    if (k1 != 0u && k1 >= thresh) s_sel[atomicAdd(&s_cnt, 1)] = k1;
-    __syncthreads();
-    stamp(stamps, 5);
     if (threadIdx.x >= 32) return;
-    uint32_t cand[kTopK];
+    uint32_t key[kPerLane];
     #pragma unroll
-    for (int j = 0; j < kTopK; ++j) cand[j] = s_sel[j];
+    for (int i = 0; i < kPerLane; ++i) key[i] = key_s[lane + 32 * i];
+    // Everything below is fully unrolled (compile-time kTopK) so sel_*/ex_v stay in registers.
     float sel_v[kTopK];
     int sel_i[kTopK];
     #pragma unroll
-    for (int k = 0; k < kTopK; ++k) {                // sel[k] = candidate of rank k (descending)
-        uint32_t pick = 0;
+    for (int k = 0; k < kTopK; ++k) {
+        uint32_t best = 0;
         #pragma unroll
-        for (int j = 0; j < kTopK; ++j) {
-            int rank = 0;
-            #pragma unroll
-            for (int i = 0; i < kTopK; ++i) rank += cand[i] > cand[j];
-            pick = rank == k ? cand[j] : pick;
-        }
-        sel_v[k] = topk_key_value(pick); sel_i[k] = topk_key_index(pick);
+        for (int i = 0; i < kPerLane; ++i) best = max(best, key[i]);
+        best = warp_max_u32(best);
+        sel_v[k] = topk_key_value(best); sel_i[k] = topk_key_index(best);
+        #pragma unroll
+        for (int i = 0; i < kPerLane; ++i) key[i] = key[i] == best ? 0u : key[i];
     }
+    stamp(stamps, 5);
     float mx = sel_v[0];
     #pragma unroll
     for (int k = 1; k < kTopK; ++k) mx = fmaxf(mx, sel_v[k]);

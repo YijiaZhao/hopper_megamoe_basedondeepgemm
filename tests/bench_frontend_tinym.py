@@ -54,7 +54,7 @@ def attribution(stamps_list, num_router_ctas, m):
     print(line("quant start", q[:, 0])); print(line("quant done", q[:, 1]))
     print(line("ticket seen (topk go)", q[:, 2]))
     if q[:, 4].max() > 0:
-        print(line("  partials loaded", q[:, 4])); print(line("  select done", q[:, 5]))
+        print(line("  partials loaded", q[:, 4])); print(line("  8 rounds done", q[:, 5]))
     print(line("topk done (kernel end)", q[:, 3]))
     late = int((r[:, 0] > r[:, 3].min()).sum())
     print(f"    router CTAs that started after the first router CTA finished (2nd wave): {late}")
