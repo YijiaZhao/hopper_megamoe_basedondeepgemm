@@ -255,6 +255,11 @@ CUTLASS_DEVICE void red_add_rel_sys(const int* ptr, const int& value) {
     asm volatile("red.release.sys.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value));
 }
 
+// Release gpu-scope 64-bit add (no return)
+CUTLASS_DEVICE void red_add_rel_gpu(const uint64_t* ptr, const uint64_t& value) {
+    asm volatile("red.release.gpu.global.add.u64 [%0], %1;" :: "l"(ptr), "l"(value));
+}
+
 // Relaxed sys-scope OR (no return): ordered by a later release.sys of the issuer
 CUTLASS_DEVICE void red_or_sys(const uint32_t* ptr, const uint32_t& value) {
     asm volatile("red.relaxed.sys.global.or.b32 [%0], %1;" :: "l"(ptr), "r"(value));
