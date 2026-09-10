@@ -2611,7 +2611,13 @@
                     // vs the old 2 sets x 2 chains) at no gain (H20 09-09: M8 1413/1420 vs
                     // 1381/1501 ns per stage, M16 1558 vs 1547/1487), so the dependent
                     // RS-wgmma chain is not the stage floor; 2 chains kept.
-                    constexpr uint32_t kAccChains = 2u;
+                    // Third math WG: ONE chain per (set, half). The two sets are per row
+                    // group there (+8 regs `final_accum_g1` on top), and at the 152-register
+                    // budget the two-chain layout made ptxas serialise the QoQ wgmmas (C7512,
+                    // "insufficient register resources") and spill 32/48 B inside the MXFP4
+                    // loop; with three WGs feeding the tensor pipe the dependent 4-deep chain
+                    // per unit is hidden by the other WGs' groups anyway.
+                    constexpr uint32_t kAccChains = kThreeMathWGs ? 1u : 2u;
                     swap_accum_t swap_accum[kNumAccKBlocks][kSFGroups][kWGHalves][kAccChains][kSwapAccum];
                     // Inline s2 may rotate 3 or 4 A-fragment buffers (kQoQInlineS2Frags,
                     // DG_FP4_QIS2_FRAGS); every other loop uses exactly two.

@@ -24,7 +24,14 @@ for kv in "mxfp4=$M/kernel.cu" "qoq=$Q/kernel.cu"; do
   ( taskset -c "$cores" bash "$here/regbudget_compile.sh" "$out/$name.cu" "$out" "${name}_w3" -DDG_FP4_MATH_WGS=3 >> "$out/summary.txt" ) &
 done
 wait
-for c in "$out"/*_w3.cubin; do
-  [ -f "$c" ] && bash "$here/regbudget_sass.sh" "$c" >> "$out/summary.txt"
+for c in "$out"/*_w2.cubin "$out"/*_w3.cubin; do
+  [ -f "$c" ] || continue
+  bash "$here/regbudget_sass.sh" "$c" >> "$out/summary.txt"
+  # Full drains per wgmma: a count close to the GMMA count means ptxas serialised the
+  # loop (C7512 "insufficient register resources" / C7518 divergent-path fences).
+  echo "   DEPBAR.LE gsb0,0x0: $(grep -c 'DEPBAR.LE gsb0, 0x0' "${c%.cubin}.sass")" >> "$out/summary.txt"
+done
+for l in "$out"/*_w2.log "$out"/*_w3.log; do
+  [ -f "$l" ] && echo "$(basename "$l"): $(grep -o '(C75[0-9]*) Potential Performance Loss: [^,]*' "$l" | sort | uniq -c | tr -s ' ' | tr '\n' ';')" >> "$out/summary.txt"
 done
 echo DONE >> "$out/summary.txt"
