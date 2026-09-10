@@ -12,6 +12,12 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 TAG=${1:-}
 RES=${RES:-/raid/kimi/results}
+# Generic knob A/B: KNOB (host env name), MARK (our *_RUNNING marker suffix), PREFIX
+# (result dir prefix). Defaults keep the original DG_FP4_FUSE_L1L2 behaviour; e.g.
+# KNOB=DG_FP4_STREAMK MARK=SK PREFIX=sk_customer MODE=customer TOKENS_LIST="2 4".
+KNOB=${KNOB:-DG_FP4_FUSE_L1L2}
+MARK=${MARK:-FUSE}
+PREFIX=${PREFIX:-fuse_customer}
 PASSES=${PASSES:-2}
 export TOKENS_LIST=${TOKENS_LIST:-"2 8 16"}
 # verify (default): the H20 boxes are locked at 1830 MHz on the host; the container cannot -lgc
@@ -20,14 +26,14 @@ MODE=${MODE:-all}  # customer | skewfree | all
 export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PYTHONPATH="$ROOT"
 mkdir -p "$RES"
-echo "$$ $(date)" > "$RES/CAPTURE_FUSE_RUNNING"
-trap 'rm -f "$RES/CAPTURE_FUSE_RUNNING"' EXIT
+echo "$$ $(date)" > "$RES/CAPTURE_${MARK}_RUNNING"
+trap 'rm -f "$RES/CAPTURE_${MARK}_RUNNING"' EXIT
 # Strict coordination: no other *_RUNNING marker of any kind (ours excepted) and no
 # compute process on any GPU, re-checked 10 s later, before every matrix; a matrix whose
 # capture exits non-zero (the capture script's own per-case idle checks fail when another
 # job appears mid-matrix) is discarded and re-captured (up to 3 attempts).
 other_markers() {
-  ls "$RES"/*_RUNNING 2>/dev/null | grep -v "/CAPTURE_FUSE_RUNNING$"
+  ls "$RES"/*_RUNNING 2>/dev/null | grep -v "/CAPTURE_${MARK}_RUNNING$"
 }
 gpus_free() {
   [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && [ -z "$(other_markers)" ]
@@ -45,7 +51,7 @@ echo "build $(git rev-parse --short HEAD) $(date)"
 [ "$MODE" = skewfree ] || for pass in $(seq 1 "$PASSES"); do
   knobs="0 1"; [ $((pass % 2)) -eq 0 ] && knobs="1 0"
   for knob in $knobs; do
-    OUT="$RES/fuse_customer${TAG}_k${knob}_p${pass}"
+    OUT="$RES/${PREFIX}${TAG}_k${knob}_p${pass}"
     if [ "${SKIP_DONE:-0}" = 1 ] && [ -f "$OUT/TIMELINE_LAST3.csv" ]; then
       echo "=== customer capture knob=$knob pass=$pass -> $OUT already complete, kept"
       cat "$OUT/TIMELINE_LAST3.csv"; continue
@@ -58,7 +64,7 @@ echo "build $(git rev-parse --short HEAD) $(date)"
       attempt=$((attempt + 1))
       wait_idle || exit 1
       echo "=== customer capture knob=$knob pass=$pass attempt=$attempt -> $OUT $(date)"
-      OUT="$OUT" RESUME=1 DG_FP4_FUSE_L1L2=$knob timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
+      OUT="$OUT" RESUME=1 env "$KNOB=$knob" timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
       rc=$?
       echo "CAPTURE_EXIT=$rc $(date) (clean reports so far: $(ls "$OUT"/*.nsys-rep 2>/dev/null | wc -l))"
       [ "$rc" -eq 0 ] && break
@@ -73,6 +79,6 @@ echo CUSTOMER_AB_DONE
 [ "$MODE" = customer ] && exit 0
 # Footnote: skew-free (host barrier) min-over-devices, mega fused only
 wait_idle || exit 1
-KNOB=DG_FP4_FUSE_L1L2 OFF=0 ON=1 PASSES="$PASSES" bash scripts/run_knob_nsys_ab.sh \
-  "$RES/fuse_l1l2_skewfree$TAG" mxfp4:8 mxfp4:2 mxfp4:16 qoq:8 qoq:16
+KNOB="$KNOB" OFF=0 ON=1 PASSES="$PASSES" bash scripts/run_knob_nsys_ab.sh \
+  "$RES/${PREFIX}_skewfree$TAG" mxfp4:8 mxfp4:2 mxfp4:16 qoq:8 qoq:16
 echo SKEWFREE_AB_DONE

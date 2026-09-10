@@ -104,6 +104,18 @@ def _run(api, args, rank, group):
     topk_weights = torch.full(
         (args.tokens, args.topk), 1.0 / args.topk,
         device="cuda", dtype=torch.float32)
+    # --global-tokens M < world (tokens must be 1): mirror the profile scripts' owner
+    # layout (tests/profile_four_api_h20.py local_tokens: one token on the first M // 2
+    # ranks of each TP4 half, M=2 -> ranks 0,4; M=4 -> ranks 0,1,4,5); the other ranks
+    # carry one padded row (topk_idx -1, weight 0). This is the only way to reach the
+    # launches where the fused kernel's tiny-M schedulers (stream-K) actually activate.
+    active = True
+    if args.global_tokens is not None and args.global_tokens < world:
+        assert args.tokens == 1, "--global-tokens < world needs --tokens 1"
+        active = (rank % 4) < args.global_tokens // 2
+        if not active:
+            topk_idx.fill_(-1)
+            topk_weights.zero_()
 
     if is_qoq:
         xq, xs = per_token_cast_to_int8(x_bf, gran_k=128)
@@ -173,7 +185,7 @@ def _run(api, args, rank, group):
         for token in range(global_tokens):
             for slot in range(args.topk):
                 expert = int(idx_all[token, slot])
-                if expert // local_experts != rank:
+                if expert < 0 or expert // local_experts != rank:
                     continue
                 local_expert = expert % local_experts
                 l1 = d1[local_expert].float() @ x_all[token]
@@ -186,6 +198,12 @@ def _run(api, args, rank, group):
         dist.all_reduce(routes, op=dist.ReduceOp.SUM, group=group)
         ref_all = routes.sum(dim=1).to(torch.bfloat16).float()
         ref = ref_all[rank * args.tokens:(rank + 1) * args.tokens]
+        if not active:
+            # Padded row: the kernel output is not part of the check (finite only);
+            # contribute a neutral (identical) pair to the collective metrics.
+            assert torch.isfinite(y).all(), api
+            y = torch.ones_like(y)
+            ref = torch.ones_like(ref)
         metrics = _metrics(y, ref, group)
         if rank == 0:
             print(
@@ -207,6 +225,8 @@ def main():
         "mxfp4_mega_moe_split", "qoq_mega_moe_split",
         "mxfp4_mega_moe_fused", "qoq_mega_moe_fused"])
     parser.add_argument("--tokens", type=int, default=1)
+    parser.add_argument("--global-tokens", type=int, default=None,
+                        help="< 8: owner-rank layout with --tokens 1 (2 -> ranks 0,4; 4 -> 0,1,4,5)")
     parser.add_argument("--hidden", type=int, default=3072)
     parser.add_argument("--intermediate", type=int, default=1280)
     parser.add_argument("--experts", type=int, default=384)
