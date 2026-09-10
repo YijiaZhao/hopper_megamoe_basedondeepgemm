@@ -2559,8 +2559,17 @@
                     // the per-token activation scale is applied once at task end, so no
                     // per-K128 accumulator readout / tensor-pipe drain sits in the loop.
                     // 2-K-block stages only (the 1-/4-block loops keep the promote path).
+                    // Third math WG (kThreeMathWGs): inline s2 is OFF. Its whole-task int32
+                    // sets are read-modify-write wgmma operands for the entire K loop, so ptxas
+                    // must pin both row-group sets next to both fragment buffers; at the
+                    // 152-register budget that spilled 166 / 248 B (34 sites inside the IGMMA
+                    // range; prefetch off, one chain) whereas the per-block promote pattern
+                    // (fresh set per block, same as MXFP4) compiles with 16 B of cold
+                    // probe-bookkeeping stack only. The per-block drain it re-introduces is
+                    // hidden by the other two WGs' groups on the tensor pipe.
                     constexpr bool kInlineS2 = kQoQ && kQoQInlineS2 && !kBlockIsL2 &&
-                                               !kHalfTileTasks && kKBlocksPerStage == 2;
+                                               !kHalfTileTasks && kKBlocksPerStage == 2 &&
+                                               !kThreeMathWGs;
                     // The plain 2-fragment-buffer inline-s2 loop takes two knobs
                     // (host env DG_FP4_QIS2_PREFETCH_PACKED / DG_FP4_QIS2_RAWU8):
                     //  * prefetch: the next block's packed words are loaded (LDS) before
