@@ -5,9 +5,12 @@
 #            owner-rank launches where stream-K actually activates: --tokens 1
 #            --global-tokens 2 / 4 (STREAMK=1 and =0)
 #   stress : 200-iteration graph-replay probe at M=2 and M=4 with STREAMK=1
-#   ab     : official capture, TOKENS_LIST="2 4", knob 0/1, PASSES passes (run_fuse_customer_ab.sh
-#            with KNOB=DG_FP4_STREAMK; result dirs $RES/sk_customer_k{0,1}_p{1,2})
-#   m8     : one official capture TOKENS_LIST="8" with knob 1 ($RES/sk_customer_m8_k1_p1)
+#   ab     : official capture, TOKENS_LIST="2 4", knob 0/1, PASSES (default 5) independent
+#            captures each (run_fuse_customer_ab.sh with KNOB=DG_FP4_STREAMK; result dirs
+#            $RES/sk_customer_k{0,1}_p{1..5}); the report is the median across captures of
+#            the customer number (GPU0 last-3 median) plus min/max
+#   m8     : M8_PASSES (default 3) official captures TOKENS_LIST="8" with knob 1
+#            ($RES/sk_customer_m8_k1_p{1..3}), the wave-path gate check
 # GPU discipline as run_fuse_customer_ab.sh (60 s continuous idle, no foreign *_RUNNING marker,
 # our marker CAPTURE_SK_RUNNING only while a GPU job runs).
 # Usage (inside four_api_build): [MODE=all] bash scripts/run_sk_customer_ab.sh
@@ -16,7 +19,8 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 MODE=${MODE:-all}
 RES=${RES:-/raid/kimi/results}
-export PASSES=${PASSES:-2}
+export PASSES=${PASSES:-5}
+M8_PASSES=${M8_PASSES:-3}
 export PYTHONPATH="$ROOT"
 export CUDA_HOME=/usr/local/cuda
 export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -94,14 +98,16 @@ if [ "$MODE" = ab ] || [ "$MODE" = all ]; then
 fi
 
 if [ "$MODE" = m8 ] || [ "$MODE" = all ]; then
-  OUT="$RES/sk_customer_m8_k1_p1"
-  if [ ! -f "$OUT/TIMELINE_LAST3.csv" ]; then
-    echo "=== m8 knob=1 capture -> $OUT $(date)" >> "$LOG"
-    DG_FP4_STREAMK=1 OUT="$OUT" RESUME=1 TOKENS_LIST="8" FORCE=1 run_gpu "m8 k1" \
-      timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
-    [ -f "$OUT/TIMELINE_LAST3.csv" ] && python3 scripts/reconcile_nsys_devices.py --last 3 \
-      "$OUT"/*_fused_*.nsys-rep > "$OUT/reconcile_fused.txt" 2>&1
-  fi
+  for p in $(seq 1 "$M8_PASSES"); do
+    OUT="$RES/sk_customer_m8_k1_p$p"
+    if [ ! -f "$OUT/TIMELINE_LAST3.csv" ]; then
+      echo "=== m8 knob=1 capture pass=$p -> $OUT $(date)" >> "$LOG"
+      DG_FP4_STREAMK=1 OUT="$OUT" RESUME=1 TOKENS_LIST="8" FORCE=1 run_gpu "m8 k1 p$p" \
+        timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
+      [ -f "$OUT/TIMELINE_LAST3.csv" ] && python3 scripts/reconcile_nsys_devices.py --last 3 \
+        "$OUT"/*_fused_*.nsys-rep > "$OUT/reconcile_fused.txt" 2>&1
+    fi
+  done
   echo M8_DONE >> "$LOG"
 fi
 echo ALL_DONE >> "$LOG"
