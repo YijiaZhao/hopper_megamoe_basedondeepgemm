@@ -28,13 +28,20 @@ export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_fou
 export PYTHONUNBUFFERED=1
 unset DG_W4A8_INT DG_W4A8_INT_PRE DG_W4A8_INT_SHADOW
 mkdir -p "$RES"
+# Mutual exclusion with run_fuse_customer_ab.sh (which holds CAPTURE_FUSE_RUNNING for its
+# whole run and waits on CAPTURE_M*_RUNNING): yield to it only BEFORE publishing our own
+# marker, never after (both sides waiting on each other would deadlock).
+for i in $(seq 1 3600); do
+  ls "$RES"/CAPTURE_FUSE_RUNNING "$RES"/OFFICIAL_*_RUNNING "$RES"/CAPTURE_RUNNING >/dev/null 2>&1 || break
+  sleep 5
+done
 echo "$$ $(date)" > "$RES/CAPTURE_MCMB_RUNNING"
 trap 'rm -f "$RES/CAPTURE_MCMB_RUNNING"' EXIT
 wait_idle() {
   local i
   for i in $(seq 1 1800); do
     if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] &&
-       ! ls "$RES"/OFFICIAL_*_RUNNING "$RES"/CAPTURE_RUNNING "$RES"/CAPTURE_FUSE_RUNNING >/dev/null 2>&1; then return 0; fi
+       ! ls "$RES"/OFFICIAL_*_RUNNING "$RES"/CAPTURE_RUNNING >/dev/null 2>&1; then return 0; fi
     sleep 2
   done
   echo "GPUs busy after 1 h" >&2; return 1
