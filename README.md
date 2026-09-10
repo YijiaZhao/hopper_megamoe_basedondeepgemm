@@ -257,7 +257,56 @@ including the real inter-kernel gap.  `Target span` in E2E is measured from
 Fable frontend start through MegaMoE completion.  It is not a sum of unrelated
 kernel statistics and is not aggregated across GPUs.
 
-## Final locked-clock performance results
+## Tiny-M optimisation results (2026-09-10)
+
+Same method and machine as the delivery table below (`10.6.131.7`, eight H20 GPUs
+locked at **1830 MHz**, `scripts/capture_four_api_h20_timelines.sh`, GPU 0 median
+of the final three complete spans).  Values are microseconds.  Mega-only Fused is
+the customer comparison column; targets were M2 < 53, M8 < 61, M16 < 85.
+
+| Precision | M | Mega-only Fused (delivery 2026-09-04) | Mega-only Fused (now) | E2E Fused (delivery) | E2E Fused (now) |
+|---|---:|---:|---:|---:|---:|
+| MXFP4 | 2  | 62.432  | **42.9**  | 100.640 | 74.5–96.8 |
+| MXFP4 | 4  | –       | **~49**   | –       | 85.6–88.3 |
+| MXFP4 | 8  | 87.584  | **56.4–59.1** | 105.440 | 75.5–89.2 |
+| MXFP4 | 16 | 115.232 | **74.0–83.4** | 147.008 | 108.5 |
+| QOQ   | 2  | 64.192  | **44.1**  | 107.584 | 74.0–94.3 |
+| QOQ   | 4  | –       | **48.0**  | –       | – |
+| QOQ   | 8  | 92.608  | **54.9–59.3** | 110.144 | 90.3 |
+| QOQ   | 16 | 123.712 | **74.0**  | 153.504 | 105.6–109.3 |
+
+M2/M4 values are medians over five independent captures (branch tip with
+`DG_FP4_STREAMK` default on); M8/M16 are the range over the r4/r5 captures
+(`docs/` and `delivery/four_api_fable_timeline_last3_r4_20260909.md`,
+`..._r5_20260909.md`).  Ranges reflect host launch skew between the eight
+ranks, not kernel variance: the kernel duration on the latest-starting rank
+agrees to within 1.5 us across captures.  Adding `dist.barrier()` before each
+graph replay in the profiling driver (`DG_PROFILE_HOST_BARRIER=1`) removes
+most of that skew (e.g. MXFP4 M8 110.8 -> 57.6 in one A/B).
+
+Changes that produced these numbers (all default on unless noted; every knob
+has an env override documented in `csrc/jit_kernels/impls/sm90_fp4_mega_moe_h20_fused.hpp`):
+
+| Change | Env knob | Effect |
+|---|---|---|
+| RS register decode for QoQ (int4 -> int8 in the WGMMA A fragments) | – | QoQ inherits the MXFP4 RF pipeline |
+| QoQ inline s2 (LiquidGEMM byte-lane dequant, whole-K int32 accumulate, one promote per task) | `DG_FP4_QOQ_INLINE_S2` | QoQ stage -22%, no per-K128 accumulator read-out |
+| wgmma pipeline un-serialisation (device CALLs removed, loop-exit `wait<0>`) | – | ptxas no longer wraps every IGMMA in ARRIVE/DEPBAR |
+| Fine-grained combine (per-token arrival counters replace NVLink barrier #2) | `DG_FP4_FINE_COMBINE` | -3/-6 us at M8/M16 |
+| Push-model dispatch (sender pushes rows + remote ticket; no pull round trip) | `DG_FP4_PUSH_DISPATCH` | first math ~1.5 us after barrier #1 instead of ~7.5 |
+| Lean routing (non-zero experts only, no broadcast under push) | `DG_FP4_LEAN_ROUTING` | pre-barrier routing shortened |
+| Per-rank DONE flags replace NVLink barrier #1 (push path) | `DG_FP4_PUSH_DONE_FLAGS` | -1 us |
+| QoQ packed-word prefetch inside the RF loop | `DG_FP4_QIS2_PREFETCH_PACKED` | M16 -3..-6 us (probe) |
+| stream-K for M <= 4 (units spread over all 78 SMs) | `DG_FP4_STREAMK` (`_MAX_M`) | MXFP4 M2 49.7 -> 42.9 |
+| Tiny-M Fable frontend (router + top-8 + quant) | `DG_FE_TINYM` | FE kernel 13.7 -> 6.9 us (in progress) |
+
+Measured and kept off (documented negative results): 4 K-blocks per stage,
+per-M knob sweep, tiny-M CUDA-core GEMV path (`DG_FP4_TINYM`), whole-expert L2
+weight prefetch (`DG_FP4_L2_PREFETCH_ALL`), two-layer L1/L2 fusion
+(`DG_FP4_FUSE_L1L2`), dynamic combine claim (`DG_FP4_COMBINE_DYNAMIC`), L2
+tail split-K, raw-u8 deferred affine dequant.
+
+## Baseline delivery results (2026-09-04, locked clock)
 
 The following values were captured on `10.6.131.7` with all eight H20 GPUs
 explicitly locked at **1830 MHz**. All values are microseconds and are the
