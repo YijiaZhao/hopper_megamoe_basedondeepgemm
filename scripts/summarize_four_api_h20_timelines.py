@@ -7,6 +7,7 @@ kernel start through the L2 kernel end, including the inter-kernel gap. E2E is
 measured from the Fable frontend start through MegaMoE completion.
 """
 import argparse
+import os
 import csv
 import json
 import pathlib
@@ -192,10 +193,15 @@ def check_complete_matrix(rows, m_key="M", quant_key="quant"):
     if not m_values:
         raise RuntimeError("no reports found")
     keys = {(row["scope"], row["backend"], row[quant_key], row[m_key]) for row in rows}
+    # Sub-matrix captures (capture_four_api_h20_timelines.sh SCOPES/BACKENDS/QUANTS) export
+    # the same variables; default = full customer matrix.
+    scopes = os.environ.get("SCOPES", "e2e mega").split()
+    backends = os.environ.get("BACKENDS", "split fused").split()
+    quants = os.environ.get("QUANTS", "mxfp4 qoq").split()
     expected = {
         (scope, backend, quant, m_value)
-        for scope in ("e2e", "mega") for backend in ("split", "fused")
-        for quant in ("mxfp4", "qoq") for m_value in m_values
+        for scope in scopes for backend in backends
+        for quant in quants for m_value in m_values
     }
     if keys != expected or len(rows) != len(expected):
         raise RuntimeError(
