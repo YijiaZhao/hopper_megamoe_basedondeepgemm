@@ -608,6 +608,14 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
     constexpr uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32;
     constexpr uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32;
     constexpr uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4;
+    // Math warpgroups (DG_FP4_MATH_WGS): 2 = the two epilogue WGs (shipped kernel);
+    // 3 = one extra K-block-rotation WG on the tiny-M BM8 RF swapAB tier
+    // (`kThreeMathWGs` in the body). The epilogue / combine / CTA-wide barrier
+    // membership stays kNumEpilogueThreads (WG0 + WG1); the third WG only runs the
+    // K loop, hands its partial accumulators over through SMEM and exits.
+    constexpr uint32_t kNumMathWarpgroups = DG_FP4_MATH_WGS;
+    constexpr uint32_t kNumMathWarps = kNumMathWarpgroups * 4;
+    constexpr uint32_t kNumMathThreads = kNumMathWarpgroups * 128;
     constexpr uint32_t kNumTokensPerWarp = 32 / kNumTopk;
     constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
 #include <deep_gemm/impls/sm90_fp4_mega_moe_h20_fused_body.inl>

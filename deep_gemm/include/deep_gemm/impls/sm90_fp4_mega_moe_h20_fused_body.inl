@@ -408,6 +408,24 @@
     // the int8 RS atoms (int32 accumulators, s2[row] * s_act[token] promote).
     DG_STATIC_ASSERT(!(kMXFP4 && kQoQ), "MXFP4 and QoQ are exclusive");
     constexpr bool kRFDecode = kSwapABRequested && (kMXFP4 || kQoQ);
+    // Third math warpgroup (kThreeMathWGs; host env DG_FP4_MATH_WGS=3, gated to the
+    // tiny-M BM8 RF swapAB tier with 2 K128 blocks per stage; docs/third_math_wg.md).
+    // K-block rotation: the K128 blocks of a task are numbered g = 0, 1, 2, ... (stage
+    // s holds g = 2s, 2s + 1) and block g belongs to math WG g mod 3. The owner
+    // decodes and multiplies BOTH 128-row groups of its block (row group p = 0 / 1 ==
+    // today's WG0 / WG1 rows, same per-(block, row group) RF decode + 8 RS WGMMAs, frag
+    // buffer p, accumulator set p), so every WG carries partial accumulators for both
+    // row groups (`final_accum` / `final_accum_g1`). Per stage exactly two distinct
+    // WGs own its two blocks, so the empty-barrier arrival count (8 warps) is
+    // unchanged. At task end the three partials are reduced through SMEM
+    // (`smem_ksplit_reduce`, fixed order WG0 + WG1 + WG2: exact for the int32 QoQ
+    // inline-s2 sum, fp32 reassociation for MXFP4) into WG p's `final_accum` for row
+    // group p, and the unchanged two-WG epilogue (incl. split-K / stream-K partial
+    // publish) runs on WG0 + WG1; WG2 does not take part in any epilogue / combine /
+    // CTA-wide barrier (kNumEpilogueThreads stays 256).
+    constexpr bool kThreeMathWGs = kNumMathWarpgroups == 3;
+    DG_STATIC_ASSERT(kNumMathWarpgroups == 2 || kNumMathWarpgroups == 3,
+                     "DG_FP4_MATH_WGS must be 2 or 3");
     // Tiny-M CUDA-core GEMV (kTinyMGemv; host env DG_FP4_TINYM, gated by
     // DG_FP4_TINYM_MAX_M): the math warps stream the dense weight tiles with plain
     // 16 B loads and HFMA2 (MXFP4) / DP4A (QoQ) instead of the TMA + RS-WGMMA task
@@ -445,6 +463,12 @@
                      "Even K-block counts (L1 whole stages) are required");
     DG_STATIC_ASSERT(kKBlocksPerStage == 1 || !kSplitMDecodedWeightReuse,
                      "Multi-K-block stages are not implemented for the BM128 split-M path");
+    DG_STATIC_ASSERT(!kThreeMathWGs ||
+                     (kRFDecode && BLOCK_M == 8 && BLOCK_N == 256 && kKBlocksPerStage == 2 &&
+                      kNumEpilogueWarpgroups == 2 && !kHalfTileTasks && !kL2HalfRowTasks &&
+                      !kTinyMGemv && !kFuseL1L2 && !kSwapPipelineDecode && !kRFPrefetchPacked &&
+                      kUseInterleavedScheduler && kDenseWeightTiles),
+                     "Third math WG: tiny-M BM8 RF swapAB tier, 2 K128 blocks per stage, dense BN256 tiles");
     DG_STATIC_ASSERT(!kHalfTileTasks ||
                      (kRFDecode && kKBlocksPerStage == 2 && kNumEpilogueWarpgroups == 2 &&
                       BLOCK_N == 256 && kDenseWeightTiles),
@@ -605,8 +629,11 @@
     // Half-tile tasks: WG1 -> WG0 accumulator hand-off, [element][128 threads] floats
     // (the swapAB accumulators a thread actually uses: 2 halves x token chunks x 4).
     constexpr uint32_t kKSplitReduceElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
+    // Third math WG (kThreeMathWGs): [WG][row group][element][128 threads] floats
+    // (3 x 2 x 8 x 128 x 4 B = 24 KB for BM8), same element order.
     constexpr uint32_t SMEM_KSPLIT_REDUCE_SIZE =
-        kHalfTileTasks ? 128u * kKSplitReduceElems * static_cast<uint32_t>(sizeof(float)) : 0u;
+        kHalfTileTasks ? 128u * kKSplitReduceElems * static_cast<uint32_t>(sizeof(float)) :
+        kThreeMathWGs ? kNumMathWarpgroups * 2u * 128u * kKSplitReduceElems * static_cast<uint32_t>(sizeof(float)) : 0u;
     // Fused L1+L2 (kFuseL1L2): the SW128 [BLOCK_M x K128] int8/fp8 intermediate tile
     // (1 KB, 1024 B aligned: the WGMMA B operand of the W2 slice, same layout the L2
     // A-loader's TMA produces) followed by BLOCK_M per-token SF floats.
@@ -777,7 +804,8 @@
                      i < interleaved_scheduler_t::kNumScheduleStages;
                      ++ i) {
                     task_info_full_barriers[i].init(1);
-                    task_info_empty_barriers[i].init(kNumEpilogueWarps);
+                    // Every math warp (incl. the third WG's) releases the mailbox slot once per task.
+                    task_info_empty_barriers[i].init(kNumMathWarps);
                 }
             }
         }
@@ -829,7 +857,8 @@
     constexpr uint32_t kEpilogueFullBarrierIdx          = 2;
     constexpr uint32_t kEpilogueWGBarrierStartIdx       = 3;
     constexpr uint32_t kSplitMDecodeBarrierIdx          = 8;
-    constexpr uint32_t kKSplitReduceBarrierIdx          = 9;  // kHalfTileTasks WG1 -> WG0
+    constexpr uint32_t kKSplitReduceBarrierIdx          = 9;  // kHalfTileTasks WG1 -> WG0; kThreeMathWGs partials written
+    constexpr uint32_t kWG3HandoffReadDoneBarrierIdx    = 10; // kThreeMathWGs: WG0/WG1 read done (WG2 WAR guard)
 
     // Cross-rank NVLink barrier tags
     constexpr uint32_t kBeforeDispatchPullBarrierTag    = 1;
@@ -839,9 +868,9 @@
     // Register reconfiguration counts (chosen to fit in 64512 reg budget).
     // Compile-time overrides (register-budget experiments, -D on the nvcc line):
     // DG_FP4_DISPATCH_REGS / DG_FP4_NONEPI_REGS / DG_FP4_EPI_REGS. With
-    // DG_FP4_MATH_WGS=3 the budget is 128 producer + 384 math threads, so the math
-    // WGs get at most 144 (non-epilogue 64) or 152 (non-epilogue 40).
-    constexpr uint32_t kNumMathWarpGroupsLaunch = DG_FP4_MATH_WGS;
+    // DG_FP4_MATH_WGS=3 the budget is 128 producer + 384 math threads: the phase-1
+    // matrix (docs/third_math_wg.md) picked math 152 / loaders 40 / dispatch 48
+    // (64*48 + 64*40 + 384*152 = 64000; QoQ 0 spill, MXFP4 4 B outside the loops).
 #ifdef DG_FP4_DISPATCH_REGS
     constexpr uint32_t kNumDispatchRegisters    = DG_FP4_DISPATCH_REGS;
 #else
@@ -851,16 +880,16 @@
     constexpr uint32_t kNumNonEpilogueRegisters = DG_FP4_NONEPI_REGS;
 #else
     constexpr uint32_t kNumNonEpilogueRegisters =
-        kUseInterleavedScheduler ? 64 : 40;
+        kThreeMathWGs ? 40 : (kUseInterleavedScheduler ? 64 : 40);
 #endif
 #ifdef DG_FP4_EPI_REGS
     constexpr uint32_t kNumEpilogueRegisters    = DG_FP4_EPI_REGS;
 #else
-    constexpr uint32_t kNumEpilogueRegisters    = kNumMathWarpGroupsLaunch == 2 ? 208 : 144;
+    constexpr uint32_t kNumEpilogueRegisters    = kThreeMathWGs ? 152 : 208;
 #endif
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
-                     kNumEpilogueRegisters * (128 * kNumMathWarpGroupsLaunch) <= 64512,
+                     kNumEpilogueRegisters * kNumMathThreads <= 64512,
                      "Too many registers");
 
     constexpr uint32_t kDispatchGridSyncIndex = 0;
@@ -1947,6 +1976,11 @@
         const uint32_t epilogue_wg_idx    = epilogue_warp_idx / 4;
         const uint32_t epilogue_thread_idx = epilogue_warp_idx * 32 + lane_idx;
         const uint32_t warp_idx_in_wg     = epilogue_warp_idx % 4;
+        // Third math WG (kThreeMathWGs): K loop + partial hand-off only; it skips
+        // every kNumEpilogueThreads / dispatch+epilogue barrier and the combine.
+        const bool is_extra_math_wg = kThreeMathWGs && epilogue_wg_idx >= kNumEpilogueWarpgroups;
+        // Hand-off WAR guard state (see the hand-off in run_math_task_impl).
+        bool wg3_first_handoff = true;
 
         const auto arrive_empty_barrier = [&](const uint32_t& s) {
             if (lane_idx == 0)
@@ -1973,8 +2007,9 @@
                          (WG_BLOCK_M == L1WGMMA::M and WG_BLOCK_N == L1WGMMA::N),
                          "Split-N WGs must each run one M64N128 WGMMA per K-block");
 
-        // Sync with dispatch
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        // Sync with dispatch (the third math WG is not a member of this barrier)
+        if (!is_extra_math_wg)
+            ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Fine-grained combine: this CTA's mailbox producer sequence (CTA-uniform;
         // only epilogue thread 0 writes). Baseline = the word's value left by the
@@ -2021,6 +2056,10 @@
             const uint32_t n_idx = n_block_idx * kTaskBlockN + wg_n_idx;
             const uint32_t ksplit_kb = kHalfTileTasks ? epilogue_wg_idx : 0u;
             const bool is_epilogue_wg = !kHalfTileTasks || epilogue_wg_idx == 0;
+            // Row base of the RF decode / promote (packed-row addressing). Equal to
+            // wg_n_idx except in the third-math-WG loop, which sets it to the row group
+            // (0 / kWGBlockN) of the unit being decoded.
+            uint32_t rf_n_idx = wg_n_idx;
             const uint32_t row_block_offset =
                 kSplitMDecodedWeightReuse ? epilogue_wg_idx * WG_BLOCK_M : 0u;
             // Fine-grained combine: called by every epilogue thread right after the
@@ -2072,6 +2111,10 @@
             using WGMMA = L1WGMMA;
             constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum;  // 64 for M=64,N=128
             float final_accum[kAccumPerThread] = {};
+            // Third math WG (kThreeMathWGs): this WG's partial for row group 1 (rows
+            // [kWGBlockN, 2 kWGBlockN) of the task); `final_accum` holds row group 0.
+            // Unused (dead) in the two-WG kernel.
+            float final_accum_g1[kAccumPerThread] = {};
 
             // L2 swapAB epilogue for L2 N-block `l2_n_block_idx` from `final_accum`: BF16 x
             // per-row scale -> smem, 16-lane NVLink row scatter, CTA barrier, combine
@@ -2550,8 +2593,11 @@
                     // >2 K-blocks per stage: two accumulator sets alternate (acc[b & 1]);
                     // block b is promoted right after wait<1> following issue(b+1), which
                     // frees its set for block b+2 (4 sets = +32 regs would spill).
+                    // Third math WG: set p holds row group p of the WG's current block
+                    // (inline s2: two whole-task int32 sets, one per row group).
                     constexpr uint32_t kNumAccKBlocks =
-                        (kHalfTileTasks || (kInlineS2 && !kQIS2RawU8)) ? 1u : cute::min(kKBlocksPerStage, 2u);
+                        (kHalfTileTasks || (kInlineS2 && !kQIS2RawU8)) ? (kThreeMathWGs ? 2u : 1u)
+                                                                        : cute::min(kKBlocksPerStage, 2u);
                     // Per-64 L2 activation scales (kHalfTileTasks): K32 steps {0,1} and
                     // {2,3} of a K128 block accumulate separately (same commit group)
                     // and are promoted with their own SF row.
@@ -2613,7 +2659,7 @@
                             kb * kPackedBKBlockBytes;
                         #pragma unroll
                         for (uint32_t h = 0; h < kWGHalves; ++ h) {
-                            const uint32_t row_0 = wg_n_idx + h * 64u + r_0;
+                            const uint32_t row_0 = rf_n_idx + h * 64u + r_0;
                             const uint32_t row_1 = row_0 + 8u;
                             w[h][0] = *reinterpret_cast<const uint4*>(
                                 packed_rows + row_0 * 80u + col_idx * 16u);
@@ -2781,8 +2827,11 @@
                     // still resident in this stage); the two int32 chains are summed
                     // exactly, so the result is bit-exact vs the SS path's
                     // (scale * s2) * float(acc).
-                    const auto promote_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
-                                                      const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                    // `promote_stage_rf_to`: same, into an explicit destination (the third
+                    // math WG promotes row group 1 into `final_accum_g1`).
+                    const auto promote_stage_rf_to = [&](const uint32_t& stage, const uint32_t& kb,
+                                                         const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum],
+                                                         float (&final_accum)[kAccumPerThread]) {
                         #pragma unroll
                         for (uint32_t g = 0; g < kSFGroups; ++ g) {
                         const float* sfa = smem_sfa[stage] + (kb * kNumL2SFAGroups + g) * kL2SFAHalfStride;
@@ -2798,9 +2847,9 @@
                                 const auto* packed_rows =
                                     reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) + kb * kPackedBKBlockBytes;
                                 const uint32_t m0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                    packed_rows + (wg_n_idx + half * 64u + r_0) * 80u + 64u));
+                                    packed_rows + (rf_n_idx + half * 64u + r_0) * 80u + 64u));
                                 const uint32_t m1 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                    packed_rows + (wg_n_idx + half * 64u + r_1) * 80u + 64u));
+                                    packed_rows + (rf_n_idx + half * 64u + r_1) * 80u + 64u));
                                 s2_r0 = __uint_as_float(0x4B000000u | (m0 & 0xffu)) - 8388608.0f;
                                 s2_r1 = __uint_as_float(0x4B000000u | (m1 & 0xffu)) - 8388608.0f;
                             }
@@ -2856,6 +2905,10 @@
                         }
                         }
                     };
+                    const auto promote_stage_rf = [&](const uint32_t& stage, const uint32_t& kb,
+                                                      const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                        promote_stage_rf_to(stage, kb, acc, final_accum);
+                    };
 
                     // QoQ inline s2: the per-token activation scale (constant along K, see
                     // kInlineS2) is read once from the first stage's SFA slot (0 for padded
@@ -2871,7 +2924,8 @@
                             act_scale[i][1] = token_0 + 1 < valid_m ? raw_1 : 0.0f;
                         }
                     };
-                    const auto promote_task_rf = [&](const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                    const auto promote_task_rf_to = [&](const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum],
+                                                        float (&final_accum)[kAccumPerThread]) {
                         #pragma unroll
                         for (uint32_t half = 0; half < kWGHalves; ++ half) {
                             #pragma unroll
@@ -2889,6 +2943,9 @@
                                 }
                             }
                         }
+                    };
+                    const auto promote_task_rf = [&](const swap_accum_t (&acc)[kSFGroups][kWGHalves][kAccChains][kSwapAccum]) {
+                        promote_task_rf_to(acc, final_accum);
                     };
                     // Raw-u8 (kQIS2RawU8): colsum[tok] = sum over the K128 block of the int8
                     // activation tile, per (stage, block), by this WG's 128 threads right
@@ -2938,9 +2995,9 @@
                         #pragma unroll
                         for (uint32_t h = 0; h < kWGHalves; ++ h) {
                             const uint32_t m0 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                packed_rows + (wg_n_idx + h * 64u + r_0) * 80u + 64u));
+                                packed_rows + (rf_n_idx + h * 64u + r_0) * 80u + 64u));
                             const uint32_t m1 = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                packed_rows + (wg_n_idx + h * 64u + r_1) * 80u + 64u));
+                                packed_rows + (rf_n_idx + h * 64u + r_1) * 80u + 64u));
                             const int32_t s2_0 = static_cast<int32_t>(m0 & 0xffu);
                             const int32_t s2_1 = static_cast<int32_t>(m1 & 0xffu);
                             const int32_t zs_0 = -static_cast<int32_t>((m0 >> 8u) & 0xffu) * s2_0;
@@ -2979,9 +3036,219 @@
                         }
                     };
 
+                    // Third math WG (kThreeMathWGs): K-block rotation loop, see the definition
+                    // of kThreeMathWGs. This WG owns blocks g = epilogue_wg_idx, +3, +6, ... of
+                    // the task's K range; block g sits in task stage g / 2, slot g % 2 (ring
+                    // position / parity derived from the task-start pipeline state; the shared
+                    // state is advanced over the whole task at the end). Per owned block the
+                    // two units (g, row group 0) -> frag[0] / set 0 and (g, row group 1) ->
+                    // frag[1] / set 1 are each exactly one two-WG K-block decode + 8 RS WGMMAs
+                    // with rf_n_idx = p * kWGBlockN:
+                    //  * per-block promote (MXFP4, QoQ L2): issue(g,0); decode(g,1); issue(g,1);
+                    //    wait<1>; [next block: full barrier, decode(g',0) -> frag[0]]; wait<0>;
+                    //    promote set 0 -> final_accum, set 1 -> final_accum_g1; release the stage.
+                    //  * inline s2 (QoQ L1): the never-drained one-group lag of the plain
+                    //    inline-s2 loop, per block instead of per stage: issue(g,0); wait<1>
+                    //    (retires (g_prev,1): frag[1] free, release g_prev's stage); decode(g,1);
+                    //    issue(g,1); wait<1> (retires (g,0)); [full barrier]; decode(g',0).
+                    //    Task end: wait<0>, release the last stage, promote both sets once.
+                    //    Packed-word prefetch (kQIS2Prefetch) hoists the loads before the waits
+                    //    exactly as in the two-WG loop.
+                    // Releasing stage s needs stage s + 2 full (the next owned block), so the
+                    // ring must hold >= 3 stages. A WG that owns no block of a short
+                    // (stream-K) segment only releases the task mailbox slot. Probe slots (WG0
+                    // thread 0): 21 counts WG0's blocks, 22 = head-to-head per WG0 block
+                    // (~1.5 stages), 17/18/19/30/31 as in the two-WG loops; the kexp bit-4
+                    // experiment is not wired here.
+                    if constexpr (kThreeMathWGs) {
+                    DG_STATIC_ASSERT(kNumAccKBlocks == 2 && kFragBufs == 2 && kWGHalves == 2 && !kQIS2RawU8 &&
+                                     kKBlocksPerStage == 2 && kNumStages >= 3,
+                                     "Third math WG loop: two frag buffers / accumulator sets, two halves per unit, ring >= 3");
+                    const uint32_t g_first = epilogue_wg_idx;
+                    const auto ring_slot = [&](const uint32_t& g) -> uint32_t {
+                        return (stage_idx + g / kKBlocksPerStage) % kNumStages;
+                    };
+                    const auto ring_parity = [&](const uint32_t& g) -> uint32_t {
+                        return phase ^ (((stage_idx + g / kKBlocksPerStage) / kNumStages) & 1u);
+                    };
+                    const auto wait_full_block = [&](const uint32_t& g) {
+                        Barrier* bar = full_barriers[ring_slot(g)];
+                        const uint32_t par = ring_parity(g);
+                        if (!barrier_ready(bar, par)) {
+                            if constexpr (!kBlockIsL2)
+                                kstage_add(23, 1ull);
+                            bar->wait(par);
+                        }
+                    };
+                    const auto set_row_group = [&](const uint32_t& p) { rf_n_idx = p * kWGBlockN; };
+                    if constexpr (kInlineS2) {
+                        #pragma unroll
+                        for (uint32_t p = 0; p < 2; ++ p) {
+                            #pragma unroll
+                            for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                                #pragma unroll
+                                for (uint32_t c = 0; c < kAccChains; ++ c) {
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                        swap_accum[p][0][h][c][i] = 0;
+                                }
+                            }
+                        }
+                        // A WG without a block promotes zero sets with zero scales.
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kSwapAccum / 4; ++ i)
+                            act_scale[i][0] = act_scale[i][1] = 0.0f;
+                    }
+                    uint4 pf_w[kWGHalves][2];      // prefetched packed words (kQIS2Prefetch)
+                    uint32_t pf_sw[kWGHalves][2];
+                    if (g_first < num_k_blocks) {
+                        const unsigned long long kt_head = clock64();
+                        full_barriers[ring_slot(g_first)]->wait(ring_parity(g_first));
+                        if constexpr (!kBlockIsL2)
+                            { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
+                        if constexpr (kUseInterleavedScheduler)
+                            interleaved_scheduler.release_task_info(lane_idx);
+                        if constexpr (kInlineS2)
+                            capture_act_scale(ring_slot(g_first));
+                        set_row_group(0);
+                        decode_stage_rf(ring_slot(g_first), g_first % kKBlocksPerStage, frag[0]);
+                    } else if constexpr (kUseInterleavedScheduler) {
+                        // No block in this segment: the mailbox release is still owed (the
+                        // other WGs' releases after their first full stage keep the slot alive).
+                        interleaved_scheduler.release_task_info(lane_idx);
+                    }
+                    for (uint32_t g = g_first; g < num_k_blocks; g += kNumMathWarpgroups) {
+                        const unsigned long long kt_head = clock64();
+                        const uint32_t cur_slot = ring_slot(g);
+                        const uint32_t kb = g % kKBlocksPerStage;
+                        const uint32_t g_next = g + kNumMathWarpgroups;  // past the end: stale-slot decode
+                        const bool has_next = g_next < num_k_blocks;
+                        const uint32_t next_slot = ring_slot(g_next);
+                        const uint32_t next_kb = g_next % kKBlocksPerStage;
+                        if constexpr (!kBlockIsL2) {
+                            kstage_add(21, 1ull);
+                            if (g != g_first)
+                                kstage_add(22, kt_head - kstage_t_prev);
+                            kstage_t_prev = kt_head;
+                        }
+                        // (g, row group 0) -> set 0
+                        issue_stage_rf(cur_slot, kb, frag[0], swap_accum[0]);
+                        unsigned long long kt_b = clock64();
+                        kstage_add(31, kt_b - kt_head);
+                        if constexpr (kInlineS2) {
+                            set_row_group(1);
+                            if constexpr (kQIS2Prefetch)
+                                load_packed_rf(cur_slot, kb, pf_w, pf_sw);
+                            // Retire (g_prev, 1): frag[1] free, g_prev's stage fully read by this WG.
+                            fence_accum();
+                            ptx::warpgroup_wait<1>();
+                            fence_frag(frag[1]);
+                            if (g != g_first)
+                                arrive_empty_barrier(ring_slot(g - kNumMathWarpgroups));
+                            unsigned long long kt_a = clock64();
+                            kstage_add(19, kt_a - kt_b);
+                            if constexpr (kQIS2Prefetch)
+                                decode_words_rf(pf_w, pf_sw, frag[1]);
+                            else
+                                decode_stage_rf(cur_slot, kb, frag[1]);
+                            kt_b = clock64();
+                            kstage_add(18, kt_b - kt_a);
+                            // (g, row group 1) -> set 1
+                            issue_stage_rf(cur_slot, kb, frag[1], swap_accum[1]);
+                            kt_a = clock64();
+                            kstage_add(31, kt_a - kt_b);
+                            set_row_group(0);
+                            if constexpr (kQIS2Prefetch) {
+                                if (has_next)
+                                    wait_full_block(g_next);
+                                kt_b = clock64();
+                                kstage_add(17, kt_b - kt_a);
+                                load_packed_rf(next_slot, next_kb, pf_w, pf_sw);
+                                kt_a = clock64();
+                                kstage_add(18, kt_a - kt_b);
+                            }
+                            // Retire (g, 0) so frag[0] can take the next block's row group 0.
+                            fence_accum();
+                            ptx::warpgroup_wait<1>();
+                            fence_frag(frag[0]);
+                            kt_b = clock64();
+                            kstage_add(19, kt_b - kt_a);
+                            if constexpr (!kQIS2Prefetch) {
+                                if (has_next)
+                                    wait_full_block(g_next);
+                                kt_a = clock64();
+                                kstage_add(17, kt_a - kt_b);
+                            } else {
+                                kt_a = kt_b;
+                            }
+                            // Decoded unconditionally (stale slot after the last owned block).
+                            if constexpr (kQIS2Prefetch)
+                                decode_words_rf(pf_w, pf_sw, frag[0]);
+                            else
+                                decode_stage_rf(next_slot, next_kb, frag[0]);
+                            kt_b = clock64();
+                            kstage_add(18, kt_b - kt_a);
+                            if (!has_next) {
+                                fence_accum();
+                                ptx::warpgroup_wait<0>();
+                                fence_frag(frag[1]);
+                                arrive_empty_barrier(cur_slot);
+                                kt_a = clock64();
+                                kstage_add(19, kt_a - kt_b);
+                                promote_task_rf_to(swap_accum[0], final_accum);
+                                promote_task_rf_to(swap_accum[1], final_accum_g1);
+                                kstage_add(30, clock64() - kt_a);
+                            }
+                        } else {
+                            set_row_group(1);
+                            decode_stage_rf(cur_slot, kb, frag[1]);
+                            unsigned long long kt_a = clock64();
+                            kstage_add(18, kt_a - kt_b);
+                            // (g, row group 1) -> set 1
+                            issue_stage_rf(cur_slot, kb, frag[1], swap_accum[1]);
+                            kt_b = clock64();
+                            kstage_add(31, kt_b - kt_a);
+                            kt_a = kt_b;
+                            // Retire (g, 0) so frag[0] can take the next block's row group 0.
+                            fence_accum();
+                            ptx::warpgroup_wait<1>();
+                            fence_frag(frag[0]);
+                            kt_b = clock64();
+                            kstage_add(19, kt_b - kt_a);
+                            if (has_next) {
+                                wait_full_block(g_next);
+                                kt_a = clock64();
+                                if constexpr (!kBlockIsL2)
+                                    kstage_add(17, kt_a - kt_b);
+                                set_row_group(0);
+                                decode_stage_rf(next_slot, next_kb, frag[0]);
+                                kt_b = clock64();
+                                kstage_add(18, kt_b - kt_a);
+                            }
+                            fence_accum();
+                            ptx::warpgroup_wait<0>();
+                            fence_frag(frag[1]);
+                            kt_a = clock64();
+                            kstage_add(19, kt_a - kt_b);
+                            set_row_group(0);
+                            promote_stage_rf_to(cur_slot, kb, swap_accum[0], final_accum);
+                            set_row_group(1);
+                            promote_stage_rf_to(cur_slot, kb, swap_accum[1], final_accum_g1);
+                            kstage_add(30, clock64() - kt_a);
+                            arrive_empty_barrier(cur_slot);
+                        }
+                    }
+                    ptx::warpgroup_wait<0>();  // explicit drain on the loop exit path (ptxas C7518, see below)
+                    rf_n_idx = wg_n_idx;
+                    // Advance the shared pipeline state over the whole task (all WGs alike).
+                    {
+                        const uint32_t total = stage_idx + num_k_blocks / kKBlocksPerStage;
+                        stage_idx = total % kNumStages;
+                        phase ^= (total / kNumStages) & 1u;
+                    }
                     // Half-tile tasks use this one-K-block-per-WG loop too: WG w takes
                     // K-block ksplit_kb = w of every (2-K-block) stage.
-                    if constexpr (kKBlocksPerStage == 1 || kHalfTileTasks) {
+                    } else if constexpr (kKBlocksPerStage == 1 || kHalfTileTasks) {
                     // Software pipeline: the 8 WGMMAs of stage k are issued
                     // asynchronously; while the tensor cores run, the math warps wait
                     // for stage k+1's full barrier (the loader runs kNumStages ahead)
@@ -4193,6 +4460,61 @@
             }
             }  // kSwapPipelineDecode
 
+            // Third math WG (kThreeMathWGs): partial-accumulator hand-off. Every WG stores
+            // its two row-group partials ([WG][row group][element][128 threads] floats,
+            // conflict-free), all 384 math threads sync, then WG p (< 2) rebuilds
+            // `final_accum` for its epilogue row group p as (WG0 + WG1) + WG2 (fixed order:
+            // exact for the int32-derived QoQ inline-s2 sums, a deterministic fp32
+            // reassociation for MXFP4) and the two-WG epilogue below runs unchanged. WG2
+            // is done with the task. WAR: WG2 may run ahead into the next task's hand-off
+            // (short stream-K segments), so before overwriting the buffer it syncs on a
+            // second named barrier that WG0/WG1 arrive at after their reads; WG0 / WG1
+            // cannot overtake each other's reads (every epilogue path below passes a
+            // kNumEpilogueThreads barrier before the next task).
+            if constexpr (kThreeMathWGs) {
+                const uint32_t tid_in_wg = epilogue_thread_idx & 127u;
+                const auto slot = [&](const uint32_t& wg, const uint32_t& grp, const uint32_t& e) -> float& {
+                    return smem_ksplit_reduce[((wg * 2u + grp) * kKSplitReduceElems + e) * 128u + tid_in_wg];
+                };
+                if (is_extra_math_wg && !wg3_first_handoff)
+                    asm volatile("bar.sync %0, %1;" : :
+                                 "n"(kWG3HandoffReadDoneBarrierIdx), "n"(kNumMathThreads) : "memory");
+                #pragma unroll
+                for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 4; ++ j) {
+                            const uint32_t e = (h * kSwapABTokenChunks + i) * 4 + j;
+                            const uint32_t a = h * kSwapABHalfAccumPerThread + i * 4 + j;
+                            slot(epilogue_wg_idx, 0, e) = final_accum[a];
+                            slot(epilogue_wg_idx, 1, e) = final_accum_g1[a];
+                        }
+                    }
+                }
+                asm volatile("bar.sync %0, %1;" : :
+                             "n"(kKSplitReduceBarrierIdx), "n"(kNumMathThreads) : "memory");
+                if (is_extra_math_wg) {
+                    wg3_first_handoff = false;
+                    return;
+                }
+                #pragma unroll
+                for (uint32_t h = 0; h < kSwapABWeightHalves; ++ h) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < 4; ++ j) {
+                            const uint32_t e = (h * kSwapABTokenChunks + i) * 4 + j;
+                            const uint32_t a = h * kSwapABHalfAccumPerThread + i * 4 + j;
+                            final_accum[a] = (slot(0, epilogue_wg_idx, e) + slot(1, epilogue_wg_idx, e)) +
+                                             slot(2, epilogue_wg_idx, e);
+                        }
+                    }
+                }
+                asm volatile("bar.arrive %0, %1;" : :
+                             "n"(kWG3HandoffReadDoneBarrierIdx), "n"(kNumMathThreads) : "memory");
+            }
+
             // Skip epilogue when block is past valid M (the GEMM loop already
             // released its pipeline stages). Drain any prior L1 async store.
             if (valid_m == 0) {
@@ -4920,6 +5242,9 @@
         } else {
             for_each_static_selected_block(run_math_task);
         }
+        // Third math WG: no combine duty, not a member of any barrier below.
+        if (is_extra_math_wg)
+            return;
 
         // Fine-grained combine: tell the dispatch warps that this CTA's math tasks
         // are done (replaces the epilogue/dispatch pairing below).

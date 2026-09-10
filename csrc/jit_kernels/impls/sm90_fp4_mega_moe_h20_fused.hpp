@@ -61,6 +61,7 @@ public:
         int l2_prefetch_k_blocks;
         bool split_k_l1_all;
         bool split_k_l2_all;
+        int math_wgs;  // 2 (shipped) or 3 (kernel kThreeMathWGs, tiny-M BM8 tier)
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -89,10 +90,12 @@ public:
         const std::string kernel_header = fmt::format(
             "#define DG_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT 1\n"
             "#define DG_FP4_TINYM_PREFETCH {}\n"
+            "#define DG_FP4_MATH_WGS {}\n"
             "{}"
             "#define sm90_nvfp4_mega_moe_h200_fused_impl {}\n"
             "#include <deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh>",
             args.tinym_prefetch,
+            args.math_wgs,
             get_env<int>("DG_FP4_SPIN_TIMEOUT", 0) != 0 ? "#define DG_FUSED_SPIN_TIMEOUT 1\n" : "",
             kernel_symbol);
         const std::string policy_template_args = fmt::format(
@@ -564,6 +567,26 @@ static void sm90_fp4_h20_fused_mega_moe(
         get_sm90_fp4_h20_bm8_k_blocks_per_stage() == 2 &&
         get_env<int>("DG_FP4_FUSE_L1L2", 0) != 0 &&
         num_global_tokens_upper <= get_env<int>("DG_FP4_FUSE_L1L2_MAX_M", 16);
+    // Third math warpgroup (kernel `kThreeMathWGs`, DG_FP4_MATH_WGS, default 2;
+    // docs/third_math_wg.md): the tiny-M BM8 RF swapAB tier (2 K128 blocks per stage,
+    // dense BN256 tiles, >= 3 stages) launches 512 threads and a third math WG takes
+    // every third K128 block of a task (K-block rotation, both 128-row groups per
+    // block); the three partial accumulators are reduced through SMEM before the
+    // unchanged two-WG epilogue. setmaxnreg split 152 / 40 / 48. The large-M tiers
+    // spill at that budget and keep two WGs. Exclusive with the experiment knobs the
+    // rotation loop does not implement (RF / QIS2 variants other than the shipped
+    // 2-fragment inline-s2 + packed prefetch, half-tile / half-row tasks, tiny-M
+    // GEMV, fused L1+L2).
+    const int math_wgs = ((mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
+        config.block_n == 256 && config.num_stages >= 3 && !half_tile_tasks &&
+        !l2_half_row_tasks && !tinym && !fuse_l1l2 &&
+        plan.use_interleaved_scheduler && dense_weight_tiles &&
+        get_sm90_fp4_h20_bm8_k_blocks_per_stage() == 2 &&
+        get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) == 0 &&
+        !(qoq && (get_env<int>("DG_FP4_QIS2_ILV", 0) != 0 ||
+                  get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0 ||
+                  std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4) != 2)) &&
+        get_env<int>("DG_FP4_MATH_WGS", 2) == 3) ? 3 : 2;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;
@@ -746,6 +769,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l2_prefetch_k_blocks = std::clamp(get_env<int>("DG_FP4_L2_PREFETCH_KBLOCKS", 0), 0, 24),
         .split_k_l1_all = split_k_l1_all && !tinym && !stream_k,
         .split_k_l2_all = split_k_l2_all && !tinym && !stream_k && !fuse_l1l2,
+        .math_wgs = math_wgs,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -768,7 +792,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // kernel executes griddepcontrol.wait before touching frontend outputs).
         .launch_args = LaunchArgs(
             num_sms,
-            KernelConfig::kNumThreads,
+            KernelConfig::kNumThreads + 128 * (math_wgs - 2),
             config.smem_size, 1, true, get_env<int>("DG_FE_PDL", 0) != 0)
     };
 
@@ -791,7 +815,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0) ? "_rawu8" : "") +
-        (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "");
+        (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "") +
+        (math_wgs == 3 ? "_wg3" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }
