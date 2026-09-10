@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Capture the complete 24-report H20 delivery matrix.
+# Capture the complete H20 delivery matrix (2 scopes x 2 backends x 2 quants x
+# TOKENS_LIST). The customer method is TOKENS_LIST="2 8 16" -> 24 reports.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -10,6 +11,9 @@ GPU_IDLE_LIMIT_MIB=${GPU_IDLE_LIMIT_MIB:-64}
 GPU_IDLE_RETRIES=${GPU_IDLE_RETRIES:-45}
 LOCK_SM_CLOCK_MHZ=${LOCK_SM_CLOCK_MHZ:-1830}
 CLOCK_LOCK_MODE=${CLOCK_LOCK_MODE:-verify}
+TOKENS_LIST=${TOKENS_LIST:-"2 8 16"}
+read -r -a TOKENS <<< "$TOKENS_LIST"
+EXPECTED_COUNT=$((8 * ${#TOKENS[@]}))
 
 cd "$ROOT"
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
@@ -112,7 +116,7 @@ run_case() {
 for scope in e2e mega; do
   for backend in split fused; do
     for quant in mxfp4 qoq; do
-      for tokens in 2 8 16; do
+      for tokens in "${TOKENS[@]}"; do
         run_case "${scope}_${backend}_${quant}_M${tokens}" \
           "$scope" "$backend" "$quant" "$tokens"
       done
@@ -131,4 +135,4 @@ python3 scripts/summarize_four_api_h20_timelines.py "$OUT" | tee "$OUT/TIMELINE_
 python3 scripts/summarize_four_api_h20_last3.py "$OUT" >/dev/null
 count=$(find "$OUT" -maxdepth 1 -type f -name '*.nsys-rep' | wc -l)
 echo "TIMELINE_COUNT=$count"
-test "$count" -eq 24
+test "$count" -eq "$EXPECTED_COUNT"

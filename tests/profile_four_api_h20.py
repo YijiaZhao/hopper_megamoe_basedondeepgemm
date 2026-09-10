@@ -4,7 +4,7 @@ Matrix dimensions:
   scope:     e2e, mega
   backend:   split, fused
   quant:     mxfp4, qoq
-  global M:  2, 8, 16
+  global M:  2, 8, 16 (customer method); 4 supported as an extra point
 
 E2E captures TP4 ReduceScatter, router/activation-quant/TopK, MegaMoE, and TP4
 AllGather.  Only frontend+MegaMoE is placed in a CUDA graph because NCCL graph
@@ -201,8 +201,14 @@ def run_e2e(args, rank, tp_group, group):
 
 
 def local_tokens(global_tokens, rank):
-    if global_tokens == 2:
-        return 1 if rank in (0, 4) else 0
+    """Active rows on ``rank``; mirrors the E2E owner layout (token_id % TP per DP group).
+
+    M < WORLD: one token on the first M // 2 ranks of each of the two TP4 groups
+    (M=2 -> ranks 0,4; M=4 -> ranks 0,1,4,5); the remaining ranks carry zero active rows.
+    """
+    if global_tokens < WORLD:
+        per_dp = global_tokens // 2
+        return 1 if rank % TP < per_dp else 0
     return global_tokens // WORLD
 
 
@@ -275,7 +281,7 @@ def main():
     parser.add_argument("--scope", choices=("e2e", "mega"), required=True)
     parser.add_argument("--backend", choices=("split", "fused"), required=True)
     parser.add_argument("--quant", choices=("mxfp4", "qoq"), required=True)
-    parser.add_argument("--global-tokens", type=int, choices=(2, 8, 16), required=True)
+    parser.add_argument("--global-tokens", type=int, choices=(2, 4, 8, 16), required=True)
     args = parser.parse_args()
 
     rank = int(os.environ["RANK"])

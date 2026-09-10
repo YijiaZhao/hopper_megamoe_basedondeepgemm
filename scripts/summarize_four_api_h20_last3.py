@@ -6,7 +6,7 @@ import json
 import pathlib
 import statistics
 
-from summarize_four_api_h20_timelines import extract_final_three
+from summarize_four_api_h20_timelines import check_complete_matrix, extract_final_three
 
 
 def fmt(value):
@@ -44,8 +44,7 @@ def main():
             report=metadata["report"],
         ))
 
-    if len(rows) != 24:
-        raise RuntimeError(f"expected 24 reports, found {len(rows)}")
+    m_values = check_complete_matrix(rows, quant_key="precision")
     order_scope = {"e2e": 0, "mega": 1}
     order_quant = {"mxfp4": 0, "qoq": 1}
     order_backend = {"fused": 0, "split": 1}
@@ -70,7 +69,7 @@ def main():
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for precision in ("mxfp4", "qoq"):
-        for m_value in (2, 8, 16):
+        for m_value in m_values:
             e2e_fused = index[("e2e", precision, m_value, "fused")]
             e2e_split = index[("e2e", precision, m_value, "split")]
             mega_fused = index[("mega", precision, m_value, "fused")]
