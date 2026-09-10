@@ -741,7 +741,7 @@ static void fable_router_quant_topk_frontend(
         const torch::Tensor& hidden, const torch::Tensor& router_weight,
         const torch::Tensor& x, const torch::Tensor& x_sf,
         const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
-        const torch::Tensor& workspace, const int& mode) {
+        const torch::Tensor& workspace, const int& mode, const int& tiny, const int& stamps) {
     const auto [m, h] = get_shape<2>(hidden);
     const auto [e, h_] = get_shape<2>(router_weight);
     const int topk = static_cast<int>(topk_idx.size(1));
@@ -754,12 +754,13 @@ static void fable_router_quant_topk_frontend(
     DG_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64 and topk_idx.size(0) >= m);
     DG_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32 and topk_weights.sizes() == topk_idx.sizes());
     DG_HOST_ASSERT(x.is_contiguous() and x_sf.is_contiguous() and topk_idx.is_contiguous() and topk_weights.is_contiguous());
-    DG_HOST_ASSERT(workspace.nbytes() >= static_cast<size_t>(256 + 4 * m * e * 4));
+    DG_HOST_ASSERT(workspace.nbytes() >= static_cast<size_t>(256 + 4 * 64 * e * 4));
+    DG_HOST_ASSERT(not stamps or workspace.nbytes() >= router_quant_topk_frontend_workspace_bytes(static_cast<int>(e)));
     DG_HOST_ASSERT(mode == 0 or mode == 1);
     launch_router_quant_topk_frontend(
         hidden.data_ptr(), router_weight.data_ptr(), x.data_ptr(), x_sf.data_ptr(),
-        topk_idx.data_ptr(), topk_weights.data_ptr(), workspace.data_ptr(),
-        static_cast<int>(m), static_cast<int>(h), static_cast<int>(e), topk, mode,
+        topk_idx.data_ptr(), topk_weights.data_ptr(), workspace.data_ptr(), workspace.nbytes(),
+        static_cast<int>(m), static_cast<int>(h), static_cast<int>(e), topk, mode, tiny, stamps,
         at::cuda::getCurrentCUDAStream().stream());
 }
 

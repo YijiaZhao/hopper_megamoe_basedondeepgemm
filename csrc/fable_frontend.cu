@@ -42,6 +42,17 @@ __device__ __forceinline__ uint16_t cvt_e4m3x2(float x0, float x1) {
 #endif
     return out;
 }
+__device__ __forceinline__ unsigned long long globaltimer_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+// Optional per-CTA phase stamps (DG_FE_STAMPS=1): [blockIdx][4] u64 ns.
+// router CTA: start / chunk0 landed / mma done / ticket bumped
+// quant  CTA: start / quant done / ticket seen / top-k done
+__device__ __forceinline__ void stamp(unsigned long long* stamps, int slot) {
+    if (stamps != nullptr && threadIdx.x == 0) stamps[blockIdx.x * 4 + slot] = globaltimer_ns();
+}
 __device__ __forceinline__ float round_bf16(float x) {
     return __bfloat162float(__float2bfloat16_rn(x));
 }
@@ -66,11 +77,18 @@ constexpr int kMaxMTiles = 4;            // m <= 64
 
 // Pipeline depth per m-tile count: fewer token rows -> smaller stages -> deeper
 // pipeline (the loop is HBM/L2 latency bound, compute is negligible).
-template <int kMTiles> struct RouterCfg {
+// kTiny (DG_FE_TINYM, m <= 16 only): 3 stages instead of 8. With 8 stages the
+// dynamic smem is 143 KB -> 1 CTA/SM, so the 96 router CTAs + m quant CTAs do
+// not fit on the 78 SMs of an H20 and run as two waves (the quant/top-k CTAs
+// are in the second wave). 3 stages = 59 KB -> 3 CTAs/SM, single wave. H=3072
+// needs exactly 3 chunks per K-part, so nothing is pipelined away. The math
+// (WMMA order, K-split partial order, bf16 rounding) is unchanged -> bit-identical.
+template <int kMTiles, bool kTiny = false> struct RouterCfg {
+    static_assert(!kTiny || kMTiles == 1, "tiny-M config is the m <= 16 path");
     // K-split across CTAs: partial logits go to workspace slice [ks][m][e] and are
     // summed in fixed order by the top-k CTA (deterministic).
     static constexpr int kKSplitCTAs = kMTiles == 1 ? 4 : 2;
-    static constexpr int kStages = kMTiles == 1 ? 8 : (kMTiles == 2 ? 6 : 4);
+    static constexpr int kStages = kTiny ? 3 : (kMTiles == 1 ? 8 : (kMTiles == 2 ? 6 : 4));
     static constexpr int kHRows = kMTiles * 16;
     static constexpr int kStageElems = (kHRows + kExpertsPerCTA) * kSmemLd;   // bf16 per stage
     static constexpr int kDynSmemBytes = kStages * kStageElems * 2 + (kThreads / 32) * 256 * 4;
@@ -84,16 +102,18 @@ __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commi
 template <int N>
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory"); }
 
-template <int kMTiles>
+template <int kMTiles, bool kTiny>
 __device__ __forceinline__ void router_role(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
         float* __restrict__ logits,          // [m, e] workspace
+        unsigned long long* stamps,
         int m, int h, int e) {
     using namespace nvcuda;
-    constexpr int kStages = RouterCfg<kMTiles>::kStages;
-    constexpr int kHRows = RouterCfg<kMTiles>::kHRows;
-    constexpr int kStageElems = RouterCfg<kMTiles>::kStageElems;
+    using Cfg = RouterCfg<kMTiles, kTiny>;
+    constexpr int kStages = Cfg::kStages;
+    constexpr int kHRows = Cfg::kHRows;
+    constexpr int kStageElems = Cfg::kStageElems;
     extern __shared__ __align__(128) uint8_t dyn_smem[];
     auto stage_h = [&](int st) {
         return reinterpret_cast<__nv_bfloat16 (*)[kSmemLd]>(dyn_smem + st * kStageElems * 2);
@@ -105,7 +125,7 @@ __device__ __forceinline__ void router_role(
     constexpr int kKSplit = (kThreads / 32) / kMTiles;          // warps per m-tile
     constexpr int kKPerWarp = kChunkK / kKSplit;                // 256 / {8,4,2}
     constexpr int kVecPerRow = kChunkK / 8;                     // 16B vectors per smem row
-    constexpr int kKSplitCTAs = RouterCfg<kMTiles>::kKSplitCTAs;
+    constexpr int kKSplitCTAs = Cfg::kKSplitCTAs;
     const int warp = threadIdx.x >> 5;
     const int m_tile = warp % kMTiles, k_slice = warp / kMTiles;
     const int expert_base = (blockIdx.x / kKSplitCTAs) * kExpertsPerCTA;
@@ -150,6 +170,7 @@ __device__ __forceinline__ void router_role(
         cp_async_commit();
         cp_async_wait<kStages - 1>();     // chunk `chunk` has landed for this thread
         __syncthreads();                  // ... and for every thread
+        if (chunk == 0) stamp(stamps, 1);
         const int st = chunk % kStages;
         #pragma unroll
         for (int kk = 0; kk < kKPerWarp; kk += 16) {
@@ -164,6 +185,7 @@ __device__ __forceinline__ void router_role(
     }
     wmma::store_matrix_sync(part_s[warp], acc, 16, wmma::mem_row_major);
     __syncthreads();
+    stamp(stamps, 2);
     // Reduce the kKSplit K-slices of each m-tile; 256 threads cover 16x16 per m-tile.
     for (int i = threadIdx.x; i < kMTiles * 256; i += kThreads) {
         const int tile = i / 256, r = (i % 256) / 16, c = i % 16;
@@ -286,26 +308,36 @@ __device__ __forceinline__ void quant_role(
     }
 }
 
-template <int kMTiles, int kMode>
+template <int kMTiles, int kMode, bool kTiny>
 __global__ void __launch_bounds__(kThreads, 1) router_quant_topk_kernel(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
         uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
         int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
         int* __restrict__ ticket, float* __restrict__ logits,
+        unsigned long long* stamps,
         int m, int h, int e, int topk, int num_router_ctas) {
+    stamp(stamps, 0);
     if (static_cast<int>(blockIdx.x) >= num_router_ctas) {
-        // Quant CTA: quantize this token, then wait for all router CTAs (they are
-        // co-resident: <= 24 + 64 CTAs on 132 SMs) and run top-k for this token.
+        // Quant CTA: quantize this token, then wait for all router CTAs (they must
+        // be co-resident: kTiny keeps 96 + m CTAs within 78 SMs x 3 CTAs) and run
+        // top-k for this token.
         const int token = blockIdx.x - num_router_ctas;
         quant_role<kMode>(hidden, x_bytes, x_sf, token, h);
+        stamp(stamps, 1);
         if (threadIdx.x < 32) {
             if (threadIdx.x == 0) {
-                while (*reinterpret_cast<volatile int*>(ticket) < num_router_ctas) __nanosleep(200);
+                if constexpr (kTiny) {
+                    while (*reinterpret_cast<volatile int*>(ticket) < num_router_ctas) { }
+                } else {
+                    while (*reinterpret_cast<volatile int*>(ticket) < num_router_ctas) __nanosleep(200);
+                }
                 __threadfence();
             }
             __syncwarp();
-            topk_softmax_token(logits, topk_idx, topk_weights, token, m, e, topk, RouterCfg<kMTiles>::kKSplitCTAs);
+            stamp(stamps, 2);
+            topk_softmax_token(logits, topk_idx, topk_weights, token, m, e, topk, RouterCfg<kMTiles, kTiny>::kKSplitCTAs);
+            stamp(stamps, 3);
             // Last token CTA resets the counters for the next launch.
             if (threadIdx.x == 0 && atomicAdd(ticket + 1, 1) == m - 1) {
                 ticket[1] = 0;
@@ -315,53 +347,65 @@ __global__ void __launch_bounds__(kThreads, 1) router_quant_topk_kernel(
         }
         return;
     }
-    router_role<kMTiles>(hidden, router_weight, logits, m, h, e);
+    router_role<kMTiles, kTiny>(hidden, router_weight, logits, stamps, m, h, e);
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) atomicAdd(ticket, 1);
+    stamp(stamps, 3);
 }
 
-template <int kMTiles, int kMode>
+template <int kMTiles, int kMode, bool kTiny>
 void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
-            int64_t* idx, float* wts, int* ticket, float* logits,
+            int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
             int m, int h, int e, int topk, cudaStream_t stream) {
-    const int router_ctas = ((e + kExpertsPerCTA - 1) / kExpertsPerCTA) * RouterCfg<kMTiles>::kKSplitCTAs;
+    using Cfg = RouterCfg<kMTiles, kTiny>;
+    const int router_ctas = ((e + kExpertsPerCTA - 1) / kExpertsPerCTA) * Cfg::kKSplitCTAs;
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, RouterCfg<kMTiles>::kDynSmemBytes);
+        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::kDynSmemBytes);
         attr_set = true;
     }
-    router_quant_topk_kernel<kMTiles, kMode><<<router_ctas + m, kThreads, RouterCfg<kMTiles>::kDynSmemBytes, stream>>>(
-        hidden, w, x, sf, idx, wts, ticket, logits, m, h, e, topk, router_ctas);
+    router_quant_topk_kernel<kMTiles, kMode, kTiny><<<router_ctas + m, kThreads, Cfg::kDynSmemBytes, stream>>>(
+        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas);
 }
 
 template <int kMode>
 void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
-                 int64_t* idx, float* wts, int* ticket, float* logits,
-                 int m, int h, int e, int topk, cudaStream_t stream) {
-    if (m <= 16) launch<1, kMode>(hidden, w, x, sf, idx, wts, ticket, logits, m, h, e, topk, stream);
-    else if (m <= 32) launch<2, kMode>(hidden, w, x, sf, idx, wts, ticket, logits, m, h, e, topk, stream);
-    else launch<4, kMode>(hidden, w, x, sf, idx, wts, ticket, logits, m, h, e, topk, stream);
+                 int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
+                 int m, int h, int e, int topk, bool tiny, cudaStream_t stream) {
+    if (m <= 16 && tiny) launch<1, kMode, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
+    else if (m <= 16) launch<1, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
+    else if (m <= 32) launch<2, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
+    else launch<4, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
 }
 
 }  // namespace
 
+size_t router_quant_topk_frontend_workspace_bytes(int e) {
+    return kFrontendStampsOffsetBase + static_cast<size_t>(4) * 64 * e * 4 + kFrontendStampsBytes;
+}
+
 void launch_router_quant_topk_frontend(
         const void* hidden, const void* router_weight,
         void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
-        void* workspace, int m, int h, int e, int topk, int mode,
-        cudaStream_t stream) {
+        void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
+        int tiny, int stamps_on, cudaStream_t stream) {
     int* ticket = static_cast<int*>(workspace);
-    float* logits = reinterpret_cast<float*>(static_cast<char*>(workspace) + 256);
+    float* logits = reinterpret_cast<float*>(static_cast<char*>(workspace) + kFrontendStampsOffsetBase);
+    unsigned long long* stamps = nullptr;
+    if (stamps_on && workspace_bytes >= router_quant_topk_frontend_workspace_bytes(e))
+        stamps = reinterpret_cast<unsigned long long*>(
+            static_cast<char*>(workspace) + kFrontendStampsOffsetBase + static_cast<size_t>(4) * 64 * e * 4);
     const auto* hp = static_cast<const __nv_bfloat16*>(hidden);
     const auto* wp = static_cast<const __nv_bfloat16*>(router_weight);
+    const bool use_tiny = tiny != 0;
     if (mode == 0)
         launch_mode<0>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, m, h, e, topk, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, stream);
     else
         launch_mode<1>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, m, h, e, topk, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, stream);
 }
