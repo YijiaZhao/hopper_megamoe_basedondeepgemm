@@ -46,10 +46,10 @@ public:
         bool tinym;
         int tinym_prefetch;
         bool push_dispatch;
-        bool push_det_slots;
         int push_max_tokens_per_rank;
         bool lean_routing;
         bool push_done_flags;
+        bool push_det_slots;
         bool qoq_inline_s2;
         int qoq_inline_s2_frags;
         bool qoq_inline_s2_ilv;
