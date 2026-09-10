@@ -764,10 +764,12 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l2_global_scales = l2_global_scales_ptr,
         .phase_stamps = phase_stamps.has_value() ?
             reinterpret_cast<unsigned long long*>(phase_stamps->data_ptr()) : nullptr,
+        // DG_FE_PDL=1: programmatic dependent launch on the Fable frontend (the
+        // kernel executes griddepcontrol.wait before touching frontend outputs).
         .launch_args = LaunchArgs(
             num_sms,
             KernelConfig::kNumThreads,
-            config.smem_size, 1)
+            config.smem_size, 1, true, get_env<int>("DG_FE_PDL", 0) != 0)
     };
 
     const auto code = SM90FP4H20FusedRuntime::generate(args);

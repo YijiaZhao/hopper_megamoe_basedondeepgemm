@@ -30,10 +30,11 @@ def make_buffer(max_m):
     )
 
 
-def run(buf, hidden, w, quant, tinym):
+def run(buf, hidden, w, quant, tinym, l2_persist=0):
     buf.x.view(torch.uint8).fill_(0xAB); buf.x_sf.fill_(-1.0)
     buf.topk_idx.fill_(-7); buf.topk_weights.fill_(-1.0)
-    deep_gemm.fable_router_quant_topk_frontend(hidden, w, buf, quant=quant, tinym=tinym, stamps=0)
+    deep_gemm.fable_router_quant_topk_frontend(hidden, w, buf, quant=quant, tinym=tinym, stamps=0,
+                                               l2_persist=l2_persist)
     torch.cuda.synchronize()
     m = hidden.size(0)
     return (buf.x[:m].view(torch.uint8).clone(), buf.x_sf[:m].clone(),
@@ -44,6 +45,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=100)
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    ap.add_argument("--l2-persist", type=int, default=0,
+                    help="DG_FE_ROUTER_L2_PERSIST value for the tiny-M side (reference stays 0)")
     args = ap.parse_args()
     buf_old, buf_new = make_buffer(64), make_buffer(64)
     names = ("x", "x_sf", "topk_idx", "topk_weights")
@@ -60,7 +63,7 @@ def main():
                 hidden = (hidden * 4).round().to(torch.bfloat16) / 4
             for quant in ("mxfp4", "qoq"):
                 old = run(buf_old, hidden, w, quant, 0)
-                new = run(buf_new, hidden, w, quant, 1)
+                new = run(buf_new, hidden, w, quant, 1, args.l2_persist)
                 total += 1
                 bad = [n for n, a, b in zip(names, old, new) if not torch.equal(a, b)]
                 if bad:
@@ -69,7 +72,7 @@ def main():
                     if "topk_idx" in bad:
                         print("  old idx", old[2].tolist()); print("  new idx", new[2].tolist())
     print(f"frontend tiny-M bit-identity: {total - mismatches}/{total} identical "
-          f"(seeds={args.seeds}, rows={args.rows}, quant=mxfp4+qoq)")
+          f"(seeds={args.seeds}, rows={args.rows}, quant=mxfp4+qoq, l2_persist={args.l2_persist})")
     sys.exit(1 if mismatches else 0)
 
 

@@ -12,6 +12,9 @@
 #include <cuda_fp8.h>
 #include <mma.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <algorithm>
 
 namespace {
 
@@ -103,6 +106,19 @@ __device__ __forceinline__ void cp_async_16(void* smem_dst, const void* gmem_src
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N>
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory"); }
+// DG_FE_ROUTER_L2_PERSIST=2: the router-weight cp.async carry an L2::evict_last
+// cache-policy hint so the 2.4 MB router matrix outranks the (evict_normal) MoE
+// weights that stream through L2 between launches. No host-side set-aside.
+__device__ __forceinline__ uint64_t l2_evict_last_policy() {
+    uint64_t p;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;\n" : "=l"(p));
+    return p;
+}
+__device__ __forceinline__ void cp_async_16_hint(void* smem_dst, const void* gmem_src, uint64_t policy) {
+    const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
+                 :: "r"(d), "l"(gmem_src), "l"(policy) : "memory");
+}
 
 template <int kMTiles, bool kTiny>
 __device__ __forceinline__ void router_role(
@@ -110,7 +126,7 @@ __device__ __forceinline__ void router_role(
         const __nv_bfloat16* __restrict__ router_weight,
         float* __restrict__ logits,          // [m, e] workspace
         unsigned long long* stamps,
-        int m, int h, int e) {
+        int m, int h, int e, int w_hint) {
     using namespace nvcuda;
     using Cfg = RouterCfg<kMTiles, kTiny>;
     constexpr int kStages = Cfg::kStages;
@@ -137,6 +153,7 @@ __device__ __forceinline__ void router_role(
     const int chunk_base = k_part * chunks_per_part;
     const int num_chunks = chunks_per_part;
     float* part_logits = logits + static_cast<int64_t>(k_part) * m * e;
+    const uint64_t w_policy = w_hint ? l2_evict_last_policy() : 0ull;
 
     // Padding token rows (>= m) are never loaded; zero them once in every stage.
     for (int st = 0; st < kStages; ++st)
@@ -154,8 +171,9 @@ __device__ __forceinline__ void router_role(
         }
         for (int i = threadIdx.x; i < kExpertsPerCTA * kVecPerRow; i += kThreads) {
             const int r = i / kVecPerRow, c = (i % kVecPerRow) * 8;
-            cp_async_16(&stage_w(st)[r][c],
-                        router_weight + static_cast<int64_t>(expert_base + r) * h + k0 + c);
+            const __nv_bfloat16* src = router_weight + static_cast<int64_t>(expert_base + r) * h + k0 + c;
+            if (w_hint) cp_async_16_hint(&stage_w(st)[r][c], src, w_policy);
+            else cp_async_16(&stage_w(st)[r][c], src);
         }
     };
 
@@ -404,8 +422,15 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
         int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
         int* __restrict__ ticket, float* __restrict__ logits,
         unsigned long long* stamps,
-        int m, int h, int e, int topk, int num_router_ctas) {
+        int m, int h, int e, int topk, int num_router_ctas, int w_hint) {
     stamp(stamps, 0);
+    // PDL (DG_FE_PDL): let the dependent MegaMoE grid be scheduled as soon as every
+    // FE CTA is resident (the trigger fires once all CTAs passed this point). Its
+    // griddepcontrol.wait still blocks until this grid has fully completed and
+    // flushed, so nothing it reads can be early. No-op without a PDL dependent.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
     if (static_cast<int>(blockIdx.x) >= num_router_ctas) {
         // Quant CTA: quantize this token, then wait for all router CTAs (they must
         // be co-resident: kTiny keeps 96 + m CTAs within 78 SMs x 3 CTAs) and run
@@ -452,17 +477,40 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
         }
         return;
     }
-    router_role<kMTiles, kTiny>(hidden, router_weight, logits, stamps, m, h, e);
+    router_role<kMTiles, kTiny>(hidden, router_weight, logits, stamps, m, h, e, w_hint);
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) atomicAdd(ticket, 1);
     stamp(stamps, 3);
 }
 
+// DG_FE_ROUTER_L2_PERSIST=1: CUDA persisting-L2 set-aside for the router weights.
+// Once per process: carve `bytes` (clamped to cudaDevAttrMaxPersistingL2CacheSize)
+// out of L2; per launch: an access-policy-window launch attribute over the router
+// weight buffer (hitProp Persisting). Launch attributes are recorded on the kernel
+// node under stream capture, so eager and CUDA-graph paths behave the same. Normal
+// / streaming accesses (MoE weights, L2 flushes) cannot evict persisting lines.
+static void set_persisting_l2_once(size_t bytes) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    int dev = 0, max_persist = 0, max_window = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&max_persist, cudaDevAttrMaxPersistingL2CacheSize, dev);
+    cudaDeviceGetAttribute(&max_window, cudaDevAttrAccessPolicyMaxWindowSize, dev);
+    const size_t want = std::min(bytes, static_cast<size_t>(max_persist));
+    const cudaError_t err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, want);
+    size_t got = 0;
+    cudaDeviceGetLimit(&got, cudaLimitPersistingL2CacheSize);
+    if (getenv("DG_FE_ROUTER_L2_PERSIST_VERBOSE") != nullptr)
+        fprintf(stderr, "[fable_frontend] persisting L2: max %d B, max window %d B, requested %zu B, "
+                "set %zu B (%s)\n", max_persist, max_window, want, got, cudaGetErrorString(err));
+}
+
 template <int kMTiles, int kMode, bool kTiny>
 void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
             int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-            int m, int h, int e, int topk, cudaStream_t stream) {
+            int m, int h, int e, int topk, int l2_persist, cudaStream_t stream) {
     using Cfg = RouterCfg<kMTiles, kTiny>;
     const int router_ctas = ((e + kExpertsPerCTA - 1) / kExpertsPerCTA) * Cfg::kKSplitCTAs;
     static bool attr_set = false;
@@ -471,18 +519,41 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
                              cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::kDynSmemBytes);
         attr_set = true;
     }
-    router_quant_topk_kernel<kMTiles, kMode, kTiny><<<router_ctas + m, kThreads, Cfg::kDynSmemBytes, stream>>>(
-        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas);
+    const size_t w_bytes = static_cast<size_t>(e) * h * sizeof(__nv_bfloat16);
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(router_ctas + m);
+    cfg.blockDim = dim3(kThreads);
+    cfg.dynamicSmemBytes = Cfg::kDynSmemBytes;
+    cfg.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    cfg.attrs = attrs;
+    cfg.numAttrs = 0;
+    if (l2_persist == 1) {
+        set_persisting_l2_once(w_bytes);
+        int max_window = 0, dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&max_window, cudaDevAttrAccessPolicyMaxWindowSize, dev);
+        auto& a = attrs[cfg.numAttrs++];
+        a.id = cudaLaunchAttributeAccessPolicyWindow;
+        a.val.accessPolicyWindow.base_ptr = const_cast<void*>(static_cast<const void*>(w));
+        a.val.accessPolicyWindow.num_bytes = std::min(w_bytes, static_cast<size_t>(max_window));
+        a.val.accessPolicyWindow.hitRatio = 1.0f;
+        a.val.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+        a.val.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    }
+    const int w_hint = l2_persist == 2 ? 1 : 0;
+    cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny>,
+                       hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint);
 }
 
 template <int kMode>
 void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
                  int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-                 int m, int h, int e, int topk, bool tiny, cudaStream_t stream) {
-    if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
-    else if (m <= 16) launch<1, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
-    else if (m <= 32) launch<2, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
-    else launch<4, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
+                 int m, int h, int e, int topk, bool tiny, int l2_persist, cudaStream_t stream) {
+    if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, stream);
+    else if (m <= 16) launch<1, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, stream);
+    else if (m <= 32) launch<2, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, stream);
+    else launch<4, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, stream);
 }
 
 }  // namespace
@@ -495,7 +566,7 @@ void launch_router_quant_topk_frontend(
         const void* hidden, const void* router_weight,
         void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
         void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-        int tiny, int stamps_on, cudaStream_t stream) {
+        int tiny, int stamps_on, int l2_persist, cudaStream_t stream) {
     int* ticket = static_cast<int*>(workspace);
     float* logits = reinterpret_cast<float*>(static_cast<char*>(workspace) + kFrontendStampsOffsetBase);
     unsigned long long* stamps = nullptr;
@@ -508,9 +579,9 @@ void launch_router_quant_topk_frontend(
     if (mode == 0)
         launch_mode<0>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, use_tiny, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, stream);
     else
         launch_mode<1>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, use_tiny, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, stream);
 }

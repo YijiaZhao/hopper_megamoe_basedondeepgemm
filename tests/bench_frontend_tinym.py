@@ -9,7 +9,10 @@ FE+Mega) is timed separately, ITERS times; rank 0 (GPU0) median/min/p90 in us.
       tests/bench_frontend_tinym.py --quant mxfp4 --global-tokens 8 [--iters 100]
 
 DG_FE_STAMPS=1 additionally launches the frontend once (eagerly, after an L2
-flush) with per-CTA %globaltimer stamps and prints the phase attribution.
+flush) with per-CTA %globaltimer stamps and prints the phase attribution, and
+replays a stamped FE+Mega graph (stamps taken inside the graph, i.e. after the
+previous replay's Mega streamed its weights through L2).
+Knobs echoed: DG_FE_ROUTER_L2_PERSIST (router weights pinned in L2), DG_FE_PDL.
 """
 import argparse
 import os
@@ -76,6 +79,8 @@ def main():
     local_rows = max(1, args.global_tokens // WORLD)
     tinym = int(os.environ.get("DG_FE_TINYM", "1"))
     stamps = int(os.environ.get("DG_FE_STAMPS", "0"))
+    l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
+    pdl = int(os.environ.get("DG_FE_PDL", "0"))
     buffer, launch_moe = prepare_backend(args, rank, local_rows, group)
     try:
         torch.manual_seed(20260805)
@@ -84,9 +89,9 @@ def main():
         x = torch.randn(local_rows, HIDDEN, device="cuda", dtype=torch.bfloat16)
         y = torch.empty_like(x)
 
-        def fe():
+        def fe(st=0):
             deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant,
-                                                       tinym=tinym, stamps=0)
+                                                       tinym=tinym, stamps=st)
 
         def mega():
             launch_moe(y)
@@ -94,9 +99,15 @@ def main():
         def both():
             fe(); mega()
 
+        def both_stamped():
+            fe(1); mega()
+
         both(); torch.cuda.synchronize(); dist.barrier(group=group)
         graphs = {}
-        for name, body in (("FE", fe), ("Mega", mega), ("FE+Mega", both)):
+        bodies = [("FE", fe), ("Mega", mega), ("FE+Mega", both)]
+        if stamps:
+            bodies.append(("FE+Mega/st", both_stamped))
+        for name, body in bodies:
             s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g, stream=s, capture_error_mode="relaxed"):
@@ -107,8 +118,10 @@ def main():
         # Phase-sequential (all FE iterations, then all Mega, then all FE+Mega): the fused
         # MegaMoE's cross-rank flag protocol is captured per graph, so the two graphs that
         # contain it are never interleaved.
-        times = {k: [] for k in graphs}
-        for name, g in graphs.items():
+        timed = ("FE", "Mega", "FE+Mega")
+        times = {k: [] for k in timed}
+        for name in timed:
+            g = graphs[name]
             torch.cuda.synchronize(); dist.barrier(group=group)
             for it in range(args.warmup + args.iters):
                 flush_l2_cache()
@@ -123,8 +136,8 @@ def main():
         if rank == 0:
             print(f"== frontend direct timing: quant={args.quant} M={args.global_tokens} "
                   f"(rows/rank={local_rows}) backend={args.backend} DG_FE_TINYM={tinym} "
-                  f"iters={args.iters} GPU0 ==")
-            for name in graphs:
+                  f"DG_FE_ROUTER_L2_PERSIST={l2_persist} DG_FE_PDL={pdl} iters={args.iters} GPU0 ==")
+            for name in timed:
                 print(fmt_stats(name, times[name]))
         if stamps:
             collected = []
@@ -135,6 +148,16 @@ def main():
                 torch.cuda.synchronize()
                 collected.append(deep_gemm.fable_frontend_stamps(buffer, EXPERTS))
             if rank == 0:
+                print("  [eager FE after L2 flush]")
+                attribution(collected, (EXPERTS // 16) * 4, local_rows)
+            collected = []
+            g = graphs["FE+Mega/st"]
+            for _ in range(5):
+                flush_l2_cache(); torch.cuda.synchronize(); dist.barrier(group=group)
+                g.replay(); torch.cuda.synchronize()
+                collected.append(deep_gemm.fable_frontend_stamps(buffer, EXPERTS))
+            if rank == 0:
+                print("  [FE inside the FE+Mega graph replay, L2 flush + previous Mega before it]")
                 attribution(collected, (EXPERTS // 16) * 4, local_rows)
         dist.barrier(group=group)
     finally:

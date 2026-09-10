@@ -776,6 +776,15 @@
         }
         cutlass::arch::fence_barrier_init();
     }
+    // PDL (host: DG_FE_PDL -> LaunchArgs::force_pdl): launched with programmatic
+    // stream serialization this grid may start while the Fable frontend is still
+    // running. Everything above touches only SMEM, m-barriers, TMA descriptors and
+    // the constant LUT; from here on we read frontend outputs (topk_idx, x, x_sf),
+    // so every thread blocks until the prerequisite grid has completed and its
+    // memory is visible. No-op when launched without the attribute.
+    #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    #endif
     // Fast NVLink-barrier epilogue: every thread snapshots the done count BEFORE
     // the kernel-start __syncthreads (see fused_comm::nvlink_barrier for why this
     // is race-free: SM0's first write of the word this launch is ordered after the

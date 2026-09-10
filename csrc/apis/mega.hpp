@@ -741,7 +741,8 @@ static void fable_router_quant_topk_frontend(
         const torch::Tensor& hidden, const torch::Tensor& router_weight,
         const torch::Tensor& x, const torch::Tensor& x_sf,
         const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
-        const torch::Tensor& workspace, const int& mode, const int& tiny, const int& stamps) {
+        const torch::Tensor& workspace, const int& mode, const int& tiny, const int& stamps,
+        const int& l2_persist) {
     const auto [m, h] = get_shape<2>(hidden);
     const auto [e, h_] = get_shape<2>(router_weight);
     const int topk = static_cast<int>(topk_idx.size(1));
@@ -761,7 +762,7 @@ static void fable_router_quant_topk_frontend(
         hidden.data_ptr(), router_weight.data_ptr(), x.data_ptr(), x_sf.data_ptr(),
         topk_idx.data_ptr(), topk_weights.data_ptr(), workspace.data_ptr(), workspace.nbytes(),
         static_cast<int>(m), static_cast<int>(h), static_cast<int>(e), topk, mode, tiny, stamps,
-        at::cuda::getCurrentCUDAStream().stream());
+        l2_persist, at::cuda::getCurrentCUDAStream().stream());
 }
 
 static void register_apis(pybind11::module_& m) {
