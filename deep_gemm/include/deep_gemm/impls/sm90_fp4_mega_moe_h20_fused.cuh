@@ -553,7 +553,12 @@ template <
     // DG_FP4_L2_PREFETCH_KBLOCKS, 0 = the whole K range): the first-wave tasks then
     // find their head stages resident while the flood stays inside what HBM can
     // deliver during the communication window.
-    uint32_t kL2PrefetchKBlocks = 0
+    uint32_t kL2PrefetchKBlocks = 0,
+    // M=16 task-shape knobs (host env DG_FP4_SPLITK_L1_ALL / DG_FP4_SPLITK_L2_ALL, per-rank
+    // rows == 2 only): every L1 / L2 task of the launch is claimed as K-split halves
+    // (scheduler `kSplitL1All` / `kSplitL2All`) instead of only the last partial wave.
+    bool kSplitKL1All = false,
+    bool kSplitKL2All = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

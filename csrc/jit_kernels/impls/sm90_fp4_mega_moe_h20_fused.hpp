@@ -59,6 +59,8 @@ public:
         bool l2_prefetch_all;
         int l2_prefetch_max_mb;
         int l2_prefetch_k_blocks;
+        bool split_k_l1_all;
+        bool split_k_l2_all;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -128,7 +130,9 @@ public:
             "        /* kStridedPoolDebug */ {},\n"
             "        /* kL2PrefetchAllRequested */ {},\n"
             "        /* kL2PrefetchMaxMB */ {},\n"
-            "        /* kL2PrefetchKBlocks */ {}",
+            "        /* kL2PrefetchKBlocks */ {},\n"
+            "        /* kSplitKL1All */ {},\n"
+            "        /* kSplitKL2All */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -163,7 +167,9 @@ public:
             args.strided_pool_debug ? "true" : "false",
             args.l2_prefetch_all ? "true" : "false",
             args.l2_prefetch_max_mb,
-            args.l2_prefetch_k_blocks);
+            args.l2_prefetch_k_blocks,
+            args.split_k_l1_all ? "true" : "false",
+            args.split_k_l2_all ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -352,6 +358,19 @@ static void sm90_fp4_h20_fused_mega_moe(
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
         dense_weight_tiles && split_k_l2_env != 0;
     const uint32_t split_k_l2_ways = split_k_l2_env >= 3 ? 3u : 2u;
+    // M=16 task-shape experiment (per-rank rows == 2 only, i.e. 16 global tokens on 8
+    // ranks): DG_FP4_SPLITK_L1_ALL=1 claims EVERY L1 task as two K halves (kernel
+    // `kSplitKL1All`, scheduler `kSplitL1All`): ~160 tasks / 78 SMs = 2.05 waves + a
+    // 4-task straggler wave today -> ~320 half tasks (4.1 waves) with the existing
+    // publisher/finisher protocol. DG_FP4_SPLITK_L2_ALL=1 does the same for the L2
+    // tasks (~180 -> ~360 halves; MXFP4 only, like kSplitKL2; implies the 2-way L2
+    // split for the launch). Both default 0; see the H20 .8 A/B in the report.
+    const bool m16_rows = num_tokens == 2 && num_ranks == 8;
+    const bool split_k_l1_all = split_k_l1 && m16_rows &&
+        get_env<int>("DG_FP4_SPLITK_L1_ALL", 0) != 0;
+    const bool split_k_l2_all = mxfp4 && plan.swap_ab && config.block_m == 8 &&
+        !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
+        dense_weight_tiles && m16_rows && get_env<int>("DG_FP4_SPLITK_L2_ALL", 0) != 0;
     // Stream-K (kernel `kStreamK`): for tiny M the (task, K128 block) units of the
     // L1 and of the L2 phase are split into 78 contiguous near-equal unit ranges (one
     // per SM, task-major) with an n-way cross-CTA fp32 reduction per tile through
@@ -593,7 +612,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         .half_tile_tasks = half_tile_tasks,
         .split_k_l1 = split_k_l1 && !tinym,
         .l2_half_row_tasks = l2_half_row_tasks,
-        .split_k_l2_ways = (split_k_l2 && !tinym && !fuse_l1l2) ? split_k_l2_ways : 0u,
+        .split_k_l2_ways = ((split_k_l2 || split_k_l2_all) && !tinym && !fuse_l1l2) ?
+            (split_k_l2_all ? 2u : split_k_l2_ways) : 0u,
         .stream_k = stream_k && !tinym && !fuse_l1l2,
         .nvl_fast_epilogue = nvl_fast_epilogue,
         .fine_combine = fine_combine,
@@ -693,6 +713,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         // DG_FP4_L2_PREFETCH_KBLOCKS (default 0 = whole K): leading K128 blocks of each
         // W1 task to prefetch, to keep the flood within the window's HBM capacity.
         .l2_prefetch_k_blocks = std::clamp(get_env<int>("DG_FP4_L2_PREFETCH_KBLOCKS", 0), 0, 24),
+        .split_k_l1_all = split_k_l1_all && !tinym && !stream_k,
+        .split_k_l2_all = split_k_l2_all && !tinym && !stream_k && !fuse_l1l2,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,

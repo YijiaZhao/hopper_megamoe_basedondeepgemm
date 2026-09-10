@@ -367,7 +367,8 @@
         /* phase-specific task N: L1 256-row tasks, L2 TASK_BLOCK_N_L2-row tasks */
         kNumRoutedL1BlockNs, kNumRoutedL2BlockNs,
         kNumL2KSplits, kStreamK, /* stream-K unit == one 2-K-block stage */ 2u,
-        L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K, kPushBlocksPerExpert, kFuseL1L2>;
+        L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K, kPushBlocksPerExpert, kFuseL1L2,
+        /* all-task K splits (M=16 experiment) */ kSplitKL1All && kSplitKL1, kSplitKL2All && kSplitKL2>;
     constexpr bool kSplitMDecodedWeightReuse =
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
     constexpr uint32_t WG_BLOCK_M =
