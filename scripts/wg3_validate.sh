@@ -17,6 +17,11 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 MODE=${MODE:-all}
 TAG=${TAG:-}
+# MODE=a,b,c runs the modes one after another (each holds the marker for its duration).
+if [[ "$MODE" == *,* ]]; then
+  for m in ${MODE//,/ }; do MODE=$m bash "$0" || true; done
+  exit 0
+fi
 export PYTHONPATH="$ROOT"
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -48,6 +53,10 @@ wait_idle() {
   return 1
 }
 hold() { echo "$$ $(date -u +%FT%TZ) wg3 $MODE" > "$MARK"; }
+# Another wg3_validate instance (e.g. an earlier MODE) may still hold the marker.
+if [ "${WAIT_FOR_MARKER:-1}" = 1 ]; then
+  while [ -e "$MARK" ]; do sleep 10; done
+fi
 trap 'rm -f "$MARK"' EXIT
 hold
 
