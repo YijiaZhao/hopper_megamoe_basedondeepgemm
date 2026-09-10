@@ -137,7 +137,53 @@ Rejected on the way: two chains + inline s2 (qoq: 0 B but C7512 — every IGMMA 
 a full drain; mxfp4 32 / 48 B with 5 sites in the loop), one chain + inline s2 with prefetch
 (qoq 166 / 248 B), one chain + inline s2 without prefetch (same).
 
-RESULTS_PLACEHOLDER
+Numerics (tests/test_four_api_correctness.py, 8 ranks, same seed; WGS=3 vs today's WGS=2):
+
+| point | mxfp4 WGS=2 | mxfp4 WGS=3 | qoq WGS=2 (inline s2) | qoq WGS=3 (per-block promote) |
+|---|---|---|---|---|
+| T=8 / rank (64 global) | cos_min 0.9999882579 | 0.9999882579 (identical) | 0.9999301434 | 0.9999301434 (identical) |
+| global 2 (stream-K) | 0.9999975562 | 0.9999975562 (identical) | — | 0.9999385476 |
+| T=16 / rank (128 global) | — | (host keeps 2 WGs) | 0.9999272823 (per-block promote also 0.9999272823) | 0.9999272823 |
+
+The first 3-WG build ran MXFP4 with one accumulator chain and read cos_min 0.9999583364
+(mean_abs +36 %) at every point: the Hopper FP8 tensor-core accumulator truncates, so 4
+dependent K32 steps in one chain lose precision vs 2 x 2 — the reason the two-WG kernel has
+two chains (and DeepGEMM promotes per K128). QoQ (int32) is exact with one chain.
+
+### Perf — probe (scripts/run_probe.sh, rank 0 medians, us from kernel entry; two passes)
+
+| quant | M | knob | first math (3) | last L1 (4) | L1 phase (4-3) | kernel end (7) | slot 22 head-to-head |
+|---|---|---|---|---|---|---|---|
+| mxfp4 | 8 | WGS=2 | 14.6 / 13.6 | 44.1 / 43.4 | **29.6 / 29.8** | 52.9 / 51.9 | 1342 / 1328 ns per 2-block stage |
+| mxfp4 | 8 | WGS=3 | 13.1 / 13.2 | 44.7 / 44.9 | **31.6 / 31.6** | 52.9 / 53.0 | 1791 / 1784 ns per WG0 block (= 1.5 stages -> 1194 / 1189 per stage) |
+| mxfp4 | 16 | WGS=2 | 10.3 / 10.9 | 56.9 / 57.4 | **46.6 / 46.6** | 72.1 / 73.4 | 1350 / 1351 |
+| mxfp4 | 16 | WGS=3 | 13.5 / 11.2 | 61.5 / 59.1 | **48.0 / 47.9** | 74.8 / 72.2 | 1703 / 1694 (-> 1135 / 1129 per stage) |
+| qoq | 8 | WGS=2 | 10.6 / 11.1 | 40.1 / 40.4 | **29.5 / 29.3** | 49.1 / 49.2 | 1214 / 1215 |
+| qoq | 8 | WGS=3 | 10.7 / 10.4 | 40.5 / 40.5 | **29.7 / 30.1** | 48.2 / 48.9 | 1688 / 1653 (-> 1125 / 1102 per stage) |
+| qoq | 16 | WGS=2 | 23.8 / — | 67.7 / — | **43.8 / —** | 83.1 / — | 1248 |
+| qoq | 16 | WGS=3 | 11.4 / — | 57.1 / — | **45.7 / —** | — | — |
+
+Per-WG stage-loop probe (mxfp4 M8, ns; WGS=2 per 2-block stage = 2 decode units per WG,
+WGS=3 per owned block = also 2 decode units per WG): decode+LUT (18) 777 / 788 -> 1195 /
+1197 (x1.52), promote (30) 150 / 148 -> 525 / 515, exposed k+1 wait (17) 293 / 287 -> 667 /
+669, wgmma issue (31) 482 / 462 -> 407 / 413, drain (19) 196 / 197 -> 201 / 202.
+
+**Verdict: the third math WG does not speed up the tiny-M L1 loop** (L1 phase +1.8 / +1.3 us
+at M8 / M16 MXFP4, +0.4 / +1.9 us QoQ; kernel end within noise). The same per-WG work
+(two decode units) takes 1.5x longer once three WGs share the SM: the loop is bound by
+the SM's issue / shared-memory bandwidth (per 2-block stage the two WGs move ~180 KB
+through LDS: 32 LUT gathers x 8 B and 2 x 16 B packed words per row pair per unit, plus
+the SFA / meta reads), not by the per-WG latency chain the microbench modelled. Adding a
+WG just shares the same issue slots (3 warps per scheduler instead of 2) and, with the
+4-stage ring, exposes more of the k+1 wait (a stage is released only after its two owners
+also have their next block, so the loader runs at most ~2 stages ahead). Slot 22 per stage
+equivalent improves only 10 % (1328 -> 1189 ns) and that is eaten by the hand-off + the
+longer first-block wait. Keep `DG_FP4_MATH_WGS=2` as the default; the knob stays as a
+documented negative result. The lever for this loop is fewer LDS bytes per K-block
+(LUT-free / packed-LUT decode, wider per-thread rows), not more warps.
+
+EVENT_NSYS_PLACEHOLDER
+
 
 ## Phase 2 sketch (original, superseded by the implementation above)
 
