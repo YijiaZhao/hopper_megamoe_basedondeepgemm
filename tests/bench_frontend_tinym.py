@@ -36,16 +36,19 @@ def fmt_stats(name, v):
     return f"{name:>8}: median {pct(v, 0.5):7.2f}  min {min(v):7.2f}  p90 {pct(v, 0.9):7.2f} us  (n={len(v)})"
 
 
-def attribution(buffer, num_router_ctas, m):
-    st = deep_gemm.fable_frontend_stamps(buffer, EXPERTS)[: num_router_ctas + m].double()
-    t0 = st[:, 0].min()
-    valid = st > 0
-    st = torch.where(valid, (st - t0) / 1e3, torch.zeros_like(st))
-    r, q = st[:num_router_ctas], st[num_router_ctas:]
+def attribution(stamps_list, num_router_ctas, m):
+    rs, qs = [], []
+    for st in stamps_list:
+        st = st[: num_router_ctas + m].double()
+        t0 = st[:, 0].min()
+        st = torch.where(st > 0, (st - t0) / 1e3, torch.zeros_like(st))
+        rs.append(st[:num_router_ctas]); qs.append(st[num_router_ctas:])
+    r, q = torch.cat(rs), torch.cat(qs)
 
     def line(tag, col):
         return (f"    {tag:<22} median {col.median():6.2f}  min {col.min():6.2f}  max {col.max():6.2f} us")
-    print(f"  stamps (us rel. earliest CTA start; router CTAs={num_router_ctas}, quant CTAs={m}):")
+    print(f"  stamps over {len(stamps_list)} launches (us rel. earliest CTA start of each launch; "
+          f"router CTAs={num_router_ctas}, quant CTAs={m}):")
     print(line("router start", r[:, 0])); print(line("router chunk0 landed", r[:, 1]))
     print(line("router mma done", r[:, 2])); print(line("router ticket bumped", r[:, 3]))
     print(line("quant start", q[:, 0])); print(line("quant done", q[:, 1]))
@@ -120,12 +123,15 @@ def main():
             for name in graphs:
                 print(fmt_stats(name, times[name]))
         if stamps:
-            flush_l2_cache(); torch.cuda.synchronize(); dist.barrier(group=group)
-            deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant,
-                                                       tinym=tinym, stamps=1)
-            torch.cuda.synchronize()
+            collected = []
+            for _ in range(5):
+                flush_l2_cache(); torch.cuda.synchronize(); dist.barrier(group=group)
+                deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant,
+                                                           tinym=tinym, stamps=1)
+                torch.cuda.synchronize()
+                collected.append(deep_gemm.fable_frontend_stamps(buffer, EXPERTS))
             if rank == 0:
-                attribution(buffer, (EXPERTS // 16) * 4, local_rows)
+                attribution(collected, (EXPERTS // 16) * 4, local_rows)
         dist.barrier(group=group)
     finally:
         buffer.destroy()

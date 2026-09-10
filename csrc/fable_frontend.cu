@@ -275,30 +275,33 @@ __device__ __forceinline__ uint32_t warp_max_u32(uint32_t v) {
     return v;
 }
 
+// Called by the whole CTA (kThreads): the kKSplit partial logits of every expert
+// are fetched by all 256 threads (<= 2 experts per thread, one L2 round trip),
+// summed in the legacy order and parked as keys in smem; warp 0 then selects.
 template <int kKSplit, int kPerLane, int kTopK>
 __device__ __forceinline__ void topk_softmax_token_tiny(
         const float* __restrict__ logits, int64_t* __restrict__ topk_idx,
         float* __restrict__ topk_weights, unsigned long long* stamps, int t, int m, int e) {
+    __shared__ uint32_t key_s[kMaxExperts];
     const int lane = threadIdx.x & 31;
-    float part[kKSplit][kPerLane];
-    #pragma unroll
-    for (int ks = 0; ks < kKSplit; ++ks) {
-        #pragma unroll
-        for (int i = 0; i < kPerLane; ++i) {
-            const int ex = lane + 32 * i;
-            part[ks][i] = ex < e ? __ldcg(logits + (static_cast<int64_t>(ks) * m + t) * e + ex) : 0.0f;
+    for (int ex = threadIdx.x; ex < kPerLane * 32; ex += kThreads) {
+        float acc = 0.0f;
+        if (ex < e) {
+            float p[kKSplit];
+            #pragma unroll
+            for (int ks = 0; ks < kKSplit; ++ks)
+                p[ks] = __ldcg(logits + (static_cast<int64_t>(ks) * m + t) * e + ex);
+            #pragma unroll
+            for (int ks = 0; ks < kKSplit; ++ks) acc += p[ks];      // same order as legacy
         }
+        key_s[ex] = topk_key(ex < e ? round_bf16(acc) : -INFINITY, ex);
     }
+    __syncthreads();
+    stamp(stamps, 4);
+    if (threadIdx.x >= 32) return;
     uint32_t key[kPerLane];
     #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-        const int ex = lane + 32 * i;
-        float acc = 0.0f;
-        #pragma unroll
-        for (int ks = 0; ks < kKSplit; ++ks) acc += part[ks][i];     // same order as legacy
-        key[i] = topk_key(ex < e ? round_bf16(acc) : -INFINITY, ex);
-    }
-    stamp(stamps, 4);
+    for (int i = 0; i < kPerLane; ++i) key[i] = key_s[lane + 32 * i];
     // Everything below is fully unrolled (compile-time kTopK) so sel_*/ex_v stay in registers.
     float sel_v[kTopK];
     int sel_i[kTopK];
@@ -410,25 +413,35 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
         const int token = blockIdx.x - num_router_ctas;
         quant_role<kMode>(hidden, x_bytes, x_sf, token, h);
         stamp(stamps, 1);
+        if constexpr (kTiny) {
+            if (threadIdx.x == 0) {
+                while (*reinterpret_cast<volatile int*>(ticket) < num_router_ctas) { }
+                __threadfence();
+            }
+            __syncthreads();
+            stamp(stamps, 2);
+            constexpr int kKS = RouterCfg<kMTiles, kTiny>::kKSplitCTAs;
+            if (e <= 384)   // E=384 -> 12 experts per lane
+                topk_softmax_token_tiny<kKS, 12, kMaxTopK>(logits, topk_idx, topk_weights, stamps, token, m, e);
+            else
+                topk_softmax_token_tiny<kKS, kMaxExperts / 32, kMaxTopK>(logits, topk_idx, topk_weights, stamps, token, m, e);
+            // warps 1..7 returned inside topk_softmax_token_tiny; warp 0 continues
+            stamp(stamps, 3);
+            if (threadIdx.x == 0 && atomicAdd(ticket + 1, 1) == m - 1) {
+                ticket[1] = 0;
+                __threadfence();
+                ticket[0] = 0;
+            }
+            return;
+        }
         if (threadIdx.x < 32) {
             if (threadIdx.x == 0) {
-                if constexpr (kTiny) {
-                    while (*reinterpret_cast<volatile int*>(ticket) < num_router_ctas) { }
-                } else {
-                    while (*reinterpret_cast<volatile int*>(ticket) < num_router_ctas) __nanosleep(200);
-                }
+                while (*reinterpret_cast<volatile int*>(ticket) < num_router_ctas) __nanosleep(200);
                 __threadfence();
             }
             __syncwarp();
             stamp(stamps, 2);
-            if constexpr (kTiny) {
-                constexpr int kKS = RouterCfg<kMTiles, kTiny>::kKSplitCTAs;
-                if (e <= 384)   // E=384 -> 12 experts per lane (fewer live registers)
-                    topk_softmax_token_tiny<kKS, 12, kMaxTopK>(logits, topk_idx, topk_weights, stamps, token, m, e);
-                else
-                    topk_softmax_token_tiny<kKS, kMaxExperts / 32, kMaxTopK>(logits, topk_idx, topk_weights, stamps, token, m, e);
-            } else
-                topk_softmax_token(logits, topk_idx, topk_weights, token, m, e, topk, RouterCfg<kMTiles, kTiny>::kKSplitCTAs);
+            topk_softmax_token(logits, topk_idx, topk_weights, token, m, e, topk, RouterCfg<kMTiles, kTiny>::kKSplitCTAs);
             stamp(stamps, 3);
             // Last token CTA resets the counters for the next launch.
             if (threadIdx.x == 0 && atomicAdd(ticket + 1, 1) == m - 1) {
