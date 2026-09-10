@@ -259,9 +259,9 @@ kernel statistics and is not aggregated across GPUs.
 
 ## Performance results (2026-09-10, locked clock)
 
-Method: `10.6.131.7`, eight H20 GPUs
-locked at **1830 MHz**, `scripts/capture_four_api_h20_timelines.sh`, GPU 0 median
-of the final three complete spans).  Values are microseconds.  Mega-only Fused is
+Method: `10.6.131.7`, eight H20 GPUs locked at **1830 MHz**,
+`scripts/capture_four_api_h20_timelines.sh`, GPU 0 median of the final three
+complete spans (see the runnable commands below).  Values are microseconds.  Mega-only Fused is
 the customer comparison column (targets M2 < 53, M8 < 61, M16 < 85: all met).
 
 | Precision | M | FE Fused | E2E Fused (FE + Mega) | Mega-only Fused |
