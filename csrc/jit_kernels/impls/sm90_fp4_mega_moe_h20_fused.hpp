@@ -512,9 +512,29 @@ static void sm90_fp4_h20_fused_mega_moe(
     // blocks) and one red.or.sys sets the slot's bit in the destination's per-expert
     // mask (ordered by the same DONE release as the row). After DONE, SM e's two
     // dispatch warps compact the sparse rows in place (usually <= 1 row per expert at
-    // M <= 16) and publish the count + completeness word; the task producers poll
-    // that word (as before DONE flags) instead of reading the ticket totals.
-    // Downstream (packed rows, valid_m) is untouched. Default: see the H20 A/B below.
+    // M <= 16) and release-add the per-block L1 arrival counts + the count word; the
+    // task producers take the counts as popc(mask) right at DONE (no wait for the
+    // compaction), the A loaders spin on the arrival count again. Downstream (packed
+    // rows, valid_m) is untouched. Default OFF: H20 A/B 2026-09-10 (build 85d99d5,
+    // knob 1 vs 0, us). Phase stamps, rank 0: push issued (slot 9 - 8) 1.6/1.6/1.3 vs
+    // 2.8/2.5/2.1 at mxfp4 M2/8/16 (the ticket round trip is gone), but DONE
+    // (slot 1 - 16) only 4.9/4.85/3.7 vs 5.1/4.75/4.3 and DONE -> first math equal
+    // (2.7/2.1/1.6 vs 2.7/2.3/1.4): the ticket's round trip was mostly overlapped by
+    // the sender's release.sys store drain before its DONE signal, and the per-task
+    // A-loader acquire (0.2 us per task on SM0) gives the rest back. Skew-free nsys
+    // min-over-devices kernel duration (2 passes): mxfp4 M2 40.1/39.2 vs 40.0/38.3,
+    // M8 58.8/58.5 vs 58.0/58.2, M16 77.0/76.9 vs 78.2/78.5; qoq M2 37.6/36.8 vs
+    // 36.6/36.3, M8 56.5/55.7 vs 55.5/55.6, M16 75.0/75.0 vs 75.2/75.1. CUDA-event
+    // method (bench_frontend_tinym Mega graph, host barrier, n=100 GPU0 median,
+    // 2 passes + 3 qoq M8 repro passes): mxfp4 M2 72.5 vs 72.9, M8 72.6/72.7 vs
+    // 72.7/73.0, M16 95.7/95.1 vs 95.4/93.8; qoq M2 70.9/70.2 vs 70.5/70.5, M8
+    // 72.0/70.2/70.3/70.0 vs 71.6/71.3/70.6, M16 92.8 vs 90.5/91.0. (That harness
+    // shows a whole-session +14..18 us shift of the Mega graph, min = median, in 4 of
+    // 30 sessions of either knob - 3x knob 1, 1x knob 0 - never in the nsys probe
+    // sessions; those sessions are excluded above.) Never >= 1 us better at M2/M8 in
+    // either method (mostly within +-0.5 us), so the ticket path stays the default.
+    // Numerics identical (mxfp4/qoq T=2/8/8/16 x2, mxfp4 128/512, 200-iter graph-replay
+    // stress M=8 and M=2 under DG_FP4_SPIN_TIMEOUT=1).
     const bool push_det_slots = push_done_flags &&
         get_env<int>("DG_FP4_PUSH_DET_SLOTS", 0) != 0;
     // Fast NVLink-barrier epilogue (kernel `kNvlFastEpilogue`, needs the
