@@ -41,6 +41,7 @@ public:
         bool nvl_fast_epilogue;
         bool fine_combine;
         bool combine_dynamic;
+        bool fuse_l1l2;
         int k_blocks_per_stage;
         bool tinym;
         int tinym_prefetch;
@@ -111,6 +112,7 @@ public:
             "        /* kNvlFastEpilogueRequested */ {},\n"
             "        /* kFineCombineRequested */ {},\n"
             "        /* kCombineDynamicRequested */ {},\n"
+            "        /* kFuseL1L2Requested */ {},\n"
             "        /* kKBlocksPerStageRequested */ {},\n"
             "        /* kTinyMGemvRequested */ {},\n"
             "        /* kPushDispatchRequested */ {},\n"
@@ -145,6 +147,7 @@ public:
             args.nvl_fast_epilogue ? "true" : "false",
             args.fine_combine ? "true" : "false",
             args.combine_dynamic ? "true" : "false",
+            args.fuse_l1l2 ? "true" : "false",
             args.k_blocks_per_stage,
             args.tinym ? "true" : "false",
             args.push_dispatch ? "true" : "false",
@@ -482,6 +485,23 @@ static void sm90_fp4_h20_fused_mega_moe(
     // the first warps grid-wide that become free now spin on the arrival counters.
     // DG_FP4_COMBINE_DYNAMIC=0 restores the static map.
     const bool combine_dynamic = fine_combine && get_env<int>("DG_FP4_COMBINE_DYNAMIC", 1) != 0;
+    // Two-layer fusion for tiny M (kernel `kFuseL1L2`, docs/fuse_l1l2_design.md): every
+    // L1 task keeps its SwiGLU output in SMEM and runs the W2 K-slice (12 output
+    // N-blocks x its K128 block, 6 extra pipeline stages) itself; the 10 L1 tasks of a
+    // pool block red.add their fp32 partials into the (otherwise unused) L2 split-K
+    // scratch and the 10th arriver per (pool block, N-block) runs the L2 epilogue. No
+    // L2 tasks exist, so the L2 quantisation tail and the L1->L2 dependency waits
+    // disappear (the straggler L1 tasks carry their W2 slice, see the design note).
+    // DG_FP4_FUSE_L1L2=1 enables (default 0), for <= DG_FP4_FUSE_L1L2_MAX_M (default 16)
+    // global tokens; BM8 RF swapAB (MXFP4 / QoQ), 2 K-blocks per stage, dense tiles,
+    // interleaved scheduler; exclusive with half-tile / L2 half-row / split-K L2 /
+    // stream-K / tiny-M (forced off below).
+    const bool fuse_l1l2 = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 &&
+        config.block_n == 256 && !half_tile_tasks && !l2_half_row_tasks && !tinym &&
+        plan.use_interleaved_scheduler && dense_weight_tiles &&
+        get_sm90_fp4_h20_bm8_k_blocks_per_stage() == 2 &&
+        get_env<int>("DG_FP4_FUSE_L1L2", 0) != 0 &&
+        num_global_tokens_upper <= get_env<int>("DG_FP4_FUSE_L1L2_MAX_M", 16);
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n;
     constexpr int kL1ScaleGranK = 128;
     const int l2_scale_gran_k = task_block_n / 2;
@@ -561,11 +581,12 @@ static void sm90_fp4_h20_fused_mega_moe(
         .half_tile_tasks = half_tile_tasks,
         .split_k_l1 = split_k_l1 && !tinym,
         .l2_half_row_tasks = l2_half_row_tasks,
-        .split_k_l2_ways = (split_k_l2 && !tinym) ? split_k_l2_ways : 0u,
-        .stream_k = stream_k && !tinym,
+        .split_k_l2_ways = (split_k_l2 && !tinym && !fuse_l1l2) ? split_k_l2_ways : 0u,
+        .stream_k = stream_k && !tinym && !fuse_l1l2,
         .nvl_fast_epilogue = nvl_fast_epilogue,
         .fine_combine = fine_combine,
         .combine_dynamic = combine_dynamic,
+        .fuse_l1l2 = fuse_l1l2,
         // K128 blocks per pipeline stage on the BM8 RF swapAB tiers (MXFP4 and QoQ,
         // kernel `kKBlocksPerStage`; other tiers ignore it). DG_FP4_KBLOCKS_PER_STAGE in
         // {2, 4}: 2 blocks x 4 stages (default) or 4 blocks x 2 stages (same 173 KB

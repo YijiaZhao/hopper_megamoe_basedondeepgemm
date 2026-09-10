@@ -384,7 +384,11 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           // task's `pool_block_idx` is expert * stride + m_block instead of the
           // dense prefix-sum block index. Task indices / counts stay dense.
           // 0 == packed (pull) layout.
-          uint32_t kPushBlocksPerExpert = 0>
+          uint32_t kPushBlocksPerExpert = 0,
+          // Fused L1+L2 (kernel `kFuseL1L2`): no L2 tasks exist (every L1 task runs its
+          // W2 K-slice itself), so all L1 waves are claimed as warm-up waves and the
+          // L2 claim only terminates the producer.
+          bool kNoL2Tasks = false>
 struct InterleavedMegaMoEScheduler {
     DG_STATIC_ASSERT(!kStreamK || (kNumL1BlockKs % kStreamKKBlocksPerUnit == 0 &&
                                    kNumL2BlockKs % kStreamKKBlocksPerUnit == 0),
@@ -577,6 +581,12 @@ struct InterleavedMegaMoEScheduler {
         num_l2_split_base = split_l2_tail ? num_l2_full_tasks - num_l2_tail_tasks : num_l2_full_tasks;
         num_total_l2_task_indices =
             num_l2_split_base + (num_l2_full_tasks - num_l2_split_base) * num_l2_k_splits;
+        if constexpr (kNoL2Tasks) {
+            num_l2_k_splits = 1u;
+            num_l2_split_base = 0u;
+            num_total_l2_task_indices = 0u;
+            num_l1_warmup_waves = num_total_l1_waves;
+        }
     }
 
     // Number of L1 task indices covering the first `num_full_tasks` L1 tasks

@@ -222,6 +222,22 @@
         kStreamKRequested && kSwapABRequested && (kMXFP4 || kQoQ) && BLOCK_M == 8 &&
         !kHalfTileTasks && !kL2HalfRowTasks && kUseInterleavedScheduler &&
         kDenseWeightTiles && BLOCK_N == 256 && kKBlocksPerStageRequested == 2;
+    // Two-layer fusion for tiny M (kFuseL1L2; host env DG_FP4_FUSE_L1L2, gated by
+    // DG_FP4_FUSE_L1L2_MAX_M; docs/fuse_l1l2_design.md). Every L1 task keeps its 128
+    // SwiGLU columns (== L2 K-block n_block_idx) in SMEM and runs the W2 K-slice itself:
+    // kNumW2Blocks dense W2 tiles (one per output N-block, 256 rows x this K128 block)
+    // in kNumW2Stages extra pipeline stages, each promoted with the intermediate SF
+    // exactly like one L2 K128 block and red.add-ed into the per-(pool block, N-block)
+    // fp32 scratch (the otherwise unused L2 split-K slot); the 10th arriver (acq_rel
+    // ticket == the L2 split-K flag) runs the L2 epilogue for that N-block. No L2 tasks
+    // exist (scheduler kNoL2Tasks); the intermediate global buffer, the L1-ready mask
+    // and the L2 SF buffer are unused. Same tier gate as stream-K (exclusive with it,
+    // with split-K L2 and with the tiny-M GEMV: the host forces those off).
+    constexpr bool kFuseL1L2 =
+        kFuseL1L2Requested && kSwapABRequested && (kMXFP4 || kQoQ) && BLOCK_M == 8 &&
+        !kHalfTileTasks && !kL2HalfRowTasks && kSplitKL2Ways == 0 && !kStreamKRequested &&
+        !kTinyMGemvRequested && kUseInterleavedScheduler && kDenseWeightTiles &&
+        BLOCK_N == 256 && kKBlocksPerStageRequested == 2 && kNumEpilogueWarpgroups == 2;
     // Fast NVLink-barrier epilogue (kNvlFastEpilogue; host env DG_FP4_NVL_FAST_EPI):
     // see fused_comm::nvlink_barrier. Needs the first barrier (before dispatch
     // pull) to have a prologue grid sync, i.e. kDistributedExpertBcast, so that
@@ -351,7 +367,7 @@
         /* phase-specific task N: L1 256-row tasks, L2 TASK_BLOCK_N_L2-row tasks */
         kNumRoutedL1BlockNs, kNumRoutedL2BlockNs,
         kNumL2KSplits, kStreamK, /* stream-K unit == one 2-K-block stage */ 2u,
-        L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K, kPushBlocksPerExpert>;
+        L1_SHAPE_K / BLOCK_K, L2_SHAPE_K / BLOCK_K, kPushBlocksPerExpert, kFuseL1L2>;
     constexpr bool kSplitMDecodedWeightReuse =
         BLOCK_M == 128 && BLOCK_N == 128 && kNumEpilogueWarpgroups == 2;
     constexpr uint32_t WG_BLOCK_M =
@@ -474,6 +490,18 @@
                      "L1 output N-blocks must tile the L2 K dimension exactly");
     DG_STATIC_ASSERT(L1_OUT_BLOCK_N % kL2ActsSFGranK == 0,
                      "L2 activation scale groups must not straddle L1 output blocks");
+    // Fused L1+L2 (kFuseL1L2): W2 tiles per L1 task (one per L2 output N-block) and the
+    // pipeline stages they occupy (kKBlocksPerStage tiles per stage).
+    constexpr uint32_t kNumW2Blocks = kFuseL1L2 ? kNumRoutedL2BlockNs : 0u;
+    constexpr uint32_t kNumW2Stages = kFuseL1L2 ? kNumW2Blocks / kKBlocksPerStage : 0u;
+    DG_STATIC_ASSERT(!kFuseL1L2 ||
+                     (kRFDecode && kKBlocksPerStage == 2 && !kSplitKL2 && !kStreamK && !kTinyMGemv &&
+                      kNumL1BlocksPerL2KBlock == 1 && kNumW2Blocks % kKBlocksPerStage == 0 &&
+                      kNumW2Blocks == fused_layout::kSM90SplitKL2NumL2BlockNs &&
+                      kNumRoutedL1BlockNs == fused_layout::kSM90SplitKL1NumL1BlockNs &&
+                      kL2ActsSFGranK == 128 && L2_WG_BLOCK_N == WG_BLOCK_N && TASK_BLOCK_N_L2 == TASK_BLOCK_N &&
+                      BLOCK_M * L1_OUT_BLOCK_N == kNumEpilogueThreads * 4u),
+                     "Fused L1+L2: RF decode, 2 tiles per stage, one L1 N-block per L2 K-block, 12 W2 N-blocks, one SF per K128");
 
     // =====================================================================
     // Shared memory layout
@@ -578,10 +606,14 @@
     constexpr uint32_t kKSplitReduceElems = kSwapABWeightHalves * kSwapABTokenChunks * 4u;
     constexpr uint32_t SMEM_KSPLIT_REDUCE_SIZE =
         kHalfTileTasks ? 128u * kKSplitReduceElems * static_cast<uint32_t>(sizeof(float)) : 0u;
+    // Fused L1+L2 (kFuseL1L2): the SW128 [BLOCK_M x K128] int8/fp8 intermediate tile
+    // (1 KB, 1024 B aligned: the WGMMA B operand of the W2 slice, same layout the L2
+    // A-loader's TMA produces) followed by BLOCK_M per-token SF floats.
+    constexpr uint32_t SMEM_FUSE_SIZE = kFuseL1L2 ? 2u * kSharedMemoryAlignment : 0u;
 
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
         SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_NVFP4_LUT_SIZE + SMEM_RF_LUT_REP_SIZE +
-        SMEM_CD_SIZE +
+        SMEM_CD_SIZE + SMEM_FUSE_SIZE +
         kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_PACKED_B_SIZE_PER_STAGE) +
         kNumDecodedBStages * SMEM_B_SIZE_PER_STAGE;
 
@@ -605,26 +637,29 @@
     auto smem_cd_l1_shared_sf =
         math::advance_ptr<float>(smem_cd_base, SMEM_CD_OUTPUT_BASE_SIZE);
     auto smem_cd_l2 = reinterpret_cast<nv_bfloat16*>(smem_cd_base);
+    // Fused L1+L2: intermediate tile + its per-token SF (see SMEM_FUSE_SIZE)
+    auto smem_fuse_b = math::advance_ptr<uint8_t>(smem_gemm_base, SMEM_CD_SIZE);
+    auto smem_fuse_sf = reinterpret_cast<float*>(smem_fuse_b + kSharedMemoryAlignment);
 
     auto smem_a = utils::PatternVisitor([=](const uint32_t& i) {
-        return math::advance_ptr<a_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+        return math::advance_ptr<a_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + SMEM_FUSE_SIZE + i * SMEM_A_SIZE_PER_STAGE);
     });
     auto smem_b = utils::PatternVisitor([=](const uint32_t& i) {
         const uint32_t decoded_stage =
             kDoubleBufferDecodedB ? (i & 1u) : i;
         return math::advance_ptr<b_dtype_t>(
             smem_gemm_base,
-            SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE +
+            SMEM_CD_SIZE + SMEM_FUSE_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE +
             decoded_stage * SMEM_B_SIZE_PER_STAGE);
     });
     auto smem_packed_b = utils::PatternVisitor([=](const uint32_t& i) {
         return math::advance_ptr<b_dtype_t>(
-            smem_gemm_base, SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE +
+            smem_gemm_base, SMEM_CD_SIZE + SMEM_FUSE_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE +
             kNumDecodedBStages * SMEM_B_SIZE_PER_STAGE +
             i * SMEM_PACKED_B_SIZE_PER_STAGE);
     });
     auto sf_start_ptr = math::advance_ptr<uint8_t>(smem_gemm_base,
-        SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_PACKED_B_SIZE_PER_STAGE) +
+        SMEM_CD_SIZE + SMEM_FUSE_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_PACKED_B_SIZE_PER_STAGE) +
         kNumDecodedBStages * SMEM_B_SIZE_PER_STAGE);
     auto smem_sfa = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<float*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
@@ -1648,6 +1683,20 @@
                 }
                 __syncwarp();
             }
+            if constexpr (kFuseL1L2 && !kBlockIsL2) {
+                // W2 slice stages (finisher / unsplit L1 tasks only): no A / SF bytes (the
+                // B operand is the SMEM intermediate), just the producer arrival.
+                if (num_k_splits == 1u || k_split_idx + 1u == num_k_splits) {
+                    for (uint32_t s = 0; s < kNumW2Stages; ++ s) {
+                        empty_barriers[stage_idx]->wait(phase ^ 1);
+                        if (cute::elect_one_sync())
+                            full_barriers[stage_idx]->arrive();
+                        __syncwarp();
+                        uint32_t w2_dummy_k = 0;
+                        advance_pipeline(w2_dummy_k);
+                    }
+                }
+            }
         };
         if constexpr (kTinyMGemv) {
             // TinyM GEMV: the math warps read weights and activations themselves
@@ -1737,6 +1786,35 @@
                         kDenseWeightTiles ? stage_bytes : SMEM_PACKED_B_SIZE_PER_STAGE);
                 }
                 __syncwarp();
+            }
+            if constexpr (kFuseL1L2 && !kBlockIsL2) {
+                // W2 slice (finisher / unsplit L1 tasks only): kNumW2Blocks dense W2 tiles
+                // (output N-block j, K128 block n_block_idx), kKBlocksPerStage per stage at
+                // +0 / +20 KB of the packed-B slot, in the rotated order j = (u + n_block_idx)
+                // % kNumW2Blocks shared with the math warps.
+                if (num_k_splits == 1u || k_split_idx + 1u == num_k_splits) {
+                    const auto* w2_tiles = reinterpret_cast<const uint8_t*>(l2_weights_ptr) +
+                        static_cast<size_t>(local_expert_idx * (L2_SHAPE_N / kPackedTileN)) *
+                            (L2_SHAPE_K / BLOCK_K) * kPackedTileBytes +
+                        static_cast<size_t>(n_block_idx) * kPackedTileBytes;
+                    for (uint32_t s = 0; s < kNumW2Stages; ++ s) {
+                        empty_barriers[stage_idx]->wait(phase ^ 1);
+                        if (cute::elect_one_sync()) {
+                            #pragma unroll
+                            for (uint32_t b = 0; b < kKBlocksPerStage; ++ b) {
+                                const uint32_t j = (s * kKBlocksPerStage + b + n_block_idx) % kNumW2Blocks;
+                                ptx::tma_load_1d(
+                                    reinterpret_cast<uint8_t*>(smem_packed_b[stage_idx]) + b * kPackedTileBytes,
+                                    w2_tiles + static_cast<size_t>(j) * (L2_SHAPE_K / BLOCK_K) * kPackedTileBytes,
+                                    full_barriers[stage_idx], kPackedTileBytes);
+                            }
+                            full_barriers[stage_idx]->arrive_and_expect_tx(kKBlocksPerStage * kPackedTileBytes);
+                        }
+                        __syncwarp();
+                        uint32_t w2_dummy_k = 0;
+                        advance_pipeline(w2_dummy_k);
+                    }
+                }
             }
         };
         if constexpr (kL2PrefetchAll && !kTinyMGemv) {
@@ -1960,6 +2038,332 @@
             using WGMMA = L1WGMMA;
             constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum;  // 64 for M=64,N=128
             float final_accum[kAccumPerThread] = {};
+
+            // L2 swapAB epilogue for L2 N-block `l2_n_block_idx` from `final_accum`: BF16 x
+            // per-row scale -> smem, 16-lane NVLink row scatter, CTA barrier, combine
+            // mailbox entry. The L2 task path calls it with its own n_block_idx, the
+            // fused-L1L2 finisher (kFuseL1L2) with the W2 N-block whose 10 partials it
+            // completed (same pool block / valid_m / WG column split).
+            const auto l2_epilogue_swap = [&](const uint32_t& l2_n_block_idx) {
+                if constexpr (kSwapABRequested) {
+                    const uint32_t l2_n_idx = l2_n_block_idx * TASK_BLOCK_N_L2 + wg_n_idx;
+                    const float* __restrict__ l2_rows = kPerRowEpilogueScale ?
+                        l2_global_scales + local_expert_idx * L2_SHAPE_N + l2_n_idx : nullptr;
+                    const auto scale_at = [&](const uint32_t& col) -> float {
+                        if constexpr (kPerRowEpilogueScale)
+                            return __ldg(l2_rows + col);
+                        else
+                            return l2_global_scale;
+                    };
+                    // Each active warp scatters a contiguous group of up to 16 rows.
+                    constexpr uint32_t kNumRowsPerWarp =
+                        BLOCK_M == 8 ? 4u : 8u;
+                    auto store_swap_bf16 = [&](const uint32_t& token, const uint32_t& col, const float& value) {
+                        if (token < valid_m)
+                            smem_cd_l2[token * BLOCK_N + wg_n_idx + col] =
+                                __float2bfloat16_rn(value * scale_at(col));
+                    };
+
+                    const uint32_t num_swap_token_chunks = (valid_m + 7u) / 8u;
+                    auto store_l2_swap_chunk = [&](const uint32_t& i) {
+                        const uint32_t token_0 = i * 8 + col_idx * 2;
+                        const uint32_t token_1 = token_0 + 1;
+                        // L2 half-row tasks: one 64-row half per WG (own accumulators,
+                        // own 64 hidden rows [n_idx, n_idx + 64) of the combine row).
+                        #pragma unroll
+                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
+                            const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
+                            const uint32_t col_offset = half * 64u;
+                            store_swap_bf16(token_0, col_offset + r_0, final_accum[accum_offset + 0]);
+                            store_swap_bf16(token_0, col_offset + r_1, final_accum[accum_offset + 2]);
+                            store_swap_bf16(token_1, col_offset + r_0, final_accum[accum_offset + 1]);
+                            store_swap_bf16(token_1, col_offset + r_1, final_accum[accum_offset + 3]);
+                        }
+                    };
+
+                    if (is_epilogue_wg) {
+                        store_l2_swap_chunk(0);
+                        if (valid_m > 8) {
+                            #pragma unroll
+                            for (uint32_t i = 1; i < kSwapABTokenChunks; ++ i) {
+                                if (i < num_swap_token_chunks)
+                                    store_l2_swap_chunk(i);
+                            }
+                        }
+                    }
+
+                    ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+
+                    const uint32_t row_in_warp_block = lane_idx / 16;
+                    const uint32_t lane_in_row = lane_idx % 16;
+                    constexpr uint32_t kColsPerScatterLane = kWGBlockN / 16;
+                    DG_STATIC_ASSERT(kWGBlockN % 16 == 0,
+                                     "SwapAB L2 scatter expects an even lane partition");
+                    DG_STATIC_ASSERT(kColsPerScatterLane == 4 || kColsPerScatterLane == 8,
+                                     "SwapAB L2 scatter supports WG_BLOCK_N=64 or 128");
+
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
+                        const uint32_t token = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
+                        if (token >= valid_m || !is_epilogue_wg) break;
+
+                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(
+                            pool_block_idx * BLOCK_M + token);
+                        const uint32_t dst_rank_idx = src_metadata.rank_idx;
+                        const uint32_t dst_token_idx = src_metadata.token_idx;
+                        const uint32_t dst_topk_idx = src_metadata.topk_idx;
+                        const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
+                                               .get_data_buffer(dst_token_idx);
+                        auto smem_ptr = smem_cd_l2
+                            + token * BLOCK_N
+                            + wg_n_idx
+                            + lane_in_row * kColsPerScatterLane;
+                        if constexpr (kColsPerScatterLane == 8) {
+                            const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
+                            auto dst_ptr = math::advance_ptr<uint4>(
+                                dst_token.get_base_ptr(),
+                                l2_n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint4));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        } else {
+                            const auto packed = *reinterpret_cast<uint2*>(smem_ptr);
+                            auto dst_ptr = math::advance_ptr<uint2>(
+                                dst_token.get_base_ptr(),
+                                l2_n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint2));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        }
+                    }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    signal_combine_arrivals();
+                }
+            };
+
+            // Fused L1+L2 (kFuseL1L2, L1 tasks): W2 K-slice right after the SwiGLU epilogue
+            // (see docs/fuse_l1l2_design.md). Called after the CTA barrier that follows the
+            // FP8/INT8 quantisation into `smem_cd_l1` ([BLOCK_M][L1_OUT_BLOCK_N] bytes) and
+            // the per-token SF into `smem_fuse_sf`.
+            const auto run_w2_slice = [&]() {
+                if constexpr (kFuseL1L2 && !kBlockIsL2) {
+                    const bool w2_probe_on =
+                        (phase_stamps != nullptr) && (sm_idx == 0) && (epilogue_thread_idx == 0);
+                    const unsigned long long w2_t0 = w2_probe_on ? clock64() : 0ull;
+                    // (1) Intermediate -> SW128 tile (the layout the L2 A-loader's TMA would
+                    // have produced: 16 B chunk c of 128 B row t at chunk c ^ (t & 7)). One
+                    // 4 B word per thread (BLOCK_M * 128 B == 256 threads * 4 B), then the
+                    // async-proxy fence + CTA barrier before the first WGMMA reads it.
+                    {
+                        const uint32_t t = epilogue_thread_idx >> 5, c = (epilogue_thread_idx & 31u) * 4u;
+                        const uint32_t word = *reinterpret_cast<const uint32_t*>(
+                            reinterpret_cast<const uint8_t*>(smem_cd_l1) + t * L1_OUT_BLOCK_N + c);
+                        *reinterpret_cast<uint32_t*>(
+                            smem_fuse_b + t * 128u + (((c >> 4) ^ (t & 7u)) << 4) + (c & 15u)) = word;
+                    }
+                    cutlass::arch::fence_view_async_shared();
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+                    // (2) Per-tile RS pipeline: same decode / RS WGMMA / promote as one L2 K128
+                    // block (BLOCK_M == 8: N_SWAP 8, token chunk 0 only), fresh accumulators per
+                    // tile; the promoted fp32 partial goes to the tile's scratch slot by red.add.
+                    using W2RS = typename std::conditional_t<kQoQ,
+                        mma::sm90::INT8MMARSSelector<8>, mma::sm90::FP8MMARSSelector<8>>::type;
+                    constexpr uint32_t kW2Accum = W2RS::kNumAccum;
+                    constexpr uint32_t kW2Chains = 2u;
+                    DG_STATIC_ASSERT(kW2Accum == 4 && W2RS::K == 32, "W2 slice expects m64n8k32 RS atoms");
+                    swap_accum_t w2_acc[kKBlocksPerStage][kWGHalves][kW2Chains][kW2Accum];
+                    uint32_t w2_frag[kKBlocksPerStage][kWGHalves][4][4];
+                    uint32_t w2_meta[kKBlocksPerStage][kWGHalves][2];
+
+                    const auto w2_decode = [&](const uint32_t& stage, const uint32_t& b,
+                                               uint32_t (&f)[kWGHalves][4][4], uint32_t (&meta)[kWGHalves][2]) {
+                        const auto* packed_rows =
+                            reinterpret_cast<const uint8_t*>(smem_packed_b[stage]) + b * kPackedTileBytes;
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            const uint32_t row_0 = wg_n_idx + h * 64u + r_0, row_1 = row_0 + 8u;
+                            const uint4 w0 = *reinterpret_cast<const uint4*>(packed_rows + row_0 * 80u + col_idx * 16u);
+                            const uint4 w1 = *reinterpret_cast<const uint4*>(packed_rows + row_1 * 80u + col_idx * 16u);
+                            const uint32_t sw0 = *reinterpret_cast<const uint32_t*>(packed_rows + row_0 * 80u + 64u);
+                            const uint32_t sw1 = *reinterpret_cast<const uint32_t*>(packed_rows + row_1 * 80u + 64u);
+                            meta[h][0] = sw0;
+                            meta[h][1] = sw1;
+                            const uint32_t wr0[4] = {w0.x, w0.y, w0.z, w0.w};
+                            const uint32_t wr1[4] = {w1.x, w1.y, w1.z, w1.w};
+                            if constexpr (kQoQ) {
+                                // (code - z) int8, borrow-guarded per byte (see `decode_words_rf`)
+                                const uint32_t z0 = ((sw0 >> 8u) & 0xffu) * 0x01010101u;
+                                const uint32_t z1 = ((sw1 >> 8u) & 0xffu) * 0x01010101u;
+                                #pragma unroll
+                                for (uint32_t k = 0; k < 4; ++ k) {
+                                    f[h][k][0] = ((((wr0[k] >> 4) & 0x0f0f0f0fu) | 0x80808080u) - z0) ^ 0x80808080u;
+                                    f[h][k][1] = ((((wr1[k] >> 4) & 0x0f0f0f0fu) | 0x80808080u) - z1) ^ 0x80808080u;
+                                    f[h][k][2] = (((wr0[k] & 0x0f0f0f0fu) | 0x80808080u) - z0) ^ 0x80808080u;
+                                    f[h][k][3] = (((wr1[k] & 0x0f0f0f0fu) | 0x80808080u) - z1) ^ 0x80808080u;
+                                }
+                            } else {
+                                #pragma unroll
+                                for (uint32_t k = 0; k < 4; ++ k) {
+                                    const uint2 lut0 = smem_nvfp4_lut[(sw0 >> (k * 8u)) & 0x7fu];
+                                    const uint2 lut1 = smem_nvfp4_lut[(sw1 >> (k * 8u)) & 0x7fu];
+                                    const uint2 d0 = deep_gemm::nvfp4::dequant_mode2_nibble_word(wr0[k], lut0);
+                                    const uint2 d1 = deep_gemm::nvfp4::dequant_mode2_nibble_word(wr1[k], lut1);
+                                    f[h][k][0] = d0.x; f[h][k][1] = d1.x;
+                                    f[h][k][2] = d0.y; f[h][k][3] = d1.y;
+                                }
+                            }
+                        }
+                    };
+                    const auto w2_fence = [&](uint32_t (&f)[kWGHalves][4][4],
+                                              swap_accum_t (&acc)[kWGHalves][kW2Chains][kW2Accum]) {
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            #pragma unroll
+                            for (uint32_t c = 0; c < kW2Chains; ++ c) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kW2Accum; ++ i)
+                                    ptx::warpgroup_fence_operand(acc[h][c][i]);
+                            }
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 4; ++ k) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++ i)
+                                    ptx::warpgroup_fence_operand(reinterpret_cast<float&>(f[h][k][i]));
+                            }
+                        }
+                    };
+                    const auto w2_issue = [&](uint32_t (&f)[kWGHalves][4][4],
+                                              swap_accum_t (&acc)[kWGHalves][kW2Chains][kW2Accum]) {
+                        w2_fence(f, acc);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            #pragma unroll
+                            for (uint32_t k = 0; k < 4; ++ k) {
+                                auto desc_b = mma::sm90::make_smem_desc(
+                                    reinterpret_cast<a_dtype_t*>(smem_fuse_b) + k * W2RS::K, 1);
+                                W2RS::wgmma(f[h][k], desc_b, acc[h][k % kW2Chains], (k / kW2Chains) > 0);
+                            }
+                        }
+                        ptx::warpgroup_commit_batch();
+                    };
+                    // Promote one tile (intermediate SF x QoQ s2[row]) into the 8 partial
+                    // floats this thread owns of the slot (elements (h * 4 + i), i.e.
+                    // final_accum[h * kSwapABHalfAccumPerThread + i] of token chunk 0), and
+                    // red.add them into the tile's scratch slot ([element][256 threads]).
+                    const auto w2_promote_add = [&](const swap_accum_t (&acc)[kWGHalves][kW2Chains][kW2Accum],
+                                                    const uint32_t (&meta)[kWGHalves][2], float* slot) {
+                        const uint32_t token_0 = col_idx * 2, token_1 = token_0 + 1;
+                        const float raw_0 = ptx::ld_shared(smem_fuse_sf + token_0);
+                        const float raw_1 = ptx::ld_shared(smem_fuse_sf + token_1);
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            float s2_r0 = 1.0f, s2_r1 = 1.0f;
+                            if constexpr (kQoQ) {
+                                s2_r0 = __uint_as_float(0x4B000000u | (meta[h][0] & 0xffu)) - 8388608.0f;
+                                s2_r1 = __uint_as_float(0x4B000000u | (meta[h][1] & 0xffu)) - 8388608.0f;
+                            }
+                            const auto acc_sum = [&](const uint32_t& j) -> float {
+                                swap_accum_t v = acc[h][0][j];
+                                #pragma unroll
+                                for (uint32_t c = 1; c < kW2Chains; ++ c)
+                                    v += acc[h][c][j];
+                                if constexpr (kQoQ)
+                                    return __int_as_float(0x4B400000 + v) - 12582912.0f;
+                                else
+                                    return static_cast<float>(v);
+                            };
+                            float part[4];
+                            part[0] = token_0 < valid_m ? (raw_0 * s2_r0) * acc_sum(0) : 0.0f;
+                            part[2] = token_0 < valid_m ? (raw_0 * s2_r1) * acc_sum(2) : 0.0f;
+                            part[1] = token_1 < valid_m ? (raw_1 * s2_r0) * acc_sum(1) : 0.0f;
+                            part[3] = token_1 < valid_m ? (raw_1 * s2_r1) * acc_sum(3) : 0.0f;
+                            #pragma unroll
+                            for (uint32_t i = 0; i < 4; ++ i)
+                                atomicAdd(slot + (h * 4u + i) * kNumEpilogueThreads + epilogue_thread_idx, part[i]);
+                        }
+                    };
+                    // Finisher: this CTA's ticket for N-block j was the last of the
+                    // kNumRoutedL1BlockNs contributors. Load the slot (thread 0's acq_rel
+                    // ticket + the CTA barrier made every contributor's red.adds visible), zero
+                    // it and reset the ticket for the next launch, then run the L2 epilogue.
+                    const auto w2_finish = [&](const uint32_t& j) {
+                        const bool fin_probe_on = w2_probe_on;
+                        const unsigned long long fin_t0 = fin_probe_on ? clock64() : 0ull;
+                        float* slot = workspace.get_splitk_l2_scratch_ptr(pool_block_idx, j, 0u);
+                        #pragma unroll
+                        for (uint32_t h = 0; h < kWGHalves; ++ h) {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < 4; ++ i) {
+                                float* p = slot + (h * 4u + i) * kNumEpilogueThreads + epilogue_thread_idx;
+                                final_accum[h * kSwapABHalfAccumPerThread + i] = __ldcg(p);
+                                __stcg(p, 0.0f);
+                            }
+                        }
+                        if (epilogue_thread_idx == 0)
+                            *workspace.get_splitk_l2_flag_ptr(pool_block_idx, j) = 0u;
+                        l2_epilogue_swap(j);
+                        if (epilogue_thread_idx == 0) {
+                            stamp_max(5);
+                            if (phase_stamps != nullptr) atomicAdd(phase_stamps + 41, 1ull);
+                        }
+                        if (fin_probe_on) atomicAdd(phase_stamps + 42, clock64() - fin_t0);
+                    };
+                    const auto w2_block_idx = [&](const uint32_t& s, const uint32_t& b) -> uint32_t {
+                        return (s * kKBlocksPerStage + b + n_block_idx) % kNumW2Blocks;
+                    };
+                    // Tickets of stage s are taken (warp 0, lane b) after the CTA barrier that
+                    // follows the stage's red.adds and consumed one stage later (published
+                    // through the 16 B stream-K ticket word, [parity][b]), so the L2 round
+                    // trip hides behind the next stage's math.
+                    uint32_t* const w2_ticket_smem = smem_streamk_ticket;
+                    uint32_t my_ticket = 0;
+                    const auto w2_handle_tickets = [&](const uint32_t& s) {
+                        #pragma unroll
+                        for (uint32_t b = 0; b < kKBlocksPerStage; ++ b) {
+                            const uint32_t ticket = ptx::ld_shared(w2_ticket_smem + (s & 1u) * kKBlocksPerStage + b);
+                            if (ticket == kNumRoutedL1BlockNs - 1u)
+                                w2_finish(w2_block_idx(s, b));
+                        }
+                    };
+                    for (uint32_t s = 0; s < kNumW2Stages; ++ s) {
+                        full_barriers[stage_idx]->wait(phase);
+                        const uint32_t cur_stage = stage_idx;
+                        w2_decode(cur_stage, 0, w2_frag[0], w2_meta[0]);
+                        w2_issue(w2_frag[0], w2_acc[0]);
+                        w2_decode(cur_stage, 1, w2_frag[1], w2_meta[1]);
+                        w2_issue(w2_frag[1], w2_acc[1]);
+                        w2_fence(w2_frag[0], w2_acc[0]);
+                        ptx::warpgroup_wait<1>();
+                        w2_fence(w2_frag[0], w2_acc[0]);
+                        w2_promote_add(w2_acc[0], w2_meta[0],
+                                       workspace.get_splitk_l2_scratch_ptr(pool_block_idx, w2_block_idx(s, 0), 0u));
+                        w2_fence(w2_frag[1], w2_acc[1]);
+                        ptx::warpgroup_wait<0>();
+                        w2_fence(w2_frag[1], w2_acc[1]);
+                        w2_promote_add(w2_acc[1], w2_meta[1],
+                                       workspace.get_splitk_l2_scratch_ptr(pool_block_idx, w2_block_idx(s, 1), 0u));
+                        arrive_empty_barrier(cur_stage);
+                        uint32_t w2_dummy_k = 0;
+                        advance_pipeline(w2_dummy_k);
+                        // Publish the previous stage's tickets, barrier (orders this stage's
+                        // red.adds before the tickets below), take this stage's tickets.
+                        if (s > 0 && epilogue_warp_idx == 0 && lane_idx < kKBlocksPerStage)
+                            ptx::st_shared(w2_ticket_smem + ((s - 1u) & 1u) * kKBlocksPerStage + lane_idx, my_ticket);
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        if (epilogue_warp_idx == 0 && lane_idx < kKBlocksPerStage)
+                            my_ticket = ptx::atomic_add_acq_rel(
+                                workspace.get_splitk_l2_flag_ptr(pool_block_idx, w2_block_idx(s, lane_idx)), 1u);
+                        if (s > 0)
+                            w2_handle_tickets(s - 1u);
+                    }
+                    if (epilogue_warp_idx == 0 && lane_idx < kKBlocksPerStage)
+                        ptx::st_shared(w2_ticket_smem + ((kNumW2Stages - 1u) & 1u) * kKBlocksPerStage + lane_idx, my_ticket);
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    w2_handle_tickets(kNumW2Stages - 1u);
+                    if (w2_probe_on) {
+                        atomicAdd(phase_stamps + 43, 1ull);
+                        atomicAdd(phase_stamps + 44, clock64() - w2_t0);
+                    }
+                }
+            };
             const auto decode_b_stage = [&](const uint32_t& decoded_stage) {
                 if constexpr (kSplitMDecodedWeightReuse) {
                     // Both M64 consumers share the same decoded N128 tile.
@@ -4103,10 +4507,15 @@
                             math::get_e4m3_sf_and_sf_inv(amax_pair, sf_pair, sf_inv_pair);
                         }
 
-                        auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
-                        const uint32_t token_idx = m_idx + token;
-                        sf_base_ptr[sf_base_k_idx * kNumPaddedSFPoolTokens + token_idx] =
-                            sf_pair.x;
+                        if constexpr (kFuseL1L2) {
+                            // The W2 slice promotes with the SF straight from SMEM
+                            smem_fuse_sf[token] = sf_pair.x;
+                        } else {
+                            auto sf_base_ptr = l2_sf_buffer.get_base_ptr<float>();
+                            const uint32_t token_idx = m_idx + token;
+                            sf_base_ptr[sf_base_k_idx * kNumPaddedSFPoolTokens + token_idx] =
+                                sf_pair.x;
+                        }
                         smem_cd_l1_shared_sf[token * kNumEpilogueWarps + reduce_warp_start] = sf_inv_pair.x;
                     }
 
@@ -4136,20 +4545,26 @@
                         }
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    if (epilogue_wg_idx == 0 and warp_idx_in_wg == 0 and cute::elect_one_sync()) {
-                        const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
-                        cute::tma_store_fence();
-                        cute::SM90_TMA_STORE_2D::copy(
-                            &tensor_map_l1_output,
-                            smem_cd_l1,
-                            out_n_idx,
-                            m_idx);
-                        cute::tma_store_arrive();
+                    if constexpr (kFuseL1L2) {
+                        // No intermediate global store / L1-ready notify: the W2 slice
+                        // consumes the tile from SMEM (see `run_w2_slice`).
+                        run_w2_slice();
+                    } else {
+                        if (epilogue_wg_idx == 0 and warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                            const uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N;
+                            cute::tma_store_fence();
+                            cute::SM90_TMA_STORE_2D::copy(
+                                &tensor_map_l1_output,
+                                smem_cd_l1,
+                                out_n_idx,
+                                m_idx);
+                            cute::tma_store_arrive();
+                        }
+                        __syncwarp();
+                        ptx::tma_store_wait<0>();
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        notify_l1_ready(pool_block_idx, n_block_idx);
                     }
-                    __syncwarp();
-                    ptx::tma_store_wait<0>();
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    notify_l1_ready(pool_block_idx, n_block_idx);
                 } else {
                     // ---------------- L1 EPILOGUE: SwiGLU + FP8 quantize + TMA store ----------------
                     const bool valid_r0 = row_offset_r0 < valid_m;
@@ -4353,85 +4768,7 @@
             } else {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
                 if constexpr (kSwapABRequested) {
-                    // Each active warp scatters a contiguous group of up to 16 rows.
-                    constexpr uint32_t kNumRowsPerWarp =
-                        BLOCK_M == 8 ? 4u : 8u;
-                    auto store_swap_bf16 = [&](const uint32_t& token, const uint32_t& col, const float& value) {
-                        if (token < valid_m)
-                            smem_cd_l2[token * BLOCK_N + wg_n_idx + col] =
-                                __float2bfloat16_rn(value * l2_scale_at(col));
-                    };
-
-                    const uint32_t num_swap_token_chunks = (valid_m + 7u) / 8u;
-                    auto store_l2_swap_chunk = [&](const uint32_t& i) {
-                        const uint32_t token_0 = i * 8 + col_idx * 2;
-                        const uint32_t token_1 = token_0 + 1;
-                        // L2 half-row tasks: one 64-row half per WG (own accumulators,
-                        // own 64 hidden rows [n_idx, n_idx + 64) of the combine row).
-                        #pragma unroll
-                        for (uint32_t half = 0; half < kWGHalves; ++ half) {
-                            const uint32_t accum_offset = half * kSwapABHalfAccumPerThread + i * 4;
-                            const uint32_t col_offset = half * 64u;
-                            store_swap_bf16(token_0, col_offset + r_0, final_accum[accum_offset + 0]);
-                            store_swap_bf16(token_0, col_offset + r_1, final_accum[accum_offset + 2]);
-                            store_swap_bf16(token_1, col_offset + r_0, final_accum[accum_offset + 1]);
-                            store_swap_bf16(token_1, col_offset + r_1, final_accum[accum_offset + 3]);
-                        }
-                    };
-
-                    if (is_epilogue_wg) {
-                        store_l2_swap_chunk(0);
-                        if (valid_m > 8) {
-                            #pragma unroll
-                            for (uint32_t i = 1; i < kSwapABTokenChunks; ++ i) {
-                                if (i < num_swap_token_chunks)
-                                    store_l2_swap_chunk(i);
-                            }
-                        }
-                    }
-
-                    ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
-
-                    const uint32_t row_in_warp_block = lane_idx / 16;
-                    const uint32_t lane_in_row = lane_idx % 16;
-                    constexpr uint32_t kColsPerScatterLane = kWGBlockN / 16;
-                    DG_STATIC_ASSERT(kWGBlockN % 16 == 0,
-                                     "SwapAB L2 scatter expects an even lane partition");
-                    DG_STATIC_ASSERT(kColsPerScatterLane == 4 || kColsPerScatterLane == 8,
-                                     "SwapAB L2 scatter supports WG_BLOCK_N=64 or 128");
-
-                    #pragma unroll
-                    for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
-                        const uint32_t token = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
-                        if (token >= valid_m || !is_epilogue_wg) break;
-
-                        const auto src_metadata = *workspace.get_token_src_metadata_ptr(
-                            pool_block_idx * BLOCK_M + token);
-                        const uint32_t dst_rank_idx = src_metadata.rank_idx;
-                        const uint32_t dst_token_idx = src_metadata.token_idx;
-                        const uint32_t dst_topk_idx = src_metadata.topk_idx;
-                        const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
-                                               .get_data_buffer(dst_token_idx);
-                        auto smem_ptr = smem_cd_l2
-                            + token * BLOCK_N
-                            + wg_n_idx
-                            + lane_in_row * kColsPerScatterLane;
-                        if constexpr (kColsPerScatterLane == 8) {
-                            const auto packed = *reinterpret_cast<uint4*>(smem_ptr);
-                            auto dst_ptr = math::advance_ptr<uint4>(
-                                dst_token.get_base_ptr(),
-                                n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint4));
-                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
-                        } else {
-                            const auto packed = *reinterpret_cast<uint2*>(smem_ptr);
-                            auto dst_ptr = math::advance_ptr<uint2>(
-                                dst_token.get_base_ptr(),
-                                n_idx * sizeof(nv_bfloat16) + lane_in_row * sizeof(uint2));
-                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
-                        }
-                    }
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    signal_combine_arrivals();
+                    l2_epilogue_swap(n_block_idx);
                 } else {
                     DG_STATIC_ASSERT(WG_BLOCK_N == 64 || WG_BLOCK_N == 128,
                                      "Direct L2 scatter requires N64/N128");

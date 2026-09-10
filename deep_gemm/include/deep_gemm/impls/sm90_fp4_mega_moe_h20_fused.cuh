@@ -484,6 +484,12 @@ template <
     // the first CTAs to finish their math take the tokens; see `kCombineDynamic`
     // in the body. Env DG_FP4_COMBINE_DYNAMIC (default 1).
     bool kCombineDynamicRequested = true,
+    // Host-selected two-layer fusion for tiny M (docs/fuse_l1l2_design.md): every L1
+    // task keeps its SwiGLU output in SMEM and runs the W2 K-slice (12 output N-blocks
+    // x its K128 block) itself, reducing across the 10 L1 tasks of a pool block with
+    // red.add into the workspace scratch + one ticket per (pool block, N-block); no
+    // L2 tasks. See `kFuseL1L2` in the body. Env DG_FP4_FUSE_L1L2 / DG_FP4_FUSE_L1L2_MAX_M.
+    bool kFuseL1L2Requested = false,
     // Host-selected K128 blocks per pipeline stage for the BM8 MXFP4 RF swapAB
     // path (2 or 4; see `kKBlocksPerStage` in the body). Ignored by every other
     // tier (one K-block per stage). Env DG_FP4_KBLOCKS_PER_STAGE (see the heuristic).
