@@ -198,7 +198,28 @@ kernel, as the probe says.
 Stress: 200 FE+Mega graph replays at M=8 with WGS=3 (spin timeout on): mxfp4 and qoq exit 0,
 Mega median 81.4 / 74.6 us (n=200), no hang, no timeout trap.
 
-NSYS_PLACEHOLDER
+### nsys customer method (one capture per knob, TOKENS_LIST="2 4 8 16", e2e + mega fused)
+
+Attempted twice on 2026-09-10 (`MODE=nsys bash scripts/wg3_validate.sh`, output
+`/raid/kimi/wg3_val_f/nsys_wg{2,3}`): both runs were cut short by the capture script's
+all-GPUs-idle check — first by the post-torchrun teardown (> 45 s to release GPU memory;
+now `GPU_IDLE_RETRIES=300` + `RESUME=1` in the validate script), then by a foreign sglang
+server that keeps re-launching on GPU 3 (~117 GB). Only e2e_fused_mxfp4 M2 / M4 (WGS=2) and
+M2 (WGS=3) reports exist; no customer-method table yet. Resume when .7 is free:
+`MODE=nsys TAG=_f bash scripts/wg3_validate.sh` (keeps the existing reports), then
+`scripts/summarize_knob_captures.py --knob 2 nsys_wg2 --knob 3 nsys_wg3 --fused-only`.
+Given the probe and the event method (no gain, +-1-2 us), the capture is for the record only.
+
+### Merge status
+
+`DG_FP4_MATH_WGS` defaults to 2: the shipped TU differs only by the `#define DG_FP4_MATH_WGS 2`
+line, ptxas is unchanged (168 registers, 0 spill, 4 full drains, both quants) and every
+WGS=2 correctness point reproduces today's cos_min to 10 digits. The knob is a documented
+negative result: correct (cos_min identical to the two-WG kernel at 2 / 4 / 8 / 16 global
+tokens, 200-replay stress clean), register-clean (QoQ 0 B; MXFP4 <= 32 B of cold per-task
+bookkeeping stack), but not faster, because the tiny-M L1 loop is SM issue / LDS-bandwidth
+bound. Mergeable as an OFF-by-default knob; nothing in the default path changes.
+
 
 
 
