@@ -176,7 +176,14 @@
     constexpr bool kSplitKL1 =
         kSplitKL1Requested && kSwapABRequested && (kMXFP4 || kQoQ) && BLOCK_M == 8 &&
         !kHalfTileTasks && kUseInterleavedScheduler && kDenseWeightTiles && BLOCK_N == 256;
-    constexpr uint32_t kNumL1KSplits = kSplitKL1 ? fused_layout::kSM90SplitKL1NumKSplits : 1u;
+    // Wide L1 tasks: M=16 gives 16 pool blocks x 5 = 80 tasks on 78 SMs, so the 2-task
+    // straggler wave is split THREE ways (8 K128 blocks each, ~1/3 of a task) instead
+    // of two; the two publishers' 16 KB partials use the (idle with wide tasks) L2
+    // split-K scratch, see `slot_of` in the reduction.
+    constexpr uint32_t kNumL1KSplits = kSplitKL1 ?
+        ((kWideTiles && kL1Tiles > 1) ? 3u : fused_layout::kSM90SplitKL1NumKSplits) : 1u;
+    DG_STATIC_ASSERT(kNumL1KSplits <= 1u + fused_layout::kSM90SplitKL2MaxPublishers,
+                     "Wide L1 3-way split: publisher partials live in the L2 split-K slots");
     // L2 half-row tasks (kL2HalfRowTasks; host env DG_FP4_L2_HALFROW, default OFF;
     // only the BM8 MXFP4 RF swapAB tier == the 2-K-block-per-stage path with dense
     // BN256 tiles and the interleaved scheduler can enable it; exclusive with
@@ -4471,13 +4478,21 @@
                                      fused_layout::kSM90SplitKL1PartialBytes * kPhaseTiles,
                                      "Split-K partial slot size mismatch");
                     DG_STATIC_ASSERT(fused_layout::kSM90SplitKL1NumKSplits == 2,
-                                     "L1 split-K handshake assumes one publisher and one finisher half");
+                                     "L1 split-K default handshake: one publisher and one finisher half");
+                    DG_STATIC_ASSERT(kBlockIsL2 || kNumL1KSplits == 2 || (kPhaseTiles > 1 && !kSplitKL2 && !kStreamK),
+                                     "Wide L1 3-way split needs the L2 split-K scratch to be free");
                     // Publisher p (k_split_idx < num_k_splits - 1) owns partial slot p;
                     // the finisher (last split) sums slots 0 .. num_k_splits - 2.
+                    // Wide L1 (3-way): publisher p's 16 KB partial = the two 8 KB publisher
+                    // slots of L2 N-block (n_block * 2 + p) (<= 9 < 12), contiguous.
                     const auto slot_of = [&](const uint32_t& publisher_idx) -> float* {
-                        return kBlockIsL2 ?
-                            workspace.get_splitk_l2_scratch_ptr(pool_block_idx, n_block_idx, publisher_idx) :
-                            workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx * kPhaseTiles);
+                        if constexpr (kBlockIsL2)
+                            return workspace.get_splitk_l2_scratch_ptr(pool_block_idx, n_block_idx, publisher_idx);
+                        else if constexpr (kPhaseTiles > 1)
+                            return workspace.get_splitk_l2_scratch_ptr(
+                                pool_block_idx, n_block_idx * kPhaseTiles + publisher_idx, 0u);
+                        else
+                            return workspace.get_splitk_l1_scratch_ptr(pool_block_idx, n_block_idx);
                     };
                     float* slot = slot_of(k_split_idx);
                     uint32_t* flag = kBlockIsL2 ?

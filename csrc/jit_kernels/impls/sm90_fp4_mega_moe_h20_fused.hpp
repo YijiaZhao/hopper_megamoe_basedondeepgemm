@@ -412,7 +412,9 @@ static void sm90_fp4_h20_fused_mega_moe(
     // all-split L2 additionally doubles the L2 tail. Numerics identical (T=2/8/8/16 both
     // quants, mxfp4 128/512: same cos_min digits as knob off).
     const bool m16_rows = num_tokens == 2 && num_ranks == 8;
-    const bool split_k_l1_all = split_k_l1 && m16_rows &&
+    // (Not with wide tasks: all-task splits measured +3.7..+7.3 us at M=16; wide L1 uses
+    // a 3-way TAIL split instead, see the kernel.)
+    const bool split_k_l1_all = split_k_l1 && m16_rows && !wide_tiles &&
         get_env<int>("DG_FP4_SPLITK_L1_ALL", 0) != 0;
     const bool split_k_l2_all = mxfp4 && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
