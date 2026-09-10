@@ -89,6 +89,18 @@ if [ "$MODE" = corr ] || [ "$MODE" = all ]; then
   echo ALL_CORR_DONE >> "$LOG"
 fi
 
+if [ "$MODE" = corrq ]; then
+  # quick numerics + ptxas check without the spin-timeout trap (which adds a CALL: C7510)
+  echo "=== CORRQ build $(git rev-parse --short HEAD) $(date -u +%FT%TZ)" >> "$LOG"
+  run_corr mxfp4_mega_moe_fused 8 0.99998 "q_mxfp4_w3_T8" DG_FP4_MATH_WGS=3 DG_JIT_PTXAS_VERBOSE=1
+  run_corr qoq_mega_moe_fused 8 0.99993 "q_qoq_w3_T8" DG_FP4_MATH_WGS=3 DG_JIT_PTXAS_VERBOSE=1
+  run_corr mxfp4_mega_moe_fused g2 0.99998 "q_mxfp4_w3_g2" DG_FP4_MATH_WGS=3 DG_JIT_PTXAS_VERBOSE=1
+  run_corr mxfp4_mega_moe_fused g2 0.99 "q_mxfp4_w2_g2" DG_FP4_MATH_WGS=2 DG_JIT_PTXAS_VERBOSE=1
+  run_corr qoq_mega_moe_fused 16 0.99 "q_qoq_w2_T16" DG_FP4_MATH_WGS=2 DG_JIT_PTXAS_VERBOSE=1
+  run_corr qoq_mega_moe_fused 16 0.99 "q_qoq_w2_noqis2_T16" DG_FP4_MATH_WGS=2 DG_FP4_QOQ_INLINE_S2=0 DG_JIT_PTXAS_VERBOSE=1
+  echo ALL_CORRQ_DONE >> "$LOG"
+fi
+
 if [ "$MODE" = stress ] || [ "$MODE" = all ]; then
   for q in mxfp4 qoq; do
     wait_idle || exit 1

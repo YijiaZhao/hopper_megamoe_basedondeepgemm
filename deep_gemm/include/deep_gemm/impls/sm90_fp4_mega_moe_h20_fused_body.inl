@@ -2620,13 +2620,16 @@
                     // vs the old 2 sets x 2 chains) at no gain (H20 09-09: M8 1413/1420 vs
                     // 1381/1501 ns per stage, M16 1558 vs 1547/1487), so the dependent
                     // RS-wgmma chain is not the stage floor; 2 chains kept.
-                    // Third math WG: ONE chain per (set, half). The two sets are per row
+                    // Third math WG, QoQ: ONE chain per (set, half). The two sets are per row
                     // group there (+8 regs `final_accum_g1` on top), and at the 152-register
                     // budget the two-chain layout made ptxas serialise the QoQ wgmmas (C7512,
-                    // "insufficient register resources") and spill 32/48 B inside the MXFP4
-                    // loop; with three WGs feeding the tensor pipe the dependent 4-deep chain
-                    // per unit is hidden by the other WGs' groups anyway.
-                    constexpr uint32_t kAccChains = kThreeMathWGs ? 1u : 2u;
+                    // "insufficient register resources"); with three WGs feeding the tensor
+                    // pipe the dependent 4-deep chain per unit is hidden by the other WGs'
+                    // groups, and the int32 sum is exact either way. MXFP4 keeps two chains:
+                    // the Hopper FP8 tensor-core accumulator truncates (the reason DeepGEMM
+                    // promotes per K128), so 4 dependent K32 steps in one chain instead of 2
+                    // measurably degrade the result (cos_min 0.999958 vs 0.999988 at M=64).
+                    constexpr uint32_t kAccChains = (kThreeMathWGs && kQoQ) ? 1u : 2u;
                     swap_accum_t swap_accum[kNumAccKBlocks][kSFGroups][kWGHalves][kAccChains][kSwapAccum];
                     // Inline s2 may rotate 3 or 4 A-fragment buffers (kQoQInlineS2Frags,
                     // DG_FP4_QIS2_FRAGS); every other loop uses exactly two.
@@ -3230,32 +3233,35 @@
                             kt_b = clock64();
                             kstage_add(31, kt_b - kt_a);
                             kt_a = kt_b;
-                            // Retire (g, 0) so frag[0] can take the next block's row group 0.
+                            // Retire (g, 0) so frag[0] can take the next block's row group 0,
+                            // and promote set 0 right away: its registers are then free during
+                            // the next decode (the MXFP4 LUT gathers are the register peak).
                             fence_accum();
                             ptx::warpgroup_wait<1>();
                             fence_frag(frag[0]);
                             kt_b = clock64();
                             kstage_add(19, kt_b - kt_a);
+                            set_row_group(0);
+                            promote_stage_rf_to(cur_slot, kb, swap_accum[0], final_accum);
+                            kt_a = clock64();
+                            kstage_add(30, kt_a - kt_b);
                             if (has_next) {
                                 wait_full_block(g_next);
-                                kt_a = clock64();
-                                if constexpr (!kBlockIsL2)
-                                    kstage_add(17, kt_a - kt_b);
-                                set_row_group(0);
-                                decode_stage_rf(next_slot, next_kb, frag[0]);
                                 kt_b = clock64();
-                                kstage_add(18, kt_b - kt_a);
+                                if constexpr (!kBlockIsL2)
+                                    kstage_add(17, kt_b - kt_a);
+                                decode_stage_rf(next_slot, next_kb, frag[0]);
+                                kt_a = clock64();
+                                kstage_add(18, kt_a - kt_b);
                             }
                             fence_accum();
                             ptx::warpgroup_wait<0>();
                             fence_frag(frag[1]);
-                            kt_a = clock64();
-                            kstage_add(19, kt_a - kt_b);
-                            set_row_group(0);
-                            promote_stage_rf_to(cur_slot, kb, swap_accum[0], final_accum);
+                            kt_b = clock64();
+                            kstage_add(19, kt_b - kt_a);
                             set_row_group(1);
                             promote_stage_rf_to(cur_slot, kb, swap_accum[1], final_accum_g1);
-                            kstage_add(30, clock64() - kt_a);
+                            kstage_add(30, clock64() - kt_b);
                             arrive_empty_barrier(cur_slot);
                         }
                     }
