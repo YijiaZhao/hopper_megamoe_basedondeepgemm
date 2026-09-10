@@ -14,7 +14,7 @@
 // math, bit-identical outputs. `stamps_on`: record %globaltimer phase stamps.
 constexpr size_t kFrontendStampsOffsetBase = 256;
 constexpr size_t kFrontendMaxCTAs = 256;
-constexpr size_t kFrontendStampsBytes = kFrontendMaxCTAs * 4 * sizeof(unsigned long long);
+constexpr size_t kFrontendStampsBytes = kFrontendMaxCTAs * 8 * sizeof(unsigned long long);
 size_t router_quant_topk_frontend_workspace_bytes(int e);
 void launch_router_quant_topk_frontend(
     const void* hidden, const void* router_weight,

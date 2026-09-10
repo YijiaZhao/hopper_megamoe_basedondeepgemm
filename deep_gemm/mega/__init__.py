@@ -587,7 +587,7 @@ def qoq_mega_moe_split(*args, **kwargs):
 from .fused import FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe, transform_mxfp4_weights_for_mega_moe_fused, transform_qoq_weights_for_mega_moe_fused, mxfp4_mega_moe_fused, qoq_mega_moe_fused
 
 
-_FRONTEND_STAMPS_BYTES = 256 * 4 * 8
+_FRONTEND_STAMPS_BYTES = 256 * 8 * 8
 
 
 def fable_frontend_workspace_bytes(e: int) -> int:
@@ -627,11 +627,11 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
 
 
 def fable_frontend_stamps(sym_buffer, e: int) -> torch.Tensor:
-    """[num_ctas, 4] int64 ns %globaltimer stamps of the last DG_FE_STAMPS=1 launch.
+    """[num_ctas, 8] int64 ns %globaltimer stamps of the last DG_FE_STAMPS=1 launch.
 
     Router CTAs (first 96 for E=384, m <= 16): start / chunk0 landed / mma done / ticket bumped.
-    Quant CTAs (next m): start / quant done / ticket seen / top-k done.
+    Quant CTAs (next m): start / quant done / ticket seen / top-k done / [tiny: partials loaded / rounds done].
     """
     workspace = sym_buffer._fable_frontend_cache["workspace"]
     off = 256 + 4 * 64 * e * 4
-    return workspace[off:off + _FRONTEND_STAMPS_BYTES].view(torch.int64).view(-1, 4).clone()
+    return workspace[off:off + _FRONTEND_STAMPS_BYTES].view(torch.int64).view(-1, 8).clone()

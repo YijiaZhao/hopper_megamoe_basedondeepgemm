@@ -39,7 +39,8 @@ def fmt_stats(name, v):
 def attribution(buffer, num_router_ctas, m):
     st = deep_gemm.fable_frontend_stamps(buffer, EXPERTS)[: num_router_ctas + m].double()
     t0 = st[:, 0].min()
-    st = (st - t0) / 1e3
+    valid = st > 0
+    st = torch.where(valid, (st - t0) / 1e3, torch.zeros_like(st))
     r, q = st[:num_router_ctas], st[num_router_ctas:]
 
     def line(tag, col):
@@ -48,7 +49,10 @@ def attribution(buffer, num_router_ctas, m):
     print(line("router start", r[:, 0])); print(line("router chunk0 landed", r[:, 1]))
     print(line("router mma done", r[:, 2])); print(line("router ticket bumped", r[:, 3]))
     print(line("quant start", q[:, 0])); print(line("quant done", q[:, 1]))
-    print(line("ticket seen (topk go)", q[:, 2])); print(line("topk done (kernel end)", q[:, 3]))
+    print(line("ticket seen (topk go)", q[:, 2]))
+    if q[:, 4].max() > 0:
+        print(line("  partials loaded", q[:, 4])); print(line("  8 rounds done", q[:, 5]))
+    print(line("topk done (kernel end)", q[:, 3]))
     late = int((r[:, 0] > r[:, 3].min()).sum())
     print(f"    router CTAs that started after the first router CTA finished (2nd wave): {late}")
 

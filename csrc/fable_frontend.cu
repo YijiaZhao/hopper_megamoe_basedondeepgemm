@@ -47,11 +47,13 @@ __device__ __forceinline__ unsigned long long globaltimer_ns() {
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;
 }
-// Optional per-CTA phase stamps (DG_FE_STAMPS=1): [blockIdx][4] u64 ns.
-// router CTA: start / chunk0 landed / mma done / ticket bumped
-// quant  CTA: start / quant done / ticket seen / top-k done
+// Optional per-CTA phase stamps (DG_FE_STAMPS=1): [blockIdx][8] u64 ns.
+// router CTA: 0 start / 1 chunk0 landed / 2 mma done / 3 ticket bumped
+// quant  CTA: 0 start / 1 quant done / 2 ticket seen / 3 top-k done
+//             (tiny top-k: 4 partial logits loaded / 5 selection rounds done)
+constexpr int kStampSlots = 8;
 __device__ __forceinline__ void stamp(unsigned long long* stamps, int slot) {
-    if (stamps != nullptr && threadIdx.x == 0) stamps[blockIdx.x * 4 + slot] = globaltimer_ns();
+    if (stamps != nullptr && threadIdx.x == 0) stamps[blockIdx.x * kStampSlots + slot] = globaltimer_ns();
 }
 __device__ __forceinline__ float round_bf16(float x) {
     return __bfloat162float(__float2bfloat16_rn(x));
@@ -273,12 +275,11 @@ __device__ __forceinline__ uint32_t warp_max_u32(uint32_t v) {
     return v;
 }
 
-template <int kKSplit>
+template <int kKSplit, int kPerLane, int kTopK>
 __device__ __forceinline__ void topk_softmax_token_tiny(
         const float* __restrict__ logits, int64_t* __restrict__ topk_idx,
-        float* __restrict__ topk_weights, int t, int m, int e, int topk) {
+        float* __restrict__ topk_weights, unsigned long long* stamps, int t, int m, int e) {
     const int lane = threadIdx.x & 31;
-    constexpr int kPerLane = kMaxExperts / 32;
     float part[kKSplit][kPerLane];
     #pragma unroll
     for (int ks = 0; ks < kKSplit; ++ks) {
@@ -297,9 +298,12 @@ __device__ __forceinline__ void topk_softmax_token_tiny(
         for (int ks = 0; ks < kKSplit; ++ks) acc += part[ks][i];     // same order as legacy
         key[i] = topk_key(ex < e ? round_bf16(acc) : -INFINITY, ex);
     }
-    float sel_v[kMaxTopK];
-    int sel_i[kMaxTopK];
-    for (int k = 0; k < topk; ++k) {
+    stamp(stamps, 4);
+    // Everything below is fully unrolled (compile-time kTopK) so sel_*/ex_v stay in registers.
+    float sel_v[kTopK];
+    int sel_i[kTopK];
+    #pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
         uint32_t best = 0;
         #pragma unroll
         for (int i = 0; i < kPerLane; ++i) best = max(best, key[i]);
@@ -308,13 +312,19 @@ __device__ __forceinline__ void topk_softmax_token_tiny(
         #pragma unroll
         for (int i = 0; i < kPerLane; ++i) key[i] = key[i] == best ? 0u : key[i];
     }
+    stamp(stamps, 5);
     float mx = sel_v[0];
-    for (int k = 1; k < topk; ++k) mx = fmaxf(mx, sel_v[k]);
-    float sum = 0.0f, ex_v[kMaxTopK];
-    for (int k = 0; k < topk; ++k) { ex_v[k] = expf(sel_v[k] - mx); sum += ex_v[k]; }
-    if (lane < topk) {
-        topk_idx[static_cast<int64_t>(t) * topk + lane] = sel_i[lane];
-        topk_weights[static_cast<int64_t>(t) * topk + lane] = ex_v[lane] / sum;
+    #pragma unroll
+    for (int k = 1; k < kTopK; ++k) mx = fmaxf(mx, sel_v[k]);
+    float sum = 0.0f, ex_v[kTopK];
+    #pragma unroll
+    for (int k = 0; k < kTopK; ++k) { ex_v[k] = expf(sel_v[k] - mx); sum += ex_v[k]; }
+    int my_i = 0; float my_w = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < kTopK; ++k) if (lane == k) { my_i = sel_i[k]; my_w = ex_v[k] / sum; }
+    if (lane < kTopK) {
+        topk_idx[static_cast<int64_t>(t) * kTopK + lane] = my_i;
+        topk_weights[static_cast<int64_t>(t) * kTopK + lane] = my_w;
     }
 }
 
@@ -382,8 +392,9 @@ __device__ __forceinline__ void quant_role(
     }
 }
 
+// kTiny: <= 85 regs/thread so 3 CTAs (59 KB smem each) fit per SM -> single wave.
 template <int kMTiles, int kMode, bool kTiny>
-__global__ void __launch_bounds__(kThreads, 1) router_quant_topk_kernel(
+__global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_kernel(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
         uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
@@ -410,9 +421,13 @@ __global__ void __launch_bounds__(kThreads, 1) router_quant_topk_kernel(
             }
             __syncwarp();
             stamp(stamps, 2);
-            if constexpr (kTiny)
-                topk_softmax_token_tiny<RouterCfg<kMTiles, kTiny>::kKSplitCTAs>(logits, topk_idx, topk_weights, token, m, e, topk);
-            else
+            if constexpr (kTiny) {
+                constexpr int kKS = RouterCfg<kMTiles, kTiny>::kKSplitCTAs;
+                if (e <= 384)   // E=384 -> 12 experts per lane (fewer live registers)
+                    topk_softmax_token_tiny<kKS, 12, kMaxTopK>(logits, topk_idx, topk_weights, stamps, token, m, e);
+                else
+                    topk_softmax_token_tiny<kKS, kMaxExperts / 32, kMaxTopK>(logits, topk_idx, topk_weights, stamps, token, m, e);
+            } else
                 topk_softmax_token(logits, topk_idx, topk_weights, token, m, e, topk, RouterCfg<kMTiles, kTiny>::kKSplitCTAs);
             stamp(stamps, 3);
             // Last token CTA resets the counters for the next launch.
@@ -451,7 +466,7 @@ template <int kMode>
 void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
                  int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
                  int m, int h, int e, int topk, bool tiny, cudaStream_t stream) {
-    if (m <= 16 && tiny) launch<1, kMode, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
+    if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
     else if (m <= 16) launch<1, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
     else if (m <= 32) launch<2, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
     else launch<4, kMode, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, stream);
