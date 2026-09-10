@@ -17,11 +17,30 @@ export PYTHONUNBUFFERED=1
 TR=$(command -v torchrun)
 MODE=${1:-}; shift || true
 
-wait_idle() {  # other containers' processes are invisible here: gate on memory.used (<= 64 MiB on all 8 GPUs)
+# Shared-box discipline: MARKER (e.g. /raid/kimi/results/CAPTURE_M16_RUNNING) is created while
+# this runner holds the GPUs; wait_idle also waits while any FOREIGN *_RUNNING marker exists
+# in the marker directory. Other containers' processes are invisible here, so the GPU gate
+# is memory.used (<= 64 MiB on all 8 GPUs) + no visible compute app.
+MARKER=${MARKER:-}
+foreign_marker() {
+  [ -n "$MARKER" ] || return 1
+  local f
+  for f in "$(dirname "$MARKER")"/*_RUNNING; do
+    [ -e "$f" ] || continue
+    [ "$f" = "$MARKER" ] || return 0
+  done
+  return 1
+}
+hold_marker() { [ -n "$MARKER" ] && echo "$$ $(date -u +%FT%TZ) $*" > "$MARKER"; }
+drop_marker() { [ -n "$MARKER" ] && rm -f "$MARKER"; }
+trap drop_marker EXIT
+wait_idle() {
   for _ in $(seq 1 4320); do
     busy=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk '$1 > 64 {n++} END {print n+0}')
-    if [ "$busy" = 0 ] && [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then return 0; fi
-    sleep 10
+    if [ "$busy" = 0 ] && [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && ! foreign_marker; then
+      hold_marker "$MODE"; return 0
+    fi
+    drop_marker; sleep 10
   done
   echo "GPUs busy for 12 h, giving up" >&2; return 1
 }
@@ -46,6 +65,7 @@ case "$MODE" in
       done
     fi
     echo "CORR_RC=$rc" >> "$LOG"
+    drop_marker
     ;;
   capture)
     OUTBASE=$1; PASSES=$2; TOK=$3; shift 3
@@ -60,6 +80,7 @@ case "$MODE" in
     done
     python3 scripts/summarize_m16_passes.py "$OUTBASE"/p* > "$OUTBASE/SUMMARY.md" 2>> "$LOG"
     echo "CAPTURE_RC=$rc" >> "$LOG"
+    drop_marker
     ;;
   *) echo "usage: $0 corr <log> [ENV..] | capture <outdir> <passes> <tokens_list> [ENV..]" >&2; exit 2 ;;
 esac
