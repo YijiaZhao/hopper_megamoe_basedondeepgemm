@@ -497,7 +497,7 @@ static void set_persisting_l2_once(size_t bytes) {
     int dev = 0, max_persist = 0, max_window = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&max_persist, cudaDevAttrMaxPersistingL2CacheSize, dev);
-    cudaDeviceGetAttribute(&max_window, cudaDevAttrAccessPolicyMaxWindowSize, dev);
+    cudaDeviceGetAttribute(&max_window, cudaDevAttrMaxAccessPolicyWindowSize, dev);
     const size_t want = std::min(bytes, static_cast<size_t>(max_persist));
     const cudaError_t err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, want);
     size_t got = 0;
@@ -532,7 +532,7 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         set_persisting_l2_once(w_bytes);
         int max_window = 0, dev = 0;
         cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&max_window, cudaDevAttrAccessPolicyMaxWindowSize, dev);
+        cudaDeviceGetAttribute(&max_window, cudaDevAttrMaxAccessPolicyWindowSize, dev);
         auto& a = attrs[cfg.numAttrs++];
         a.id = cudaLaunchAttributeAccessPolicyWindow;
         a.val.accessPolicyWindow.base_ptr = const_cast<void*>(static_cast<const void*>(w));
