@@ -28,23 +28,36 @@ export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_fou
 export PYTHONUNBUFFERED=1
 unset DG_W4A8_INT DG_W4A8_INT_PRE DG_W4A8_INT_SHADOW
 mkdir -p "$RES"
-# Mutual exclusion with run_fuse_customer_ab.sh (which holds CAPTURE_FUSE_RUNNING for its
-# whole run and waits on CAPTURE_M*_RUNNING): yield to it only BEFORE publishing our own
-# marker, never after (both sides waiting on each other would deadlock).
-for i in $(seq 1 3600); do
-  ls "$RES"/CAPTURE_FUSE_RUNNING "$RES"/OFFICIAL_*_RUNNING "$RES"/CAPTURE_RUNNING >/dev/null 2>&1 || break
-  sleep 5
-done
-echo "$$ $(date)" > "$RES/CAPTURE_MCMB_RUNNING"
-trap 'rm -f "$RES/CAPTURE_MCMB_RUNNING"' EXIT
-wait_idle() {
-  local i
-  for i in $(seq 1 1800); do
-    if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] &&
-       ! ls "$RES"/OFFICIAL_*_RUNNING "$RES"/CAPTURE_RUNNING >/dev/null 2>&1; then return 0; fi
-    sleep 2
+MARK="$RES/CAPTURE_MCMB_RUNNING"
+trap 'rm -f "$MARK"' EXIT
+# Strict exclusivity: before each capture wait until NO other *_RUNNING marker exists and
+# the GPUs are empty (60 s of continuous quiet), and only then publish our marker; the
+# marker is removed right after the capture. A capture during which another marker
+# appeared or another GPU process ran is discarded and re-run (see overlap_watch).
+other_markers() { ls "$RES"/*_RUNNING 2>/dev/null | grep -v "CAPTURE_MCMB_RUNNING" || true; }
+wait_exclusive() {
+  local i quiet=0
+  for i in $(seq 1 7200); do
+    if [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && [ -z "$(other_markers)" ]; then
+      quiet=$((quiet + 5)); [ "$quiet" -ge 60 ] && return 0
+    else
+      quiet=0
+    fi
+    sleep 5
   done
-  echo "GPUs busy after 1 h" >&2; return 1
+  echo "GPUs / markers busy after 10 h" >&2; return 1
+}
+wait_idle() { wait_exclusive; }
+# Background watcher during a capture: logs any foreign marker or foreign GPU process
+overlap_watch() {  # $1 = overlap file
+  : > "$1"
+  while true; do
+    other_markers >> "$1"
+    for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do
+      case "$(readlink /proc/$p/cwd 2>/dev/null)" in "$ROOT"*) ;; *) echo "pid $p cwd $(readlink /proc/$p/cwd 2>/dev/null)" >> "$1" ;; esac
+    done
+    sleep 5
+  done
 }
 NSYS=(/usr/local/bin/nsys profile --trace=cuda,nvtx --cuda-graph-trace=node --sample=none
       --cpuctxsw=none --force-overwrite=true)
@@ -61,10 +74,22 @@ for pass in $(seq 1 "$PASSES"); do
   knobs="0 1"; [ $((pass % 2)) -eq 0 ] && knobs="1 0"
   for knob in $knobs; do
     OUT="$RES/cmb_customer${TAG}_k${knob}_p${pass}"
-    wait_idle || exit 1
-    echo "=== customer capture knob=$knob pass=$pass -> $OUT $(date)"
-    OUT="$OUT" FORCE=1 DG_FP4_COMBINE_DYNAMIC=$knob timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
-    echo "CAPTURE_EXIT=$?"
+    for try in 1 2 3 4; do
+      wait_exclusive || exit 1
+      echo "$$ $(date)" > "$MARK"
+      echo "=== customer capture knob=$knob pass=$pass try=$try -> $OUT $(date)"
+      overlap_watch "$OUT.overlap" & watch_pid=$!
+      OUT="$OUT" FORCE=1 DG_FP4_COMBINE_DYNAMIC=$knob timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.log" 2>&1
+      rc=$?
+      kill "$watch_pid" 2>/dev/null; wait "$watch_pid" 2>/dev/null
+      rm -f "$MARK"
+      echo "CAPTURE_EXIT=$rc"
+      if [ -s "$OUT.overlap" ]; then
+        echo "OVERLAP: discarding capture (foreign marker/process during capture): $(sort -u "$OUT.overlap" | tr '\n' ';')"
+        rm -rf "$OUT"; continue
+      fi
+      [ "$rc" = 0 ] && break
+    done
     for attempt in $(seq 1 "$RECAPTURE_MAX"); do
       bad=$(skewed_points "$OUT")
       [ -z "$bad" ] && break
@@ -72,11 +97,13 @@ for pass in $(seq 1 "$PASSES"); do
       while read -r name skew; do
         [ -z "$name" ] && continue
         q=$(echo "$name" | cut -d_ -f3); m=$(echo "$name" | sed -E 's/.*_M([0-9]+)$/\1/')
-        wait_idle || exit 1
+        wait_exclusive || exit 1
+        echo "$$ $(date)" > "$MARK"
         DG_FP4_COMBINE_DYNAMIC=$knob timeout 600 "${NSYS[@]}" --output="$OUT/$name" \
           /usr/local/bin/torchrun --standalone --nproc_per_node=8 tests/profile_four_api_h20.py \
           --scope mega --backend fused --quant "$q" --global-tokens "$m" >> "$OUT.log" 2>&1
-        echo "recapture $name EXIT=$?"
+        echo "recapture $name EXIT=$? foreign_markers=[$(other_markers | tr '\n' ' ')]"
+        rm -f "$MARK"
       done <<< "$bad"
     done
     skewed_points "$OUT" | sed 's/^/STILL_SKEWED /'
