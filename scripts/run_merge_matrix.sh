@@ -71,7 +71,7 @@ run_corr() {   # tag, extra args..., env via caller
 }
 case "$MODE" in
   corr)    rc=0; for T in "$@"; do run_corr "corr_t$T" --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --tokens "$T" || rc=1; done; echo "CORR_RC=$rc" ;;
-  corrref) rc=0; for T in "$@"; do run_corr "corrref_t$T" --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --tokens "$T" --frontend fe --cosine-min 0.9999 || rc=1; done; echo "CORRREF_RC=$rc" ;;
+  corrref) rc=0; for T in "$@"; do run_corr "corrref_t$T" --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --tokens "$T" --frontend fe --cosine-min "${COSMIN:-0.9999}" || rc=1; done; echo "CORRREF_RC=$rc" ;;
   corrfe)  rc=0; for T in "$@"; do DG_FP4_FUSE_FE=1 run_corr "corrfe_t$T" --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --tokens "$T" --frontend fused || rc=1; done; echo "CORRFE_RC=$rc" ;;
   mx)      rc=0; for T in "$@"; do run_corr "mx_t$T" --apis mxfp4_mega_moe_fused --tokens "$T" || rc=1; done; echo "MX_RC=$rc" ;;
   revert)
@@ -132,6 +132,16 @@ case "$MODE" in
       bash "$0" mx 128 512
       for p in 1 2 3; do bash "$0" capture "$RES/cap_final/p$p" "2 8 16"; done
       echo "CHAIN3_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
+  chain4)   # default = swapab + fragment (96 grid) for every row count: 8-rank matrix (+ --frontend fe at 32 rows = non-tiny FE) + 3 customer captures
+    C="$RES/chain4.log"; : > "$C"
+    { echo "start $(git rev-parse --short HEAD) $(date -u +%FT%TZ)"
+      bash "$0" corr 1 2 8 16
+      bash "$0" corrref 1 2
+      COSMIN=0.999 bash "$0" corrref 32
+      bash "$0" corrfe 2
+      bash "$0" mx 128 512
+      for p in 1 2 3; do bash "$0" capture "$RES/cap_swapab/p$p" "2 8 16"; done
+      echo "CHAIN4_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
   stop)     # stop OUR OWN jobs only: processes whose cwd is this worktree (run inside the same container)
     for pid in $(pgrep -f "run_merge_matrix.sh|capture_four_api_h20_timelines.sh|nsys profile|profile_four_api_h20.py|torchrun|test_four_api_correctness.py|test_frontend_fe78.py"); do
       [ "$pid" = "$$" ] && continue

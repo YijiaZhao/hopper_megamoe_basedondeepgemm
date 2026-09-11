@@ -609,7 +609,7 @@ def _fe_grid_from_env(grid):
 
 
 def _fe_mma_from_env(mma):
-    """DG_FE_TINYM_MMA: 'auto' (default) -> -1 = cc for m <= 2 rows, swapab otherwise (_fe_resolve_knobs);
+    """DG_FE_TINYM_MMA: 'auto' (default) -> -1 = swapab (+ fragment) on the 96 grid (_fe_resolve_knobs);
     'wmma' -> 0, 'fma' -> 1 (full-K grid only), 'swapab' -> 2 (experts on the MMA M dimension,
     mma.sync m16n8k16, A fragments straight from global; legacy 96 x 4 grid and full-K grid),
     'cc' -> 4 / 'cc6' -> 5 (full-K grid, m <= 2: CUDA-core K-split router, 5 experts x 4 | 6 warps
@@ -623,17 +623,19 @@ def _fe_mma_from_env(mma):
 
 
 def _fe_resolve_knobs(m, grid=None, mma=None, k_parts=None, l2_persist=None):
-    """Resolve (grid, mma, k_parts, l2_persist) for m rows. Default scheme (DG_FE_TINYM_MMA=auto):
-    m <= 2 rows -> the CUDA-core K-split router on the SM-count grid with the router weights pinned
-    in L2 (cc + DG_FE_TINYM_GRID=auto + DG_FE_ROUTER_L2_PERSIST=1: H20 kernel end 4.35 / 4.61 us vs
-    6.14 swapab+fragment); rows > 2, an explicit 96 grid or K-parts > 1 -> swapab (+ fragment
-    layout), no L2 persistence, as before. Explicit knobs / env values pass through unchanged; an
-    unset grid follows the MMA (cc -> auto, everything else -> the legacy 96 grid)."""
+    """Resolve (grid, mma, k_parts, l2_persist) for m rows. Default scheme (DG_FE_TINYM_MMA=auto) =
+    swapab (+ fragment layout) on the legacy 96 grid for every row count: under the customer method
+    (nsys kernel span, H20 1830 MHz, 1 row/rank) it measures 7.5-7.7 us vs 8.0-8.7 wmma and
+    8.9-9.4 for the CUDA-core router (cc + auto grid + L2 persist), although the cc router's
+    kernel-end stamps are the shortest (4.35 / 4.61 us) -- see the README knob table. cc / cc6 /
+    cc44 stay opt-in (DG_FE_TINYM_MMA=cc); with them an unset grid follows the MMA (-> auto) and an
+    unset DG_FE_ROUTER_L2_PERSIST defaults to 1 (cc + persist 8.9-9.0 vs cc alone 9.2-9.4 us nsys).
+    Explicit knobs / env values pass through unchanged."""
     grid = _fe_grid_from_env(grid)
     mma = _fe_mma_from_env(mma)
     k_parts = _fe_kparts_from_env(k_parts)
     if mma == -1:
-        mma = 4 if (m <= 2 and grid in (None, 0) and k_parts == 1) else 2
+        mma = 2
     if grid is None:
         grid = 0 if mma in (4, 5, 6) else 96
     if l2_persist is None:
@@ -725,7 +727,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     3-stage configuration (bit-identical outputs, ~4x lower latency on 78-SM H20).
     ``stamps`` (env ``DG_FE_STAMPS``, default 0): record per-CTA %globaltimer phase
     stamps into the workspace; read them back with ``fable_frontend_stamps``.
-    ``l2_persist`` (env ``DG_FE_ROUTER_L2_PERSIST``, default 1 with the cc router, else 0): 1 = pin the router
+    ``l2_persist`` (env ``DG_FE_ROUTER_L2_PERSIST``, default 1 with the opt-in cc router, else 0): 1 = pin the router
     weights in L2 with the persisting-L2 set-aside (access policy window launch
     attribute), 2 = PTX ``L2::evict_last`` hint on the router weight loads.
     ``pdl`` (env ``DG_FE_PDL``, default 0): programmatic-dependent-launch trigger for
@@ -737,10 +739,11 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     ``96`` = legacy 24 expert groups x 4 K-parts + m quant/top-k CTAs; ``N`` = full-K
     scheme with N CTAs in total. Full-K is deterministic but not bit-identical to 96
     (different fp32 accumulation order before the bf16 logit rounding).
-    ``mma`` (env ``DG_FE_TINYM_MMA``, default ``auto`` = ``cc`` on the ``auto`` grid with L2-pinned
-    router weights for m <= 2 rows, ``swapab`` otherwise): ``cc`` = CUDA-core K-split router (5 experts
-    x 4 warps per CTA, weights straight into registers, last-arriving CTA does top-8 + softmax; H20
-    kernel end 4.35 / 4.61 us for rows 1 / 2 with ``l2_persist=1``); ``wmma`` = legacy cp.async ring / TMA row
+    ``mma`` (env ``DG_FE_TINYM_MMA``, default ``auto`` = ``swapab`` + fragment layout on the 96 grid;
+    nsys FE span 7.5-7.7 us on H20 at 1830 MHz): ``cc`` = opt-in CUDA-core K-split router on the
+    ``auto`` grid with L2-pinned weights (5 experts x 4 warps per CTA, weights straight into
+    registers, last-arriving CTA does top-8 + softmax; kernel-end stamps 4.35 / 4.61 us for rows 1 / 2
+    but 8.9-9.4 us nsys kernel span under the customer method); ``wmma`` = legacy cp.async ring / TMA row
     pieces into smem + WMMA bf16 m16n16k16 fp32-accumulate; ``fma`` = CUDA-core fp32 FMA
     straight from global memory (16 B ld.global.nc, warp butterfly + 8-warp smem sum);
     ``swapab`` (legacy 96 x 4 grid AND full-K) = experts on the MMA M dimension, tokens on N
