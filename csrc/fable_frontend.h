@@ -55,14 +55,22 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 // one 8-round redux merge (DG_FE_CC_SELECT=insert; =redux: 8 rounds of per-lane tree max + redux,
 // 0.5 us slower), softmax, writes top-k. The extra CTA only quantises the m rows. =poll keeps the
 // streaming merger (16 B ld.cv polls; relaxed.gpu / cg polls measured 0.5-0.8 us slower).
+// Keys: compact [token][e] array (DG_FE_CC_KEYS=compact, default for e = 384: the last arriver reads
+// 12 keys per lane, 3 x 16 B; =slots: the 616 cand slots, 5 x 16 B). Router weights sit in the
+// persisting L2 set-aside by default on cc (DG_FE_ROUTER_L2_PERSIST=0 opts out).
 // H20-3e (.7) standalone kernel-end stamp median (us), rows 1|2 x mxfp4|qoq, L2 flushed:
-//   96 x 4 wmma 6.91 | 7.17 | 6.66 | 6.91  ->  cc 4.61 | 4.61-4.86 | 4.86 | 4.86
-//   + DG_FE_ROUTER_L2_PERSIST=1 (router weights in the persisting L2 set-aside): 4.35 | 4.35 | 4.61 | 4.61
-//   (cc poll 4.86-5.38, cc6 +0.25-1.0, cc44 with grid 97 = 2nd wave 7.2-7.7).
-// Chain (rows 1, 256 ns stamp ticks): chunk0 landed 1.54 (persist 1.0-1.3), all logits 2.05-2.30
-// (1.79-2.05), last CTA's keys + ticket 2.8-3.3, ticket won +0.25-0.5 (atomic round trip; the
-// release drain of acq_rel is not the cost), keys read +0.25, select +0.5-0.75 (a serial 20 x 8
-// insertion chain + 8 redux rounds in one warp; 48 slots/lane -> 1.3), softmax + write +0.25.
+//   96 x 4 wmma 6.91 | 7.17 | 6.66 | 6.91  ->  cc (round 3 defaults) 3.84 in all four cells
+//   steps: ticket+slots cold 4.61-4.86 -> +L2 persist 4.35-4.61 -> +compact keys 3.84 (slots 4.10-4.35);
+//   cc poll merger 4.86-5.38, cc6 +0.25-1.0, cc44 with grid 97 = 2nd wave 7.2-7.7.
+// Chain (rows 1, 256 ns stamp ticks): chunk0 landed 1.28-1.54, all logits 1.79, last CTA's keys +
+// ticket 2.30-2.56, ticket won 2.82, keys read 3.07, select done 3.58 (12 x 8 insertion + merge8),
+// softmax + write 3.84. Launch probe (router_cc_bench --variant empty): an EMPTY 78 x 640 kernel is
+// 4.86 us of CUDA-event time and 5.1 us behind the previous kernel's end in eager mode, CTA start
+// spread 0.03 us -> the stamp chain contains no launch ramp; the eager launch cost is on top of it.
+// EXPERIMENT DG_FE_TINYM_MMA=ccfp8 (router weights e4m3 + fp32 row scale, fable_router_weight_fp8,
+// 5 experts x 3 K-parts, cvt.rn.f16x2.e4m3x2 dequant): kernel end 4.35 (slower: 15 warps x 2 chunks,
+// dequant on the critical path) AND 552 / 3000 top-8 index-set mismatches vs bf16 (288 near-tie) ->
+// not usable for the customer; kept as a knob for the record.
 // Microkernel (csrc/router_cc_bench.cu): all 384 logits at 2.05 us (rows 1) / 2.6 (rows 2) with
 // 20-30 warps x 2-3 chunks per lane; 8 warps x 12 chunks 2.9; the issue is back-pressured by the SM's
 // outstanding-request capacity (2 loads/lane still take 1.5 us to issue); cp.async.bulk per warp
