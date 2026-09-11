@@ -642,6 +642,17 @@ def _fe_resolve_knobs(m, grid=None, mma=None, k_parts=None, l2_persist=None):
     return grid, mma, k_parts, int(l2_persist)
 
 
+def _fe_wlayout_from_env(wlayout):
+    """DG_FE_ROUTER_WLAYOUT: 'row' -> 0 = [e][h] router weights; 'fragment' (default) -> 1 =
+    one-time host permutation into m16n8k16 A-fragment order (swapab only; cached per weight
+    tensor); 'pre' -> 2 = the caller already passes the permuted tensor."""
+    if wlayout is None:
+        wlayout = os.environ.get("DG_FE_ROUTER_WLAYOUT", "fragment")
+    if isinstance(wlayout, str):
+        wlayout = {"row": 0, "fragment": 1, "pre": 2, "0": 0, "1": 1, "2": 2}[wlayout.strip().lower()]
+    return int(wlayout)
+
+
 def fable_router_weight_fragment_layout(router_weight: torch.Tensor) -> torch.Tensor:
     """Permute [E, K] bf16 router weights (E % 16 == 0, K % 32 == 0) into the swapab
     A-fragment order the frontend reads with DG_FE_ROUTER_WLAYOUT=fragment: same bytes,
