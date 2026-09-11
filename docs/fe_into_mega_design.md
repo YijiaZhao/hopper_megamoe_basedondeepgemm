@@ -94,3 +94,77 @@ skip the FE launch and pass `frontend=` when `DG_FP4_FUSE_FE=1` (the E2E graph s
 the fused kernel). `tests/test_four_api_correctness.py --frontend fused` runs the standalone FE +
 Mega first (reference routing / quant / y), then the fused kernel, and asserts bit-equality of
 `x / x_sf / topk_idx / topk_weights / y` plus the usual exact-quantised reference check.
+
+## Result (H20 .7, 2026-09-11, 8 ranks, tip perf/fe-into-mega)
+
+**Correctness.** `tests/test_four_api_correctness.py --frontend fused` (standalone FE + Mega first,
+then the fused kernel into cleared views): `x / x_sf / topk_idx / topk_weights / y` bit-identical on
+all 8 ranks for T=1 (M=8) and T=2 (M=16), both quants; exact-reference cos_min MXFP4 0.999996 /
+0.99999, QoQ 0.99993 with the FE's real (unbalanced) routing. The knob is inert without frontend
+tensors (`--tokens 2 8 8 16` matrix unchanged: MXFP4 0.99997-0.99999, QoQ 0.99993). 200-iteration
+graph-replay stress (FE / Mega / FE+Mega / FEinMega graphs) clean at M=2/8/16, both quants.
+
+**Side finding (fixed, commit "split-K tail tasks of a wave-scheduled launch ...").** With the FE's
+real routing the *existing* kernel was wrong on ranks with >= 8 active local experts at <= 8 global
+tokens (cos_min 0.67; per-slot cos 0.15-0.3 on the highest-index experts of those ranks): stream-K is
+compiled in for M <= 8 but inactive in-kernel once the rank has >= 78 L1 tasks, and the wave
+scheduler's 2-way split-K tail tasks then took the stream-K reduction branch (worker slots 0/1 shared
+by every concurrent tail). The balanced correctness test never produced >= 78 L1 tasks with stream-K
+compiled in. Non-stream-K tasks now carry `first_worker_idx == kNotStreamKWorker` and use the split-K
+publisher/finisher protocol; `--frontend fe` (real routing, knob off) is the regression test.
+
+**Performance: a loss at every M (default stays 0).** CUDA-event E2E (`tests/bench_frontend_tinym.py`,
+n=100, host barrier, GPU0 median us; FE+Mega graph = knob 0, FEinMega graph = knob 1, same process):
+
+| variant | MXFP4 M2 | QoQ M2 | MXFP4 M8 | QoQ M8 | MXFP4 M16 | QoQ M16 |
+|---|---|---|---|---|---|---|
+| v1 cp.async loads, inlined crew: FE+Mega -> FEinMega | 80.2 -> 86.5 (+6.3) | 77.5 -> 85.2 (+7.6) | 80.2 -> 86.0 (+5.8) | 78.2 -> 85.6 (+7.4) | 116.8 -> 124.1 (+7.3) | (n/a) |
+| v2 bulk copies, prefetching top-k, inlined | 83.7 -> 91.3 (+7.5) | 79.2 -> 86.7 (+7.5) | 80.8 -> 86.9 (+6.1) | 79.7 -> 86.1 (+6.4) | 101.3 -> 107.9 (+6.7) | 97.7 -> 102.9 (+5.3) |
+| v4 = v2 + crew in a `__noinline__` function (final) | 95.2 -> 100.0 (+4.8) | 94.8 -> 99.7 (+5.0) | 79.9 -> 84.7 (+4.8) | 78.3 -> 84.7 (+6.4) | 115.4 -> 120.2 (+4.8) | 99.0 -> 103.9 (+4.9) |
+
+(Absolute numbers drift between sessions -- clocks not locked in the bench, another agent's
+single-GPU jobs on the node; the knob-0/knob-1 pair of each row is from the same process.)
+
+Where the time goes (rank-0 phase stamps, MXFP4 M=8, same FE routing for both, us from kernel
+entry, `tests/profile_fused_phase_stamps.py --fe-routing` vs `--fuse-fe`):
+
+| | knob 0 (FE launched before, routing from FE) | knob 1 v2 (inlined) | knob 1 v4 (noinline) |
+|---|---|---|---|
+| init done | 1.47 | 1.47 | 1.50 |
+| FE loads issued (max) | - | 5.06 | 7.01 |
+| FE loads landed (max) | - | 5.58 | 7.52 |
+| FE WMMA + partial stores (max) | - | 7.23 | 9.17 |
+| FE top-k written (max) | - | 10.48 | 15.63 |
+| routing done (DONE flags) | 10.69 | 19.68 | (skewed session) |
+| first math task | 14.00 | 22.98 | |
+| last L1 task end | 25.36 | 37.97 | |
+| kernel end | 34.61 | 48.43 | |
+| L1 stage head-to-head (SM0, ns) | 983 | 1747 | 1074 |
+| L1 stage RF decode + LUT (ns) | 574 | 1213 | 831 |
+| SM0 L1 task (us) | 10.61 | 14.21 | 10.61 |
+
+Per-CTA durations (max over CTAs, v2/v4): issue 3.2/4.8 us, land 1.3/1.1, WMMA+store 1.7/1.9,
+release 0.45/0.5, top-k wait-for-units 2.0/2.7, top-k compute+write 2.5/5.5.
+
+Three reasons the fusion loses:
+1. The crew is slower than the standalone FE at every step. Issuing the router loads costs 2.3 us
+   (cp.async, LSU issue-bound) or 3.2-4.8 us (bulk copies -- not better), the data lands within
+   ~1 us of the last issue, i.e. the standalone FE's 96 CTAs x 3 CTAs/SM issue far more in parallel
+   than 78 x 8 warps (18 CTAs carry 2 units). WMMA + partial stores 1.7 us, top-k 2.5-5.5 us (the FE
+   kernel: ~1.5 us). The dispatch sees the top-k at 11 us (v2) after kernel entry; the standalone FE
+   + gap costs the graph ~9-10 us (FE+Mega - Mega = 8.9-10.2 us) and overlaps the Mega launch ramp.
+2. Inlined into the math role the crew's code (WMMA fragments, bulk-copy / mbarrier asm, top-k)
+   degrades the RF K-loop's code generation: the per-stage decode+LUT doubles (574 -> 1213 ns),
+   the L1 phase +3.6 us and the L2 tail +1.5 us at identical routing (0 spills reported). A
+   `__noinline__` crew restores the K-loop (SM0 L1 task 10.61 us both ways) but makes the crew
+   itself slower (ABI call, 15.6 us to the top-k).
+3. The dispatch warps idle for the whole FE phase, whereas with a separate FE kernel the Mega
+   prologue (TMA descriptor prefetch, barrier init, DONE-count reads) already overlaps the FE tail.
+
+What would be needed to win (not done): a crew that finishes the top-k <= ~5 us after entry --
+e.g. all 4 K-parts of an expert group on one CTA with a per-group candidate top-8 (24 CTAs x 96 KB,
+bandwidth-bound ~1 us, hand-off of 192 keys instead of 1536 partials), the quant on the loader
+warps, and the crew code kept out of the math role's register allocation without an ABI call
+(separate warps: not available -- the 8 math warps are the only 256-thread group with registers).
+Customer-method nsys captures (knob 0 vs 1, e2e fused, M=2/8/16) are in
+`/raid/kimi/results/fefuse/run3/CAPTURE_SUMMARY.md`.

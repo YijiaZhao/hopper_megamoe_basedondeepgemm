@@ -338,12 +338,14 @@ has an env override documented in `csrc/jit_kernels/impls/sm90_fp4_mega_moe_h20_
 | stream-K for M <= 4 (units spread over all 78 SMs) | `DG_FP4_STREAMK` (`_MAX_M`) | MXFP4 M2 49.7 -> 42.9 |
 | Wide L1 tasks (BN=512, 1 K-block/stage, 3-way tail split) for M >= 16 | `DG_FP4_L1_BN` (`DG_FP4_BN512_MIN_M`) | M16 Mega-only 5-capture medians MXFP4 84.1 -> 82.6, QoQ 80.4 -> 77.4 |
 | Tiny-M Fable frontend (3 smem stages -> 3 CTAs/SM single wave; 256-thread partial fetch; warp-0 32-bit-key top-8) | `DG_FE_TINYM` | FE 13.8–14.9 -> 8.3–8.7 us (nsys span), bit-identical outputs |
+| Split-K tail tasks of a wave-scheduled launch use the split-K (not the stream-K) reduction slots | – (fix) | real, unbalanced routing at M <= 8 with >= 8 active local experts: cos_min 0.67 -> 0.99999 (`tests/test_four_api_correctness.py --frontend fe`) |
 
 Measured and kept off (documented negative results): 4 K-blocks per stage,
 per-M knob sweep, tiny-M CUDA-core GEMV path (`DG_FP4_TINYM`), whole-expert L2
 weight prefetch (`DG_FP4_L2_PREFETCH_ALL`), two-layer L1/L2 fusion
 (`DG_FP4_FUSE_L1L2`), dynamic combine claim (`DG_FP4_COMBINE_DYNAMIC`), L2
-tail split-K, all-task L1/L2 split-K at M16, wide L2 tasks (BN=512), third math warpgroup (`DG_FP4_MATH_WGS=3`), deterministic push slots (`DG_FP4_PUSH_DET_SLOTS`), FE router-weight L2 persistence and FE->Mega PDL, raw-u8 deferred affine dequant.
+tail split-K, all-task L1/L2 split-K at M16, wide L2 tasks (BN=512), third math warpgroup (`DG_FP4_MATH_WGS=3`), deterministic push slots (`DG_FP4_PUSH_DET_SLOTS`), FE router-weight L2 persistence and FE->Mega PDL, raw-u8 deferred affine dequant,
+Fable frontend fused into the MegaMoE kernel (`DG_FP4_FUSE_FE`, docs/fe_into_mega_design.md: bit-identical outputs, E2E +4.8..+7.6 us at M=2/8/16).
 
 ## Relevant source files
 

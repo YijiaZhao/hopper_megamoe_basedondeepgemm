@@ -651,7 +651,14 @@ static void sm90_fp4_h20_fused_mega_moe(
     // kernel start (math warps, hand-off through the frontend workspace) and the FE
     // launch is skipped. Tiny M only (<= DG_FP4_FUSE_FE_MAX_M global tokens, default
     // 16, and <= num_sms local rows); MXFP4 (fp8 e4m3 + per-K128 SF) and QoQ (int8 +
-    // per-row scale) exactly like the standalone FE. Default 0.
+    // per-row scale) exactly like the standalone FE. Default 0: H20 2026-09-11 A/B
+    // (CUDA-event E2E, FE+Mega graph vs fused-only graph, GPU0 median, n=100) is a loss
+    // at every M -- MXFP4 M2 +4.8, M8 +4.8, M16 +4.8; QoQ M2 +5.0, M8 +6.4, M16 +4.9 us
+    // (best variant: bulk-copy loads, __noinline__ crew). The in-kernel crew reaches the
+    // top-k only ~11-15 us after kernel entry (load issue 2-5 us, top-k 2.5-5.5 us on 8
+    // warps vs 96 dedicated FE CTAs) while the standalone FE + gap costs the graph ~9-10 us
+    // and overlaps the Mega prologue; inlined, the crew also degraded the RF K-loop codegen
+    // (+3.6 us L1 phase). Outputs are bit-identical to FE + Mega (see the design note).
     const bool fuse_fe_requested = fe_hidden.has_value() && get_env<int>("DG_FP4_FUSE_FE", 0) != 0;
     const bool fuse_fe = fuse_fe_requested && (mxfp4 || qoq) && plan.use_interleaved_scheduler &&
         !tinym && num_global_tokens_upper <= get_env<int>("DG_FP4_FUSE_FE_MAX_M", 16) && num_tokens <= num_sms;
