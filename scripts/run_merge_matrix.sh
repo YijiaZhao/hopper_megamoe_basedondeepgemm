@@ -95,7 +95,7 @@ case "$MODE" in
     OUTDIR=$1; TOK=${2:-"2 8 16"}
     mkdir -p "$(dirname "$OUTDIR")"
     wait_idle "capture $OUTDIR"
-    TOKENS_LIST="$TOK" OUT="$OUTDIR" LOCK_SM_CLOCK_MHZ=1830 FORCE=1 SCOPES="e2e" BACKENDS=fused \
+    TOKENS_LIST="$TOK" OUT="$OUTDIR" LOCK_SM_CLOCK_MHZ=1830 FORCE=1 SCOPES="e2e" BACKENDS=fused GPU_IDLE_LIMIT_MIB=${GPU_IDLE_LIMIT_MIB:-256} \
       timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUTDIR.log" 2>&1
     echo "CAPTURE_RC=$?" >> "$OUTDIR.log"; tail -2 "$OUTDIR.log"; drop_marker ;;
   chain1)
