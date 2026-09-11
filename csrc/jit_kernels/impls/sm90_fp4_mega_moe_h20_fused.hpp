@@ -633,9 +633,10 @@ static void sm90_fp4_h20_fused_mega_moe(
         num_global_tokens_upper <= get_env<int>("DG_FP4_FUSE_L1L2_MAX_M", 16);
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n * l1_task_tiles;
     constexpr int kL1ScaleGranK = 128;
-    // L2 activation scale granularity: one per L1 output K128 (per 64 with half-tile
-    // tasks); a wide L1 task publishes two such groups (one per WG).
-    const int l2_scale_gran_k = half_tile_tasks ? task_block_n / 2 : 128;
+    // L2 activation scale granularity (kernel kL2ActsSFGranK): per 64 on the BM128/BN128
+    // split-M tier and with half-tile tasks, per K128 otherwise; a wide L1 task publishes
+    // two K128 groups (one per WG), so it is not task_block_n / 2 any more.
+    const int l2_scale_gran_k = (half_tile_tasks || config.block_n == 128) ? 64 : 128;
     const auto tensor_map_l1_acts = make_tma_2d_desc(
         l1_acts, hidden, config.num_max_pool_tokens,
         KernelConfig::kBlockK, config.block_m,
