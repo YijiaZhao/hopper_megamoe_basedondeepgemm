@@ -38,6 +38,15 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 //   6.14 (-0.77) | 78 full-K wmma 7.94-8.45 | 78 full-K swapab 6.40-6.91.
 //   NCU (96, rows 1, mxfp4): L2 read requests 49.1k (wmma) -> 37.7k (swapab row), read sectors
 //   113k -> 77k, LSU instructions 89k -> 29k; fragment layout: see README knob row.
+// 4 | 5 | 6 = cc | cc6 | cc44 (full-K grid, m <= 2): CUDA-core K-split router, see README.
+// 7 | 8 | 9 = tc16 | tc16w3 | tc16w2 (full-K grid, m <= 2, h = 3072, e % 16 == 0): padding-free
+// tensor-core router; X viewed as a 16 x 192 A tile (row = K-segment), unit = (segment, 16-expert
+// group) -> one m16n16k192 mma.sync product of which only row `segment` is kept; 5 units per CTA
+// x 6 | 3 | 2 warps per unit; 16 segment partials per expert summed by the last-arriving CTA
+// (cc ticket hand-off). H20-3e standalone kernel end rows 1|2 (mxfp4, qoq alike): tc16 6.66 | 9.73,
+// tc16w3 6.14 | 8.70 vs cc 4.61 | 4.86 (persist 1: tc16 6.91 | 9.73, tc16w3 5.89 | 8.45, cc 4.35 |
+// 4.61): kept for the record, cc stays the tiny-M default candidate. Correct: 6000 row-evaluations
+// each, top-8 sets identical, x/x_sf bit-identical.
 // Default stays 0 (row-major weights): swapab alone is < 0.3 us; the fragment variant needs the
 // caller to permute the router weight at weight-transform time (opt-in).
 // 4 = cc | 5 = cc6 | 6 = cc44 (full-K grid, m <= 2, h = 3072, k_parts 1): CUDA-core K-split router,
