@@ -304,7 +304,7 @@ std::vector<Variant> variants() {
         {"h3",   78, launch_v<15, 1, 3, 0, 0, kM>, "78 CTA x 15 warps: 5 experts x 3 third-K warps (4 chunks/lane)"},
         {"h4",   78, launch_v<20, 1, 4, 0, 0, kM>, "78 CTA x 20 warps: 5 experts x 4 quarter-K warps (3 chunks/lane)"},
         {"h6",   78, launch_v<30, 1, 6, 0, 0, kM>, "78 CTA x 30 warps: 5 experts x 6 warps (2 chunks/lane)"},
-        {"h12", 192, launch_v<32, 1, 12, 0, 0, kM>, "78 CTA x 32 warps: 2 experts x 12 warps (1 chunk/lane) -- needs grid 192 (2 experts/CTA)"},
+        {"h12", 192, launch_v<24, 1, 12, 0, 0, kM>, "192 CTA x 24 warps: 2 experts x 12 warps (1 chunk/lane), 2-3 CTAs per SM"},
         {"h4b",  78, launch_v<20, 1, 4, 3, 0, kM>, "h4 with weights via cp.async.bulk 1.5 KB/warp into smem"},
         {"h4x",  78, launch_v<20, 1, 4, 0, 1, kM>, "h4 with activation rows via cp.async.bulk into smem"},
     };
