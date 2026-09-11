@@ -40,6 +40,18 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 //   113k -> 77k, LSU instructions 89k -> 29k; fragment layout: see README knob row.
 // Default stays 0 (row-major weights): swapab alone is < 0.3 us; the fragment variant needs the
 // caller to permute the router weight at weight-transform time (opt-in).
+// 4 = cc | 5 = cc6 (full-K grid, m <= 2, h = 3072, k_parts 1): CUDA-core K-split router, CTA =
+// 5 experts x 4 (cc, 640 threads) | 6 (cc6, 960) warps, one warp = one expert x one K-part, every
+// weight chunk ld.global.nc straight into registers as the kernel's first instructions; the m rows
+// are quantised by the merger CTA's idle warps (named barrier) while its warps 0..7 poll; the
+// merger keeps per-lane top-8 and merges once (DG_FE_MERGER_DEFER, default 1 for cc).
+// H20-3e (.7) standalone kernel-end stamp median (us), rows 1|2 x mxfp4|qoq:
+//   96 x 4 wmma 6.91 | 7.17 | 6.66 | 6.91  ->  cc 5.38 | 5.12 | 4.86-5.12 | 4.86-5.38  (cc6 +0.25-1.0).
+// Microkernel (csrc/router_cc_bench.cu): all 384 logits at 2.05 us (rows 1) / 2.6 (rows 2) with
+// 20-30 warps x 2-3 chunks per lane; 8 warps x 12 chunks 2.9; the issue is back-pressured by the SM's
+// outstanding-request capacity (2 loads/lane still take 1.5 us to issue); cp.async.bulk slower.
+// Equality vs the 96 x 4 WMMA path (tests/test_frontend_fe78.py --mma cc): 3000 row-evaluations,
+// 0 top-8 index-set mismatches, 2 bf16 rounding flips, x/x_sf bit-identical.
 // Router CTA count the launch will use (bench / stamp attribution helper).
 // `k_parts` (DG_FE_TINYM_KPARTS, full-K grid only): 1 | 2 | 4 K-parts per expert
 // group (grid=97,k_parts=4 = the legacy 24 x 16 x 4 layout inside the full-K
