@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include <deep_gemm/layout/mega_moe_fused.cuh>
 
 #include "../../utils/exception.hpp"
@@ -8,6 +10,16 @@
 namespace deep_gemm {
 
 static constexpr int kSM90NVFP4BStoragePerKBlock = 80;
+
+// K128 blocks per pipeline stage of the BM8 MXFP4 RF swapAB tier (kernel
+// `kKBlocksPerStage`): env DG_FP4_KBLOCKS_PER_STAGE in {2, 4}. Shared by the
+// heuristic (stage depth) and the host (kernel template argument). Default 2:
+// 4 blocks x 2 stages measured slower on H20 (see the host comment next to
+// `k_blocks_per_stage`).
+static inline int get_sm90_fp4_h20_bm8_k_blocks_per_stage() {
+    const int v = get_env<int>("DG_FP4_KBLOCKS_PER_STAGE", 2);
+    return v == 4 ? 4 : 2;
+}
 
 struct SM90FP4H20FusedConfig {
     static constexpr int kBlockK = 128;
@@ -60,6 +72,13 @@ struct SM90FP4H20FusedInput {
     int num_max_tokens_per_rank, num_tokens, num_topk;
     int hidden, intermediate_hidden;
     int num_padded_sf_pool_tokens;
+    // RF-decode swapAB hosts (MXFP4, QoQ; kernel `kRFDecode`) run multi-K-block
+    // BM8 stages; NVFP4 keeps one K-block per stage (>= 4 stages).
+    bool rf_decode = false;
+    // Wide (2 packed tiles == 512-row) L1 and/or L2 tasks requested for this launch
+    // (host env DG_FP4_L1_BN / DG_FP4_L2_BN, see the host): the BM8 RF tier then
+    // carries ONE K128 block per stage (1 KB A + 40 KB B) in >= 4 stages.
+    bool wide_tiles = false;
 
     SM90FP4H20FusedShape shape() const noexcept {
         return {
@@ -101,14 +120,23 @@ select_sm90_nvfp4_h200_fused(
         bool single_active_dispatch_warp;
     } tuning {};
 
+    // BM8 (MXFP4 RF swapAB) runs kKBlocksPerStage == 2 or 4 (host knob
+    // DG_FP4_KBLOCKS_PER_STAGE, see `get_sm90_fp4_h20_bm8_k_blocks_per_stage`):
+    // a stage carries 2 K128 blocks (2 KB A + 40 KB packed B + 2 SFA slots, 4
+    // stages = 173056 B) or 4 (4 KB + 80 KB + 4 slots, 2 stages = 173056 B); both
+    // keep 8 K-blocks in flight at the smem capacity. DG_FP4_BM8_STAGES overrides
+    // the depth (kernel static-asserts 2..4 for 2 blocks, exactly 2 for 4 blocks).
+    const int bm8_k_blocks = (input.rf_decode && !input.wide_tiles) ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 1;
+    const int bm8_stages = bm8_k_blocks == 4 ? 2 :
+        std::clamp(get_env<int>("DG_FP4_BM8_STAGES", 4), bm8_k_blocks == 2 ? 2 : 4, bm8_k_blocks == 2 ? 4 : 7);
     if (input.num_tokens <= 1)
-        tuning = {8, 256, 24, 4, SM90ArchSpec::smem_capacity,
+        tuning = {8, 256, 24, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 8)
-        tuning = {8, 256, 16, 4, SM90ArchSpec::smem_capacity,
+        tuning = {8, 256, 16, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 16)
-        tuning = {8, 256, 24, 4, SM90ArchSpec::smem_capacity,
+        tuning = {8, 256, 24, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 32)
         tuning = {16, 256, 48, 3, SM90ArchSpec::smem_capacity,

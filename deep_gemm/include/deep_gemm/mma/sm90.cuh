@@ -270,6 +270,25 @@ struct INT8MMARSSelector {
     using type = INT8MMARS<N, decltype(select_mma())>;
 };
 
+// INT8 u8*s8->s32 RS WGMMA: A = raw unsigned 4-bit codes widened to u8 in registers,
+// B = signed int8 activations. Used by the QoQ inline-s2 raw-u8 loop, which folds
+// the per-row affine ((code - z) * s2) into the int32 accumulator after the block
+// instead of into every A byte.
+template <int N>
+struct INT8U8MMARSSelector {
+    static constexpr auto select_mma() {
+        using namespace cute::SM90::GMMA;
+        if constexpr (N == 8) return MMA_64x8x32_S32U8S8_RS_TN();
+        if constexpr (N == 16) return MMA_64x16x32_S32U8S8_RS_TN();
+        if constexpr (N == 32) return MMA_64x32x32_S32U8S8_RS_TN();
+        if constexpr (N == 64) return MMA_64x64x32_S32U8S8_RS_TN();
+        DG_STATIC_ASSERT(N == 8 or N == 16 or N == 32 or N == 64,
+                         "Invalid N for INT8 U8xS8 RS WGMMA (must be 8/16/32/64)");
+    }
+
+    using type = INT8MMARS<N, decltype(select_mma())>;
+};
+
 // INT8 s8*s8->s32 WGMMA with both operands in SMEM (SS form). Used by the
 // W4A8-integer non-swapAB (large M) path: int4 weights are decoded to int8 in
 // SMEM by the dequant stage and IGMMA accumulates raw products in int32.

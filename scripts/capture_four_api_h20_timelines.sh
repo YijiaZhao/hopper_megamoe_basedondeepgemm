@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Capture the complete 24-report H20 delivery matrix.
+# Capture the complete H20 delivery matrix (2 scopes x 2 backends x 2 quants x
+# TOKENS_LIST). The customer method is TOKENS_LIST="2 8 16" -> 24 reports.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -10,6 +11,15 @@ GPU_IDLE_LIMIT_MIB=${GPU_IDLE_LIMIT_MIB:-64}
 GPU_IDLE_RETRIES=${GPU_IDLE_RETRIES:-45}
 LOCK_SM_CLOCK_MHZ=${LOCK_SM_CLOCK_MHZ:-1830}
 CLOCK_LOCK_MODE=${CLOCK_LOCK_MODE:-verify}
+TOKENS_LIST=${TOKENS_LIST:-"2 8 16"}
+read -r -a TOKENS <<< "$TOKENS_LIST"
+# Optional sub-matrix (default = full customer matrix): SCOPES="e2e" BACKENDS="fused"
+SCOPES=${SCOPES:-"e2e mega"}
+BACKENDS=${BACKENDS:-"split fused"}
+QUANTS=${QUANTS:-"mxfp4 qoq"}
+read -r -a _SC <<< "$SCOPES"; read -r -a _BK <<< "$BACKENDS"; read -r -a _QU <<< "$QUANTS"
+EXPECTED_COUNT=$((${#_SC[@]} * ${#_BK[@]} * ${#_QU[@]} * ${#TOKENS[@]}))
+export EXPECTED_PER_M=$((${#_SC[@]} * ${#_BK[@]} * ${#_QU[@]}))
 
 cd "$ROOT"
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
@@ -53,7 +63,10 @@ check_idle_gpus() {
   return 1
 }
 
-if find "$OUT" -maxdepth 1 -name '*.nsys-rep' -print -quit 2>/dev/null | grep -q .; then
+# RESUME=1: keep the existing reports and capture only the missing cases (a case whose
+# post-capture idle check fails is deleted, so kept reports are always clean).
+RESUME=${RESUME:-0}
+if [ "$RESUME" != 1 ] && find "$OUT" -maxdepth 1 -name '*.nsys-rep' -print -quit 2>/dev/null | grep -q .; then
   if [ "$FORCE" != 1 ]; then
     echo "output contains existing .nsys-rep files: $OUT (set FORCE=1 to replace)" >&2
     exit 3
@@ -100,19 +113,27 @@ COMMON=(--trace=cuda,nvtx --cuda-graph-trace=node --sample=none
         --cpuctxsw=none --force-overwrite=true)
 run_case() {
   local name=$1 scope=$2 backend=$3 quant=$4 tokens=$5
+  if [ "$RESUME" = 1 ] && [ -f "$OUT/$name.nsys-rep" ]; then
+    echo "=== $name === (kept)"
+    return 0
+  fi
   check_idle_gpus
   echo "=== $name ==="
   nsys profile "${COMMON[@]}" --output="$OUT/$name" \
     torchrun --standalone --nproc_per_node=8 tests/profile_four_api_h20.py \
       --scope "$scope" --backend "$backend" --quant "$quant" \
       --global-tokens "$tokens"
-  check_idle_gpus
+  # Another job appearing mid-case contaminates it: drop the report before failing
+  if ! check_idle_gpus; then
+    rm -f "$OUT/$name.nsys-rep"
+    return 1
+  fi
 }
 
-for scope in e2e mega; do
-  for backend in split fused; do
-    for quant in mxfp4 qoq; do
-      for tokens in 2 8 16; do
+for scope in $SCOPES; do
+  for backend in $BACKENDS; do
+    for quant in $QUANTS; do
+      for tokens in "${TOKENS[@]}"; do
         run_case "${scope}_${backend}_${quant}_M${tokens}" \
           "$scope" "$backend" "$quant" "$tokens"
       done
@@ -131,4 +152,4 @@ python3 scripts/summarize_four_api_h20_timelines.py "$OUT" | tee "$OUT/TIMELINE_
 python3 scripts/summarize_four_api_h20_last3.py "$OUT" >/dev/null
 count=$(find "$OUT" -maxdepth 1 -type f -name '*.nsys-rep' | wc -l)
 echo "TIMELINE_COUNT=$count"
-test "$count" -eq 24
+test "$count" -eq "$EXPECTED_COUNT"

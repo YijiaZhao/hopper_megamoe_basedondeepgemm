@@ -207,9 +207,23 @@ CUTLASS_DEVICE uint64_t atomic_add_sys(const uint64_t* ptr, const uint64_t& valu
     return ret;
 }
 
+CUTLASS_DEVICE uint64_t atomic_add_rel_gpu(const uint64_t* ptr, const uint64_t& value) {
+    uint64_t ret;
+    asm volatile("atom.release.gpu.global.add.u64 %0, [%1], %2;" : "=l"(ret) : "l"(ptr), "l"(value));
+    return ret;
+}
+
 CUTLASS_DEVICE uint32_t atomic_add_rel(const uint32_t* ptr, const uint32_t& value) {
     uint32_t ret;
     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
+    return ret;
+}
+
+// Arrival ticket: release this thread's (and, after a CTA barrier, the CTA's) prior
+// stores and acquire every earlier arriver's stores (stream-K partial-sum counter).
+CUTLASS_DEVICE uint32_t atomic_add_acq_rel(const uint32_t* ptr, const uint32_t& value) {
+    uint32_t ret;
+    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value) : "memory");
     return ret;
 }
 
@@ -227,6 +241,10 @@ CUTLASS_DEVICE void red_or_rel_sys(const uint64_t* ptr, const uint64_t& value) {
 
 CUTLASS_DEVICE void red_or_rel_gpu(uint64_t* ptr, const uint64_t& value) {
     asm volatile("red.release.gpu.global.or.b64 [%0], %1;" :: "l"(ptr), "l"(value));
+}
+
+CUTLASS_DEVICE void st_rel_gpu(const uint32_t* ptr, const uint32_t& value) {
+    asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(ptr), "r"(value));
 }
 
 CUTLASS_DEVICE void red_add_rel(const uint32_t* ptr, const uint32_t& value) {

@@ -587,17 +587,44 @@ def qoq_mega_moe_split(*args, **kwargs):
 from .fused import FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe, transform_mxfp4_weights_for_mega_moe_fused, transform_qoq_weights_for_mega_moe_fused, mxfp4_mega_moe_fused, qoq_mega_moe_fused
 
 
+_FRONTEND_STAMPS_BYTES = 256 * 8 * 8
+
+
+def fable_frontend_workspace_bytes(e: int) -> int:
+    return 256 + 4 * 64 * e * 4 + _FRONTEND_STAMPS_BYTES
+
+
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
-                                     sym_buffer, quant: str = "mxfp4"):
-    """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend."""
+                                     sym_buffer, quant: str = "mxfp4", tinym=None, stamps=None,
+                                     l2_persist=None, pdl=None):
+    """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend.
+
+    ``tinym`` (env ``DG_FE_TINYM``, default 1): for m <= 16 use the single-wave
+    3-stage configuration (bit-identical outputs, ~4x lower latency on 78-SM H20).
+    ``stamps`` (env ``DG_FE_STAMPS``, default 0): record per-CTA %globaltimer phase
+    stamps into the workspace; read them back with ``fable_frontend_stamps``.
+    ``l2_persist`` (env ``DG_FE_ROUTER_L2_PERSIST``, default 0): 1 = pin the router
+    weights in L2 with the persisting-L2 set-aside (access policy window launch
+    attribute), 2 = PTX ``L2::evict_last`` hint on the router weight loads.
+    ``pdl`` (env ``DG_FE_PDL``, default 0): programmatic-dependent-launch trigger for
+    the fused Mega that follows: 1 = at CTA start, 2 = after the CTA's last store.
+    """
     assert quant in ("mxfp4", "qoq")
     m = hidden.size(0)
     e = router_weight.size(0)
+    if tinym is None:
+        tinym = int(os.environ.get("DG_FE_TINYM", "1"))
+    if stamps is None:
+        stamps = int(os.environ.get("DG_FE_STAMPS", "0"))
+    if l2_persist is None:
+        l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
+    if pdl is None:
+        pdl = int(os.environ.get("DG_FE_PDL", "0"))
     cache = getattr(sym_buffer, "_fable_frontend_cache", None)
     if cache is None:
         cache = sym_buffer._fable_frontend_cache = {}
     workspace = cache.get("workspace")
-    required = 256 + 4 * 64 * e * 4
+    required = fable_frontend_workspace_bytes(e)
     if workspace is None or workspace.numel() < required:
         workspace = cache["workspace"] = torch.zeros(required, dtype=torch.uint8, device=hidden.device)
     views = cache.get(m)
@@ -606,4 +633,15 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
                             sym_buffer.topk_idx[:m], sym_buffer.topk_weights[:m])
     _C.fable_router_quant_topk_frontend(
         hidden, router_weight, views[0], views[1], views[2], views[3], workspace,
-        0 if quant == "mxfp4" else 1)
+        0 if quant == "mxfp4" else 1, int(bool(tinym)), int(bool(stamps)), int(l2_persist), int(pdl))
+
+
+def fable_frontend_stamps(sym_buffer, e: int) -> torch.Tensor:
+    """[num_ctas, 8] int64 ns %globaltimer stamps of the last DG_FE_STAMPS=1 launch.
+
+    Router CTAs (first 96 for E=384, m <= 16): start / chunk0 landed / mma done / ticket bumped.
+    Quant CTAs (next m): start / quant done / ticket seen / top-k done / [tiny: partials loaded / rounds done].
+    """
+    workspace = sym_buffer._fable_frontend_cache["workspace"]
+    off = 256 + 4 * 64 * e * 4
+    return workspace[off:off + _FRONTEND_STAMPS_BYTES].view(torch.int64).view(-1, 8).clone()

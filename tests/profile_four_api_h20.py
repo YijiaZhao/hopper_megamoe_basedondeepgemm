@@ -4,7 +4,7 @@ Matrix dimensions:
   scope:     e2e, mega
   backend:   split, fused
   quant:     mxfp4, qoq
-  global M:  2, 8, 16
+  global M:  2, 8, 16 (customer method); 4 supported as an extra point
 
 E2E captures TP4 ReduceScatter, router/activation-quant/TopK, MegaMoE, and TP4
 AllGather.  Only frontend+MegaMoE is placed in a CUDA graph because NCCL graph
@@ -38,6 +38,11 @@ def flush_l2_cache():
     n = max(0, num_bytes // 4)
     if n:
         torch.empty(n, dtype=torch.int32, device="cuda").zero_()
+
+# DG_PROFILE_HOST_BARRIER=1: dist.barrier() on all 8 ranks right before each launch
+# (after the L2 flush + synchronize) so the ranks launch together and the kernel
+# span is not inflated by host launch skew.  Default off = customer method.
+HOST_BARRIER = os.environ.get("DG_PROFILE_HOST_BARRIER", "0") == "1"
 
 WORLD = 8
 TP = 4
@@ -157,6 +162,9 @@ def run_e2e(args, rank, tp_group, group):
             flush_l2_cache()
             torch.cuda.synchronize()
             work.copy_(partials[input_id])
+            if HOST_BARRIER:
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
             if annotate:
                 nvtx.range_push(f"rank{rank}/tp_reduce_scatter")
             dist.reduce_scatter_tensor(x, work, group=tp_group)
@@ -193,8 +201,14 @@ def run_e2e(args, rank, tp_group, group):
 
 
 def local_tokens(global_tokens, rank):
-    if global_tokens == 2:
-        return 1 if rank in (0, 4) else 0
+    """Active rows on ``rank``; mirrors the E2E owner layout (token_id % TP per DP group).
+
+    M < WORLD: one token on the first M // 2 ranks of each of the two TP4 groups
+    (M=2 -> ranks 0,4; M=4 -> ranks 0,1,4,5); the remaining ranks carry zero active rows.
+    """
+    if global_tokens < WORLD:
+        per_dp = global_tokens // 2
+        return 1 if rank % TP < per_dp else 0
     return global_tokens // WORLD
 
 
@@ -235,6 +249,8 @@ def run_mega(args, rank, group):
         def replay(annotate):
             flush_l2_cache()
             torch.cuda.synchronize()
+            if HOST_BARRIER:
+                dist.barrier(group=group)
             if annotate:
                 nvtx.range_push(
                     f"rank{rank}/megamoe_graph/{args.backend}/{args.quant}/M{args.global_tokens}")
@@ -265,7 +281,7 @@ def main():
     parser.add_argument("--scope", choices=("e2e", "mega"), required=True)
     parser.add_argument("--backend", choices=("split", "fused"), required=True)
     parser.add_argument("--quant", choices=("mxfp4", "qoq"), required=True)
-    parser.add_argument("--global-tokens", type=int, choices=(2, 8, 16), required=True)
+    parser.add_argument("--global-tokens", type=int, choices=(2, 4, 8, 16), required=True)
     args = parser.parse_args()
 
     rank = int(os.environ["RANK"])

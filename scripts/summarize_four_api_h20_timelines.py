@@ -7,6 +7,7 @@ kernel start through the L2 kernel end, including the inter-kernel gap. E2E is
 measured from the Fable frontend start through MegaMoE completion.
 """
 import argparse
+import os
 import csv
 import json
 import pathlib
@@ -16,7 +17,7 @@ import statistics
 import subprocess
 
 REPORT_RE = re.compile(
-    r"(e2e|mega)_(split|fused)_(mxfp4|qoq)_M(2|8|16)\.nsys-rep"
+    r"(e2e|mega)_(split|fused)_(mxfp4|qoq)_M(\d+)\.nsys-rep"
 )
 METRIC_KEYS = (
     "frontend_us", "router_us", "quant_us", "l1_us", "l2_us",
@@ -183,6 +184,32 @@ def fmt(value):
     return "-" if value is None else f"{value:.3f}"
 
 
+def check_complete_matrix(rows, m_key="M", quant_key="quant"):
+    """Require a full 2x2x2 matrix for every M present; return the sorted M list.
+
+    The expected report count is 8 per M value (customer method M=2,8,16 -> 24).
+    """
+    m_values = sorted({row[m_key] for row in rows})
+    if not m_values:
+        raise RuntimeError("no reports found")
+    keys = {(row["scope"], row["backend"], row[quant_key], row[m_key]) for row in rows}
+    # Sub-matrix captures (capture_four_api_h20_timelines.sh SCOPES/BACKENDS/QUANTS) export
+    # the same variables; default = full customer matrix.
+    scopes = os.environ.get("SCOPES", "e2e mega").split()
+    backends = os.environ.get("BACKENDS", "split fused").split()
+    quants = os.environ.get("QUANTS", "mxfp4 qoq").split()
+    expected = {
+        (scope, backend, quant, m_value)
+        for scope in scopes for backend in backends
+        for quant in quants for m_value in m_values
+    }
+    if keys != expected or len(rows) != len(expected):
+        raise RuntimeError(
+            f"expected {len(expected)} reports for M={m_values}, found {len(rows)}; "
+            f"missing={sorted(expected - keys)} extra={sorted(keys - expected)}")
+    return m_values
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=pathlib.Path)
@@ -190,8 +217,7 @@ def main():
     args = parser.parse_args()
 
     rows = [summarize(path, args.device_id) for path in sorted(args.directory.glob("*.nsys-rep"))]
-    if len(rows) != 24:
-        raise RuntimeError(f"expected 24 reports, found {len(rows)}")
+    check_complete_matrix(rows)
     order_scope = {"e2e": 0, "mega": 1}
     order_quant = {"mxfp4": 0, "qoq": 1}
     order_backend = {"fused": 0, "split": 1}

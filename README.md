@@ -257,50 +257,93 @@ including the real inter-kernel gap.  `Target span` in E2E is measured from
 Fable frontend start through MegaMoE completion.  It is not a sum of unrelated
 kernel statistics and is not aggregated across GPUs.
 
-## Final locked-clock performance results
+## Performance results (2026-09-10, locked clock)
 
-The following values were captured on `10.6.131.7` with all eight H20 GPUs
-explicitly locked at **1830 MHz**. All values are microseconds and are the
-GPU 0 / rank 0 median of the final three complete spans.
+Method: `10.6.131.7`, eight H20 GPUs locked at **1830 MHz**,
+`scripts/capture_four_api_h20_timelines.sh`, GPU 0 median of the final three
+complete spans (see the runnable commands below).  Values are microseconds.  Mega-only Fused is
+the customer comparison column (targets M2 < 53, M8 < 61, M16 < 85: all met).
 
-| Precision | M | FE Fused | FE Split | E2E Mega Fused | E2E Mega Split | E2E Fused | E2E Split | Mega-only Fused | Mega-only Split |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| MXFP4 | 2 | 13.760 | 13.856 | 86.624 | 107.520 | **100.640** | **121.440** | 62.432† | 57.152 |
-| MXFP4 | 8 | 13.632 | 13.792 | 91.520 | 125.568 | **105.440** | **139.424** | 87.584 | 105.088 |
-| MXFP4 | 16 | 13.696 | 13.856 | 133.024 | 147.424 | **147.008** | **161.088** | 115.232 | 128.416 |
-| QOQ | 2 | 14.272 | 14.400 | 92.896 | 87.040 | **107.584** | **101.632** | 64.192 | 50.400 |
-| QOQ | 8 | 14.432 | 14.432 | 95.456 | 84.352 | **110.144** | **98.880** | 92.608 | 81.760 |
-| QOQ | 16 | 14.720 | 14.400 | 138.784 | 125.120 | **153.504** | **139.968** | 123.712 | 114.112 |
+| Precision | M | FE Fused | E2E Fused (FE + Mega) | Mega-only Fused |
+|---|---:|---:|---:|---:|
+| MXFP4 | 2  | 8.3 (13.9 legacy) | 74.5–96.8   | **42.9** |
+| MXFP4 | 4  | 8.3 (13.8 legacy) | 81.5–88.3   | **~49** |
+| MXFP4 | 8  | 8.3 (13.9 legacy) | 75.5–89.2   | **56.4–59.1** |
+| MXFP4 | 16 | 8.7 (14.0 legacy) | 108.5–117.0 | **74.0–82.6** |
+| QOQ   | 2  | 8.7 (14.5 legacy) | 73.5–94.3   | **44.1** |
+| QOQ   | 4  | 8.5 (14.6 legacy) | 84.9–87.1   | **48.0** |
+| QOQ   | 8  | 8.6 (14.8 legacy) | 80.2–90.3   | **54.9–59.3** |
+| QOQ   | 16 | 8.7 (14.9 legacy) | 94.9–109.3  | **74.0–77.4** |
 
-† MXFP4 Mega-only Fused M2 uses the median across three independent timeline medians; see `delivery/mxfp4_fused_m2_repeat_audit_20260904.md`.
+FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16;
+kernel time 6.9 us, nsys span 8.3–8.7 us); the legacy frontend value is in
+parentheses.  E2E ranges span captures with different host launch skew.
 
-Validation summary:
+M2/M4 values are medians over five independent captures (branch tip with
+`DG_FP4_STREAMK` default on); M8/M16 are the range over the r4/r5 captures
+(`docs/` and `delivery/four_api_fable_timeline_last3_r4_20260909.md`,
+`..._r5_20260909.md`).  Ranges reflect host launch skew between the eight
+ranks, not kernel variance: the kernel duration on the latest-starting rank
+agrees to within 1.5 us across captures.  Adding `dist.barrier()` before each
+graph replay in the profiling driver (`DG_PROFILE_HOST_BARRIER=1`) removes
+most of that skew (e.g. MXFP4 M8 110.8 -> 57.6 in one A/B).
 
-```text
-24/24 NSYS reports structurally valid
-4968/4968 clock samples at 1830 MHz
-250 ms GPU-process audit violations: 0
-qoq_quant_topk_kernel calls: 0
-E2E reports using router_quant_topk_kernel: 12/12
+### How the table is produced (runnable as-is)
+
+```bash
+# On 10.6.131.7, inside the four_api_build container, repo at /raid/kimi/dg_dev
+cd /raid/kimi/dg_dev && git fetch origin perf/phase-stamps-probe && git reset --hard FETCH_HEAD
+export CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:/usr/local/bin:$PATH \
+       DG_CUTLASS_INCLUDE_PATH=/raid/kimi/dg_dev/third-party/cutlass/include TORCH_CUDA_ARCH_LIST=9.0a \
+       PYTHONPATH=/raid/kimi/dg_dev CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 PYTHONUNBUFFERED=1
+bash develop.sh                                   # build the extension (JIT kernels compile on first use)
+
+# correctness gate (exit 0; cos_min MXFP4 >= 0.99998, QoQ >= 0.99992)
+torchrun --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
+    --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --tokens 2 8 8 16
+
+# one official capture = 8 nsys timelines per M ({e2e,mega} x {split,fused} x {mxfp4,qoq}),
+# GPUs must be idle and SM clock locked at 1830 MHz (the script verifies via nvidia-smi dmon)
+TOKENS_LIST="2 4 8 16" OUT=/raid/kimi/results/cap_p1 LOCK_SM_CLOCK_MHZ=1830 FORCE=1 \
+    bash scripts/capture_four_api_h20_timelines.sh
+python3 scripts/summarize_four_api_h20_last3.py /raid/kimi/results/cap_p1     # customer table (GPU0, median of last 3 spans)
+python3 scripts/reconcile_nsys_devices.py /raid/kimi/results/cap_p1/mega_fused_mxfp4_M8.nsys-rep   # per-device durations + start skew
+
+# Repeat the capture >= 5 times (cap_p1 .. cap_p5) and take the median across captures per cell:
+# a single capture can carry a persistent ~50 us rank-0 launch lead (all 10 rounds), which the
+# last-3 median cannot remove.  Optional: DG_PROFILE_HOST_BARRIER=1 adds dist.barrier() before
+# each replay in tests/profile_four_api_h20.py and removes most of that skew (not the customer method).
+
+# In-kernel phase breakdown (rank 0 globaltimer stamps; relative comparisons only, not kernel time):
+LOG_TAG=_x bash scripts/run_probe.sh mxfp4 2 8 16
 ```
 
-The final table, raw values, report verification, and SHA256 manifest are kept
-under `delivery/`:
+Knob A/B drivers used for the individual changes live in `scripts/run_*_ab.sh` /
+`scripts/run_*_validate.sh` (each waits for idle GPUs and writes under
+`/raid/kimi/results/`).
 
-```text
-delivery/four_api_fable_final_summary_20260903.md
-delivery/four_api_fable_timeline_table_20260903.md
-delivery/four_api_fable_timeline_table_20260903.csv
-delivery/four_api_fable_timeline_table_20260903.json
-delivery/four_api_fable_timeline_verify_20260903.json
-delivery/four_api_fable_timeline_sha256_20260903.txt
-delivery/four_api_fable_timeline_last3_20260903.md
-delivery/four_api_fable_timeline_last3_20260903.csv
-delivery/four_api_fable_timeline_last3_20260903.json
-```
+Changes that produced these numbers (all default on unless noted; every knob
+has an env override documented in `csrc/jit_kernels/impls/sm90_fp4_mega_moe_h20_fused.hpp`):
 
-Raw `.nsys-rep` files are not committed to Git because of their size.  They are
-packaged separately in the customer delivery directory.
+| Change | Env knob | Effect |
+|---|---|---|
+| RS register decode for QoQ (int4 -> int8 in the WGMMA A fragments) | – | QoQ inherits the MXFP4 RF pipeline |
+| QoQ inline s2 (LiquidGEMM byte-lane dequant, whole-K int32 accumulate, one promote per task) | `DG_FP4_QOQ_INLINE_S2` | QoQ stage -22%, no per-K128 accumulator read-out |
+| wgmma pipeline un-serialisation (device CALLs removed, loop-exit `wait<0>`) | – | ptxas no longer wraps every IGMMA in ARRIVE/DEPBAR |
+| Fine-grained combine (per-token arrival counters replace NVLink barrier #2) | `DG_FP4_FINE_COMBINE` | -3/-6 us at M8/M16 |
+| Push-model dispatch (sender pushes rows + remote ticket; no pull round trip) | `DG_FP4_PUSH_DISPATCH` | first math ~1.5 us after barrier #1 instead of ~7.5 |
+| Lean routing (non-zero experts only, no broadcast under push) | `DG_FP4_LEAN_ROUTING` | pre-barrier routing shortened |
+| Per-rank DONE flags replace NVLink barrier #1 (push path) | `DG_FP4_PUSH_DONE_FLAGS` | -1 us |
+| QoQ packed-word prefetch inside the RF loop | `DG_FP4_QIS2_PREFETCH_PACKED` | M16 -3..-6 us (probe) |
+| stream-K for M <= 4 (units spread over all 78 SMs) | `DG_FP4_STREAMK` (`_MAX_M`) | MXFP4 M2 49.7 -> 42.9 |
+| Wide L1 tasks (BN=512, 1 K-block/stage, 3-way tail split) for M >= 16 | `DG_FP4_L1_BN` (`DG_FP4_BN512_MIN_M`) | M16 Mega-only 5-capture medians MXFP4 84.1 -> 82.6, QoQ 80.4 -> 77.4 |
+| Tiny-M Fable frontend (3 smem stages -> 3 CTAs/SM single wave; 256-thread partial fetch; warp-0 32-bit-key top-8) | `DG_FE_TINYM` | FE 13.8–14.9 -> 8.3–8.7 us (nsys span), bit-identical outputs |
+
+Measured and kept off (documented negative results): 4 K-blocks per stage,
+per-M knob sweep, tiny-M CUDA-core GEMV path (`DG_FP4_TINYM`), whole-expert L2
+weight prefetch (`DG_FP4_L2_PREFETCH_ALL`), two-layer L1/L2 fusion
+(`DG_FP4_FUSE_L1L2`), dynamic combine claim (`DG_FP4_COMBINE_DYNAMIC`), L2
+tail split-K, all-task L1/L2 split-K at M16, wide L2 tasks (BN=512), third math warpgroup (`DG_FP4_MATH_WGS=3`), deterministic push slots (`DG_FP4_PUSH_DET_SLOTS`), FE router-weight L2 persistence and FE->Mega PDL, raw-u8 deferred affine dequant.
 
 ## Relevant source files
 

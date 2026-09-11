@@ -49,6 +49,49 @@ __device__ __forceinline__ uint2 dequant_mode2_nibble_word(
 // `kPer32Scale` (MXFP4): one scale byte per 32 K values, i.e. one LUT row per
 // 16-byte quad, stored in the first 4 bytes of the scale word. NVFP4 uses two
 // scale bytes per quad (per 16 K values).
+//
+// MXFP4 rows are additionally stored in WGMMA "RF fragment" order (host
+// `_mxfp4_rf_fragment_order`): within the 16-byte quad of K32 group g, word c
+// (c = 0..3) holds K = g*32 + 4c + {0..3} in its "hi" braid slots and
+// K = g*32 + 16 + 4c + {0..3} in its "lo" slots. That is exactly the A
+// fragment thread `lane % 4 == c` needs for an m64nNk32 RS WGMMA, so the
+// swapAB tiers decode one uint4 per row straight into registers. The SMEM
+// tile decoders below gather (q0.x, q1.x, q2.x, q3.x) for K[0..16) and
+// (q0.y, q1.y, q2.y, q3.y) for K[16..32) so the decoded tile is unchanged.
+// RF-ordered MXFP4 rows are additionally word-transposed on the host
+// (`_fused_word_transpose`): 16-byte chunk c holds word c of K32 groups 0..3,
+// so the RS loader fetches all four K32 steps of thread `lane % 4 == c` with a
+// single uint4. The SS tile decoders load the whole 64-byte row anyway, so
+// they undo the transpose in registers (pure renaming after unrolling): after
+// this, `quads[g]` holds words c = 0..3 of K32 group g, i.e. word (g, c) is
+// read from byte offset c*16 + g*4.
+__device__ __forceinline__ void transpose_rf_quads(uint4 (&quads)[4]) {
+    const uint4 t0 = quads[0], t1 = quads[1], t2 = quads[2], t3 = quads[3];
+    quads[0] = make_uint4(t0.x, t1.x, t2.x, t3.x);
+    quads[1] = make_uint4(t0.y, t1.y, t2.y, t3.y);
+    quads[2] = make_uint4(t0.z, t1.z, t2.z, t3.z);
+    quads[3] = make_uint4(t0.w, t1.w, t2.w, t3.w);
+}
+
+template <bool kRFOrder>
+__device__ __forceinline__ void store_decoded_quad(
+        uint8_t* __restrict__ fp8_dst,
+        const uint2& q0, const uint2& q1, const uint2& q2, const uint2& q3,
+        const uint32_t k_offset0, const uint32_t k_offset1,
+        const uint32_t row_swizzle) {
+    if constexpr (kRFOrder) {
+        *reinterpret_cast<uint4*>(fp8_dst + (k_offset0 ^ row_swizzle)) =
+            make_uint4(q0.x, q1.x, q2.x, q3.x);
+        *reinterpret_cast<uint4*>(fp8_dst + (k_offset1 ^ row_swizzle)) =
+            make_uint4(q0.y, q1.y, q2.y, q3.y);
+    } else {
+        *reinterpret_cast<uint4*>(fp8_dst + (k_offset0 ^ row_swizzle)) =
+            make_uint4(q0.x, q0.y, q1.x, q1.y);
+        *reinterpret_cast<uint4*>(fp8_dst + (k_offset1 ^ row_swizzle)) =
+            make_uint4(q2.x, q2.y, q3.x, q3.y);
+    }
+}
+
 template <bool kQuadILP = false, bool kPer32Scale = false>
 __device__ __forceinline__ void dequant_mode2_nibble_row_regs(
         uint8_t* __restrict__ fp8_dst,
@@ -80,7 +123,7 @@ __device__ __forceinline__ void dequant_mode2_nibble_row_regs(
 
         const uint2 q0 = dequant_mode2_nibble_word(q.x, lut0);
         const uint2 q1 = dequant_mode2_nibble_word(q.y, lut0);
-        if constexpr (!kQuadILP) {
+        if constexpr (!kQuadILP && !kPer32Scale) {
             *reinterpret_cast<uint4*>(
                 fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
                 make_uint4(q0.x, q0.y, q1.x, q1.y);
@@ -88,14 +131,20 @@ __device__ __forceinline__ void dequant_mode2_nibble_row_regs(
 
         const uint2 q2 = dequant_mode2_nibble_word(q.z, lut1);
         const uint2 q3 = dequant_mode2_nibble_word(q.w, lut1);
-        if constexpr (kQuadILP) {
+        if constexpr (kPer32Scale) {
+            // RF-ordered row: both 16B chunks depend on all four words.
+            store_decoded_quad<true>(fp8_dst, q0, q1, q2, q3,
+                                     scale_i0 * 16, scale_i1 * 16, row_swizzle);
+        } else {
+            if constexpr (kQuadILP) {
+                *reinterpret_cast<uint4*>(
+                    fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
+                    make_uint4(q0.x, q0.y, q1.x, q1.y);
+            }
             *reinterpret_cast<uint4*>(
-                fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
-                make_uint4(q0.x, q0.y, q1.x, q1.y);
+                fp8_dst + ((scale_i1 * 16) ^ row_swizzle)) =
+                make_uint4(q2.x, q2.y, q3.x, q3.y);
         }
-        *reinterpret_cast<uint4*>(
-            fp8_dst + ((scale_i1 * 16) ^ row_swizzle)) =
-            make_uint4(q2.x, q2.y, q3.x, q3.y);
     }
 }
 
@@ -112,6 +161,8 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_mode2_nibble(
 #pragma unroll
     for (int i = 0; i < 4; ++i)
         fp4_quads[i] = fp4_src[i];
+    if constexpr (kPer32Scale)
+        transpose_rf_quads(fp4_quads);
     const uint2 scale_words =
         *reinterpret_cast<const uint2*>(row_ptr + 64);
     dequant_mode2_nibble_row_regs<kQuadILP, kPer32Scale>(
@@ -141,7 +192,17 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_mode2_nibble_split_m(
 
     #pragma unroll
     for (uint32_t quad_i = 0; quad_i < 2; ++ quad_i) {
-        const uint4 q = fp4_src[quad_i];
+        uint4 q;
+        if constexpr (kPer32Scale) {
+            // Word-transposed RF row: word c of K32 group g lives at byte
+            // c*16 + g*4, so gather the four words of this half's group.
+            const uint32_t g = k_half_idx * 2u + quad_i;
+            const uint32_t* __restrict__ words =
+                reinterpret_cast<const uint32_t*>(row_ptr + g * 4u);
+            q = make_uint4(words[0], words[4], words[8], words[12]);
+        } else {
+            q = fp4_src[quad_i];
+        }
         const uint32_t scale_i0 = quad_i * 2u;
         const uint32_t scale_i1 = scale_i0 + 1u;
         uint2 lut0, lut1;
@@ -164,10 +225,8 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_mode2_nibble_split_m(
             k_half_idx * 64u + scale_i0 * 16u;
         const uint32_t k_offset1 =
             k_half_idx * 64u + scale_i1 * 16u;
-        *reinterpret_cast<uint4*>(fp8_dst + (k_offset0 ^ row_swizzle)) =
-            make_uint4(q0.x, q0.y, q1.x, q1.y);
-        *reinterpret_cast<uint4*>(fp8_dst + (k_offset1 ^ row_swizzle)) =
-            make_uint4(q2.x, q2.y, q3.x, q3.y);
+        store_decoded_quad<kPer32Scale>(fp8_dst, q0, q1, q2, q3,
+                                        k_offset0, k_offset1, row_swizzle);
     }
 }
 
@@ -182,6 +241,7 @@ __device__ __forceinline__ uint2 dequant_braided_selector_word(
     return make_uint2(out0, out1);
 }
 
+template <bool kRFOrder = false>
 __device__ __forceinline__ void dequant_braided_quad(
         uint8_t* __restrict__ fp8_dst,
         const uint4& q,
@@ -191,15 +251,23 @@ __device__ __forceinline__ void dequant_braided_quad(
         const uint32_t row_swizzle) {
     const uint2 q0 = dequant_braided_selector_word(q.x, lut0);
     const uint2 q1 = dequant_braided_selector_word(q.y, lut0);
-    *reinterpret_cast<uint4*>(fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
-        make_uint4(q0.x, q0.y, q1.x, q1.y);
+    if constexpr (!kRFOrder) {
+        *reinterpret_cast<uint4*>(fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
+            make_uint4(q0.x, q0.y, q1.x, q1.y);
+    }
 
     const uint2 q2 = dequant_braided_selector_word(q.z, lut1);
     const uint2 q3 = dequant_braided_selector_word(q.w, lut1);
-    *reinterpret_cast<uint4*>(fp8_dst + (((scale_i0 + 1) * 16) ^ row_swizzle)) =
-        make_uint4(q2.x, q2.y, q3.x, q3.y);
+    if constexpr (kRFOrder) {
+        store_decoded_quad<true>(fp8_dst, q0, q1, q2, q3,
+                                 scale_i0 * 16, (scale_i0 + 1) * 16, row_swizzle);
+    } else {
+        *reinterpret_cast<uint4*>(fp8_dst + (((scale_i0 + 1) * 16) ^ row_swizzle)) =
+            make_uint4(q2.x, q2.y, q3.x, q3.y);
+    }
 }
 
+template <bool kRFOrder = false>
 __device__ __forceinline__ void dequant_braided_quad_ilp(
         uint8_t* __restrict__ fp8_dst,
         const uint4& q,
@@ -236,10 +304,11 @@ __device__ __forceinline__ void dequant_braided_quad_ilp(
     q3_out0 |= q.w & 0x80808080u;
     q3_out1 |= (q.w << 4) & 0x80808080u;
 
-    *reinterpret_cast<uint4*>(fp8_dst + ((scale_i0 * 16) ^ row_swizzle)) =
-        make_uint4(q0_out0, q0_out1, q1_out0, q1_out1);
-    *reinterpret_cast<uint4*>(fp8_dst + (((scale_i0 + 1) * 16) ^ row_swizzle)) =
-        make_uint4(q2_out0, q2_out1, q3_out0, q3_out1);
+    store_decoded_quad<kRFOrder>(
+        fp8_dst,
+        make_uint2(q0_out0, q0_out1), make_uint2(q1_out0, q1_out1),
+        make_uint2(q2_out0, q2_out1), make_uint2(q3_out0, q3_out1),
+        scale_i0 * 16, (scale_i0 + 1) * 16, row_swizzle);
 }
 
 template <int kQuad, bool kQuadIlp, bool kPer32Scale = false>
@@ -274,10 +343,10 @@ __device__ __forceinline__ void dequant_braided_quad_lut_window(
     }
 
     if constexpr (kQuadIlp) {
-        dequant_braided_quad_ilp(
+        dequant_braided_quad_ilp<kPer32Scale>(
             fp8_dst, fp4_quads[kQuad], lut0, lut1, kQuad * 2, row_swizzle);
     } else {
-        dequant_braided_quad(
+        dequant_braided_quad<kPer32Scale>(
             fp8_dst, fp4_quads[kQuad], lut0, lut1, kQuad * 2, row_swizzle);
     }
 
@@ -300,6 +369,8 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_braided_lut_window(
 #pragma unroll
     for (int i = 0; i < 4; ++i)
         fp4_quads[i] = fp4_src[i];
+    if constexpr (kPer32Scale)
+        transpose_rf_quads(fp4_quads);
 
     const uint2 scale_words = *reinterpret_cast<const uint2*>(row_ptr + 64);
     const uint2 lut0 = lut_smem[scale_words.x & 0x7fu];
@@ -314,8 +385,13 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_braided_lut_window(
 // into 128 int8 bytes = (code - z) in [-15, 15]. "SHIFTXOR": spread nibbles
 // with shift/mask, then per-byte subtract z with a borrow guard
 // ((x | 0x80) - z) ^ 0x80 == (x - z) mod 256 lane-wise. s2 is applied at the
-// per-K128 promote, s1 in the epilogue. Same Marlin byte order as the FP4
-// decoders (word: high nibbles = K[0..3], low nibbles = K[4..7]).
+// per-K128 promote, s1 in the epilogue. QoQ rows are stored in the same RF
+// fragment order + word transpose as MXFP4 (host `_mxfp4_rf_fragment_order`,
+// `_fused_word_transpose`; plain nibbles, no braid): after `transpose_rf_quads`,
+// word c of K32 group g holds K = g*32 + 4c + [0..4) in its high nibbles and
+// K = g*32 + 16 + 4c + [0..4) in its low nibbles, so the decoded high words of
+// c = 0..3 form K[0..16) and the low words K[16..32) of the group. The swapAB
+// tiers decode the same words straight into RS A fragments (`decode_stage_rf`).
 __device__ __forceinline__ void dequant_smem_b_from_packed_qoq_shiftxor(
         uint8_t* __restrict__ smem_b,
         const uint8_t* __restrict__ packed_b,
@@ -325,22 +401,22 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_qoq_shiftxor(
     const uint32_t zz = static_cast<uint32_t>(row_ptr[65]) * 0x01010101u;
     uint8_t* __restrict__ dst = smem_b + row * 128u;
     const uint32_t row_swizzle = (row & 7u) << 4;
+    uint4 quads[4] = {src[0], src[1], src[2], src[3]};
+    transpose_rf_quads(quads);
     #pragma unroll
-    for (uint32_t quad_i = 0; quad_i < 4; ++ quad_i) {
-        const uint4 q = src[quad_i];
+    for (uint32_t g = 0; g < 4; ++ g) {
+        const uint4 q = quads[g];
         const uint32_t w[4] = {q.x, q.y, q.z, q.w};
-        uint32_t out[8];
+        uint32_t hi[4], lo[4];
         #pragma unroll
-        for (uint32_t j = 0; j < 4; ++ j) {
-            const uint32_t hi = ((w[j] >> 4) & 0x0f0f0f0fu) | 0x80808080u;
-            const uint32_t lo = (w[j] & 0x0f0f0f0fu) | 0x80808080u;
-            out[j * 2 + 0] = (hi - zz) ^ 0x80808080u;
-            out[j * 2 + 1] = (lo - zz) ^ 0x80808080u;
+        for (uint32_t c = 0; c < 4; ++ c) {
+            hi[c] = ((((w[c] >> 4) & 0x0f0f0f0fu) | 0x80808080u) - zz) ^ 0x80808080u;
+            lo[c] = (((w[c] & 0x0f0f0f0fu) | 0x80808080u) - zz) ^ 0x80808080u;
         }
-        *reinterpret_cast<uint4*>(dst + ((quad_i * 32u) ^ row_swizzle)) =
-            make_uint4(out[0], out[1], out[2], out[3]);
-        *reinterpret_cast<uint4*>(dst + ((quad_i * 32u + 16u) ^ row_swizzle)) =
-            make_uint4(out[4], out[5], out[6], out[7]);
+        *reinterpret_cast<uint4*>(dst + ((g * 32u) ^ row_swizzle)) =
+            make_uint4(hi[0], hi[1], hi[2], hi[3]);
+        *reinterpret_cast<uint4*>(dst + ((g * 32u + 16u) ^ row_swizzle)) =
+            make_uint4(lo[0], lo[1], lo[2], lo[3]);
     }
 }
 
@@ -364,7 +440,130 @@ template <
     uint32_t kPrefetchWeightKBlocks = 0,
     bool kSwapPipelineDecode = true,
     bool kDistributedExpertBcast = true,
-    bool kQoQ = false
+    bool kQoQ = false,
+    // Weights stored as dense (E, N/BLOCK_N, K/BLOCK_K, BLOCK_N, 80 B) tiles:
+    // the B loader streams one 1D bulk copy (BLOCK_N*80 B) per stage from
+    // `l{1,2}_weights_ptr` instead of the 2D TMA box (H20: 2D box is
+    // TMA-issue bound, ~0.4us/stage; 1D bulk ~0.18us/stage at 7 in flight).
+    bool kDenseWeightTiles = false,
+    // Host-selected half-tile tasks (128-row tasks + intra-CTA K-split) on the
+    // BM8 MXFP4 RF swapAB path; see `kHalfTileTasks` in the body. Ignored by
+    // every other tier.
+    bool kHalfTileTasksRequested = false,
+    // Host-selected L1 split-K tasks (two K halves of one (expert, n_block) task
+    // on two SMs, cross-CTA fp32 reduction through the workspace) on the BM8
+    // MXFP4 RF swapAB path; see `kSplitKL1` in the body. Ignored by every other
+    // tier. Env DG_FP4_SPLITK_L1 (default 1).
+    bool kSplitKL1Requested = false,
+    // Host-selected L2 half-row tasks (128-row L2 tasks, the two math WGs each own
+    // 64 rows over the full K, no cross-WG reduction) on the BM8 MXFP4 RF swapAB
+    // path; see `kL2HalfRowTasks` in the body. Ignored by every other tier.
+    // Env DG_FP4_L2_HALFROW (default 0: measured slower on H20, see the body).
+    bool kL2HalfRowTasksRequested = false,
+    // Host-selected L2 split-K tasks (the L2 tasks of the last partial L2 wave run
+    // as two K ranges on two SMs, same cross-CTA fp32 reduction as kSplitKL1) on
+    // the BM8 MXFP4 RF swapAB path; see `kSplitKL2` in the body. Env DG_FP4_SPLITK_L2
+    // (default 0: measured neutral/slower on H20, see the host).
+    // 0 off; 2 or 3 = number of K ranges per tail task.
+    uint32_t kSplitKL2Ways = 0,
+    // Host-selected stream-K (tiny M: the (task, K128 block) units of a phase are
+    // split into kNumSMs contiguous ranges, n-way cross-CTA fp32 reduction per
+    // tile) on the BM8 MXFP4/QoQ RF swapAB path; see `kStreamK` in the body. Env
+    // DG_FP4_STREAMK / DG_FP4_STREAMK_MAX_M.
+    bool kStreamKRequested = false,
+    // Host-selected fast NVLink-barrier epilogue (SM0 publishes completion through
+    // one word instead of a second grid-wide sync); see `kNvlFastEpilogue` in the
+    // body. Env DG_FP4_NVL_FAST_EPI (default 0: within noise on H20, see the host).
+    bool kNvlFastEpilogueRequested = false,
+    // Host-selected fine-grained combine (per-token NVLink arrival counters replace
+    // the combine NVLink barrier); see `kFineCombine` in the body. Env
+    // DG_FP4_FINE_COMBINE (default 1).
+    bool kFineCombineRequested = true,
+    // Host-selected dynamic combine token claim (fine combine only): combine warps
+    // take tokens from a per-launch ticket instead of the static (SM, warp) map, so
+    // the first CTAs to finish their math take the tokens; see `kCombineDynamic`
+    // in the body. Env DG_FP4_COMBINE_DYNAMIC (default 1).
+    bool kCombineDynamicRequested = true,
+    // Host-selected two-layer fusion for tiny M (docs/fuse_l1l2_design.md): every L1
+    // task keeps its SwiGLU output in SMEM and runs the W2 K-slice (12 output N-blocks
+    // x its K128 block) itself, reducing across the 10 L1 tasks of a pool block with
+    // red.add into the workspace scratch + one ticket per (pool block, N-block); no
+    // L2 tasks. See `kFuseL1L2` in the body. Env DG_FP4_FUSE_L1L2 / DG_FP4_FUSE_L1L2_MAX_M.
+    bool kFuseL1L2Requested = false,
+    // Host-selected K128 blocks per pipeline stage for the BM8 MXFP4 RF swapAB
+    // path (2 or 4; see `kKBlocksPerStage` in the body). Ignored by every other
+    // tier (one K-block per stage). Env DG_FP4_KBLOCKS_PER_STAGE (see the heuristic).
+    uint32_t kKBlocksPerStageRequested = 2,
+    // Host-selected tiny-M CUDA-core GEMV math path (replaces the L1/L2 tensor-core
+    // task loop; see `kTinyMGemv` in the body and
+    // impls/sm90_fp4_mega_moe_h20_tinym_math.inl). Env DG_FP4_TINYM / DG_FP4_TINYM_MAX_M.
+    bool kTinyMGemvRequested = false,
+    // Host-selected push dispatch (tiny M): the source rank writes each routed
+    // token row + SF + weight + metadata straight into the destination rank's
+    // pool over NVLink during routing (row = remote atomic ticket on the
+    // destination's per-expert count), so no pull round trip follows NVLink
+    // barrier #1; see `kPushDispatch` in the body. Env DG_FP4_PUSH_DISPATCH /
+    // DG_FP4_PUSH_DISPATCH_MAX_M. `kPushMaxTokensPerRank` bounds the rows one rank
+    // can send to one expert (== its local token count) and sizes the per-expert
+    // pool stride.
+    bool kPushDispatchRequested = false,
+    uint32_t kPushMaxTokensPerRank = 2,
+    // Lean routing (host env DG_FP4_LEAN_ROUTING): see the dispatch prologue in
+    // the body (`kLeanRouting` / `kLeanPush`).
+    bool kLeanRouting = true,
+    // Push DONE flags (host env DG_FP4_PUSH_DONE_FLAGS, default 1; lean push only):
+    // NVLink barrier #1 is replaced by one release.sys DONE signal per source rank
+    // into every destination's DONE count; see `kPushDoneFlags` in the body.
+    bool kPushDoneFlagsRequested = true,
+    // QoQ inline s2 (host env DG_FP4_QOQ_INLINE_S2, default 1): fold the per-(row,
+    // K128) integer s2 into the int8 weight at RF decode time and accumulate the
+    // whole L1 task K range in one int32 set (see `kInlineS2` in the body).
+    bool kQoQInlineS2 = false,
+    // QoQ inline s2 A-fragment register buffers (host env DG_FP4_QIS2_FRAGS, 2|3|4,
+    // default 2): the wgmma.wait_group lag before a fragment buffer is re-decoded
+    // is kQoQInlineS2Frags - 1 groups (+32 regs per extra buffer).
+    uint32_t kQoQInlineS2Frags = 2,
+    // QoQ inline s2 interleaved issue (host env DG_FP4_QIS2_ILV): one commit group per
+    // K32 step (2 wgmma) and the next block's K32-step decode between the groups, so
+    // the ALU decode runs while the tensor pipe drains instead of after it.
+    bool kQoQInlineS2Ilv = false,
+    // QoQ inline s2, 2-buffer loop (host env DG_FP4_QIS2_PREFETCH_PACKED): load the
+    // next block's packed words before the wgmma wait that frees its fragment buffer.
+    bool kQoQInlineS2PrefetchPacked = true,
+    // QoQ inline s2, 2-buffer loop (host env DG_FP4_QIS2_RAWU8, default off): raw-u8
+    // nibble decode, s32.u8.s8 RS wgmma into per-block int32 sets, exact int32
+    // deferred affine after a stage-end drain (see `kQIS2RawU8` in the body).
+    bool kQoQInlineS2RawU8 = false,
+    // Generic 2-K-block RF loop (host env DG_FP4_RF_PREFETCH_PACKED): k+1 barrier check
+    // and next block-0 packed LDS before the wait<1> that frees frag[0].
+    bool kRFPrefetchPacked = false,
+    // Debug (host env DG_FP4_POOL_STRIDE_DEBUG, pull dispatch only): address the
+    // token pool with the push-dispatch fixed per-expert stride while keeping the
+    // pull protocol; see `kStridedPool` in the body.
+    bool kStridedPoolDebug = false,
+    // Communication-window L2 weight prefetch (host env DG_FP4_L2_PREFETCH_ALL /
+    // DG_FP4_L2_PREFETCH_MAX_MB, push dispatch + dense tiles only): while the CTAs
+    // idle between their routing duties and NVLink barrier #1, the B loader warp
+    // polls the local per-expert ticket counts and issues cp.async.bulk.prefetch.L2
+    // for this CTA's 1/kNumSMs slice of every active local expert's W1 (then W2)
+    // dense tiles, up to kL2PrefetchMaxMB per rank; see `kL2PrefetchAll` in the body.
+    bool kL2PrefetchAllRequested = false,
+    uint32_t kL2PrefetchMaxMB = 48,
+    // Leading K128 blocks of every (expert, n_block) W1 task to prefetch (host env
+    // DG_FP4_L2_PREFETCH_KBLOCKS, 0 = the whole K range): the first-wave tasks then
+    // find their head stages resident while the flood stays inside what HBM can
+    // deliver during the communication window.
+    uint32_t kL2PrefetchKBlocks = 0,
+    // M=16 task-shape knobs (host env DG_FP4_SPLITK_L1_ALL / DG_FP4_SPLITK_L2_ALL, per-rank
+    // rows == 2 only): every L1 / L2 task of the launch is claimed as K-split halves
+    // (scheduler `kSplitL1All` / `kSplitL2All`) instead of only the last partial wave.
+    bool kSplitKL1All = false,
+    bool kSplitKL2All = false,
+    // Wide tasks (host env DG_FP4_L1_BN / DG_FP4_L2_BN = 512, gated by
+    // DG_FP4_BN512_MIN_M / DG_FP4_BN512_MAX_M on the global token count): packed
+    // 256-row weight tiles per L1 / L2 task (1 or 2). See `kWideTiles` in the body.
+    uint32_t kL1TaskTiles = 1,
+    uint32_t kL2TaskTiles = 1
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
@@ -379,6 +578,9 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts,
         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf,
         const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights,
+        // Raw fused weight bytes; only read when kDenseWeightTiles (MXFP4/QoQ).
+        const void* __restrict__ l1_weights_ptr,
+        const void* __restrict__ l2_weights_ptr,
         // NVFP4: optional per-expert scale [E].
         // MXFP4: required per-(expert, weight row) scale [E, N] = 2^e_ref * global.
         const float* __restrict__ l1_global_scales,

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Verify the structure and CUDA Graph contents of the 24 NSYS reports."""
+"""Verify the structure and CUDA Graph contents of the NSYS report matrix.
+
+The expected count is derived from the M values present: 8 reports per M
+(2 scopes x 2 backends x 2 quants); the customer method (M=2,8,16) gives 24."""
 import argparse
 import json
+import os
 import pathlib
 import re
 import sqlite3
@@ -14,14 +18,16 @@ def main():
     args = parser.parse_args()
     reports = sorted(args.directory.glob("*.nsys-rep"))
     results = []
+    m_values = set()
     for report in reports:
         match = re.fullmatch(
-            r"(e2e|mega)_(split|fused)_(mxfp4|qoq)_M(2|8|16)\.nsys-rep",
+            r"(e2e|mega)_(split|fused)_(mxfp4|qoq)_M(\d+)\.nsys-rep",
             report.name)
         if not match:
             results.append({"file": report.name, "ok": False, "reason": "unexpected filename"})
             continue
-        scope, backend, quant, _ = match.groups()
+        scope, backend, quant, m_text = match.groups()
+        m_values.add(int(m_text))
         database = pathlib.Path("/tmp") / f"{report.stem}.verify.sqlite"
         subprocess.run([
             "nsys", "export", "--type", "sqlite", "--force-overwrite=true",
@@ -65,13 +71,18 @@ def main():
             "nccl_outside_graph": nccl_outside_graph,
             "ok": ok,
         })
+    per_m = int(os.environ.get("EXPECTED_PER_M", "8"))  # capture script sub-matrix (SCOPES/BACKENDS/QUANTS)
     summary = {
         "count": len(reports),
-        "all_ok": len(reports) == 24 and all(item["ok"] for item in results),
+        "m_values": sorted(m_values),
+        "expected_count": per_m * len(m_values),
+        "all_ok": (len(reports) > 0 and len(reports) == per_m * len(m_values)
+                   and all(item["ok"] for item in results)),
         "results": results,
     }
     (args.directory / "VERIFY.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps({"count": summary["count"], "all_ok": summary["all_ok"]}))
+    print(json.dumps({"count": summary["count"], "expected_count": summary["expected_count"],
+                      "m_values": summary["m_values"], "all_ok": summary["all_ok"]}))
     if not summary["all_ok"]:
         for result in results:
             if not result["ok"]:

@@ -62,6 +62,9 @@ struct alignas(16) TaskInfo {
     uint32_t pool_block_idx;
     uint32_t valid_m;
     uint32_t shape_n;
+    // bits [0, 16): K extent of the whole GEMM; bits [16, 24): K-split index;
+    // bits [24, 32): number of K splits of this task (1 == unsplit). Consumers
+    // derive their K-block range from `get_k_split_idx()` / `get_num_k_splits()`.
     uint32_t shape_k;
 
     CUTLASS_HOST_DEVICE
@@ -80,11 +83,32 @@ struct alignas(16) TaskInfo {
         local_expert_idx(local_expert_idx),
         m_block_idx(m_block_idx), n_block_idx(n_block_idx),
         pool_block_idx(pool_block_idx), valid_m(valid_m),
-        shape_n(shape_n), shape_k(shape_k) {}
+        shape_n(shape_n), shape_k(shape_k | (1u << 24)) {}
 
     CUTLASS_HOST_DEVICE bool is_valid() const {
         return block_phase != BlockPhase::None;
     }
+
+    CUTLASS_HOST_DEVICE void set_k_split(const uint32_t& k_split_idx, const uint32_t& num_k_splits) {
+        shape_k = (shape_k & 0xffffu) | (k_split_idx << 16) | (num_k_splits << 24);
+    }
+    CUTLASS_HOST_DEVICE uint32_t get_shape_k() const { return shape_k & 0xffffu; }
+    CUTLASS_HOST_DEVICE uint32_t get_k_split_idx() const { return (shape_k >> 16) & 0xffu; }
+    CUTLASS_HOST_DEVICE uint32_t get_num_k_splits() const { return shape_k >> 24; }
+
+    // Stream-K segments (no consumer reads `shape_n` / the K extent, both are
+    // compile-time per phase): `shape_n` carries the K-block range
+    // [k_block_begin, k_block_end) and bits [0, 16) of `shape_k` the worker index
+    // of the tile's FIRST contributor (this segment's worker == first + split idx).
+    CUTLASS_HOST_DEVICE void set_streamk(const uint32_t& k_block_begin, const uint32_t& k_block_end,
+                                         const uint32_t& first_worker_idx,
+                                         const uint32_t& k_split_idx, const uint32_t& num_k_splits) {
+        shape_n = k_block_begin | (k_block_end << 16);
+        shape_k = (first_worker_idx & 0xffffu) | (k_split_idx << 16) | (num_k_splits << 24);
+    }
+    CUTLASS_HOST_DEVICE uint32_t get_k_block_begin() const { return shape_n & 0xffffu; }
+    CUTLASS_HOST_DEVICE uint32_t get_k_block_end() const { return shape_n >> 16; }
+    CUTLASS_HOST_DEVICE uint32_t get_first_worker_idx() const { return shape_k & 0xffffu; }
 };
 
 DG_STATIC_ASSERT(sizeof(TaskInfo) == 32, "Invalid task payload layout");
@@ -256,16 +280,36 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0, 0, 0};
     }
 
-    CUTLASS_DEVICE void fetch_expert_recv_count() {
+    // `push_done_ptr` (kPushDoneFlags): wait for the push DONE count to reach
+    // `push_done_target` (acquire.sys: every source rank's rows and tickets of this
+    // launch are then visible) and take the final low words directly, instead of
+    // polling the per-expert completeness high word published by SM e.
+    CUTLASS_DEVICE void fetch_expert_recv_count(const int* push_done_ptr = nullptr,
+                                                const int& push_done_target = 0) {
+        if (push_done_ptr != nullptr) {
+            // Lane 0 spins with relaxed loads (one poller per warp, no sys-scope acquire
+            // per poll), then one acquire.sys load establishes the ordering; bar.warp.sync
+            // extends it to the other lanes' loads of the count words below.
+            if (ptx::get_lane_idx() == 0) {
+                DG_SPIN_WHILE(static_cast<int>(ptx::ld_volatile(
+                    reinterpret_cast<const uint32_t*>(push_done_ptr))) - push_done_target < 0, 90010);
+                DG_SPIN_WHILE(ptx::ld_acq_sys(push_done_ptr) - push_done_target < 0, 90020);
+            }
+            __syncwarp();
+        }
         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
+                if (push_done_ptr != nullptr) {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                } else {
+                    DG_SPIN_WHILE(static_cast<uint32_t>(
+                        (value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
+                        kNumSMs * kNumRanks, 90001);
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
@@ -307,23 +351,79 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t L2_SHAPE_N, uint32_t L2_SHAPE_K,
           uint32_t kNumExpertsPerRank,
           uint32_t kNumSMs, uint32_t kNumRanks,
+          // L1 split-K: the L1 tasks of the last, partial L1 wave (the
+          // `num_l1_tasks % kNumSMs` highest task indices, i.e. the stragglers
+          // that would otherwise serialise a whole extra task length) are each
+          // claimed as `kNumL1KSplits` K-range tasks (adjacent task indices, so
+          // the halves run concurrently on different SMs). Splitting is only
+          // applied when all the halves fit one wave and the launch's pool block
+          // count fits the partial-sum scratch (`kMaxSplitKPoolBlocks`);
+          // otherwise the launch runs unsplit tasks.
+          uint32_t kNumL1KSplits = 1,
+          uint32_t kMaxSplitKPoolBlocks = 0xffffffffu,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
-          uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N>
+          uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
+          // L2 split-K: same tail rule for the L2 tasks of the last partial L2 wave
+          // (`num_l2_tasks % kNumSMs` highest L2 task indices), each claimed as
+          // kNumL2KSplits adjacent K-range task indices. Same fit conditions.
+          uint32_t kNumL2KSplits = 1,
+          // Stream-K (tiny M): see `claim_next_streamk_task`. Replaces the wave
+          // scheduler and both tail splits whenever the pool block count fits the
+          // scratch (kMaxSplitKPoolBlocks); otherwise the launch falls back to the
+          // wave scheduler above.
+          bool kStreamK = false,
+          // Stream-K unit = one pipeline stage (kKBlocksPerStage K128 blocks): the RF
+          // math loop consumes whole stages, so segments must be stage-aligned.
+          uint32_t kStreamKKBlocksPerUnit = 2,
+          uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
+          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
+          // Push dispatch (kernel `kPushDispatch`): the token pool is addressed with
+          // a fixed stride of kPushBlocksPerExpert blocks per local expert (the
+          // sender picks the row before the destination knows any total), so a
+          // task's `pool_block_idx` is expert * stride + m_block instead of the
+          // dense prefix-sum block index. Task indices / counts stay dense.
+          // 0 == packed (pull) layout.
+          uint32_t kPushBlocksPerExpert = 0,
+          // Fused L1+L2 (kernel `kFuseL1L2`): no L2 tasks exist (every L1 task runs its
+          // W2 K-slice itself), so all L1 waves are claimed as warm-up waves and the
+          // L2 claim only terminates the producer.
+          bool kNoL2Tasks = false,
+          // All-task K splits (kernel `kSplitKL1All` / `kSplitKL2All`, M=16 experiment):
+          // every L1 (resp. L2) task of a launch that fits the scratch is claimed as
+          // kNumL1KSplits (resp. kNumL2KSplits) adjacent K-range indices, not only the
+          // tasks of the last partial wave. Same protocol, same fit rule on the pool
+          // block count; the tail rule is bypassed.
+          bool kSplitL1All = false,
+          bool kSplitL2All = false>
 struct InterleavedMegaMoEScheduler {
+    DG_STATIC_ASSERT(!kStreamK || (kNumL1BlockKs % kStreamKKBlocksPerUnit == 0 &&
+                                   kNumL2BlockKs % kStreamKKBlocksPerUnit == 0),
+                     "Stream-K units (stages) must tile both K extents");
+    static constexpr uint32_t kNumL1StreamKUnitsPerTask = kNumL1BlockKs / kStreamKKBlocksPerUnit;
+    static constexpr uint32_t kNumL2StreamKUnitsPerTask = kNumL2BlockKs / kStreamKKBlocksPerUnit;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using task_info_t = TaskInfo;
 
     static constexpr uint32_t kNumScheduleStages = 2;
     static constexpr uint32_t kNumL1WavesDone = 0xffffffffu;
+    // The split tail adds < 1 wave of L1 task indices; one extra L1-first wave
+    // keeps them ahead of the L2 claims (extra L1 waves are deadlock-free).
+    static constexpr uint32_t kNumSplitKExtraWarmupWaves = 1;
 
     DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid L1 shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid L2 shape");
     DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid L1 K shape");
     DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid L2 K shape");
     DG_STATIC_ASSERT(kNumL1BlockNs <= 64, "L1 readiness mask is too small");
-    DG_STATIC_ASSERT(kNumL2BlockNs >= kNumL1BlockNs,
-                     "Alternating scheduler requires at least as many L2 tasks as L1 tasks");
+    // More L1 than L2 tasks per M block (split-K L1 all-task splits, or wide L2 tasks
+    // with BN256 L1 tasks: 10 vs 6) is handled by `get_num_l1_warmup_waves` through
+    // its per-M-block task difference term (extra L1-first waves), so no L2-claim
+    // can outrun the L1 indices it depends on.
+    DG_STATIC_ASSERT(kNumL1KSplits >= 1 && kNumL1KSplits <= 255, "Invalid L1 K-split count");
+    DG_STATIC_ASSERT(kNumL2KSplits >= 1 && kNumL2KSplits <= 255, "Invalid L2 K-split count");
+    DG_STATIC_ASSERT(L2_SHAPE_K <= 0xffffu, "L2 K extent must fit the TaskInfo shape_k field");
+    DG_STATIC_ASSERT(L1_SHAPE_K <= 0xffffu, "L1 K extent must fit the TaskInfo shape_k field");
 
     const fused_layout::Workspace& workspace;
     Barrier* task_info_full_barriers;
@@ -335,6 +435,31 @@ struct InterleavedMegaMoEScheduler {
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
     uint32_t num_total_m_blocks = 0;
     uint32_t num_l1_warmup_waves = 0;
+    // Effective L1 K-split factor for this launch (1 or kNumL1KSplits)
+    uint32_t num_l1_k_splits = 1;
+    // L1 task indices [0, num_l1_split_base) are unsplit tasks; indices from
+    // `num_l1_split_base` on are the K splits of the tail tasks.
+    uint32_t num_l1_split_base = 0;
+    uint32_t num_total_l1_task_indices = 0;
+    // L2 counterpart: effective split factor, first split L2 task, total indices
+    uint32_t num_l2_k_splits = 1;
+    uint32_t num_l2_split_base = 0;
+    uint32_t num_total_l2_task_indices = 0;
+
+    // Stream-K state (kStreamK launches that fit the scratch). Units are (task,
+    // K128 block) pairs numbered task-major; worker w owns the contiguous unit
+    // range [begin(w), end(w)) of a phase (near-equal: total / kNumSMs each, the
+    // first total % kNumSMs workers one more). Each CTA claims exactly one L1
+    // worker index (L1 task counter ticket) and then one L2 worker index (L2
+    // counter ticket) and publishes its range segment by segment (one segment ==
+    // one task with a K-block sub-range). All L1 units are owned by the first
+    // ceil(U1 / units-per-worker) tickets, which never wait on L2 progress, so an
+    // L2 segment's L1-readiness waits are deadlock-free by induction.
+    bool streamk_active = false;
+    uint32_t sk_state = 0;  // 0 claim L1 range, 1 in L1 range, 2 claim L2 range, 3 in L2 range, 4 done
+    uint32_t sk_worker_idx = 0;
+    uint32_t sk_unit = 0, sk_unit_end = 0;
+    uint32_t sk_num_l1_units = 0, sk_num_l2_units = 0;
 
     CUTLASS_DEVICE
     InterleavedMegaMoEScheduler(
@@ -372,29 +497,118 @@ struct InterleavedMegaMoEScheduler {
         return __reduce_add_sync(0xffffffff, num_blocks);
     }
 
-    CUTLASS_DEVICE void fetch_expert_recv_count() {
+    // `push_done_ptr` (kPushDoneFlags): wait for the push DONE count to reach
+    // `push_done_target` (acquire.sys: every source rank's rows and tickets of this
+    // launch are then visible) and take the final low words directly, instead of
+    // polling the per-expert completeness high word published by SM e.
+    CUTLASS_DEVICE void fetch_expert_recv_count(const int* push_done_ptr = nullptr,
+                                                const int& push_done_target = 0) {
+        if (push_done_ptr != nullptr) {
+            // Lane 0 spins with relaxed loads (one poller per warp, no sys-scope acquire
+            // per poll), then one acquire.sys load establishes the ordering; bar.warp.sync
+            // extends it to the other lanes' loads of the count words below.
+            if (ptx::get_lane_idx() == 0) {
+                DG_SPIN_WHILE(static_cast<int>(ptx::ld_volatile(
+                    reinterpret_cast<const uint32_t*>(push_done_ptr))) - push_done_target < 0, 90010);
+                DG_SPIN_WHILE(ptx::ld_acq_sys(push_done_ptr) - push_done_target < 0, 90020);
+            }
+            __syncwarp();
+        }
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(
-                        workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                if (push_done_ptr != nullptr) {
+                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                } else {
+                    DG_SPIN_WHILE(static_cast<uint32_t>(
+                        (value = ptx::ld_acq_gpu(workspace.get_expert_recv_count_sum_ptr(expert_idx))) >> 32) !=
+                        kNumSMs * kNumRanks, 90002);
+                }
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
         __syncwarp();
 
         num_total_m_blocks = get_pool_block_offset(kNumExpertsPerRank);
-        const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1BlockNs;
+        // Stream-K only pays when L1 tasks leave SMs idle (fewer L1 tasks than SMs:
+        // H20 M=2, 16-20 tasks). With >= 1 full L1 wave the per-SM stage chain, not
+        // idle SMs, bounds the phase, and serialising L1 before L2 (a CTA runs its
+        // whole L1 range first) loses the wave scheduler's L1/L2 overlap: H20
+        // 2026-09-09 M=8 +10 us, M=16 +20 us kernel end (see the host).
+        streamk_active = kStreamK && num_total_m_blocks <= kMaxSplitKPoolBlocks &&
+            num_total_m_blocks * kNumL1BlockNs < kNumSMs;
+        if (streamk_active) {
+            sk_num_l1_units = num_total_m_blocks * kNumL1BlockNs * kNumL1StreamKUnitsPerTask;
+            sk_num_l2_units = num_total_m_blocks * kNumL2BlockNs * kNumL2StreamKUnitsPerTask;
+        }
+        const uint32_t num_l1_full_tasks = num_total_m_blocks * kNumL1BlockNs;
+        const uint32_t num_l1_tail_tasks = num_l1_full_tasks % kNumSMs;
+        // Split only when the tail's splits fit one wave (otherwise they would
+        // form another full wave and merely add per-task fixed cost).
+        const bool split_all_l1 = kSplitL1All && !streamk_active && kNumL1KSplits > 1 &&
+            num_total_m_blocks <= kMaxSplitKPoolBlocks;
+        const bool split_tail = !split_all_l1 && !streamk_active && kNumL1KSplits > 1 &&
+            num_total_m_blocks <= kMaxSplitKPoolBlocks &&
+            num_l1_tail_tasks > 0 && num_l1_tail_tasks * kNumL1KSplits <= kNumSMs;
+        num_l1_k_splits = (split_tail || split_all_l1) ? kNumL1KSplits : 1u;
+        num_l1_split_base = split_all_l1 ? 0u :
+            (split_tail ? num_l1_full_tasks - num_l1_tail_tasks : num_l1_full_tasks);
+        num_total_l1_task_indices =
+            num_l1_split_base + (num_l1_full_tasks - num_l1_split_base) * num_l1_k_splits;
         const uint32_t num_total_l1_waves =
-            math::ceil_div(num_total_l1_tasks, kNumSMs);
-        const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
-            num_total_m_blocks, kNumSMs, kNumL1BlockNs, kNumL2BlockNs);
+            math::ceil_div(num_total_l1_task_indices, kNumSMs);
+        // All-split L1: every M block owns kNumL1BlockNs * splits L1 indices, so the
+        // warm-up wave count is derived from that effective per-M-block L1 index count.
+        uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
+            num_total_m_blocks, kNumSMs,
+            split_all_l1 ? kNumL1BlockNs * kNumL1KSplits : kNumL1BlockNs, kNumL2BlockNs);
+        // Split-K tail: claim the (short) halves in the L1 warm-up rather than
+        // behind an L2 task on the alternating schedule (M=16: 156 + 8 indices
+        // on 78 SMs -> 3 warm-up waves claim them all).
+        if (split_tail || split_all_l1)
+            min_l1_warmup_waves += kNumSplitKExtraWarmupWaves;
         num_l1_warmup_waves =
             cute::min(min_l1_warmup_waves, num_total_l1_waves);
+
+        // L2 split-K tail. L2 indices are claimed in batches: the producers that
+        // run out of L1 indices in the last L1 wave (kNumSMs - L1 indices % kNumSMs
+        // of them) take the first batch, then ~kNumSMs per batch as SMs free up
+        // (the tasks of a batch are dependency-gated on the same L1 wave, so they
+        // finish together). The last batch, (num_l2 - first_batch) % kNumSMs tasks
+        // (H20 M=8: 22 of 96, not 96 % 78 = 18; M=16: 44 -> 88 halves do not fit,
+        // unsplit), is the L2 tail that runs after the last L1 wave; only it is
+        // split, and only if its halves fit one wave. The halves are adjacent
+        // indices so the finisher is always claimed after its publisher.
+        const uint32_t num_l2_full_tasks = num_total_m_blocks * kNumL2BlockNs;
+        const uint32_t num_l1_last_wave = num_total_l1_task_indices % kNumSMs;
+        const uint32_t num_l2_first_batch = num_l1_last_wave == 0 ? 0u : kNumSMs - num_l1_last_wave;
+        const uint32_t num_l2_tail_tasks = num_l2_full_tasks <= num_l2_first_batch ?
+            num_l2_full_tasks : (num_l2_full_tasks - num_l2_first_batch) % kNumSMs;
+        const bool split_all_l2 = kSplitL2All && !streamk_active && kNumL2KSplits > 1 &&
+            num_total_m_blocks <= kMaxSplitKPoolBlocks;
+        const bool split_l2_tail = !split_all_l2 && !streamk_active && kNumL2KSplits > 1 &&
+            num_total_m_blocks <= kMaxSplitKPoolBlocks &&
+            num_l2_tail_tasks > 0 && num_l2_tail_tasks * kNumL2KSplits <= kNumSMs;
+        num_l2_k_splits = (split_l2_tail || split_all_l2) ? kNumL2KSplits : 1u;
+        num_l2_split_base = split_all_l2 ? 0u :
+            (split_l2_tail ? num_l2_full_tasks - num_l2_tail_tasks : num_l2_full_tasks);
+        num_total_l2_task_indices =
+            num_l2_split_base + (num_l2_full_tasks - num_l2_split_base) * num_l2_k_splits;
+        if constexpr (kNoL2Tasks) {
+            num_l2_k_splits = 1u;
+            num_l2_split_base = 0u;
+            num_total_l2_task_indices = 0u;
+            num_l1_warmup_waves = num_total_l1_waves;
+        }
+    }
+
+    // Number of L1 task indices covering the first `num_full_tasks` L1 tasks
+    CUTLASS_DEVICE uint32_t get_num_l1_task_indices(const uint32_t& num_full_tasks) const {
+        return num_full_tasks <= num_l1_split_base ?
+            num_full_tasks :
+            num_l1_split_base + (num_full_tasks - num_l1_split_base) * num_l1_k_splits;
     }
 
     CUTLASS_DEVICE task_info_t create_task(
@@ -435,6 +649,8 @@ struct InterleavedMegaMoEScheduler {
                 result.local_expert_idx = ptx::exchange(expert_idx, owner_lane_idx);
                 result.m_block_idx = ptx::exchange(owner_m_block_idx, owner_lane_idx);
                 result.valid_m = ptx::exchange(owner_valid_m, owner_lane_idx);
+                if constexpr (kPushBlocksPerExpert != 0)
+                    result.pool_block_idx = result.local_expert_idx * kPushBlocksPerExpert + result.m_block_idx;
             }
             block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
         }
@@ -448,40 +664,134 @@ struct InterleavedMegaMoEScheduler {
         return ptx::exchange(result, 0);
     }
 
+    // Stream-K partition of `num_units` units over kNumSMs workers.
+    static CUTLASS_HOST_DEVICE void get_streamk_range(
+            const uint32_t& num_units, const uint32_t& worker_idx,
+            uint32_t& begin, uint32_t& end) {
+        const uint32_t base = num_units / kNumSMs, rem = num_units % kNumSMs;
+        begin = worker_idx * base + cute::min(worker_idx, rem);
+        end = begin + base + (worker_idx < rem ? 1u : 0u);
+    }
+
+    // Inverse: the worker owning unit `unit_idx` (< num_units)
+    static CUTLASS_HOST_DEVICE uint32_t get_streamk_worker_of_unit(
+            const uint32_t& num_units, const uint32_t& unit_idx) {
+        const uint32_t base = num_units / kNumSMs, rem = num_units % kNumSMs;
+        const uint32_t num_long_units = rem * (base + 1);
+        return unit_idx < num_long_units ?
+            unit_idx / (base + 1) :
+            rem + (unit_idx - num_long_units) / base;
+    }
+
+    // Next segment of the current range: the task owning unit `sk_unit` and the
+    // stage-aligned K-block range of the range's units inside that task.
+    template <bool kIsL2>
+    CUTLASS_DEVICE task_info_t make_streamk_segment() {
+        constexpr uint32_t units_per_task = kIsL2 ? kNumL2StreamKUnitsPerTask : kNumL1StreamKUnitsPerTask;
+        const uint32_t num_units = kIsL2 ? sk_num_l2_units : sk_num_l1_units;
+        const uint32_t task_idx = sk_unit / units_per_task;
+        const uint32_t unit_begin = sk_unit % units_per_task;
+        const uint32_t unit_end = cute::min(units_per_task, unit_begin + (sk_unit_end - sk_unit));
+        sk_unit += unit_end - unit_begin;
+        const uint32_t k_block_begin = unit_begin * kStreamKKBlocksPerUnit;
+        const uint32_t k_block_end = unit_end * kStreamKKBlocksPerUnit;
+        // Contributors of this tile: the workers owning its first and last unit
+        const uint32_t first_worker_idx =
+            get_streamk_worker_of_unit(num_units, task_idx * units_per_task);
+        const uint32_t last_worker_idx =
+            get_streamk_worker_of_unit(num_units, task_idx * units_per_task + units_per_task - 1);
+        auto task_info = kIsL2 ?
+            create_task(BlockPhase::Linear2, task_idx, kNumL2BlockNs, L2_SHAPE_N, L2_SHAPE_K) :
+            create_task(BlockPhase::Linear1, task_idx, kNumL1BlockNs, L1_SHAPE_N, L1_SHAPE_K);
+        task_info.set_streamk(k_block_begin, k_block_end, first_worker_idx,
+                              sk_worker_idx - first_worker_idx,
+                              last_worker_idx - first_worker_idx + 1);
+        return task_info;
+    }
+
+    CUTLASS_DEVICE task_info_t claim_next_streamk_task() {
+        while (true) {
+            if (sk_state == 0 || sk_state == 2) {
+                const bool is_l2 = sk_state == 2;
+                sk_worker_idx = get_next_task_idx(
+                    is_l2 ? workspace.get_l2_task_count_ptr() : workspace.get_l1_task_count_ptr());
+                if (sk_worker_idx < kNumSMs) {
+                    get_streamk_range(is_l2 ? sk_num_l2_units : sk_num_l1_units,
+                                      sk_worker_idx, sk_unit, sk_unit_end);
+                    sk_state += 1;
+                } else {
+                    sk_state += 2;
+                }
+            } else if (sk_state == 1) {
+                if (sk_unit < sk_unit_end)
+                    return make_streamk_segment<false>();
+                sk_state = 2;
+            } else if (sk_state == 3) {
+                if (sk_unit < sk_unit_end)
+                    return make_streamk_segment<true>();
+                sk_state = 4;
+            } else {
+                return task_info_t();
+            }
+        }
+    }
+
     // Producer-side dynamic claim.  Task counters describe issued work, while
     // the activation loader's acquire waits below the scheduler protect actual
     // data completion.
     CUTLASS_DEVICE task_info_t claim_next_task() {
+        if constexpr (kStreamK) {
+            if (streamk_active)
+                return claim_next_streamk_task();
+        }
         while (true) {
             if (num_l1_warmup_waves != kNumL1WavesDone &&
                 num_l1_warmup_waves > 0) {
                 -- num_l1_warmup_waves;
                 const uint32_t task_idx =
                     get_next_task_idx(workspace.get_l1_task_count_ptr());
-                if (task_idx >= num_total_m_blocks * kNumL1BlockNs) {
+                if (task_idx >= num_total_l1_task_indices) {
                     num_l1_warmup_waves = kNumL1WavesDone;
                     continue;
                 }
-                return create_task(
-                    BlockPhase::Linear1, task_idx, kNumL1BlockNs,
-                    L1_SHAPE_N, L1_SHAPE_K);
+                // Split-K tail: index = base + (full_idx - base) * splits + k_split
+                if (task_idx < num_l1_split_base)
+                    return create_task(
+                        BlockPhase::Linear1, task_idx, kNumL1BlockNs,
+                        L1_SHAPE_N, L1_SHAPE_K);
+                const uint32_t tail_idx = task_idx - num_l1_split_base;
+                auto task_info = create_task(
+                    BlockPhase::Linear1, num_l1_split_base + tail_idx / num_l1_k_splits,
+                    kNumL1BlockNs, L1_SHAPE_N, L1_SHAPE_K);
+                task_info.set_k_split(tail_idx % num_l1_k_splits, num_l1_k_splits);
+                return task_info;
             }
 
             const uint32_t task_idx =
                 get_next_task_idx(workspace.get_l2_task_count_ptr());
-            if (task_idx >= num_total_m_blocks * kNumL2BlockNs)
+            if (task_idx >= num_total_l2_task_indices)
                 break;
 
             if (num_l1_warmup_waves != kNumL1WavesDone)
                 num_l1_warmup_waves = 1;
 
+            // Split-K tail: index = base + (full_idx - base) * splits + k_split
+            const bool is_l2_split = task_idx >= num_l2_split_base;
+            const uint32_t l2_tail_idx = is_l2_split ? task_idx - num_l2_split_base : 0u;
+            const uint32_t l2_full_task_idx =
+                is_l2_split ? num_l2_split_base + l2_tail_idx / num_l2_k_splits : task_idx;
             auto task_info = create_task(
-                BlockPhase::Linear2, task_idx, kNumL2BlockNs,
-                L2_SHAPE_N, L2_SHAPE_K);
+                BlockPhase::Linear2, l2_full_task_idx,
+                kNumL2BlockNs, L2_SHAPE_N, L2_SHAPE_K);
+            if (is_l2_split)
+                task_info.set_k_split(l2_tail_idx % num_l2_k_splits, num_l2_k_splits);
+            // Dependency gate on the DENSE block index (task_info.pool_block_idx is
+            // the strided pool index under push dispatch).
+            const uint32_t dense_pool_block_idx = l2_full_task_idx / kNumL2BlockNs;
             const uint32_t num_required_l1_tasks =
-                (task_info.pool_block_idx + 1) * kNumL1BlockNs;
-            while (ptx::ld_volatile(workspace.get_l1_task_count_ptr()) <
-                   num_required_l1_tasks) {}
+                get_num_l1_task_indices((dense_pool_block_idx + 1) * kNumL1BlockNs);
+            DG_SPIN_WHILE(ptx::ld_volatile(workspace.get_l1_task_count_ptr()) <
+                          num_required_l1_tasks, 90003);
             return task_info;
         }
         return task_info_t();
