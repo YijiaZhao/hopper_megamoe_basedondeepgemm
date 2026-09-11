@@ -87,7 +87,7 @@ case "$MODE" in
   fe78)
     MM=$1; SEEDS=$2; GPU=${3:-7}; shift 3 || shift $#
     ROWS=${*:-1 2 8 16}
-    if [ "$MM" = cc ]; then EXTRA="--grid auto --mma cc"; else EXTRA="--grid 96 --mma swapab --wlayout fragment"; fi
+    case "$MM" in cc) EXTRA="--grid auto --mma cc" ;; auto) EXTRA="--mma auto" ;; *) EXTRA="--grid 96 --mma swapab --wlayout fragment" ;; esac
     log="$RES/fe78_${MM}_s$SEEDS.log"
     CUDA_VISIBLE_DEVICES=$GPU timeout 3600 python3 tests/test_frontend_fe78.py --seeds "$SEEDS" $EXTRA --rows $ROWS > "$log" 2>&1
     echo "== fe78 $MM seeds=$SEEDS rows=$ROWS rc=$?"; grep -E "new-scheme|full-K vs legacy|MISMATCH|WEIGHT DIFF|^PASS|^FAIL|Error" "$log" | tail -5 ;;
