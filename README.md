@@ -269,11 +269,11 @@ the customer comparison column (targets M2 < 53, M8 < 61, M16 < 85: all met).
 | MXFP4 | 2  | 8.3 (13.9 legacy) | 74.5–96.8   | **42.9** |
 | MXFP4 | 4  | 8.3 (13.8 legacy) | 81.5–88.3   | **~49** |
 | MXFP4 | 8  | 8.3 (13.9 legacy) | 75.5–89.2   | **56.4–59.1** |
-| MXFP4 | 16 | 8.7 (14.0 legacy) | 108.5–117.0 | **74.0–83.4** |
+| MXFP4 | 16 | 8.7 (14.0 legacy) | 108.5–117.0 | **74.0–82.6** |
 | QOQ   | 2  | 8.7 (14.5 legacy) | 73.5–94.3   | **44.1** |
 | QOQ   | 4  | 8.5 (14.6 legacy) | 84.9–87.1   | **48.0** |
 | QOQ   | 8  | 8.6 (14.8 legacy) | 80.2–90.3   | **54.9–59.3** |
-| QOQ   | 16 | 8.7 (14.9 legacy) | 94.9–109.3  | **74.0** |
+| QOQ   | 16 | 8.7 (14.9 legacy) | 94.9–109.3  | **74.0–77.4** |
 
 FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16;
 kernel time 6.9 us, nsys span 8.3–8.7 us); the legacy frontend value is in
@@ -336,13 +336,14 @@ has an env override documented in `csrc/jit_kernels/impls/sm90_fp4_mega_moe_h20_
 | Per-rank DONE flags replace NVLink barrier #1 (push path) | `DG_FP4_PUSH_DONE_FLAGS` | -1 us |
 | QoQ packed-word prefetch inside the RF loop | `DG_FP4_QIS2_PREFETCH_PACKED` | M16 -3..-6 us (probe) |
 | stream-K for M <= 4 (units spread over all 78 SMs) | `DG_FP4_STREAMK` (`_MAX_M`) | MXFP4 M2 49.7 -> 42.9 |
+| Wide L1 tasks (BN=512, 1 K-block/stage, 3-way tail split) for M >= 16 | `DG_FP4_L1_BN` (`DG_FP4_BN512_MIN_M`) | M16 Mega-only 5-capture medians MXFP4 84.1 -> 82.6, QoQ 80.4 -> 77.4 |
 | Tiny-M Fable frontend (3 smem stages -> 3 CTAs/SM single wave; 256-thread partial fetch; warp-0 32-bit-key top-8) | `DG_FE_TINYM` | FE 13.8–14.9 -> 8.3–8.7 us (nsys span), bit-identical outputs |
 
 Measured and kept off (documented negative results): 4 K-blocks per stage,
 per-M knob sweep, tiny-M CUDA-core GEMV path (`DG_FP4_TINYM`), whole-expert L2
 weight prefetch (`DG_FP4_L2_PREFETCH_ALL`), two-layer L1/L2 fusion
 (`DG_FP4_FUSE_L1L2`), dynamic combine claim (`DG_FP4_COMBINE_DYNAMIC`), L2
-tail split-K, raw-u8 deferred affine dequant.
+tail split-K, all-task L1/L2 split-K at M16, wide L2 tasks (BN=512), third math warpgroup (`DG_FP4_MATH_WGS=3`), deterministic push slots (`DG_FP4_PUSH_DET_SLOTS`), FE router-weight L2 persistence and FE->Mega PDL, raw-u8 deferred affine dequant.
 
 ## Relevant source files
 
