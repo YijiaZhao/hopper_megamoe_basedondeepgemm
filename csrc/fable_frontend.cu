@@ -1105,6 +1105,11 @@ __device__ __forceinline__ void topk_finish(uint32_t run, int lane, int t, int64
         topk_weights[static_cast<int64_t>(t) * kTopK + lane] = ex / sum;
     }
 }
+__device__ __forceinline__ uint4 ld_cg_v4(const uint32_t* p) {
+    uint4 v;
+    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+    return v;
+}
 // Last-arriver merge (cc, DG_FE_CC_MERGE=ticket, default): called by the router CTA whose
 // atom.acq_rel.gpu ticket was the last (every CTA: keys stored -> bar.sync -> thread 0 atomic;
 // the release orders the CTA's key stores, the acquire on the last CTA orders its reads).
@@ -1183,11 +1188,6 @@ __device__ __forceinline__ void last_arriver_topk(
     #pragma unroll
     for (int i = 0; i < kVecPerLane; ++i)      // slots back to 0 (the polling merger mode relies on it)
         if (4 * (lane + 32 * i) < nslots) *reinterpret_cast<uint4*>(base + 4 * (lane + 32 * i)) = make_uint4(0u, 0u, 0u, 0u);
-}
-__device__ __forceinline__ uint4 ld_cg_v4(const uint32_t* p) {
-    uint4 v;
-    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
-    return v;
 }
 __device__ __forceinline__ int atom_add_acq_rel_gpu(int* p, int v) {
     int old;
