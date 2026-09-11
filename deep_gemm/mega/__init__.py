@@ -596,26 +596,46 @@ def fable_frontend_workspace_bytes(e: int) -> int:
 
 
 def _fe_grid_from_env(grid):
-    """DG_FE_TINYM_GRID: '96' (default) -> legacy 24x4 K-split tiny-M grid; 'auto' -> 0 =
-    full-K scheme sized to the SM count; N -> full-K scheme with N CTAs in total.
-    Default stays 96: on H20 every SM-count scheme measured slower (README knob table)."""
+    """DG_FE_TINYM_GRID: unset -> None (follows the MMA: cc -> auto, else 96; see _fe_resolve_knobs);
+    '96' -> legacy 24x4 K-split tiny-M grid; 'auto' -> 0 = full-K scheme sized to the SM count;
+    N -> full-K scheme with N CTAs in total."""
     if grid is None:
-        grid = os.environ.get("DG_FE_TINYM_GRID", "96")
+        grid = os.environ.get("DG_FE_TINYM_GRID")
+        if grid is None:
+            return None
     if isinstance(grid, str):
         grid = 0 if grid.strip().lower() in ("auto", "", "0") else int(grid)
     return int(grid)
 
 
 def _fe_mma_from_env(mma):
-    """DG_FE_TINYM_MMA: 'wmma' -> 0, 'fma' -> 1 (full-K grid only), 'swapab' (default) -> 2
-    (experts on the MMA M dimension, mma.sync m16n8k16, A fragments straight from global;
-    legacy 96 x 4 grid and full-K grid), 'cc' -> 4 / 'cc6' -> 5 (full-K grid, m <= 2: CUDA-core
-    K-split router, 5 experts x 4 | 6 warps per CTA, weights straight into registers)."""
+    """DG_FE_TINYM_MMA: 'auto' (default) -> -1 = cc for m <= 2 rows, swapab otherwise (_fe_resolve_knobs);
+    'wmma' -> 0, 'fma' -> 1 (full-K grid only), 'swapab' -> 2 (experts on the MMA M dimension,
+    mma.sync m16n8k16, A fragments straight from global; legacy 96 x 4 grid and full-K grid),
+    'cc' -> 4 / 'cc6' -> 5 (full-K grid, m <= 2: CUDA-core K-split router, 5 experts x 4 | 6 warps
+    per CTA, weights straight into registers)."""
     if mma is None:
-        mma = os.environ.get("DG_FE_TINYM_MMA", "swapab")
+        mma = os.environ.get("DG_FE_TINYM_MMA", "auto")
     if isinstance(mma, str):
-        mma = {"wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5}[mma.strip().lower()]
+        mma = {"auto": -1, "wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5,
+               "-1": -1, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5}[mma.strip().lower()]
     return int(mma)
+
+
+def _fe_resolve_knobs(m, grid=None, mma=None, k_parts=None):
+    """Resolve (grid, mma, k_parts) for m rows. Default scheme (DG_FE_TINYM_MMA=auto): m <= 2 rows
+    -> the CUDA-core K-split router on the SM-count grid (cc + DG_FE_TINYM_GRID=auto: H20 kernel
+    end 4.61 / 4.86 us vs 6.14 swapab+fragment); rows > 2, an explicit 96 grid or K-parts > 1 ->
+    swapab (+ fragment layout) as before. Explicit knobs pass through unchanged; an unset grid
+    follows the MMA (cc -> auto, everything else -> the legacy 96 grid)."""
+    grid = _fe_grid_from_env(grid)
+    mma = _fe_mma_from_env(mma)
+    k_parts = _fe_kparts_from_env(k_parts)
+    if mma == -1:
+        mma = 4 if (m <= 2 and grid in (None, 0) and k_parts == 1) else 2
+    if grid is None:
+        grid = 0 if mma in (4, 5) else 96
+    return grid, mma, k_parts
 
 
 def _fe_wlayout_from_env(wlayout):
@@ -670,11 +690,12 @@ def _fe_kparts_from_env(k_parts):
     return int(k_parts)
 
 
-def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tinym=None, grid=None, k_parts=None) -> int:
+def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tinym=None, grid=None, k_parts=None, mma=None) -> int:
     """Router CTA count the frontend launch uses for (m, h, e, topk) under the current knobs."""
     if tinym is None:
         tinym = int(os.environ.get("DG_FE_TINYM", "1"))
-    return _C.fable_frontend_router_ctas(m, h, e, topk, int(bool(tinym)), _fe_grid_from_env(grid), _fe_kparts_from_env(k_parts))
+    grid, mma, k_parts = _fe_resolve_knobs(m, grid, mma, k_parts)
+    return _C.fable_frontend_router_ctas(m, h, e, topk, int(bool(tinym)), grid, k_parts)
 
 
 def fable_frontend_workspace(sym_buffer, e: int, device) -> torch.Tensor:
@@ -705,13 +726,17 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     attribute), 2 = PTX ``L2::evict_last`` hint on the router weight loads.
     ``pdl`` (env ``DG_FE_PDL``, default 0): programmatic-dependent-launch trigger for
     the fused Mega that follows: 1 = at CTA start, 2 = after the CTA's last store.
-    ``grid`` (env ``DG_FE_TINYM_GRID``, default ``96``): tiny-M CTA scheme. ``auto`` =
+    ``grid`` (env ``DG_FE_TINYM_GRID``, default: follows ``mma`` -- ``auto`` for the cc router,
+    ``96`` otherwise): tiny-M CTA scheme. ``auto`` =
     full-K router CTAs sized to the SM count (H20: 77 x 5 experts + 1 merger CTA = 78,
     final logits per CTA, streaming top-8 merge, quant on the router CTAs' idle time);
     ``96`` = legacy 24 expert groups x 4 K-parts + m quant/top-k CTAs; ``N`` = full-K
     scheme with N CTAs in total. Full-K is deterministic but not bit-identical to 96
     (different fp32 accumulation order before the bf16 logit rounding).
-    ``mma`` (env ``DG_FE_TINYM_MMA``, default ``swapab``): ``wmma`` = legacy cp.async ring / TMA row
+    ``mma`` (env ``DG_FE_TINYM_MMA``, default ``auto`` = ``cc`` on the ``auto`` grid for m <= 2 rows,
+    ``swapab`` otherwise): ``cc`` = CUDA-core K-split router (5 experts x 4 warps per CTA, weights
+    straight into registers, last-arriving CTA does top-8 + softmax; H20 kernel end 4.61 / 4.86 us
+    for rows 1 / 2); ``wmma`` = legacy cp.async ring / TMA row
     pieces into smem + WMMA bf16 m16n16k16 fp32-accumulate; ``fma`` = CUDA-core fp32 FMA
     straight from global memory (16 B ld.global.nc, warp butterfly + 8-warp smem sum);
     ``swapab`` (legacy 96 x 4 grid AND full-K) = experts on the MMA M dimension, tokens on N
@@ -737,9 +762,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
         l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
     if pdl is None:
         pdl = int(os.environ.get("DG_FE_PDL", "0"))
-    grid = _fe_grid_from_env(grid)
-    mma = _fe_mma_from_env(mma)
-    k_parts = _fe_kparts_from_env(k_parts)
+    grid, mma, k_parts = _fe_resolve_knobs(m, grid, mma, k_parts)
     wlayout = _fe_wlayout_from_env(wlayout)
     if mma == 2 and wlayout == 1:
         router_weight = _fe_router_weight_for_layout(router_weight, 1)

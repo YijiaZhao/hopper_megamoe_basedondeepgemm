@@ -115,8 +115,8 @@ def main():
     stamps = int(os.environ.get("DG_FE_STAMPS", "0"))
     l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
     pdl = int(os.environ.get("DG_FE_PDL", "0"))
-    grid_env = os.environ.get("DG_FE_TINYM_GRID", "96")
-    mma_env = os.environ.get("DG_FE_TINYM_MMA", "wmma")
+    grid_env = os.environ.get("DG_FE_TINYM_GRID", "auto-default")
+    mma_env = os.environ.get("DG_FE_TINYM_MMA", "auto")
     kparts_env = os.environ.get("DG_FE_TINYM_KPARTS", "1")
     hot_hidden = int(os.environ.get("DG_BENCH_HOT_HIDDEN", "0"))
     fuse_fe = int(os.environ.get("DG_FP4_FUSE_FE", "0")) != 0 and args.backend == "fused"
@@ -151,7 +151,9 @@ def main():
 
         both(); torch.cuda.synchronize(); dist.barrier(group=group)
         n_router = deep_gemm.fable_frontend_router_ctas(local_rows, EXPERTS, HIDDEN, 8, tinym)
-        fullk = bool(tinym) and local_rows <= 16 and grid_env.strip().lower() != "96"
+        grid_res, mma_res, _ = deep_gemm.mega._fe_resolve_knobs(local_rows)
+        grid_env = f"{grid_env}->{grid_res}"; mma_env = f"{mma_env}->{mma_res}"
+        fullk = bool(tinym) and local_rows <= 16 and grid_res != 96
         if fuse_fe:
             fe_in_mega(); torch.cuda.synchronize(); dist.barrier(group=group)
         graphs = {}
