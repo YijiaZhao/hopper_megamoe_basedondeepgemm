@@ -594,9 +594,26 @@ def fable_frontend_workspace_bytes(e: int) -> int:
     return 256 + 4 * 64 * e * 4 + _FRONTEND_STAMPS_BYTES
 
 
+def _fe_grid_from_env(grid):
+    """DG_FE_TINYM_GRID: 'auto' (default) -> 0 = full-K scheme sized to the SM count;
+    '96' -> legacy 24x4 K-split tiny-M grid; N -> full-K scheme with N CTAs in total."""
+    if grid is None:
+        grid = os.environ.get("DG_FE_TINYM_GRID", "auto")
+    if isinstance(grid, str):
+        grid = 0 if grid.strip().lower() in ("auto", "", "0") else int(grid)
+    return int(grid)
+
+
+def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tinym=None, grid=None) -> int:
+    """Router CTA count the frontend launch uses for (m, h, e, topk) under the current knobs."""
+    if tinym is None:
+        tinym = int(os.environ.get("DG_FE_TINYM", "1"))
+    return _C.fable_frontend_router_ctas(m, h, e, topk, int(bool(tinym)), _fe_grid_from_env(grid))
+
+
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
                                      sym_buffer, quant: str = "mxfp4", tinym=None, stamps=None,
-                                     l2_persist=None, pdl=None):
+                                     l2_persist=None, pdl=None, grid=None):
     """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend.
 
     ``tinym`` (env ``DG_FE_TINYM``, default 1): for m <= 16 use the single-wave
@@ -608,6 +625,12 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     attribute), 2 = PTX ``L2::evict_last`` hint on the router weight loads.
     ``pdl`` (env ``DG_FE_PDL``, default 0): programmatic-dependent-launch trigger for
     the fused Mega that follows: 1 = at CTA start, 2 = after the CTA's last store.
+    ``grid`` (env ``DG_FE_TINYM_GRID``, default ``auto``): tiny-M CTA scheme. ``auto`` =
+    full-K router CTAs sized to the SM count (H20: 77 x 5 experts + 1 merger CTA = 78,
+    final logits per CTA, streaming top-8 merge, quant on the router CTAs' idle time);
+    ``96`` = legacy 24 expert groups x 4 K-parts + m quant/top-k CTAs; ``N`` = full-K
+    scheme with N CTAs in total. Full-K is deterministic but not bit-identical to 96
+    (different fp32 accumulation order before the bf16 logit rounding).
     """
     assert quant in ("mxfp4", "qoq")
     m = hidden.size(0)
@@ -620,6 +643,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
         l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
     if pdl is None:
         pdl = int(os.environ.get("DG_FE_PDL", "0"))
+    grid = _fe_grid_from_env(grid)
     cache = getattr(sym_buffer, "_fable_frontend_cache", None)
     if cache is None:
         cache = sym_buffer._fable_frontend_cache = {}
@@ -633,14 +657,18 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
                             sym_buffer.topk_idx[:m], sym_buffer.topk_weights[:m])
     _C.fable_router_quant_topk_frontend(
         hidden, router_weight, views[0], views[1], views[2], views[3], workspace,
-        0 if quant == "mxfp4" else 1, int(bool(tinym)), int(bool(stamps)), int(l2_persist), int(pdl))
+        0 if quant == "mxfp4" else 1, int(bool(tinym)), int(bool(stamps)), int(l2_persist), int(pdl), grid)
 
 
 def fable_frontend_stamps(sym_buffer, e: int) -> torch.Tensor:
     """[num_ctas, 8] int64 ns %globaltimer stamps of the last DG_FE_STAMPS=1 launch.
 
-    Router CTAs (first 96 for E=384, m <= 16): start / chunk0 landed / mma done / ticket bumped.
-    Quant CTAs (next m): start / quant done / ticket seen / top-k done / [tiny: partials loaded / rounds done].
+    Legacy grid (DG_FE_TINYM_GRID=96): router CTAs (first 96 for E=384, m <= 16): start /
+    chunk0 landed / mma done / ticket bumped; quant CTAs (next m): start / quant done /
+    ticket seen / top-k done / [tiny: partials loaded / rounds done].
+    Full-K grid (auto): router CTAs (``fable_frontend_router_ctas``): start / chunk0 landed /
+    mma done / keys written / quant done (CTAs t < m) / all chunks issued; merger CTA (last,
+    token 0's warp): start / first CTA seen / last CTA seen / merge done / top-k written.
     """
     workspace = sym_buffer._fable_frontend_cache["workspace"]
     off = 256 + 4 * 64 * e * 4

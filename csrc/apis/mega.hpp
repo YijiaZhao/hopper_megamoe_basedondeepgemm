@@ -742,7 +742,7 @@ static void fable_router_quant_topk_frontend(
         const torch::Tensor& x, const torch::Tensor& x_sf,
         const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
         const torch::Tensor& workspace, const int& mode, const int& tiny, const int& stamps,
-        const int& l2_persist, const int& pdl_mode) {
+        const int& l2_persist, const int& pdl_mode, const int& grid) {
     const auto [m, h] = get_shape<2>(hidden);
     const auto [e, h_] = get_shape<2>(router_weight);
     const int topk = static_cast<int>(topk_idx.size(1));
@@ -762,12 +762,18 @@ static void fable_router_quant_topk_frontend(
         hidden.data_ptr(), router_weight.data_ptr(), x.data_ptr(), x_sf.data_ptr(),
         topk_idx.data_ptr(), topk_weights.data_ptr(), workspace.data_ptr(), workspace.nbytes(),
         static_cast<int>(m), static_cast<int>(h), static_cast<int>(e), topk, mode, tiny, stamps,
-        l2_persist, pdl_mode, at::cuda::getCurrentCUDAStream().stream());
+        l2_persist, pdl_mode, grid, at::cuda::getCurrentCUDAStream().stream());
+}
+
+static int fable_frontend_router_ctas(const int& m, const int& h, const int& e, const int& topk,
+                                      const int& tiny, const int& grid) {
+    return router_quant_topk_frontend_router_ctas(m, h, e, topk, tiny, grid);
 }
 
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("fable_router_quant_topk_frontend", &fable_router_quant_topk_frontend);
+    m.def("fable_frontend_router_ctas", &fable_frontend_router_ctas);
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_ring_limit_for_mega_moe", &get_ring_limit_for_mega_moe);
     m.def("get_legacy_pool_tokens_for_mega_moe", &get_legacy_pool_tokens_for_mega_moe);

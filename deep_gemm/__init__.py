@@ -96,6 +96,7 @@ from .mega import (
     mxfp4_mega_moe_from_bf16,
     int4_mega_moe,
     fable_router_quant_topk_frontend,
+    fable_frontend_router_ctas,
     fable_frontend_stamps,
     fable_frontend_workspace_bytes,
     mxfp4_mega_moe_split, qoq_mega_moe_split,

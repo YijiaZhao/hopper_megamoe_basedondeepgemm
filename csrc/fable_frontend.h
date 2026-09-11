@@ -21,9 +21,16 @@
 constexpr size_t kFrontendStampsOffsetBase = 256;
 constexpr size_t kFrontendMaxCTAs = 256;
 constexpr size_t kFrontendStampsBytes = kFrontendMaxCTAs * 8 * sizeof(unsigned long long);
+// `grid` (DG_FE_TINYM_GRID): 96 = legacy tiny-M split (24 expert groups x 4
+// K-parts + m quant/top-k CTAs); 0 = auto: full-K scheme sized to the SM count
+// (H20: 77 router CTAs x 5 experts + 1 merger CTA = 78); N > 0 = full-K scheme
+// with N CTAs in total. Full-K outputs are deterministic but not bit-identical to
+// the legacy split (different fp32 accumulation order before the bf16 rounding).
 size_t router_quant_topk_frontend_workspace_bytes(int e);
+// Router CTA count the launch will use (bench / stamp attribution helper).
+int router_quant_topk_frontend_router_ctas(int m, int h, int e, int topk, int tiny, int grid);
 void launch_router_quant_topk_frontend(
     const void* hidden, const void* router_weight,
     void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
     void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-    int tiny, int stamps_on, int l2_persist, int pdl_mode, cudaStream_t stream);
+    int tiny, int stamps_on, int l2_persist, int pdl_mode, int grid, cudaStream_t stream);

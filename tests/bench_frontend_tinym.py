@@ -12,7 +12,8 @@ DG_FE_STAMPS=1 additionally launches the frontend once (eagerly, after an L2
 flush) with per-CTA %globaltimer stamps and prints the phase attribution, and
 replays a stamped FE+Mega graph (stamps taken inside the graph, i.e. after the
 previous replay's Mega streamed its weights through L2).
-Knobs echoed: DG_FE_ROUTER_L2_PERSIST (router weights pinned in L2), DG_FE_PDL.
+Knobs echoed: DG_FE_TINYM_GRID (96 = legacy 24x4 split, auto = full-K SM-count grid),
+DG_FE_ROUTER_L2_PERSIST (router weights pinned in L2), DG_FE_PDL.
 DG_BENCH_HOT_HIDDEN=1: re-touch the hidden rows after every L2 flush (in the real
 pipeline the attention output is written right before the FE and is L2-hot; the
 flush would otherwise put both the hidden rows and the router weights in HBM and
@@ -43,10 +44,11 @@ def fmt_stats(name, v):
     return f"{name:>8}: median {pct(v, 0.5):7.2f}  min {min(v):7.2f}  p90 {pct(v, 0.9):7.2f} us  (n={len(v)})"
 
 
-def attribution(stamps_list, num_router_ctas, m):
+def attribution(stamps_list, num_router_ctas, m, fullk=False):
+    n_tail = 1 if fullk else m      # full-K: one merger CTA; legacy: m quant/top-k CTAs
     rs, qs = [], []
     for st in stamps_list:
-        st = st[: num_router_ctas + m].double()
+        st = st[: num_router_ctas + n_tail].double()
         t0 = st[:, 0].min()
         st = torch.where(st > 0, (st - t0) / 1e3, torch.zeros_like(st))
         rs.append(st[:num_router_ctas]); qs.append(st[num_router_ctas:])
@@ -54,6 +56,21 @@ def attribution(stamps_list, num_router_ctas, m):
 
     def line(tag, col):
         return (f"    {tag:<22} median {col.median():6.2f}  min {col.min():6.2f}  max {col.max():6.2f} us")
+    if fullk:
+        print(f"  stamps over {len(stamps_list)} launches (us rel. earliest CTA start of each launch; "
+              f"full-K router CTAs={num_router_ctas}, merger CTA=1, quant on router CTAs 0..{m - 1}):")
+        print(line("router start", r[:, 0])); print(line("router chunks issued", r[:, 5]))
+        print(line("router chunk0 landed", r[:, 1]))
+        rq = r[:, 4][r[:, 4] > 0]
+        if rq.numel():
+            print(line("router quant done", rq))
+        print(line("router mma done", r[:, 2])); print(line("router keys written", r[:, 3]))
+        print(line("merger start", q[:, 0])); print(line("merger first CTA seen", q[:, 1]))
+        print(line("merger last CTA seen", q[:, 2])); print(line("merger merge done", q[:, 3]))
+        print(line("topk written (end)", q[:, 4]))
+        late = int((r[:, 0] > r[:, 3].min()).sum())
+        print(f"    router CTAs that started after the first router CTA finished (2nd wave): {late}")
+        return
     print(f"  stamps over {len(stamps_list)} launches (us rel. earliest CTA start of each launch; "
           f"router CTAs={num_router_ctas}, quant CTAs={m}):")
     print(line("router start", r[:, 0])); print(line("router chunk0 landed", r[:, 1]))
@@ -85,6 +102,7 @@ def main():
     stamps = int(os.environ.get("DG_FE_STAMPS", "0"))
     l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
     pdl = int(os.environ.get("DG_FE_PDL", "0"))
+    grid_env = os.environ.get("DG_FE_TINYM_GRID", "auto")
     hot_hidden = int(os.environ.get("DG_BENCH_HOT_HIDDEN", "0"))
     buffer, launch_moe = prepare_backend(args, rank, local_rows, group)
     try:
@@ -113,6 +131,8 @@ def main():
             fe(1); mega()
 
         both(); torch.cuda.synchronize(); dist.barrier(group=group)
+        n_router = deep_gemm.fable_frontend_router_ctas(local_rows, EXPERTS, HIDDEN, 8, tinym)
+        fullk = bool(tinym) and local_rows <= 16 and grid_env.strip().lower() != "96"
         graphs = {}
         bodies = [("FE", fe), ("Mega", mega), ("FE+Mega", both)]
         if stamps:
@@ -146,6 +166,7 @@ def main():
         if rank == 0:
             print(f"== frontend direct timing: quant={args.quant} M={args.global_tokens} "
                   f"(rows/rank={local_rows}) backend={args.backend} DG_FE_TINYM={tinym} "
+                  f"DG_FE_TINYM_GRID={grid_env} (router CTAs={n_router}, full-K={int(fullk)}) "
                   f"DG_FE_ROUTER_L2_PERSIST={l2_persist} DG_FE_PDL={pdl} DG_BENCH_HOT_HIDDEN={hot_hidden} "
                   f"iters={args.iters} GPU0 ==")
             for name in timed:
@@ -160,7 +181,7 @@ def main():
                 collected.append(deep_gemm.fable_frontend_stamps(buffer, EXPERTS))
             if rank == 0:
                 print("  [eager FE after L2 flush]")
-                attribution(collected, (EXPERTS // 16) * 4, local_rows)
+                attribution(collected, n_router, local_rows, fullk)
             collected = []
             g = graphs["FE+Mega/st"]
             for _ in range(5):
@@ -169,7 +190,7 @@ def main():
                 collected.append(deep_gemm.fable_frontend_stamps(buffer, EXPERTS))
             if rank == 0:
                 print("  [FE inside the FE+Mega graph replay, L2 flush + previous Mega before it]")
-                attribution(collected, (EXPERTS // 16) * 4, local_rows)
+                attribution(collected, n_router, local_rows, fullk)
         dist.barrier(group=group)
     finally:
         buffer.destroy()
