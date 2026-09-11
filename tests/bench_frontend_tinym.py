@@ -133,18 +133,23 @@ def main():
             if hot_hidden:
                 x.add_(0)
 
-        def fe(st=0):
+        # FE+Mega bodies run the FE with select-in-Mega (cc router ends after the keys, the fused
+        # Mega prologue selects; DG_FE_SELECT_IN_MEGA default 1 here, fused backend only); the
+        # FE-only body keeps the full frontend so its topk stays valid.
+        sel_pipe = int(os.environ.get("DG_FE_SELECT_IN_MEGA", "1") != "0" and args.backend == "fused")
+
+        def fe(st=0, sel=0):
             deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant,
-                                                       tinym=tinym, stamps=st)
+                                                       tinym=tinym, stamps=st, select_in_mega=sel)
 
         def mega():
             launch_moe(y)
 
         def both():
-            fe(); mega()
+            fe(0, sel_pipe); mega()
 
         def both_stamped():
-            fe(1); mega()
+            fe(1, sel_pipe); mega()
 
         def fe_in_mega():
             launch_moe(y, frontend=(x, router_weight))

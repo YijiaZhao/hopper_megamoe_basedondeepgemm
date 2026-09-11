@@ -112,9 +112,17 @@ def prepare_backend(args, rank, local_rows, group):
     return buffer, launch
 
 
-def launch_frontend(quant, x, router_weight, logits, buffer, rows):
+# Pipeline default: the FE is immediately followed by the fused Mega, so the cc router ends after
+# its 384 keys and the Mega prologue selects the top-8 (DG_FE_SELECT_IN_MEGA, default 1 HERE; the
+# library default stays 0 so standalone FE calls keep producing topk). Only the fused backend can
+# consume the keys; the split backend always gets the full FE.
+SELECT_IN_MEGA = os.environ.get("DG_FE_SELECT_IN_MEGA", "1") != "0"
+
+
+def launch_frontend(quant, x, router_weight, logits, buffer, rows, select_in_mega=False):
     del logits, rows
-    deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=quant)
+    deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=quant,
+                                               select_in_mega=int(select_in_mega))
 
 
 def run_e2e(args, rank, tp_group, group):
@@ -149,7 +157,8 @@ def run_e2e(args, rank, tp_group, group):
             if FUSE_FE and args.backend == "fused":
                 launch_moe(y, frontend=(x, router_weight))
             else:
-                launch_frontend(args.quant, x, router_weight, logits, buffer, local_rows)
+                launch_frontend(args.quant, x, router_weight, logits, buffer, local_rows,
+                                select_in_mega=SELECT_IN_MEGA and args.backend == "fused")
                 launch_moe(y)
 
         work.copy_(partials[0])

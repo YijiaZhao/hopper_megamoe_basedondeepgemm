@@ -589,6 +589,7 @@ from .fused import FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe, transfor
 
 
 _FRONTEND_STAMPS_BYTES = 256 * 8 * 8
+_FRONTEND_CC_KEYS_OFF = 256 + 64 * 1024   # ticket area (256 B) + kCCKeysOff: compact [token][e] u32 keys of the cc router (fable_frontend.cu, ckeys = logits + kCCKeysOff, logits = workspace + 256)
 
 
 def fable_frontend_workspace_bytes(e: int) -> int:
@@ -617,8 +618,8 @@ def _fe_mma_from_env(mma):
     if mma is None:
         mma = os.environ.get("DG_FE_TINYM_MMA", "auto")
     if isinstance(mma, str):
-        mma = {"auto": -1, "wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "cc44": 6, "ccfp8": 7,
-               "-1": -1, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5, "6": 6, "7": 7}[mma.strip().lower()]
+        mma = {"auto": -1, "wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "cc44": 6, "ccfp8": 7, "ccsel": 8,
+               "-1": -1, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8}[mma.strip().lower()]
     return int(mma)
 
 
@@ -747,7 +748,8 @@ def fable_frontend_workspace(sym_buffer, e: int, device) -> torch.Tensor:
 
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
                                      sym_buffer, quant: str = "mxfp4", tinym=None, stamps=None,
-                                     l2_persist=None, pdl=None, grid=None, mma=None, k_parts=None, wlayout=None):
+                                     l2_persist=None, pdl=None, grid=None, mma=None, k_parts=None, wlayout=None,
+                                     select_in_mega=None):
     """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend.
 
     ``tinym`` (env ``DG_FE_TINYM``, default 1): for m <= 16 use the single-wave
@@ -812,8 +814,19 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
                              f"tinym={tinym} m={m} grid={grid} h={hidden.size(1)} topk={sym_buffer.topk_idx.size(1)}")
     elif mma == 7 and router_weight.dtype == torch.bfloat16:
         router_weight = _fe_router_weight_fp8_cached(router_weight)     # ccfp8 experiment: e4m3 + row scale, cached
+    if select_in_mega is None:
+        select_in_mega = int(os.environ.get("DG_FE_SELECT_IN_MEGA", "0"))
+    # select_in_mega (env DG_FE_SELECT_IN_MEGA, default 0; cc router, m <= 2, e == 384 only): the
+    # frontend stops after the router CTAs stored the 384 keys per token (no ticket / last-arriver
+    # select); the fused MegaMoE prologue selects the top-8 + softmax (mxfp4|qoq_mega_moe_fused pick
+    # the key array up from this buffer's cache). topk_idx/topk_weights are NOT valid after this call.
+    if select_in_mega and mma == 4 and m <= 2 and e == 384 and tinym and str(grid).strip().lower() != "96":
+        mma = 8
     workspace = fable_frontend_workspace(sym_buffer, e, hidden.device)
     cache = sym_buffer._fable_frontend_cache
+    if cache.get("keys") is None or cache["keys"].data_ptr() != workspace[_FRONTEND_CC_KEYS_OFF:].data_ptr():
+        cache["keys"] = workspace[_FRONTEND_CC_KEYS_OFF:_FRONTEND_CC_KEYS_OFF + 2 * 512 * 4].view(torch.int32)   # flat, token t at [t * e, (t + 1) * e)
+    cache["keys_active"] = cache["keys"] if mma == 8 else None
     views = cache.get(m)
     if views is None:
         views = cache[m] = (sym_buffer.x[:m], sym_buffer.x_sf[:m],
@@ -821,6 +834,12 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     _C.fable_router_quant_topk_frontend(
         hidden, router_weight, views[0], views[1], views[2], views[3], workspace,
         0 if quant == "mxfp4" else 1, int(bool(tinym)), int(bool(stamps)), int(l2_persist), int(pdl), grid, mma, k_parts)
+
+
+def fable_frontend_keys(sym_buffer) -> torch.Tensor:
+    """Flat [1024] int32 view of the cc router's compact key array (token t, expert x at [t * e + x], e = 384)
+    in this buffer's frontend workspace; the array the fused Mega selects from under DG_FE_SELECT_IN_MEGA=1."""
+    return sym_buffer._fable_frontend_cache["keys"]
 
 
 def fable_frontend_stamps(sym_buffer, e: int) -> torch.Tensor:

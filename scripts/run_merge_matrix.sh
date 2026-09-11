@@ -166,6 +166,23 @@ case "$MODE" in
       for p in 1 2 3; do bash "$0" capture "$RES/cap_cc3/p$p" "2 8 16"; done
       for p in 1 2 3; do echo "## p$p"; cut -d, -f1-4,6-8 "$RES/cap_cc3/p$p/TIMELINE_LAST3.csv"; done
       echo "CHAIN6_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
+  selmega)  # 8-rank DG_FE_SELECT_IN_MEGA gate (cc router keys -> Mega prologue top-8): both quants, M=8 (1 row/rank)
+    rc=0; for q in mxfp4 qoq; do wait_idle "selmega_$q"; timeout 900 $TR --standalone --nproc_per_node=8 tests/test_select_in_mega.py --quant $q --global-tokens 8 --seeds 50 > "$RES/selmega_$q.log" 2>&1; r=$?; drop_marker; echo "== selmega_$q rc=$r"; tail -3 "$RES/selmega_$q.log"; [ $r -ne 0 ] && rc=1; done; echo "SELMEGA_RC=$rc" ;;
+  land_final)  # landing gates (cc default rows <= 2, inline-s2 gated to <= 8 rows/expert, select-in-Mega in the pipeline) + 3 customer captures
+    C="$RES/land_final.log"; : > "$C"
+    { echo "start $(git rev-parse --short HEAD) $(date -u +%FT%TZ)"
+      bash "$0" corr 1 2 8 16 32
+      COSMIN=0.999 bash "$0" corrref 1 2 32
+      bash "$0" corrfe 2
+      bash "$0" mx 128 512
+      bash "$0" corrq 64
+      bash "$0" selmega
+      bash "$0" fe78 auto 500 6 0 1 2 8 16 > "$RES/fe78_land_a.out" 2>&1 &
+      bash "$0" fe78 auto 500 7 500 1 2 8 16 > "$RES/fe78_land_b.out" 2>&1 &
+      wait; cat "$RES/fe78_land_a.out" "$RES/fe78_land_b.out"
+      for p in 1 2 3; do bash "$0" capture "$RES/cap_land/p$p" "2 8 16"; done
+      for p in 1 2 3; do echo "## p$p"; cut -d, -f1-4,6-8 "$RES/cap_land/p$p/TIMELINE_LAST3.csv"; done
+      echo "LAND_FINAL_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
   land_diag)  # chain4 corrref T=32 qoq failure triage (see README FE section)
     C="$RES/land_diag.log"; : > "$C"
     { echo "start $(git rev-parse --short HEAD) $(date -u +%FT%TZ)"

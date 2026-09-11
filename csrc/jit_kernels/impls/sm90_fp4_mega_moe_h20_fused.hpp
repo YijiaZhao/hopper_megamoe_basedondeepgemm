@@ -85,6 +85,7 @@ public:
         const void* fe_hidden;
         const void* fe_router_weight;
         void* fe_workspace;
+        const uint32_t* fe_keys;
         LaunchArgs launch_args;
     };
 
@@ -238,7 +239,8 @@ static void __instantiate_kernel() {{
             args.phase_stamps,
             args.fe_hidden,
             args.fe_router_weight,
-            args.fe_workspace));
+            args.fe_workspace,
+            args.fe_keys));
     }
 };
 
@@ -264,7 +266,8 @@ static void sm90_fp4_h20_fused_mega_moe(
     // bf16 router weight [num_experts, hidden], the Fable frontend workspace tensor.
     const std::optional<torch::Tensor>& fe_hidden = std::nullopt,
     const std::optional<torch::Tensor>& fe_router_weight = std::nullopt,
-    const std::optional<torch::Tensor>& fe_workspace = std::nullopt
+    const std::optional<torch::Tensor>& fe_workspace = std::nullopt,
+    const std::optional<torch::Tensor>& fe_keys = std::nullopt
 ) {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const int num_experts = num_experts_per_rank * num_ranks;
@@ -446,6 +449,14 @@ static void sm90_fp4_h20_fused_mega_moe(
     // all-split L2 additionally doubles the L2 tail. Numerics identical (T=2/8/8/16 both
     // quants, mxfp4 128/512: same cos_min digits as knob off).
     const bool m16_rows = num_tokens == 2 && num_ranks == 8;
+    // QoQ inline s2 (kernel `kQoQInlineS2`, DG_FP4_QOQ_INLINE_S2 default 1) is gated to launches
+    // where no local expert can receive more than one BM8 pool block: with > 8 rows on one expert
+    // the inline-s2 L1 path produces wrong partials for the rows of the second block (8-rank
+    // tests/test_four_api_correctness.py qoq: --frontend fe T=32 cos_min 0.0007, default routing
+    // T=64 / 128 cos_min < 0; DG_FP4_QOQ_INLINE_S2=0 passes, every other knob fails; 2026-09-11).
+    // Max rows per expert = num_tokens x num_ranks (all routes of every token on one expert).
+    const bool qoq_inline_s2 = qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0 &&
+        num_tokens * num_ranks <= 8;
     // (Not with wide tasks: all-task splits measured +3.7..+7.3 us at M=16; wide L1 uses
     // a 3-way TAIL split instead, see the kernel.)
     const bool split_k_l1_all = split_k_l1 && m16_rows && !wide_tiles &&
@@ -797,7 +808,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // int32 set (one promote by the per-token activation scale at task end)
         // instead of a per-K128 promote (which forced an accumulator readout /
         // tensor-pipe drain per block). 0 = the per-block promote path.
-        .qoq_inline_s2 = qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0,
+        .qoq_inline_s2 = qoq_inline_s2,
         // DG_FP4_QIS2_FRAGS (2|3|4, default 2): A-fragment register buffers of the
         // inline s2 loop (wait_group lag = frags - 1); 3/4 cost +32/+64 regs.
         .qoq_inline_s2_frags = std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4),
@@ -885,6 +896,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         .fe_hidden = fuse_fe ? fe_hidden->data_ptr() : nullptr,
         .fe_router_weight = fuse_fe ? fe_router_weight->data_ptr() : nullptr,
         .fe_workspace = fuse_fe ? fe_workspace->data_ptr() : nullptr,
+        // DG_FE_SELECT_IN_MEGA=1: Fable cc frontend compact key array ([token][384] u32)
+        .fe_keys = fe_keys.has_value() ? reinterpret_cast<const uint32_t*>(fe_keys->data_ptr()) : nullptr,
         // DG_FE_PDL=1: programmatic dependent launch on the Fable frontend (the
         // kernel executes griddepcontrol.wait before touching frontend outputs).
         .launch_args = LaunchArgs(
@@ -906,7 +919,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         (push_done_flags ? "_pdf" : "") +
         (strided_pool_debug ? "_stridedbg" : "") +
         (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "") +
-        ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "") +
+        (qoq_inline_s2 ? "_qis2" : "") +
         ((qoq && std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4) != 2) ?
             fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +

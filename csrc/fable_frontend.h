@@ -79,6 +79,31 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 // Equality vs the 96 x 4 WMMA path (tests/test_frontend_fe78.py --mma cc): 3000 + 1200 + 1200
 // row-evaluations, 0 top-8 index-set mismatches, 2 bf16 rounding flips, x/x_sf bit-identical; 8-rank
 // test_four_api_correctness (fused mxfp4 + qoq, tokens/rank 1, 2, 8): cos_min 0.99999 / 0.99993.
+// ROUND 4 (2026-09-11, H20-3e .7, tests/fe_repro_cc.py, tests/ncu_fe_cc.sh, tests/run_selmega_e2e.sh):
+// * Reproducibility of the 3.84: it holds ONLY for back-to-back launches (flush -> launch -> stamp clone,
+//   fe_standalone_bench protocol): 30 fresh processes x 100 launches: rows 1 3.58, rows 2 3.84 in every
+//   process, both quants (table in docs/fe_cc_round4.md). Any millisecond-scale host gap between two
+//   launches (a per-launch D2H reduction, or a 5 ms sleep) makes the SAME kernel 5.4-5.9 us: the router
+//   CTAs' weight loads straggle (keys written max 3.84 instead of 2.82) and the relaxed-ticket last
+//   arriver waits for them (merge done 5.12). Inside the FE+Mega graph (after the previous Mega) the
+//   stamped chain is keys written 3.58 / topk written 6.40 (rows 1 and 2, both quants): the persisting
+//   L2 set-aside does not keep the 2.36 MB router matrix resident across the Mega's weight stream.
+// * NCU (--set full --clock-control none, default cache control): duration 7.7 / 8.1 us (replayed),
+//   SM active/elapsed 55 / 52 %, issue slots 23 / 24 %, achieved occupancy 30.9 % (= theoretical, 1 CTA
+//   x 20 warps per SM), DRAM 2.45 MB read, L2 SM-read hit 21 / 34 %, 96 regs, 118.8 KB dyn smem (the
+//   1-CTA/SM pad), top stalls no_instruction 9.2 (i-cache: the fully unrolled 24-chunk body), long_scoreboard
+//   2.9, barrier 2.3. With --cache-control none: DRAM read still 1.56 / 1.66 MB (SM-read L2 hit 64 / 70 %).
+//   cudaDevAttrMaxAccessPolicyWindowSize = 128 MB, persisting max 37.5 MB, set-aside granted 3.75 MB for the
+//   requested 2.25 MB window -> the window covers the whole matrix; residency, not coverage, is the limit.
+// * DG_FE_SELECT_IN_MEGA=1 (mma 8): the FE ends after the router CTAs stored the 384 keys per token
+//   (kernel end = last keys written 2.05-2.30 back-to-back, 3.33 inside the graph; no ticket, no last
+//   arriver, no topk write); the fused Mega's prologue selects (deep_gemm/impls/fable_cc_select.cuh, one
+//   idle warp per token, ld.global.cg of the keys, before the dispatch __syncthreads; dispatch reads the
+//   topk with ld.global.cg instead of ld.global.nc since the same kernel wrote them). E2E verdict:
+//   8-rank FE+Mega graph event (us, knob 0 v1 -> knob 1): mxfp4 M2/8/16 80.4/81.0/100.7 -> 77.4/76.8/97.4,
+//   qoq 78.5/79.5/97.7 -> 75.5/76.3/95.7 (-1..-4 us, the knob-0 baseline itself moves 2-3 us run to run); gate
+//   8 ranks x 50 seeds x M 2|16 x both quants: topk_idx/topk_weights bit-identical, y max|dy| 0. Knob default 0
+//   (a standalone FE launch with it on writes no topk_idx); set DG_FE_SELECT_IN_MEGA=1 in the FE+Mega pipeline.
 // Router CTA count the launch will use (bench / stamp attribution helper).
 // `k_parts` (DG_FE_TINYM_KPARTS, full-K grid only): 1 | 2 | 4 K-parts per expert
 // group (grid=97,k_parts=4 = the legacy 24 x 16 x 4 layout inside the full-K
