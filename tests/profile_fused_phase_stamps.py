@@ -28,11 +28,10 @@ import profile_four_api_h20 as P  # noqa: E402
 import deep_gemm  # noqa: E402
 
 INT64_MAX = (1 << 63) - 1
-MIN_SLOTS = (0, 3, 33)
+MIN_SLOTS = (0, 3)
 REPORT = [
     (12, "init done"),
     # fused Fable frontend (DG_FP4_FUSE_FE=1 + --fuse-fe): FE crew timeline
-    (33, "FE crew start (min)"),
     (49, "FE router loads issued (max)"),
     (50, "FE quant done (top-k CTAs, max)"),
     (51, "FE router loads landed (max)"),
@@ -40,7 +39,6 @@ REPORT = [
     (45, "FE router units done (max)"),
     (54, "FE top-k saw all units (max)"),
     (46, "FE top-k written (max)"),
-    (32, "dispatch saw top-k (max)"),
     (8, "expert-offset atomics"),
     (9, "topk write"),
     (10, "grid sync"),
@@ -268,7 +266,7 @@ def main():
             print(f"{'slot':>4} {'phase':<32} {'median':>9} {'min':>9} {'max':>9} {'delta':>9}")
             prev = 0.0
             for slot, name in REPORT:
-                if slot in (33, 49, 50, 51, 52, 45, 54, 46, 32) and not args.fuse_fe:
+                if slot in (49, 50, 51, 52, 45, 54, 46) and not args.fuse_fe:
                     continue
                 print(f"{slot:>4} {name:<32} {med[slot]:>9.2f} {mn[slot]:>9.2f} {mx[slot]:>9.2f} {med[slot]-prev:>9.2f}")
                 prev = med[slot]
