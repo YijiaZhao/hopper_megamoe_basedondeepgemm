@@ -123,5 +123,12 @@ case "$MODE" in
       bash "$0" corrref 1 2
       for p in 1 2 3; do bash "$0" capture "$RES/cap/p$p" "2 8 16"; done
       echo "CHAIN2_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
+  stop)     # stop OUR OWN jobs only: processes whose cwd is this worktree (run inside the same container)
+    for pid in $(pgrep -f "run_merge_matrix.sh|capture_four_api_h20_timelines.sh|nsys profile|profile_four_api_h20.py|torchrun|test_four_api_correctness.py|test_frontend_fe78.py"); do
+      [ "$pid" = "$$" ] && continue
+      [ "$(readlink /proc/$pid/cwd 2>/dev/null)" = "$ROOT" ] || continue
+      echo "kill $pid $(tr '\0' ' ' < /proc/$pid/cmdline | cut -c1-120)"; kill "$pid" 2>/dev/null
+    done
+    sleep 8; drop_marker; nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader ;;
   *) echo "usage: see header" >&2; exit 2 ;;
 esac
