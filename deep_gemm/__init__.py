@@ -98,6 +98,7 @@ from .mega import (
     fable_router_quant_topk_frontend,
     fable_frontend_router_ctas,
     fable_frontend_stamps,
+    fable_frontend_keys,
     fable_frontend_workspace_bytes,
     fable_router_weight_fragment_layout,
     mxfp4_mega_moe_split, qoq_mega_moe_split,

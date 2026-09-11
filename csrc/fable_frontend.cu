@@ -12,6 +12,7 @@
 // every CTA owns ~5 experts over the whole K, final logits per CTA, streaming
 // top-8 merge in one merger CTA, quantisation on the router CTAs' idle time.
 #include "fable_frontend.h"
+#include <deep_gemm/impls/fable_cc_select.cuh>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <mma.h>
@@ -304,14 +305,8 @@ __device__ __forceinline__ uint32_t topk_key(float v, int ex) {
     const uint32_t o = (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u);
     return (o << 16) | (0xFFFFu - static_cast<uint32_t>(ex));
 }
-__device__ __forceinline__ float topk_key_value(uint32_t key) {
-    const uint32_t o = key >> 16;
-    const uint32_t b = (o & 0x8000u) ? (o & 0x7FFFu) : (~o & 0xFFFFu);
-    return __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(b)));
-}
-__device__ __forceinline__ int topk_key_index(uint32_t key) {
-    return static_cast<int>(0xFFFFu - (key & 0xFFFFu));
-}
+using fable_cc::topk_key_value;
+using fable_cc::topk_key_index;
 __device__ __forceinline__ uint32_t warp_max_u32(uint32_t v) {
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = max(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -530,13 +525,7 @@ __device__ __forceinline__ void tma_bulk_g2s_hint(void* dst, const void* src, ui
 }
 // One redux.sync instruction instead of a 5-level shuffle tree (~5x lower latency
 // per round; the merger's 8 rounds are on the exposed tail of the kernel).
-__device__ __forceinline__ uint32_t warp_max_u32_redux(uint32_t v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    return __reduce_max_sync(0xffffffffu, v);
-#else
-    return warp_max_u32(v);
-#endif
-}
+using fable_cc::warp_max_u32_redux;
 __device__ __forceinline__ uint32_t ld_cv_u32(const uint32_t* p) {
     uint32_t v;
     asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
@@ -792,6 +781,7 @@ __host__ __device__ constexpr int cc_slots(int cc) { return cc / 8; }
 __host__ __device__ constexpr int cc_ks(int cc) { return cc % 8; }
 __host__ __device__ constexpr int cc_block(int cc) { return cc > 0 ? cc_slots(cc) * cc_ks(cc) * 32 : kThreads; }
 constexpr int kTicketRelaxedBit = 128;
+constexpr int kSelectInMegaBit = 512;    // w_hint flag (cc, DG_FE_SELECT_IN_MEGA=1, mma 8): router CTAs end after storing their keys; the fused MegaMoE prologue selects (deep_gemm/impls/fable_cc_select.cuh)
 constexpr int kKeysCompactBit = 256;     // w_hint flag (cc ticket): keys in a compact [token][e] array (DG_FE_CC_KEYS=compact, default when e == 384)
 constexpr size_t kCCKeysOff = 64 * 1024; // workspace offset of the compact keys ([2][512] u32 max)
 constexpr int kCCW8Pad = 16;             // fp8 router weight row: h bytes e4m3 + fp32 row scale + pad (row stride h + 16)   // w_hint flag (cc ticket): relaxed atomic ticket, the last CTA re-reads slots still 0 (DG_FE_CC_TICKET=relaxed)
@@ -1120,41 +1110,9 @@ __device__ __forceinline__ void router_role_fullk_swapab(
 // 8 rounds of one redux.sync max over (running key in lanes 0..7, loc[0]) with the
 // winner popped -> new running top-8 in lanes 0..7, descending.
 // merge8: running top-8 (lanes 0..7 of `run`, descending) <- top-8 of (run, every lane's sorted loc[])
-template <int kTopK>
-__device__ __forceinline__ void merge8(uint32_t& run, uint32_t (&loc)[kTopK], int lane) {
-    uint32_t out = 0u;
-    #pragma unroll
-    for (int k = 0; k < kTopK; ++k) {
-        const uint32_t best = warp_max_u32_redux(max(run, loc[0]));
-        if (lane == k) out = best;
-        if (run == best) run = 0u;
-        if (loc[0] == best) {                 // pop this lane's head
-            #pragma unroll
-            for (int j = 0; j < kTopK - 1; ++j) loc[j] = loc[j + 1];
-            loc[kTopK - 1] = 0u;
-        }
-    }
-    run = lane < kTopK ? out : 0u;
-}
-// softmax over the 8 selected bf16 logits (lanes 0..7 of run), legacy order (k = 0..7 sequential sum)
-template <int kTopK>
-__device__ __forceinline__ void topk_finish(uint32_t run, int lane, int t, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights) {
-    const float sel_v = lane < kTopK ? topk_key_value(run) : -INFINITY;
-    const float mx = warp_max(sel_v);
-    const float ex = lane < kTopK ? expf(sel_v - mx) : 0.0f;
-    float sum = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < kTopK; ++k) sum += __shfl_sync(0xffffffffu, ex, k);
-    if (lane < kTopK) {
-        topk_idx[static_cast<int64_t>(t) * kTopK + lane] = topk_key_index(run);
-        topk_weights[static_cast<int64_t>(t) * kTopK + lane] = ex / sum;
-    }
-}
-__device__ __forceinline__ uint4 ld_cg_v4(const uint32_t* p) {
-    uint4 v;
-    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
-    return v;
-}
+using fable_cc::merge8;
+using fable_cc::topk_finish;
+using fable_cc::ld_cg_v4;
 // Last-arriver merge (cc, DG_FE_CC_MERGE=ticket, default): called by the router CTA whose
 // atom.acq_rel.gpu ticket was the last (every CTA: keys stored -> bar.sync -> thread 0 atomic;
 // the release orders the CTA's key stores, the acquire on the last CTA orders its reads).
@@ -1261,18 +1219,7 @@ __device__ __forceinline__ void last_arriver_topk_compact(
         }
     }
     uint32_t loc[kTopK];
-    #pragma unroll
-    for (int j = 0; j < kTopK; ++j) loc[j] = 0u;
-    #pragma unroll
-    for (int i = 0; i < kVec; ++i) {
-        const uint32_t kv[4] = {q[i].x, q[i].y, q[i].z, q[i].w};
-        #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            uint32_t k = kv[u];
-            #pragma unroll
-            for (int j = 0; j < kTopK; ++j) { const uint32_t lo = min(k, loc[j]); loc[j] = max(k, loc[j]); k = lo; }
-        }
-    }
+    fable_cc::insert_keys<kTopK, kVec>(q, loc);
     uint32_t run = 0u;
     merge8<kTopK>(run, loc, lane);
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
@@ -1411,6 +1358,11 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
                 uint32_t* ckeys = reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(logits) + kCCKeysOff);
                 const bool compact = (w_hint & kKeysCompactBit) != 0;
                 router_role_fullk_cc<cc_slots(kCC), cc_ks(kCC), kW8>(hidden, router_weight, cand, ckeys, stamps, m, h, e, epc, groups, cand_slots, compact);
+                if (w_hint & kSelectInMegaBit) {     // select in Mega: no ticket, no last arriver; kernel completion publishes the keys
+                    stamp(stamps, 3);
+                    if (pdl_mode == 2) pdl_trigger();
+                    return;
+                }
                 if (w_hint & kTicketMergeBit) {
                     __shared__ int s_last;
                     const bool relaxed = (w_hint & kTicketRelaxedBit) != 0;
@@ -1626,6 +1578,7 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         // keys: compact [token][e] array (default when e == 384: 12 keys per lane for the last arriver) | slots
         static const bool slots = getenv("DG_FE_CC_KEYS") && strcmp(getenv("DG_FE_CC_KEYS"), "slots") == 0;
         if (kCC > 0 && !slots && e == 384) w_hint |= kKeysCompactBit;
+        if (kCC > 0 && mma == 8) w_hint |= kSelectInMegaBit | kKeysCompactBit | kTicketMergeBit;   // spare CTA only quantises
     }
     cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC, kW8>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);
@@ -1651,11 +1604,11 @@ void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x
                 mma = 2;
             }
             // cc | cc6: CUDA-core K-split router (m <= 2, h = 3072, k_parts 1, epc <= 5); else WMMA
-            if (mma == 4 || mma == 5 || mma == 6 || mma == 7) {
-                const int cc = mma == 4 ? 44 : mma == 5 ? 46 : mma == 6 ? 36 : 43;      // slots * 8 + K-split (ccfp8: 5 x 3)
+            if (mma == 4 || mma == 5 || mma == 6 || mma == 7 || mma == 8) {
+                const int cc = (mma == 4 || mma == 8) ? 44 : mma == 5 ? 46 : mma == 6 ? 36 : 43;      // slots * 8 + K-split (ccfp8: 5 x 3); 8 = cc + select in Mega
                 if (m <= kCCMaxM && h == kCCH && k_parts == 1 && epc <= cc_slots(cc)) {
                     if (cc == 43) launch<1, kMode, true, true, false, 0, 43, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
-                    else if (cc == 44) launch<1, kMode, true, true, false, 0, 44>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+                    else if (cc == 44) launch<1, kMode, true, true, false, 0, 44>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream, mma);
                     else if (cc == 46) launch<1, kMode, true, true, false, 0, 46>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
                     else launch<1, kMode, true, true, false, 0, 36>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
                     return;

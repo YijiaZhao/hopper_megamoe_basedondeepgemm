@@ -31,7 +31,7 @@
     // Optional phase timestamps (globaltimer, ns). Slots:
     //   0 min kernel entry | 1 max dispatch routing done | 2 max dispatch pull done
     //   3 min first math task | 4 max last L1 task end | 5 max last L2 task end
-    //   6 max after combine NVLink barrier | 7 max combine end
+    //   6 max after combine NVLink barrier | 7 max combine end | 16 max DG_FE_SELECT_IN_MEGA select done
     const auto stamp_min = [&](const uint32_t slot) {
         if (phase_stamps != nullptr) {
             unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -842,6 +842,19 @@
     #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;" ::: "memory");
     #endif
+    // DG_FE_SELECT_IN_MEGA=1 (fe_keys != nullptr): the frontend ended after its router CTAs
+    // stored the 384 keys per token; one otherwise idle prologue warp per token (warps 4..,
+    // warps 0..2 are busy with the smem / m-barrier init above) selects the top-8 + softmax
+    // and writes THIS rank's topk_idx / topk_weights (every CTA writes the same values; the
+    // dispatch warps read them after the __syncthreads below). Frontend keys are complete
+    // because the frontend kernel finished before this grid (or before griddepcontrol.wait).
+    if (fe_keys != nullptr and warp_idx >= 4 and warp_idx - 4 < num_tokens and warp_idx - 4 < 8) {
+        const uint32_t t = warp_idx - 4;
+        fable_cc::select_topk8_compact384(fe_keys + t * kNumExperts, static_cast<int>(lane_idx), static_cast<int>(t),
+                                          input_topk_idx_buffer.get_base_ptr<int64_t>(),
+                                          input_topk_weights_buffer.get_base_ptr<float>());
+        if (thread_idx == 4 * 32) stamp_max(16);       // slot 16: max FE-select-in-Mega done
+    }
     // Fast NVLink-barrier epilogue: every thread snapshots the done count BEFORE
     // the kernel-start __syncthreads (see fused_comm::nvlink_barrier for why this
     // is race-free: SM0's first write of the word this launch is ordered after the

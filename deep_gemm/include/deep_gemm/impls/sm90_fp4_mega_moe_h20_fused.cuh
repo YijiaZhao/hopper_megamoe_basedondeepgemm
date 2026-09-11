@@ -4,6 +4,7 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 #include <cstdint>
+#include <deep_gemm/impls/fable_cc_select.cuh>
 #include <type_traits>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
@@ -585,7 +586,10 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
         // MXFP4: required per-(expert, weight row) scale [E, N] = 2^e_ref * global.
         const float* __restrict__ l1_global_scales,
         const float* __restrict__ l2_global_scales,
-        unsigned long long* __restrict__ phase_stamps) {
+        unsigned long long* __restrict__ phase_stamps,
+        // DG_FE_SELECT_IN_MEGA=1: the Fable cc frontend's compact [token][384] u32 key array
+        // (nullptr = the frontend produced topk_idx/topk_weights itself).
+        const uint32_t* __restrict__ fe_keys) {
     constexpr uint32_t kHidden = 3072;
     constexpr uint32_t kIntermediateHidden = 1280;
     constexpr uint32_t kNumExperts = 384;
