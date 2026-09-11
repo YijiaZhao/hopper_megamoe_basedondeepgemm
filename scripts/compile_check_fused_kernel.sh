@@ -3,12 +3,12 @@
 # template arguments the host JIT emits for the BM8 tier), with ptxas' register /
 # spill / smem report. Lets a task-shape change be checked and its register
 # footprint read while the GPUs are busy.
-#   bash scripts/compile_check_fused_kernel.sh <quant mxfp4|qoq> <l1_tiles 1|2> <l2_tiles 1|2> \
+#   [FUSE_FE=true] bash scripts/compile_check_fused_kernel.sh <quant mxfp4|qoq> <l1_tiles 1|2> <l2_tiles 1|2> \
 #        <k_blocks_per_stage 1|2|4> <stages> [outdir]
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 QUANT=${1:-mxfp4}; L1T=${2:-1}; L2T=${3:-1}; KB=${4:-2}; STAGES=${5:-4}
-OUT=${6:-/tmp/dg_compile_check/${QUANT}_bn$((256 * L1T))x$((256 * L2T))_kb${KB}_s${STAGES}}
+OUT=${6:-/tmp/dg_compile_check/${QUANT}_bn$((256 * L1T))x$((256 * L2T))_kb${KB}_s${STAGES}${FUSE_FE:+_fefuse}}
 mkdir -p "$OUT"
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 CUTLASS=${DG_CUTLASS_INCLUDE_PATH:-$ROOT/third-party/cutlass/include}
@@ -72,7 +72,8 @@ static void __instantiate_kernel() {
         /* kSplitKL1All */ false,
         /* kSplitKL2All */ false,
         /* kL1TaskTiles */ $L1T,
-        /* kL2TaskTiles */ $L2T
+        /* kL2TaskTiles */ $L2T,
+        /* kFuseFERequested */ ${FUSE_FE:-false}
     >);
 };
 CU

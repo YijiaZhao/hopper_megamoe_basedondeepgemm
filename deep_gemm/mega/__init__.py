@@ -594,6 +594,20 @@ def fable_frontend_workspace_bytes(e: int) -> int:
     return 256 + 4 * 64 * e * 4 + _FRONTEND_STAMPS_BYTES
 
 
+def fable_frontend_workspace(sym_buffer, e: int, device) -> torch.Tensor:
+    """The Fable frontend workspace of ``sym_buffer`` (zero-initialised once, cached):
+    [0, 256) tickets / hand-off counters, then the fp32 K-split partial logits, then the
+    optional phase stamps. Shared by the standalone FE launch and the fused-FE kernel."""
+    cache = getattr(sym_buffer, "_fable_frontend_cache", None)
+    if cache is None:
+        cache = sym_buffer._fable_frontend_cache = {}
+    workspace = cache.get("workspace")
+    required = fable_frontend_workspace_bytes(e)
+    if workspace is None or workspace.numel() < required:
+        workspace = cache["workspace"] = torch.zeros(required, dtype=torch.uint8, device=device)
+    return workspace
+
+
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
                                      sym_buffer, quant: str = "mxfp4", tinym=None, stamps=None,
                                      l2_persist=None, pdl=None):
@@ -620,13 +634,8 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
         l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
     if pdl is None:
         pdl = int(os.environ.get("DG_FE_PDL", "0"))
-    cache = getattr(sym_buffer, "_fable_frontend_cache", None)
-    if cache is None:
-        cache = sym_buffer._fable_frontend_cache = {}
-    workspace = cache.get("workspace")
-    required = fable_frontend_workspace_bytes(e)
-    if workspace is None or workspace.numel() < required:
-        workspace = cache["workspace"] = torch.zeros(required, dtype=torch.uint8, device=hidden.device)
+    workspace = fable_frontend_workspace(sym_buffer, e, hidden.device)
+    cache = sym_buffer._fable_frontend_cache
     views = cache.get(m)
     if views is None:
         views = cache[m] = (sym_buffer.x[:m], sym_buffer.x_sf[:m],

@@ -27,6 +27,7 @@
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 #include <deep_gemm/quantization/fp4_fused_dequant.cuh>
+#include <deep_gemm/impls/fable_frontend_device.cuh>
 
 namespace deep_gemm {
 namespace nvfp4 {
@@ -563,7 +564,13 @@ template <
     // DG_FP4_BN512_MIN_M / DG_FP4_BN512_MAX_M on the global token count): packed
     // 256-row weight tiles per L1 / L2 task (1 or 2). See `kWideTiles` in the body.
     uint32_t kL1TaskTiles = 1,
-    uint32_t kL2TaskTiles = 1
+    uint32_t kL2TaskTiles = 1,
+    // Fable frontend fused in (host env DG_FP4_FUSE_FE, tiny M only; kernel `kFuseFE`,
+    // docs/fe_into_mega_design.md): the math warps compute router logits / top-k /
+    // activation quantisation for the rank's rows at kernel start from `fe_hidden` and
+    // `fe_router_weight` (hand-off through `fe_workspace`), the dispatch warps wait for
+    // the top-k before routing. Off: today's kernel, the three pointers are unused.
+    bool kFuseFERequested = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
@@ -585,7 +592,10 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
         // MXFP4: required per-(expert, weight row) scale [E, N] = 2^e_ref * global.
         const float* __restrict__ l1_global_scales,
         const float* __restrict__ l2_global_scales,
-        unsigned long long* __restrict__ phase_stamps) {
+        unsigned long long* __restrict__ phase_stamps,
+        const void* __restrict__ fe_hidden,
+        const void* __restrict__ fe_router_weight,
+        void* __restrict__ fe_workspace) {
     constexpr uint32_t kHidden = 3072;
     constexpr uint32_t kIntermediateHidden = 1280;
     constexpr uint32_t kNumExperts = 384;

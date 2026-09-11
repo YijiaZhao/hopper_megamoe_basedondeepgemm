@@ -43,6 +43,10 @@ def flush_l2_cache():
 # (after the L2 flush + synchronize) so the ranks launch together and the kernel
 # span is not inflated by host launch skew.  Default off = customer method.
 HOST_BARRIER = os.environ.get("DG_PROFILE_HOST_BARRIER", "0") == "1"
+# DG_FP4_FUSE_FE=1 (fused backend, E2E scope): the Fable frontend runs inside the fused
+# MegaMoE kernel (docs/fe_into_mega_design.md); the FE launch is skipped and the graph
+# (the same "frontend + MegaMoE" span) holds just the fused kernel.
+FUSE_FE = os.environ.get("DG_FP4_FUSE_FE", "0") != "0"
 
 WORLD = 8
 TP = 4
@@ -86,7 +90,8 @@ def prepare_backend(args, rank, local_rows, group):
                 quantize_to_qoq_int4(w1), quantize_to_qoq_int4(w2), block_n=128)
             kernel = deep_gemm.qoq_mega_moe_split
 
-        def launch(y):
+        def launch(y, frontend=None):
+            assert frontend is None, "the split backend has no fused frontend"
             kernel(y, *weights, buffer, cumulative_local_expert_recv_stats=None,
                    recipe=(128, 128, 128), activation_clamp=10.0)
     else:
@@ -101,9 +106,9 @@ def prepare_backend(args, rank, local_rows, group):
                 quantize_to_qoq(w1), quantize_to_qoq(w2))
             kernel = deep_gemm.qoq_mega_moe_fused
 
-        def launch(y):
+        def launch(y, frontend=None):
             kernel(y, *weights, buffer, cumulative_local_expert_recv_stats=None,
-                   activation_clamp=10.0)
+                   activation_clamp=10.0, frontend=frontend)
     return buffer, launch
 
 
@@ -141,8 +146,11 @@ def run_e2e(args, rank, tp_group, group):
         output = torch.empty(padded_rows, HIDDEN, device="cuda", dtype=torch.bfloat16)
 
         def graph_body():
-            launch_frontend(args.quant, x, router_weight, logits, buffer, local_rows)
-            launch_moe(y)
+            if FUSE_FE and args.backend == "fused":
+                launch_moe(y, frontend=(x, router_weight))
+            else:
+                launch_frontend(args.quant, x, router_weight, logits, buffer, local_rows)
+                launch_moe(y)
 
         work.copy_(partials[0])
         dist.reduce_scatter_tensor(x, work, group=tp_group)
