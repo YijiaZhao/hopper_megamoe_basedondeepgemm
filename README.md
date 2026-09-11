@@ -266,18 +266,26 @@ the customer comparison column (targets M2 < 53, M8 < 61, M16 < 85: all met).
 
 | Precision | M | FE Fused | E2E Fused (FE + Mega) | Mega-only Fused |
 |---|---:|---:|---:|---:|
-| MXFP4 | 2  | 8.3 (13.9 legacy) | 74.5–96.8   | **42.9** |
+| MXFP4 | 2  | 7.8 (8.3 wmma, 13.9 legacy) | 74.5–96.8   | **42.9** |
 | MXFP4 | 4  | 8.3 (13.8 legacy) | 81.5–88.3   | **~49** |
-| MXFP4 | 8  | 8.3 (13.9 legacy) | 75.5–89.2   | **56.4–59.1** |
-| MXFP4 | 16 | 8.7 (14.0 legacy) | 108.5–117.0 | **74.0–82.6** |
-| QOQ   | 2  | 8.7 (14.5 legacy) | 73.5–94.3   | **44.1** |
+| MXFP4 | 8  | 7.6 (8.3 wmma, 13.9 legacy) | 75.5–89.2   | **56.4–59.1** |
+| MXFP4 | 16 | 8.0 (8.7 wmma, 14.0 legacy) | 108.5–117.0 | **74.0–82.6** |
+| QOQ   | 2  | 7.6 (8.7 wmma, 14.5 legacy) | 73.5–94.3   | **44.1** |
 | QOQ   | 4  | 8.5 (14.6 legacy) | 84.9–87.1   | **48.0** |
-| QOQ   | 8  | 8.6 (14.8 legacy) | 80.2–90.3   | **54.9–59.3** |
-| QOQ   | 16 | 8.7 (14.9 legacy) | 94.9–109.3  | **74.0–77.4** |
+| QOQ   | 8  | 7.7 (8.6 wmma, 14.8 legacy) | 80.2–90.3   | **54.9–59.3** |
+| QOQ   | 16 | 7.9 (8.7 wmma, 14.9 legacy) | 94.9–109.3  | **74.0–77.4** |
 
-FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16;
-kernel time 6.9 us, nsys span 8.3–8.7 us); the legacy frontend value is in
-parentheses.  E2E ranges span captures with different host launch skew.
+FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16) with the
+swapped-operand router MMA and the fragment weight layout (`DG_FE_TINYM_MMA=auto` ->
+`swapab`, kernel-end stamps 6.14 us): M2/M8/M16 are the medians of three
+independent customer-method captures of this tip (`/raid/kimi/results/merge/cap_swapab`,
+per-capture FE medians 7.42–8.00 us; E2E medians 85.1 / 85.5 / 96.4 MXFP4 and 76.2 / 108.5 /
+98.6 QOQ, one QOQ M8 capture at 232 us from host skew). The wmma value in parentheses
+is the previous default (96 x 4 WMMA, nsys span 8.3–8.7 us); the legacy frontend value
+is the pre-tiny-M kernel. M4 was not re-captured. The CUDA-core router (`DG_FE_TINYM_MMA=cc`)
+has the shortest kernel-end stamps (3.84 us) but the longest customer-method span
+(9.0–9.7 us in three captures as the default) and stays opt-in -- see the knob table.
+E2E ranges span captures with different host launch skew.
 
 M2/M4 values are medians over five independent captures (branch tip with
 `DG_FP4_STREAMK` default on); M8/M16 are the range over the r4/r5 captures
