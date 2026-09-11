@@ -21,7 +21,7 @@
 constexpr size_t kFrontendStampsOffsetBase = 256;
 constexpr size_t kFrontendMaxCTAs = 256;
 constexpr size_t kFrontendStampsBytes = kFrontendMaxCTAs * 8 * sizeof(unsigned long long);
-// `grid` (DG_FE_TINYM_GRID): 96 = legacy tiny-M split (24 expert groups x 4
+// `grid` (DG_FE_TINYM_GRID, default 96): 96 = legacy tiny-M split (24 expert groups x 4
 // K-parts + m quant/top-k CTAs); 0 = auto: full-K scheme sized to the SM count
 // (H20: 77 router CTAs x 5 experts + 1 merger CTA = 78); N > 0 = full-K scheme
 // with N CTAs in total. Full-K outputs are deterministic but not bit-identical to

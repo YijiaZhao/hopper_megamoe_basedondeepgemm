@@ -24,7 +24,7 @@ def main():
     ap.add_argument("--rows", type=int, default=1)
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--grid", default=os.environ.get("DG_FE_TINYM_GRID", "auto"))
+    ap.add_argument("--grid", default=os.environ.get("DG_FE_TINYM_GRID", "96"))
     ap.add_argument("--mma", default=os.environ.get("DG_FE_TINYM_MMA", "wmma"))
     args = ap.parse_args()
     torch.manual_seed(20260805)

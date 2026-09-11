@@ -109,7 +109,7 @@ def main():
     stamps = int(os.environ.get("DG_FE_STAMPS", "0"))
     l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
     pdl = int(os.environ.get("DG_FE_PDL", "0"))
-    grid_env = os.environ.get("DG_FE_TINYM_GRID", "auto")
+    grid_env = os.environ.get("DG_FE_TINYM_GRID", "96")
     mma_env = os.environ.get("DG_FE_TINYM_MMA", "wmma")
     kparts_env = os.environ.get("DG_FE_TINYM_KPARTS", "1")
     hot_hidden = int(os.environ.get("DG_BENCH_HOT_HIDDEN", "0"))

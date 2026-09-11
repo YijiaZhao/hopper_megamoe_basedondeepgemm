@@ -338,12 +338,13 @@ has an env override documented in `csrc/jit_kernels/impls/sm90_fp4_mega_moe_h20_
 | stream-K for M <= 4 (units spread over all 78 SMs) | `DG_FP4_STREAMK` (`_MAX_M`) | MXFP4 M2 49.7 -> 42.9 |
 | Wide L1 tasks (BN=512, 1 K-block/stage, 3-way tail split) for M >= 16 | `DG_FP4_L1_BN` (`DG_FP4_BN512_MIN_M`) | M16 Mega-only 5-capture medians MXFP4 84.1 -> 82.6, QoQ 80.4 -> 77.4 |
 | Tiny-M Fable frontend (3 smem stages -> 3 CTAs/SM single wave; 256-thread partial fetch; warp-0 32-bit-key top-8) | `DG_FE_TINYM` | FE 13.8–14.9 -> 8.3–8.7 us (nsys span), bit-identical outputs |
+| FE SM-count grid: full-K router CTAs (H20 77 x 5 experts, TMA row pieces + WMMA or CUDA-core FMA), 32-bit-key slots as flags, one streaming-merge CTA, quant on router CTAs, K-parts 1/2/4 | `DG_FE_TINYM_GRID=96|auto|N`, `DG_FE_TINYM_MMA=wmma|fma`, `DG_FE_TINYM_KPARTS`, `DG_FE_FULLK_1PERSM` | kept OFF (default 96): kernel end 96x4 6.9 us vs 78 full-K wmma 7.4–7.9 / fma 7.4–7.7, 78x2 wmma 8.2 / fma 9.7, 97x4 wmma 9.2; nsys FE span 8.66 (96) vs 8.77–9.15 (auto) us; top-8 sets identical on 27k rows |
 
 Measured and kept off (documented negative results): 4 K-blocks per stage,
 per-M knob sweep, tiny-M CUDA-core GEMV path (`DG_FP4_TINYM`), whole-expert L2
 weight prefetch (`DG_FP4_L2_PREFETCH_ALL`), two-layer L1/L2 fusion
 (`DG_FP4_FUSE_L1L2`), dynamic combine claim (`DG_FP4_COMBINE_DYNAMIC`), L2
-tail split-K, all-task L1/L2 split-K at M16, wide L2 tasks (BN=512), third math warpgroup (`DG_FP4_MATH_WGS=3`), deterministic push slots (`DG_FP4_PUSH_DET_SLOTS`), FE router-weight L2 persistence and FE->Mega PDL, raw-u8 deferred affine dequant.
+tail split-K, all-task L1/L2 split-K at M16, wide L2 tasks (BN=512), third math warpgroup (`DG_FP4_MATH_WGS=3`), deterministic push slots (`DG_FP4_PUSH_DET_SLOTS`), FE router-weight L2 persistence and FE->Mega PDL, raw-u8 deferred affine dequant, FE SM-count router grid (`DG_FE_TINYM_GRID=auto`: 78 full-K CTAs, also 78x2 / 97x4 K-parts, WMMA and CUDA-core FMA, 2 CTAs/SM grids 117/156 -- every variant is bounded by the ~2.5 us it takes one SM to get ~36 KB of router weights in flight after the L2 flush, so the balanced 31 KB/SM grid loses to the legacy 26 KB/SM + 19 doubled SMs; stamp tables in `scripts/run_fe78*.sh` outputs).
 
 ## Relevant source files
 

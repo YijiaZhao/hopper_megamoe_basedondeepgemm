@@ -34,7 +34,7 @@ def main():
     ap.add_argument("--quant", choices=("mxfp4", "qoq"), required=True)
     ap.add_argument("--rows", type=int, default=1, help="rows per rank seen by the kernel (1 or 2)")
     ap.add_argument("--tinym", type=int, default=int(os.environ.get("DG_FE_TINYM", "1")))
-    ap.add_argument("--grid", default=os.environ.get("DG_FE_TINYM_GRID", "auto"),
+    ap.add_argument("--grid", default=os.environ.get("DG_FE_TINYM_GRID", "96"),
                     help="DG_FE_TINYM_GRID: 96 = legacy split, auto = full-K SM-count grid, N = full-K N CTAs")
     ap.add_argument("--mma", default=os.environ.get("DG_FE_TINYM_MMA", "wmma"), help="DG_FE_TINYM_MMA: wmma | fma")
     ap.add_argument("--warmup", type=int, default=5, help="eager launches before the profiled one")

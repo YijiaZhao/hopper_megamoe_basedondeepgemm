@@ -595,10 +595,11 @@ def fable_frontend_workspace_bytes(e: int) -> int:
 
 
 def _fe_grid_from_env(grid):
-    """DG_FE_TINYM_GRID: 'auto' (default) -> 0 = full-K scheme sized to the SM count;
-    '96' -> legacy 24x4 K-split tiny-M grid; N -> full-K scheme with N CTAs in total."""
+    """DG_FE_TINYM_GRID: '96' (default) -> legacy 24x4 K-split tiny-M grid; 'auto' -> 0 =
+    full-K scheme sized to the SM count; N -> full-K scheme with N CTAs in total.
+    Default stays 96: on H20 every SM-count scheme measured slower (README knob table)."""
     if grid is None:
-        grid = os.environ.get("DG_FE_TINYM_GRID", "auto")
+        grid = os.environ.get("DG_FE_TINYM_GRID", "96")
     if isinstance(grid, str):
         grid = 0 if grid.strip().lower() in ("auto", "", "0") else int(grid)
     return int(grid)
@@ -641,7 +642,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     attribute), 2 = PTX ``L2::evict_last`` hint on the router weight loads.
     ``pdl`` (env ``DG_FE_PDL``, default 0): programmatic-dependent-launch trigger for
     the fused Mega that follows: 1 = at CTA start, 2 = after the CTA's last store.
-    ``grid`` (env ``DG_FE_TINYM_GRID``, default ``auto``): tiny-M CTA scheme. ``auto`` =
+    ``grid`` (env ``DG_FE_TINYM_GRID``, default ``96``): tiny-M CTA scheme. ``auto`` =
     full-K router CTAs sized to the SM count (H20: 77 x 5 experts + 1 merger CTA = 78,
     final logits per CTA, streaming top-8 merge, quant on the router CTAs' idle time);
     ``96`` = legacy 24 expert groups x 4 K-parts + m quant/top-k CTAs; ``N`` = full-K
