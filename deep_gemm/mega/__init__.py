@@ -746,7 +746,8 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     ``swapab`` (legacy 96 x 4 grid AND full-K) = experts on the MMA M dimension, tokens on N
     (mma.sync m16n8k16 bf16 -> fp32, rows pad to 8), weight A fragments loaded straight from
     global into registers, activation rows staged once in smem.
-    ``wlayout`` (env ``DG_FE_ROUTER_WLAYOUT``, default ``fragment``; swapab only): ``fragment`` =
+    ``wlayout`` (env ``DG_FE_ROUTER_WLAYOUT``, default ``fragment``; swapab on the legacy 96 tiny-M grid
+    only -- every other launch reads row-major weights and ignores this knob): ``fragment`` =
     the router weights are permuted ONCE on the host (``fable_router_weight_fragment_layout``,
     cached per weight tensor) into m16n8k16 A-fragment order so every warp load instruction is
     one contiguous 512 B run (4 full lines instead of 8 half lines); identical numerics; ``pre`` =
@@ -766,11 +767,19 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
         pdl = int(os.environ.get("DG_FE_PDL", "0"))
     grid, mma, k_parts, l2_persist = _fe_resolve_knobs(m, grid, mma, k_parts, l2_persist)
     wlayout = _fe_wlayout_from_env(wlayout)
-    if mma == 2 and wlayout == 1:
-        router_weight = _fe_router_weight_for_layout(router_weight, 1)
-        mma = 3          # swapab + fragment weight layout (permuted here, cached)
-    elif mma == 2 and wlayout == 2:
-        mma = 3          # 'pre': router_weight is ALREADY in fragment layout (transformed at weight-prep time)
+    if mma == 2 and wlayout in (1, 2):
+        # The fragment layout is read ONLY by the swapab kernel of the legacy 96 tiny-M grid (m <= 16,
+        # top-8, h == 3072, 16-expert groups). Every other launch (tinym=0, m > 16, the full-K grid whose
+        # expert groups are not 16 wide, other shapes) reads row-major weights, so the permutation must
+        # not be applied there: it silently produced wrong top-8 sets (test_frontend_tinym vs tinym=0).
+        fragment_ok = bool(tinym) and m <= 16 and grid == 96 and hidden.size(1) == 3072 and sym_buffer.topk_idx.size(1) == 8
+        if fragment_ok:
+            if wlayout == 1:
+                router_weight = _fe_router_weight_for_layout(router_weight, 1)
+            mma = 3      # swapab + fragment weight layout (permuted here and cached, or 'pre' = permuted by the caller)
+        elif wlayout == 2:
+            raise ValueError("wlayout='pre' (fragment-layout router weight) needs the legacy 96 tiny-M grid: "
+                             f"tinym={tinym} m={m} grid={grid} h={hidden.size(1)} topk={sym_buffer.topk_idx.size(1)}")
     workspace = fable_frontend_workspace(sym_buffer, e, hidden.device)
     cache = sym_buffer._fable_frontend_cache
     views = cache.get(m)
