@@ -503,6 +503,27 @@ __device__ __forceinline__ void tma_bulk_g2s_hint(void* dst, const void* src, ui
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
                  :: "r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)), "l"(policy) : "memory");
 }
+// One redux.sync instruction instead of a 5-level shuffle tree (~5x lower latency
+// per round; the merger's 8 rounds are on the exposed tail of the kernel).
+__device__ __forceinline__ uint32_t warp_max_u32_redux(uint32_t v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __reduce_max_sync(0xffffffffu, v);
+#else
+    return warp_max_u32(v);
+#endif
+}
+template <int N>
+__device__ __forceinline__ uint32_t tree_max_u32(const uint32_t (&v)[N]) {
+    uint32_t t[N];
+    #pragma unroll
+    for (int i = 0; i < N; ++i) t[i] = v[i];
+    #pragma unroll
+    for (int w = N; w > 1; w = (w + 1) / 2) {
+        #pragma unroll
+        for (int i = 0; i < w / 2; ++i) t[i] = max(t[i], t[w - 1 - i]);
+    }
+    return t[0];
+}
 __device__ __forceinline__ uint32_t ld_cv_u32(const uint32_t* p) {
     uint32_t v;
     asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
@@ -597,10 +618,11 @@ __device__ __forceinline__ void router_role_fullk(
 // Merger CTA: one warp per token (m <= 16 -> <= 2 tokens per warp). Lane l owns
 // slots l, l+32, ... of cand[token] (coalesced 128 B polls). Running top-8 lives in
 // lanes 0..7 (`run`); every poll round that brings new keys is merged in.
-template <int kTopK>
+template <int kTopK, int kSlotsPerLane>
 __device__ __forceinline__ void merger_role(
         uint32_t* __restrict__ cand, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
         unsigned long long* stamps, int m, int num_router_ctas) {
+    constexpr int kMaxSlotsPerLane = kSlotsPerLane;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nslots = num_router_ctas * kCandSlots;
     for (int t = warp; t < m; t += kThreads / 32) {
@@ -631,10 +653,8 @@ __device__ __forceinline__ void merger_role(
                 uint32_t out = 0u;
                 #pragma unroll
                 for (int k = 0; k < kTopK; ++k) {
-                    uint32_t best = run;
-                    #pragma unroll
-                    for (int i = 0; i < kMaxSlotsPerLane; ++i) best = max(best, key[i]);
-                    best = warp_max_u32(best);
+                    uint32_t best = max(run, tree_max_u32(key));
+                    best = warp_max_u32_redux(best);
                     if (lane == k) out = best;
                     if (run == best) run = 0u;
                     #pragma unroll
@@ -683,7 +703,10 @@ __global__ void __launch_bounds__(kThreads, kFullK ? 2 : (kTiny ? 3 : 1)) router
         if (pdl_mode == 1) pdl_trigger();
         uint32_t* cand = reinterpret_cast<uint32_t*>(logits);
         if (static_cast<int>(blockIdx.x) >= num_router_ctas) {
-            merger_role<kMaxTopK>(cand, topk_idx, topk_weights, stamps, m, num_router_ctas);
+            if (num_router_ctas * kCandSlots <= 20 * 32)      // H20: 77 x 8 = 616 slots -> 20 per lane
+                merger_role<kMaxTopK, 20>(cand, topk_idx, topk_weights, stamps, m, num_router_ctas);
+            else
+                merger_role<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, stamps, m, num_router_ctas);
         } else {
             router_role_fullk<kMode>(hidden, router_weight, cand, x_bytes, x_sf, stamps, m, h, e, epc, num_router_ctas, w_hint);
             stamp(stamps, 3);
