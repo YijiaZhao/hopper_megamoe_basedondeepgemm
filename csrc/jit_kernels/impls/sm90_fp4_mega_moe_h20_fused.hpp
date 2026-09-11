@@ -258,16 +258,36 @@ static void sm90_fp4_h20_fused_mega_moe(
     const int num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
     // Wide (512-row, two packed tiles) L1 / L2 tasks (kernel `kWideTiles`, template
     // kL1TaskTiles / kL2TaskTiles): DG_FP4_L1_BN / DG_FP4_L2_BN in {256, 512} (default
-    // 256), applied only to launches whose global token upper bound (tokens per rank
-    // x ranks) lies in [DG_FP4_BN512_MIN_M, DG_FP4_BN512_MAX_M] (default 16..16: the
-    // customer's M=16 = 2 rows per rank; M=2/4/8 (1 row per rank -> bound 8) and
-    // M=128/512 are untouched) and to the BM8 MXFP4/QoQ RF swapAB dense tier (checked
-    // below). At M=16 the BN256 L1 phase is ~160 tasks on 78 SMs (2.05 waves + tail
-    // split-K) and L2 ~180 (2.3 waves); a wide task does twice the work per stage
-    // chain (4 x 64-row halves per WG, one K128 block per stage) so the L1 phase
-    // becomes ~80 tasks == one wave. See the kernel body for the design and the
-    // report for the H20 A/B.
-    const int wide_bn_l1_env = get_env<int>("DG_FP4_L1_BN", 256);
+    // L1 512, L2 256 since the 2026-09-10 A/B below), applied only to launches whose
+    // global token upper bound (tokens per rank x ranks) lies in [DG_FP4_BN512_MIN_M,
+    // DG_FP4_BN512_MAX_M] (default 16..16: the customer's M=16 = 2 rows per rank;
+    // M=2/4/8 (1 row per rank -> bound 8) and M=128/512 are untouched) and to the BM8
+    // MXFP4/QoQ RF swapAB dense tier (checked below). At M=16 the BN256 L1 phase is
+    // 160 tasks on 78 SMs (2.05 waves + tail split-K) and L2 192 (2.5 waves); a wide
+    // task covers two adjacent packed tiles (4 x 64-row halves per WG, one K128 block
+    // per stage, RF-loop unit = (K-block, half pair): same registers, 0 spill, same
+    // per-K128 promote) so the L1 phase is 80 tasks == one wave + a 2-task tail (80 >
+    // 78 SMs) that is split THREE ways (kernel `kNumL1KSplits` == 3 for wide L1).
+    // H20 .7 2026-09-10 (tip 8a51244, 8 ranks, 1830 MHz), rank-0 phase-stamp probe, us:
+    // the wide L1 task costs 40.9 vs 21.1 (MXFP4; QoQ 38.1 vs 20.6) == 2.0x, i.e. the
+    // per-stage cost (1351 ns head-to-head, decode 791/732 + issue 444/350 ns) has NO
+    // fixed part to amortise, so the L1 phase is 48.6 vs 46.6 (one 40.9 us wave + tail
+    // vs 2.05 waves); the wide L2 task is 14.9 vs 8.2 us and 96 tasks make 2 waves, so
+    // L2 wide loses (kernel end 76.5 vs 74.0 MXFP4, 71.9 vs 68.6 QoQ). Customer method
+    // (official capture, Mega-only fused M16, GPU0 last-3 median, 5 independent passes
+    // interleaved off/on/L1-only, median across passes [skew-free min-over-device
+    // median]), MXFP4 / QoQ:
+    //   L1 256 L2 256 (off)   84.1 / 80.4   [78.0 / 74.7]
+    //   L1 512 L2 512 (on)    83.1 / 80.1   [80.1 / 78.6]
+    //   L1 512 L2 256         82.6 / 77.4   [76.5 / 73.7]   <- default
+    // L1-only wins on both quants with both methods (-1.5 / -3.0 customer, -1.5 / -1.0
+    // skew-free): the L1 phase is neutral, the gain is the shorter L1->L2 dependency
+    // chain (one wide L1 task publishes two L2 K128 blocks at once) and 2 fewer
+    // straggler tasks. Numerics identical (T=2 -> M16 mxfp4 0.99999 / qoq 0.99993,
+    // gate T=8/8/16, mxfp4 128/512, 200-iter graph-replay stress clean).
+    // DG_FP4_L1_BN=256 restores the previous schedule; DG_FP4_L2_BN=512 is the
+    // measured-worse L2 variant.
+    const int wide_bn_l1_env = get_env<int>("DG_FP4_L1_BN", 512);
     const int wide_bn_l2_env = get_env<int>("DG_FP4_L2_BN", 256);
     DG_HOST_ASSERT((wide_bn_l1_env == 256 || wide_bn_l1_env == 512) &&
                    (wide_bn_l2_env == 256 || wide_bn_l2_env == 512));
