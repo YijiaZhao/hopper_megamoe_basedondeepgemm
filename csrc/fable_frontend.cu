@@ -64,7 +64,8 @@ __device__ __forceinline__ unsigned long long globaltimer_ns() {
 // quant  CTA: 0 start / 1 quant done / 2 ticket seen / 3 top-k done
 //             (tiny top-k: 4 partial logits loaded / 5 selection rounds done)
 // full-K router CTA: 0 start / 1 chunk0 landed / 2 mma done / 3 keys written /
-//                    4 quant done (CTAs t < m only) / 5 all chunks issued
+//                    4 quant done (CTAs t < m only) / 5 all chunks issued /
+//                    6 %smid / 7 prologue done (before issue)
 // full-K merger CTA (token 0's warp): 0 start / 1 first CTA seen / 2 last CTA
 //                    seen / 3 merge done / 4 top-k written
 constexpr int kStampSlots = 8;
@@ -563,6 +564,7 @@ __device__ __forceinline__ void router_role_fullk(
     if (threadIdx.x < num_chunks) mbar_init(&chunk_bar[threadIdx.x], 1);
     mbar_fence_init();
     __syncthreads();
+    stamp(stamps, 7);        // prologue done (mbarrier init + fence + sync), about to issue
     // Lane c of warp 0 issues chunk c: (m + n_exp) bulk copies of 512 B each, all
     // chunks in flight at once (h <= 3072 -> num_chunks <= kFullKStages, no reuse).
     if (threadIdx.x < num_chunks) {

@@ -65,7 +65,8 @@ def attribution(stamps_list, num_router_ctas, m, fullk=False):
     if fullk:
         print(f"  stamps over {len(stamps_list)} launches (us rel. earliest CTA start of each launch; "
               f"full-K router CTAs={num_router_ctas}, merger CTA=1, quant on router CTAs 0..{m - 1}):")
-        print(line("router start", r[:, 0])); print(line("router chunks issued", r[:, 5]))
+        print(line("router start", r[:, 0])); print(line("router prologue done", r[:, 7]))
+        print(line("router chunks issued", r[:, 5]))
         print(line("router chunk0 landed", r[:, 1]))
         rq = r[:, 4][r[:, 4] > 0]
         if rq.numel():
