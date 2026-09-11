@@ -172,7 +172,11 @@ case "$MODE" in
       bash "$0" corrq 64 128
       DG_FE_TINYM_MMA=cc COSMIN=0.999 bash "$0" corrref 32
       COSMIN=0.999 bash "$0" corrref 8 16
+      for kv in DG_FP4_QOQ_INLINE_S2=0 DG_FP4_SPLITK_L1=0 DG_FP4_LEAN_ROUTING=0 DG_FP4_FINE_COMBINE=0 DG_FP4_COMBINE_DYNAMIC=0; do bash "$0" qknob "$kv" 32; done
       echo "LAND_DIAG_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
+  qknob)   # qoq --frontend fe under one env override: qknob NAME=VAL [T=32] (tier isolation of the 32-row qoq failure)
+    KV=$1; T=${2:-32}; export "$KV"
+    run_corr "qknob_${KV//=/_}_t$T" --apis qoq_mega_moe_fused --tokens "$T" --frontend fe --cosine-min 0.999; echo "QKNOB_RC=$? $KV" ;;
   land_ab)    # round-3 cc (3.84 us stamps) vs swapab+fragment under the customer method, M=8 = 1 row/rank, 2 x 2 captures
     C="$RES/land_ab.log"; : > "$C"
     { echo "start $(git rev-parse --short HEAD) $(date -u +%FT%TZ)"
