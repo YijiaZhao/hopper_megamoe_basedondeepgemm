@@ -374,8 +374,8 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < kH; ++k) ref += static_cast<double>(bf16_to_f(hx[static_cast<size_t>(r) * kH + k])) * bf16_to_f(hw[static_cast<size_t>(ex) * kH + k]);
                 const float got = hlog[static_cast<size_t>(r) * e + ex];
                 const float ref_bf = bf16_to_f(f_to_bf16(static_cast<float>(ref)));
-                max_err = std::max(max_err, std::fabs(got - ref));
-                max_err_bf = std::max(max_err_bf, std::fabs(got - ref_bf));
+                max_err = std::max(max_err, std::fabs(static_cast<double>(got) - ref));
+                max_err_bf = std::max(max_err_bf, static_cast<double>(std::fabs(got - ref_bf)));
                 flips += got != ref_bf;
             }
         printf("check vs fp64 ref: max|logit - ref| %.3e (before bf16), max|logit - bf16(ref)| %.3e, bf16 flips %d / %d, bad flags %d\n",
