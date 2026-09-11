@@ -614,7 +614,7 @@ def _fe_mma_from_env(mma):
     if mma is None:
         mma = os.environ.get("DG_FE_TINYM_MMA", "wmma")
     if isinstance(mma, str):
-        mma = {"wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5}[mma.strip().lower()]
+        mma = {"wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "cc44": 6, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5, "6": 6}[mma.strip().lower()]
     return int(mma)
 
 
