@@ -637,22 +637,14 @@ __device__ __forceinline__ void merger_role(
         #pragma unroll
         for (int j = 0; j < kTopK; ++j) loc[j] = 0u;
         bool first = true;
-        // Software-pipelined polling: the loads of round r+1 are issued before round r's
-        // keys are folded/merged, so the merge work hides under the L2 round trip and a
-        // key written during the merge is picked up by the already in-flight round.
-        uint32_t v[kSlotsPerLane];
-        #pragma unroll
-        for (int i = 0; i < kSlotsPerLane; ++i)
-            v[i] = (pending & (1u << i)) ? ld_cv_u32(base + lane + 32 * i) : 0u;
         while (true) {
-            uint32_t pend_next = pending;
+            // issue every pending poll first (one L2 round trip per poll round), then fold in.
+            // (Software-pipelining the next round's loads over the fold/merge was measured
+            // slower: regs 95 -> 128, first-CTA-seen +1 us, kernel end 7.94 -> 8.70 us.)
+            uint32_t v[kSlotsPerLane];
             #pragma unroll
             for (int i = 0; i < kSlotsPerLane; ++i)
-                if (v[i] != 0u) pend_next &= ~(1u << i);
-            uint32_t vn[kSlotsPerLane];
-            #pragma unroll
-            for (int i = 0; i < kSlotsPerLane; ++i)
-                vn[i] = (pend_next & (1u << i)) ? ld_cv_u32(base + lane + 32 * i) : 0u;
+                v[i] = (pending & (1u << i)) ? ld_cv_u32(base + lane + 32 * i) : 0u;
             bool got = false;
             #pragma unroll
             for (int i = 0; i < kSlotsPerLane; ++i) {
@@ -690,8 +682,6 @@ __device__ __forceinline__ void merger_role(
                 for (int j = 0; j < kTopK; ++j) loc[j] = 0u;   // losers can never re-enter
             }
             if (__all_sync(0xffffffffu, pending == 0u)) break;
-            #pragma unroll
-            for (int i = 0; i < kSlotsPerLane; ++i) v[i] = vn[i];
         }
         if (t == 0) stamp(stamps, 3);
         // softmax over the 8 selected bf16 logits, legacy order (k = 0..7 sequential sum)
