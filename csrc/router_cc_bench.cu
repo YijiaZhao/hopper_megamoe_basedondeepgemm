@@ -133,7 +133,7 @@ template <int kWarps, int kEPW, int kKS, int kLoad, int kXMode, int kM>
 __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
         const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
         float* __restrict__ logits, int* __restrict__ flags, unsigned long long* stamps, int e, int epoch) {
-    static_assert(kKS == 1 || kKS == 2, "K split 1 or 2");
+    static_assert(kChunksPerRow % kKS == 0 && kWarps % kKS == 0, "K split must divide 12 chunks and the warp count");
     constexpr int kChunks = kChunksPerRow / kKS;           // chunks per lane for this warp's K-part
     constexpr int kKPart = kH / kKS;                       // elements
     constexpr int kSlots = kWarps / kKS;                   // expert slots per CTA
@@ -154,6 +154,16 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     #pragma unroll
     for (int j = 0; j < kEPW; ++j) { ex[j] = (slot * kEPW + j) * gridDim.x + blockIdx.x; any |= ex[j] < e; }
 
+    // probe: an idle last warp (no expert) issues ONE load of the CTA's first weight chunk (same
+    // sector warp 0 loads) and stamps its landing -> true "first bytes landed" (slot 1), not
+    // ordered behind the issue loop. When every warp has an expert, slot 1 falls back to warp 0's
+    // first chunk consumed after the issue loop (an upper bound).
+    const bool probe = stamps != nullptr && warp == kWarps - 1 && !any && kLoad != 3;
+    if (probe && lane == 0) {
+        const uint4 pv = ld_nc_na_16(w + static_cast<int64_t>(blockIdx.x) * kH);
+        asm volatile("" :: "r"(pv.x));
+        stamps[blockIdx.x * kStampSlots + 1] = globaltimer_ns();
+    }
     if constexpr (kLoad == 3 || kXMode == 1) {
         if (threadIdx.x < kWarps) mbar_init(&w_bar[threadIdx.x], 1);
         if (threadIdx.x == 0) mbar_init(&x_bar, 1);
@@ -219,10 +229,11 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     if constexpr (kLoad == 3) {
         if (any) mbar_wait_parity(&w_bar[warp], 0u);
     }
-    if (stamps != nullptr && threadIdx.x == 0) {   // warp 0 lane 0: first weight chunk landed
+    if (stamps != nullptr && threadIdx.x == 0) {   // warp 0 lane 0: first weight chunk consumed
         if constexpr (kLoad == 3) asm volatile("" ::: "memory");
         else asm volatile("" :: "r"(wv[0][0].x));
-        stamps[blockIdx.x * kStampSlots + 1] = globaltimer_ns();
+        stamps[blockIdx.x * kStampSlots + 7] = globaltimer_ns();
+        if (kLoad == 3 || (kWarps - 1) * kEPW * static_cast<int>(gridDim.x) < e) stamps[blockIdx.x * kStampSlots + 1] = stamps[blockIdx.x * kStampSlots + 7];
     }
     // ---- FMA + butterfly per expert
     #pragma unroll
@@ -290,6 +301,12 @@ std::vector<Variant> variants() {
         {"h",    78, launch_v<10, 1, 2, 0, 0, kM>, "78 CTA x 10 warps: 5 experts x 2 half-K warps (6 chunks/lane)"},
         {"h2",   48, launch_v<16, 1, 2, 0, 0, kM>, "48 CTA x 16 warps: 8 experts x 2 half-K warps"},
         {"c78",  78, launch_v<4, 2, 1, 0, 0, kM>,  "78 CTA x 4 warps (3 active), 2 experts/warp"},
+        {"h3",   78, launch_v<15, 1, 3, 0, 0, kM>, "78 CTA x 15 warps: 5 experts x 3 third-K warps (4 chunks/lane)"},
+        {"h4",   78, launch_v<20, 1, 4, 0, 0, kM>, "78 CTA x 20 warps: 5 experts x 4 quarter-K warps (3 chunks/lane)"},
+        {"h6",   78, launch_v<30, 1, 6, 0, 0, kM>, "78 CTA x 30 warps: 5 experts x 6 warps (2 chunks/lane)"},
+        {"h12", 192, launch_v<32, 1, 12, 0, 0, kM>, "78 CTA x 32 warps: 2 experts x 12 warps (1 chunk/lane) -- needs grid 192 (2 experts/CTA)"},
+        {"h4b",  78, launch_v<20, 1, 4, 3, 0, kM>, "h4 with weights via cp.async.bulk 1.5 KB/warp into smem"},
+        {"h4x",  78, launch_v<20, 1, 4, 0, 1, kM>, "h4 with activation rows via cp.async.bulk into smem"},
     };
 }
 
@@ -384,9 +401,10 @@ int main(int argc, char** argv) {
     // stamps
     if (nstamps > 0) {
         std::vector<unsigned long long> hs(static_cast<size_t>(grid) * kStampSlots);
-        const char* names[] = {"start", "w_first_landed(w0)", "logits_written", "flag_written", "x_landed(w0)", "loads_issued"};
-        const int order[] = {0, 5, 4, 1, 2, 3};
-        std::vector<std::vector<double>> mins(6), meds(6), maxs(6);
+        const char* names[] = {"start", "w_first_landed(probe)", "logits_written", "flag_written", "x_landed(w0)", "loads_issued", "smid", "w_chunk0_consumed(w0)"};
+        const int order[] = {0, 5, 1, 4, 7, 2, 3};
+        constexpr int kShown = 7;
+        std::vector<std::vector<double>> mins(kShown), meds(kShown), maxs(kShown);
         for (int s = 0; s < nstamps; ++s) {
             if (flush) CK(cudaMemsetAsync(scratch, 0, 256u << 20));
             CK(cudaMemset(dst, 0, hs.size() * 8));
@@ -397,7 +415,7 @@ int main(int argc, char** argv) {
             CK(cudaMemcpy(hs.data(), dst, hs.size() * 8, cudaMemcpyDeviceToHost));
             unsigned long long t0 = ~0ull;
             for (int b = 0; b < grid; ++b) t0 = std::min(t0, hs[b * kStampSlots + 0]);
-            for (int oi = 0; oi < 6; ++oi) {
+            for (int oi = 0; oi < kShown; ++oi) {
                 const int slot = order[oi];
                 std::vector<double> v;
                 for (int b = 0; b < grid; ++b) v.push_back(static_cast<double>(hs[b * kStampSlots + slot] - t0) * 1e-3);
@@ -407,8 +425,8 @@ int main(int argc, char** argv) {
         }
         auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
         printf("stamps (us from first CTA start; median over %d launches of the per-launch min / median / max across CTAs):\n", nstamps);
-        for (int oi = 0; oi < 6; ++oi)
-            printf("  %-20s min %6.2f  med %6.2f  max %6.2f\n", names[order[oi]], med(mins[oi]), med(meds[oi]), med(maxs[oi]));
+        for (int oi = 0; oi < kShown; ++oi)
+            printf("  %-24s min %6.2f  med %6.2f  max %6.2f\n", names[order[oi]], med(mins[oi]), med(meds[oi]), med(maxs[oi]));
     }
     return 0;
 }
