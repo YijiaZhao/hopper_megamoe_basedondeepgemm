@@ -1,4 +1,5 @@
 import os
+import weakref
 import torch
 import types
 import warnings
@@ -639,18 +640,21 @@ def fable_router_weight_fragment_layout(router_weight: torch.Tensor) -> torch.Te
     return v.permute(0, 3, 1, 2, 4, 5).contiguous().view(e, k)          # [G][b][half][g][t][8]
 
 
-_fe_fragment_weight_cache = {}
+_fe_fragment_weight_cache = weakref.WeakKeyDictionary()
 
 
 def _fe_router_weight_for_layout(router_weight, wlayout):
-    """Cached one-time fragment permutation keyed by the source tensor's storage (weights are static)."""
+    """Cached one-time fragment permutation, keyed by the source tensor OBJECT (weak ref, so a
+    freed weight tensor whose address is reused by a new one -- e.g. per-seed weights in the
+    tests -- cannot hit a stale entry) plus its in-place version counter. Production callers
+    should permute once at weight-transform time (fable_router_weight_fragment_layout) instead."""
     if wlayout == 0:
         return router_weight
-    key = (router_weight.data_ptr(), tuple(router_weight.shape), router_weight.device)
-    w = _fe_fragment_weight_cache.get(key)
-    if w is None:
-        w = _fe_fragment_weight_cache[key] = fable_router_weight_fragment_layout(router_weight)
-    return w
+    hit = _fe_fragment_weight_cache.get(router_weight)
+    if hit is None or hit[0] != router_weight._version:
+        hit = (router_weight._version, fable_router_weight_fragment_layout(router_weight))
+        _fe_fragment_weight_cache[router_weight] = hit
+    return hit[1]
 
 
 def _fe_kparts_from_env(k_parts):
