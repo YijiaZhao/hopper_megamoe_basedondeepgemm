@@ -28,11 +28,20 @@ RES=${RES:-/raid/kimi/results}
 MARKER=${MARKER:-$RES/CAPTURE_FEFUSE_RUNNING}
 MODE=${1:-}; shift || true
 
+# A foreign marker older than STALE_MARKER_MIN minutes (default 30) with no GPU compute
+# process is treated as left behind (its owner's job is gone); it is never deleted.
+STALE_MARKER_MIN=${STALE_MARKER_MIN:-30}
 foreign_marker() {
-  local f
+  local f age
   for f in "$(dirname "$MARKER")"/*_RUNNING; do
     [ -e "$f" ] || continue
-    [ "$f" = "$MARKER" ] || return 0
+    [ "$f" = "$MARKER" ] && continue
+    age=$(( ($(date +%s) - $(stat -c %Y "$f")) / 60 ))
+    if [ "$age" -ge "$STALE_MARKER_MIN" ]; then
+      echo "$(date -u +%FT%TZ) ignoring stale foreign marker $f (${age} min, no GPU process)" >&2
+      continue
+    fi
+    return 0
   done
   return 1
 }
