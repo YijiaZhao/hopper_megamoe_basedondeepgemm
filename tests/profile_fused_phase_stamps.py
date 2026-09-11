@@ -27,9 +27,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import profile_four_api_h20 as P  # noqa: E402
 
 INT64_MAX = (1 << 63) - 1
-MIN_SLOTS = (0, 3)
+MIN_SLOTS = (0, 3, 33)
 REPORT = [
     (12, "init done"),
+    # fused Fable frontend (DG_FP4_FUSE_FE=1 + --fuse-fe): FE crew timeline
+    (33, "FE crew start (min)"),
+    (45, "FE router units done (max)"),
+    (46, "FE top-k written (max)"),
+    (32, "dispatch saw top-k (max)"),
     (8, "expert-offset atomics"),
     (9, "topk write"),
     (10, "grid sync"),
@@ -134,6 +139,8 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--no-graph", action="store_true")
+    ap.add_argument("--fuse-fe", action="store_true",
+                    help="run the Fable frontend inside the kernel (needs DG_FP4_FUSE_FE=1); routing from the FE")
     ap.add_argument("--no-stamps", action="store_true",
                     help="launch without phase_stamps (wall-time only) to measure probe overhead")
     args = ap.parse_args()
@@ -172,10 +179,15 @@ def main():
             buffer.topk_idx[:active_rows].copy_(idx)
             buffer.topk_weights[:active_rows].fill_(1.0 / P.TOPK)
         y = torch.empty(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
+        frontend = None
+        if args.fuse_fe:
+            torch.manual_seed(20260805)
+            router_weight = (torch.randn(P.EXPERTS, P.HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
+            frontend = (x, router_weight)
 
         def launch():
             kernel(y, *weights, buffer, cumulative_local_expert_recv_stats=None,
-                   activation_clamp=10.0, phase_stamps=None if args.no_stamps else stamps)
+                   activation_clamp=10.0, phase_stamps=None if args.no_stamps else stamps, frontend=frontend)
 
         launch()
         torch.cuda.synchronize()
@@ -239,6 +251,8 @@ def main():
             print(f"{'slot':>4} {'phase':<32} {'median':>9} {'min':>9} {'max':>9} {'delta':>9}")
             prev = 0.0
             for slot, name in REPORT:
+                if slot in (33, 45, 46, 32) and not args.fuse_fe:
+                    continue
                 print(f"{slot:>4} {name:<32} {med[slot]:>9.2f} {mn[slot]:>9.2f} {mx[slot]:>9.2f} {med[slot]-prev:>9.2f}")
                 prev = med[slot]
             for slot, name in ACCUM:

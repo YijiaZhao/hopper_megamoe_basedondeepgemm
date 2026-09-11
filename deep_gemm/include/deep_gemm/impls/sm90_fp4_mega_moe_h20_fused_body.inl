@@ -1143,7 +1143,7 @@
             if (lane_idx == 0)
                 DG_SPIN_WHILE(ptx::ld_acq(fe_topk_done) < num_tokens, 4102);
             __syncwarp();
-            if (thread_idx == 0) stamp_max(47);   // dispatch saw the fused top-k
+            if (thread_idx == 0) stamp_max(32);   // dispatch saw the fused top-k
         }
 
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
@@ -2112,6 +2112,7 @@
             float* fe_warp_max = reinterpret_cast<float*>(smem_fe_base + kFEMaxUnitsPerCTA * kFEUnitSmemBytes);
             uint32_t* fe_key_s = reinterpret_cast<uint32_t*>(fe_warp_max + 32);
             DG_TRAP_ONLY_DEVICE_ASSERT(num_tokens <= 16 && num_tokens <= kNumSMs);
+            if (fe_tid == 0) stamp_min(33);   // FE crew start (registers allocated)
             // Units of this CTA: u0 = kNumSMs - 1 - sm_idx, u0 + kNumSMs, ... < kFENumUnits
             // (the two-unit CTAs are the high ones, the top-k CTAs 0..m-1 carry one).
             const uint32_t fe_u0 = kNumSMs - 1 - sm_idx;
