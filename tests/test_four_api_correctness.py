@@ -251,6 +251,23 @@ def _run(api, args, rank, group):
         dist.all_reduce(routes, op=dist.ReduceOp.SUM, group=group)
         ref_all = routes.sum(dim=1).to(torch.bfloat16).float()
         ref = ref_all[rank * args.tokens:(rank + 1) * args.tokens]
+        if use_fe and is_fused:
+            # Per-(token, slot) kernel partials (the scattered L2 outputs the combine sums) vs the
+            # reference route: pinpoints a wrong slot (expert / destination rank) on this rank.
+            part = buffer.combine_partials[:, :args.tokens].float()          # [slot, token, hidden]
+            bad = []
+            for t in range(args.tokens):
+                for slot in range(args.topk):
+                    e_idx = int(topk_idx[t, slot])
+                    r = routes[rank * args.tokens + t, slot]
+                    k = part[slot, t]
+                    c = torch.nn.functional.cosine_similarity(k, r, dim=0).item() if r.abs().max() > 0 else 1.0
+                    if c < 0.999:
+                        bad.append(f"t{t}s{slot}:e{e_idx}@r{e_idx // local_experts}:cos={c:.4f}:w={float(topk_weights[t, slot]):.4f}:|ref|={r.abs().max().item():.3g}:|ker|={k.abs().max().item():.3g}")
+            reports = [None] * world
+            dist.all_gather_object(reports, f"rank{rank}: " + (" ".join(bad) if bad else "all slots cos>=0.999"), group=group)
+            if rank == 0:
+                print("SLOT_CHECK api=" + api + "\n  " + "\n  ".join(reports), flush=True)
         if not active:
             # Padded row: the kernel output is not part of the check (finite only);
             # contribute a neutral (identical) pair to the collective metrics.

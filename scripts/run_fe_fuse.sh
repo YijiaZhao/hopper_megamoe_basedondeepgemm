@@ -5,6 +5,7 @@
 # (captures 3600) and leaves the clocks alone (capture verifies 1830 MHz).
 #   corr    <log> <tokens...> -- [ENV=..] : plain mxfp4+qoq fused correctness per T (knob inert w/o frontend)
 #   corrfe  <log> <tokens...> -- [ENV=..] : --frontend fused: FE+Mega vs fused-FE bit-equality + reference (T <= 2)
+#   corrref <log> <tokens...> -- [ENV=..] : --frontend fe: standalone FE routing + Mega vs the exact reference (per-slot check)
 #   stress  <log> <M> -- [ENV=..]         : 200-iter graph replay of FE / Mega / FE+Mega / FEinMega, both quants
 #   bench   <log> <M...> -- [ENV=..]      : CUDA-event E2E, FE+Mega (knob 0) vs FEinMega (knob 1), n=100, both quants
 #   debug   <log> <M> -- [ENV=..]         : tests/debug_fe_fuse.py (determinism / equality diagnostics), both quants
@@ -79,6 +80,15 @@ case "$MODE" in
       grep -E "RESULT|FUSED_FE_EQUALITY|Error|error|Traceback|assert" "$LOG" | tail -4
     done
     echo "CORRFE_RC=$rc" >> "$LOG"; drop_marker ;;
+  corrref)
+    LOG=${POS[0]}; : > "$LOG"; rc=0
+    for T in "${POS[@]:1}"; do
+      echo "--- mxfp4+qoq fused --frontend fe T=$T (${ENVS[*]:-})" >> "$LOG"
+      wait_idle "corrref T=$T"
+      run_env timeout 900 "$TR" --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
+        --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --tokens "$T" --frontend fe >> "$LOG" 2>&1 || rc=1
+    done
+    echo "CORRREF_RC=$rc" >> "$LOG"; drop_marker ;;
   stress)
     LOG=${POS[0]}; M=${POS[1]}; : > "$LOG"; rc=0
     for Q in mxfp4 qoq; do

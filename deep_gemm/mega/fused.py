@@ -82,7 +82,7 @@ class FusedSymmBuffer:
         n,slice_fn=_C.get_symm_buffer_size_for_fused_mega_moe(group.size(),num_experts,max_tokens,topk,hidden,intermediate)
         from torch.distributed._symmetric_memory import empty as symm_empty, rendezvous
         self.buffer=symm_empty(n,dtype=torch.int8,device='cuda'); self.handle=rendezvous(self.buffer,group=group); self.buffer.zero_(); group.barrier(); torch.cuda.synchronize()
-        self.x,self.x_sf,self.topk_idx,self.topk_weights,self.l1_acts,self.l1_acts_sf,self.l2_acts,self.l2_acts_sf=slice_fn(self.buffer)
+        self.x,self.x_sf,self.topk_idx,self.topk_weights,self.l1_acts,self.l1_acts_sf,self.l2_acts,self.l2_acts_sf,self.combine_partials=slice_fn(self.buffer)
     def destroy(self): self.handle=None; self.buffer=None; self.group=None
 
 def get_fused_symm_buffer_for_mega_moe(group,num_experts,max_tokens,topk,hidden,intermediate):

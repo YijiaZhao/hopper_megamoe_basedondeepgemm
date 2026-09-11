@@ -28,7 +28,7 @@ static void validate_row_scale(const torch::Tensor& scale,
     DG_HOST_ASSERT(scale.is_contiguous() and scale.device() == device);
 }
 
-static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_fused_mega_moe(
         const int& num_ranks, const int& num_experts,
         const int& max_tokens, const int& topk,
@@ -68,7 +68,9 @@ get_symm_buffer_size_for_fused_mega_moe(
             t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a1.base)),{pool,hidden},torch::kFloat8_e4m3fn,b),
             t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a1sf.base)),{sf_pool,hidden/128},torch::kFloat32,b),
             t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a2.base)),{pool,intermediate},torch::kFloat8_e4m3fn,b),
-            t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a2sf.base)),{sf_pool,intermediate/64},torch::kFloat32,b));
+            t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a2sf.base)),{sf_pool,intermediate/64},torch::kFloat32,b),
+            // per-(topk slot, local token) scattered L2 partials (combine input; diagnostics)
+            t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(combine.base)),{topk,max_tokens,hidden},torch::kBFloat16,b));
     };
     return {reinterpret_cast<int64_t>(combine.get_end_ptr()),slice};
 }
@@ -92,7 +94,7 @@ static void run_fused(
     validate_stats(stats,local,y.device()); validate_row_scale(l1_scale,local,inter*2,y.device()); validate_row_scale(l2_scale,local,h,y.device());
     const auto [bytes,slice]=get_symm_buffer_size_for_fused_mega_moe(nr,experts,max_tokens,topk,h,inter);
     DG_HOST_ASSERT(buffer.nbytes() >= static_cast<size_t>(bytes));
-    const auto [x,xsf,ti,tw,a1,a1sf,a2,a2sf]=slice(buffer);
+    const auto [x,xsf,ti,tw,a1,a1sf,a2,a2sf,comb]=slice(buffer);
     sm90_fp4_h20_fused_mega_moe(y,a1,a1sf,a2,a2sf,w1,w2,stats,l1_scale,l2_scale,ptrs,rank,max_tokens,local,y.size(0),topk,h,inter,clamp.value_or(std::numeric_limits<float>::infinity()),fast_math,mode==1,phase_stamps,mode==2,fe_hidden,fe_router_weight,fe_workspace);
 }
 
