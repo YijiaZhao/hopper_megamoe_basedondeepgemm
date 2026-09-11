@@ -45,25 +45,30 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 // Default (python wrapper): mma = swapab, wlayout = fragment (the wrapper permutes a row-major
 // router weight once per tensor and caches it; pass wlayout = 'pre' with a pre-permuted weight
 // to make it a weight-transform-time cost). DG_FE_TINYM_MMA=wmma DG_FE_ROUTER_WLAYOUT=row = legacy.
-// 4 = cc | 5 = cc6 (full-K grid, m <= 2, h = 3072, k_parts 1): CUDA-core K-split router, CTA =
-// 5 experts x 4 (cc, 640 threads) | 6 (cc6, 960) warps, one warp = one expert x one K-part, every
-// weight chunk ld.global.nc straight into registers as the kernel's first instructions (the m
-// activation chunks issued back-to-back just before them). Hand-off (DG_FE_CC_MERGE, default
-// ticket): keys stored -> bar.sync -> thread 0 atom.acq_rel.gpu ticket; the LAST router CTA reads
-// the 616 key slots (5 x 16 B per lane), per-lane sorted top-8 + one 8-round redux merge
-// (DG_FE_CC_SELECT=insert; =redux, 8 rounds of per-lane max + redux, measured 0.5 us slower),
-// softmax, writes top-k. The (now merger-less) extra CTA only quantises the m rows. =poll keeps
-// the streaming merger (16 B ld.cv polls; relaxed.gpu / cg polls measured 0.5-0.8 us slower).
+// 4 = cc | 5 = cc6 | 6 = cc44 (full-K grid, m <= 2, h = 3072, k_parts 1): CUDA-core K-split router,
+// CTA = 5 experts x 4 (cc, 640 threads) | 5 x 6 (cc6, 960) | 4 x 4 (cc44, 512, for a 96 + 1 grid) warps,
+// one warp = one expert x one K-part, every weight chunk ld.global.nc straight into registers as
+// the kernel's first instructions (the m activation chunks issued back-to-back just before them).
+// Hand-off (DG_FE_CC_MERGE, default ticket): keys stored -> bar.sync -> thread 0 atomic ticket
+// (DG_FE_CC_TICKET=relaxed (default; the last CTA re-reads slots still 0) | acqrel); the LAST
+// router CTA reads the 616 key slots (5 x 16 B per lane, ld.global.cg), per-lane sorted top-8 +
+// one 8-round redux merge (DG_FE_CC_SELECT=insert; =redux: 8 rounds of per-lane tree max + redux,
+// 0.5 us slower), softmax, writes top-k. The extra CTA only quantises the m rows. =poll keeps the
+// streaming merger (16 B ld.cv polls; relaxed.gpu / cg polls measured 0.5-0.8 us slower).
 // H20-3e (.7) standalone kernel-end stamp median (us), rows 1|2 x mxfp4|qoq, L2 flushed:
-//   96 x 4 wmma 6.91 | 7.17 | 6.66 | 6.91  ->  cc ticket 4.61 | 4.61 | 4.86 | 4.86
-//   (cc poll 4.86-5.38, cc6 poll +0.25-1.0). Chain (rows 1): chunk0 landed 1.54, all logits 2.05-2.30,
-//   last CTA's keys + ticket 3.3-3.6, keys read +0.25, select +0.5, softmax + write +0.25.
+//   96 x 4 wmma 6.91 | 7.17 | 6.66 | 6.91  ->  cc 4.61 | 4.61-4.86 | 4.86 | 4.86
+//   + DG_FE_ROUTER_L2_PERSIST=1 (router weights in the persisting L2 set-aside): 4.35 | 4.35 | 4.61 | 4.61
+//   (cc poll 4.86-5.38, cc6 +0.25-1.0, cc44 with grid 97 = 2nd wave 7.2-7.7).
+// Chain (rows 1, 256 ns stamp ticks): chunk0 landed 1.54 (persist 1.0-1.3), all logits 2.05-2.30
+// (1.79-2.05), last CTA's keys + ticket 2.8-3.3, ticket won +0.25-0.5 (atomic round trip; the
+// release drain of acq_rel is not the cost), keys read +0.25, select +0.5-0.75 (a serial 20 x 8
+// insertion chain + 8 redux rounds in one warp; 48 slots/lane -> 1.3), softmax + write +0.25.
 // Microkernel (csrc/router_cc_bench.cu): all 384 logits at 2.05 us (rows 1) / 2.6 (rows 2) with
 // 20-30 warps x 2-3 chunks per lane; 8 warps x 12 chunks 2.9; the issue is back-pressured by the SM's
 // outstanding-request capacity (2 loads/lane still take 1.5 us to issue); cp.async.bulk per warp
 // 2.75, one 30 KB bulk per CTA 3.4; contiguous vs round-robin expert rows: no difference.
-// Equality vs the 96 x 4 WMMA path (tests/test_frontend_fe78.py --mma cc): 3000 + 1200 row-evaluations,
-// 0 top-8 index-set mismatches, 2 bf16 rounding flips, x/x_sf bit-identical; 8-rank
+// Equality vs the 96 x 4 WMMA path (tests/test_frontend_fe78.py --mma cc): 3000 + 1200 + 1200
+// row-evaluations, 0 top-8 index-set mismatches, 2 bf16 rounding flips, x/x_sf bit-identical; 8-rank
 // test_four_api_correctness (fused mxfp4 + qoq, tokens/rank 1, 2, 8): cos_min 0.99999 / 0.99993.
 // Router CTA count the launch will use (bench / stamp attribution helper).
 // `k_parts` (DG_FE_TINYM_KPARTS, full-K grid only): 1 | 2 | 4 K-parts per expert
