@@ -661,6 +661,13 @@ def _fe_router_weight_for_layout(router_weight, wlayout):
     return hit[1]
 
 
+def _fe_kparts_from_env(k_parts):
+    """DG_FE_TINYM_KPARTS: 1 (default) | 2 | 4 K-parts per expert group (full-K grid only)."""
+    if k_parts is None:
+        k_parts = os.environ.get("DG_FE_TINYM_KPARTS", "1")
+    return int(k_parts)
+
+
 def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tinym=None, grid=None, k_parts=None) -> int:
     """Router CTA count the frontend launch uses for (m, h, e, topk) under the current knobs."""
     if tinym is None:

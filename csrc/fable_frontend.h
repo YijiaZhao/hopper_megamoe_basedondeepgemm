@@ -27,8 +27,19 @@ constexpr size_t kFrontendStampsBytes = kFrontendMaxCTAs * 8 * sizeof(unsigned l
 // with N CTAs in total. Full-K outputs are deterministic but not bit-identical to
 // the legacy split (different fp32 accumulation order before the bf16 rounding).
 size_t router_quant_topk_frontend_workspace_bytes(int e);
-// `mma` (DG_FE_TINYM_MMA, full-K only): 0 = WMMA bf16 m16n16k16 (TMA row pieces
-// into smem); 1 = CUDA-core fp32 FMA straight from global (ld.global.nc 16 B).
+// `mma` (DG_FE_TINYM_MMA): 0 = WMMA bf16 m16n16k16 (default; legacy: cp.async smem ring,
+// full-K: TMA row pieces); 1 = CUDA-core fp32 FMA straight from global (full-K only);
+// 2 = swapab (legacy 96 x 4 grid and full-K): experts on the MMA M dimension, tokens on N,
+// mma.sync m16n8k16 bf16 -> fp32, weight A fragments ld.global.nc straight into registers,
+// activations staged once in smem; 3 = swapab with the router weights in A-fragment order
+// (DG_FE_ROUTER_WLAYOUT=fragment, host permutes once: one warp load = one contiguous 512 B).
+// H20-3e (.7) standalone, rows 1|2 x mxfp4|qoq, kernel-end stamp median (us):
+//   96 x 4 wmma 6.91 (all 4 cells) | 96 x 4 swapab row 6.66 (-0.25) | 96 x 4 swapab fragment
+//   6.14 (-0.77) | 78 full-K wmma 7.94-8.45 | 78 full-K swapab 6.40-6.91.
+//   NCU (96, rows 1, mxfp4): L2 read requests 49.1k (wmma) -> 37.7k (swapab row), read sectors
+//   113k -> 77k, LSU instructions 89k -> 29k; fragment layout: see README knob row.
+// Default stays 0 (row-major weights): swapab alone is < 0.3 us; the fragment variant needs the
+// caller to permute the router weight at weight-transform time (opt-in).
 // Router CTA count the launch will use (bench / stamp attribution helper).
 // `k_parts` (DG_FE_TINYM_KPARTS, full-K grid only): 1 | 2 | 4 K-parts per expert
 // group (grid=97,k_parts=4 = the legacy 24 x 16 x 4 layout inside the full-K
