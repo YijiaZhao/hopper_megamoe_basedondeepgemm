@@ -28,9 +28,14 @@ constexpr int kMaxTopK = 8;
 constexpr int kMaxExperts = 512;
 // full-K scheme limits
 constexpr int kFullKStages = 12;                 // K chunks in flight per CTA (h <= 3072 -> all of them)
-constexpr int kCandSlots = 8;                    // candidate keys per (token, router CTA) -> experts_per_cta <= 8
-constexpr int kMaxRouterCTAs = 128;
-constexpr int kMaxSlotsPerLane = kMaxRouterCTAs * kCandSlots / 32;   // merger warp: keys per lane
+constexpr int kCandSlots = 8;                    // candidate keys per (token, expert group) when epc <= 8 (16 otherwise)
+constexpr int kMaxCandSlots = 16;                // experts per CTA (group) <= 16 (one WMMA B tile)
+constexpr int kMaxSlotsPerLane = 48;             // merger warp: keys per lane (groups x slots <= 1536)
+constexpr int kMaxRouterCTAs = 128;              // groups x k_parts (partials / flags scratch)
+// workspace (after the 256 B ticket area): [0, 64 KB) candidate keys, [128 KB, 256 KB) fp32
+// K-part partials [cta][16][16], [256 KB, 256 KB + 512 B) K-part flags [cta]
+constexpr size_t kFullKPartialsOff = 128 * 1024;
+constexpr size_t kFullKFlagsOff = 256 * 1024;
 
 __device__ __forceinline__ float warp_max(float v) {
     #pragma unroll
@@ -441,7 +446,7 @@ __device__ __forceinline__ void quant_role(
 // 1 merger CTA = 78 = one CTA per SM). Each CTA owns its experts over the FULL
 // K, so it produces FINAL logits: no K-part partial reduction, no ticket.
 //   * the whole K of every row (m hidden rows + epc weight rows) is issued up
-//     front as TMA 1D bulk copies into row-contiguous smem (kFullKLd stride): 1-3
+//     front as TMA 1D bulk copies into row-contiguous smem (stride K-part + 16): 1-3
 //     pieces per row (mbarrier per piece, <= ~24 copies per CTA -- the bulk-copy
 //     queue is shallow), so only the first piece's HBM round trip is exposed and
 //     WMMA on piece i overlaps the landing of pieces i+1..;
@@ -464,12 +469,11 @@ __device__ __forceinline__ void quant_role(
 //   * quantisation: router CTA t < m quantises token t between issuing its
 //     chunk loads and consuming them (overlapped with the chunk-0 round trip).
 // Row-contiguous smem: row r = one token (r < m) or one expert (m <= r < m + n_exp)
-// over the full K, stride kFullKLd bf16 (6176 B: 32 B aligned for WMMA, 2-way bank
+// over its K-part, stride (K-part + 16) bf16 (full K: 6176 B; 32 B aligned for WMMA, 2-way bank
 // spread), so a TMA piece of a row is one contiguous copy. 16 rows of tail after the
 // weight rows keep the (discarded) B-tile rows inside the allocation.
-constexpr int kFullKLd = 3072 + 16;
-__host__ __device__ constexpr int fullk_smem_bytes(int m, int /*epc*/) {
-    return (m + 16) * kFullKLd * 2 + (kThreads / 32) * 256 * 4;
+__host__ __device__ constexpr int fullk_smem_bytes(int m, int kpart_len) {
+    return (m + 16) * (kpart_len + 16) * 2 + (kThreads / 32) * 256 * 4;
 }
 __device__ __forceinline__ uint32_t smid_u32() {
     uint32_t v;
@@ -524,55 +528,98 @@ __device__ __forceinline__ uint32_t ld_cv_u32(const uint32_t* p) {
     return v;
 }
 
+__device__ __forceinline__ int ld_acquire_gpu(const int* p) {
+    int v;
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_release_gpu(int* p, int v) {
+    asm volatile("st.release.gpu.global.s32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
+}
+// K-part exchange (k_parts > 1): CTA kp > 0 of a group publishes its fp32 partial
+// logits [16 rows][16 experts] + a release flag; the kp == 0 CTA acquires every
+// flag, sums own part 0 + parts 1..K-1 in that fixed order and emits the keys.
+// Returns the final fp32 logit for this thread's (r, c) or NaN-free garbage when
+// r >= m / c >= n_exp (the caller masks). Flags are reset by the consumer.
+__device__ __forceinline__ float kpart_combine(float v, float* partials, int* flags, int k_parts, int kp, int r, int c,
+                                               unsigned long long* stamps) {
+    if (k_parts == 1) return v;
+    const int cta = blockIdx.x;
+    if (kp > 0) {
+        partials[static_cast<int64_t>(cta) * 256 + r * 16 + c] = v;
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) st_release_gpu(flags + cta, 1);
+        return v;
+    }
+    if (threadIdx.x == 0) {
+        for (int j = 1; j < k_parts; ++j) {
+            while (ld_acquire_gpu(flags + cta + j) == 0) { }
+            flags[cta + j] = 0;
+        }
+    }
+    __syncthreads();
+    stamp(stamps, 4);      // all K-part partials seen (kp == 0 CTAs; slot 4 = quant done on CTAs t < m otherwise)
+    for (int j = 1; j < k_parts; ++j) v += __ldcg(partials + static_cast<int64_t>(cta + j) * 256 + r * 16 + c);
+    return v;
+}
+__device__ __forceinline__ void emit_keys(float v, uint32_t* cand, int m, int n_exp, int expert_base, int groups,
+                                          int group, int cand_slots) {
+    const int r = threadIdx.x / 16, c = threadIdx.x % 16;
+    if (r < m && c < cand_slots) {
+        const int ex = expert_base + c;
+        const uint32_t key = c < n_exp ? topk_key(round_bf16(v), ex) : 1u;
+        cand[(static_cast<int64_t>(r) * groups + group) * cand_slots + c] = key;
+    }
+}
+
 template <int kMode>
 __device__ __forceinline__ void router_role_fullk(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
-        uint32_t* __restrict__ cand,           // [m][num_router_ctas][kCandSlots] keys
+        uint32_t* __restrict__ cand,           // [m][groups][cand_slots] keys
+        float* partials, int* flags,
         uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
         unsigned long long* stamps,
-        int m, int h, int e, int epc, int num_router_ctas, int w_hint) {
+        int m, int h, int e, int epc, int k_parts, int groups, int cand_slots, int w_hint) {
     using namespace nvcuda;
     extern __shared__ __align__(128) uint8_t dyn_smem[];
-    auto row_s = [&](int r) { return reinterpret_cast<__nv_bfloat16*>(dyn_smem) + static_cast<int>(r) * kFullKLd; };
-    float (*part_s)[256] = reinterpret_cast<float (*)[256]>(dyn_smem + (m + 16) * kFullKLd * 2);
+    const int kpart_len = h / k_parts, ld = kpart_len + 16;          // 32 B aligned row stride
+    auto row_s = [&](int r) { return reinterpret_cast<__nv_bfloat16*>(dyn_smem) + static_cast<int>(r) * ld; };
+    float (*part_s)[256] = reinterpret_cast<float (*)[256]>(dyn_smem + (m + 16) * ld * 2);
     constexpr int kKSplit = kThreads / 32;                      // 8 warps = 8 K-slices per chunk
     constexpr int kKPerWarp = kChunkK / kKSplit;                // 32
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int expert_base = blockIdx.x * epc;
+    const int group = blockIdx.x / k_parts, kp = blockIdx.x % k_parts;
+    const int expert_base = group * epc;
     const int n_exp = min(epc, e - expert_base);
-    const int num_chunks = h / kChunkK;
+    const int num_chunks = kpart_len / kChunkK;
     const int n_rows = m + n_exp;
+    const int kbase = kp * kpart_len;
     // TMA pieces per row: the bulk-copy queue is shallow (72 x 512 B copies per CTA
-    // took ~2.5 us to *issue* on H20), so keep the copy count <= ~24: 3 pieces when
-    // <= 6 rows, 2 when <= 12, else 1 (m = 16 -> 23 whole-row copies).
-    int parts = n_rows <= 6 ? 3 : (n_rows <= 12 ? 2 : 1);
+    // took ~2.5 us to *issue* on H20), keep the copy count <= ~24-32.
+    int parts = max(1, min(3, 24 / n_rows));
     while (num_chunks % parts) --parts;
     const int chunks_per_part = num_chunks / parts;
     const uint32_t piece_bytes = static_cast<uint32_t>(chunks_per_part * kChunkK * 2);
     const uint64_t w_policy = w_hint ? l2_evict_last_policy() : 0ull;
-    // Rows >= m of the A tile and >= n_exp of the B tile are never loaded: they
-    // read whatever the neighbouring rows hold, which only feeds output rows /
-    // columns that are discarded (C[r][c] depends on A row r and B column c only).
     __shared__ __align__(8) uint64_t piece_bar[3];
     if (threadIdx.x < parts) mbar_init(&piece_bar[threadIdx.x], 1);
     mbar_fence_init();
     __syncthreads();
-    stamp(stamps, 7);        // prologue done (mbarrier init + fence + sync), about to issue
+    stamp(stamps, 7);
     if (warp == 0) {
         if (lane < parts) mbar_arrive_expect_tx(&piece_bar[lane], static_cast<uint32_t>(n_rows) * piece_bytes);
         __syncwarp();
-        // flat (piece, row) list spread over the 32 lanes: <= 3 copies per lane
         for (int i = lane; i < parts * n_rows; i += 32) {
             const int pc = i / n_rows, r = i % n_rows, k0 = pc * chunks_per_part * kChunkK;
-            const __nv_bfloat16* src = r < m ? hidden + static_cast<int64_t>(r) * h + k0
-                                             : router_weight + static_cast<int64_t>(expert_base + r - m) * h + k0;
+            const __nv_bfloat16* src = r < m ? hidden + static_cast<int64_t>(r) * h + kbase + k0
+                                             : router_weight + static_cast<int64_t>(expert_base + r - m) * h + kbase + k0;
             if (w_hint && r >= m) tma_bulk_g2s_hint(row_s(r) + k0, src, piece_bytes, &piece_bar[pc], w_policy);
             else tma_bulk_g2s(row_s(r) + k0, src, piece_bytes, &piece_bar[pc]);
         }
     }
     stamp(stamps, 5);
-    // Overlapped activation quantisation: while this CTA's pieces are in flight.
     if (static_cast<int>(blockIdx.x) < m) {
         quant_role<kMode>(hidden, x_bytes, x_sf, blockIdx.x, h);
         stamp(stamps, 4);
@@ -581,7 +628,7 @@ __device__ __forceinline__ void router_role_fullk(
     wmma::fill_fragment(acc, 0.0f);
     for (int chunk = 0; chunk < num_chunks; ++chunk) {
         if (chunk % chunks_per_part == 0) {
-            mbar_wait_parity(&piece_bar[chunk / chunks_per_part], 0u);   // piece landed (async proxy -> all threads)
+            mbar_wait_parity(&piece_bar[chunk / chunks_per_part], 0u);
             if (chunk == 0) stamp(stamps, 1);
         }
         #pragma unroll
@@ -589,27 +636,20 @@ __device__ __forceinline__ void router_role_fullk(
             const int k = chunk * kChunkK + warp * kKPerWarp + kk;
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
-            wmma::load_matrix_sync(a, row_s(0) + k, kFullKLd);
-            wmma::load_matrix_sync(b, row_s(m) + k, kFullKLd);   // B(k, n) = w_s[n][k]
+            wmma::load_matrix_sync(a, row_s(0) + k, ld);
+            wmma::load_matrix_sync(b, row_s(m) + k, ld);   // B(k, n) = w_s[n][k]
             wmma::mma_sync(acc, a, b, acc);
         }
     }
     wmma::store_matrix_sync(part_s[warp], acc, 16, wmma::mem_row_major);
     __syncthreads();
     stamp(stamps, 2);
-    // 256 threads = 16 token rows x 16 expert columns: fixed-order 8-slice sum,
-    // bf16 round, 32-bit key, straight into this CTA's candidate slots.
-    {
-        const int r = threadIdx.x / 16, c = threadIdx.x % 16;
-        if (r < m && c < kCandSlots) {
-            float v = 0.0f;
-            #pragma unroll
-            for (int ks = 0; ks < kKSplit; ++ks) v += part_s[ks][r * 16 + c];
-            const int ex = expert_base + c;
-            const uint32_t key = c < n_exp ? topk_key(round_bf16(v), ex) : 1u;
-            cand[(static_cast<int64_t>(r) * num_router_ctas + blockIdx.x) * kCandSlots + c] = key;
-        }
-    }
+    const int r = threadIdx.x / 16, c = threadIdx.x % 16;
+    float v = 0.0f;
+    #pragma unroll
+    for (int ks = 0; ks < kKSplit; ++ks) v += part_s[ks][r * 16 + c];
+    v = kpart_combine(v, partials, flags, k_parts, kp, r, c, stamps);
+    if (kp == 0) emit_keys(v, cand, m, n_exp, expert_base, groups, group, cand_slots);
 }
 
 // CUDA-core variant of the full-K router (DG_FE_TINYM_MMA=fma): no smem ring, no
@@ -640,65 +680,63 @@ __device__ __forceinline__ float dot8_bf16(const uint4& w, const uint4& x, float
     }
     return acc;
 }
-template <int kMode>
+template <int kMode, int kMaxExp, bool kTwoVec>
 __device__ __forceinline__ void router_role_fullk_fma(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
-        uint32_t* __restrict__ cand,
+        uint32_t* __restrict__ cand, float* partials, int* flags,
         uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
         unsigned long long* stamps,
-        int m, int h, int e, int epc, int num_router_ctas) {
+        int m, int h, int e, int epc, int k_parts, int groups, int cand_slots) {
     extern __shared__ __align__(128) uint8_t dyn_smem[];
-    float (*part_s)[kCandSlots][16] = reinterpret_cast<float (*)[kCandSlots][16]>(dyn_smem);   // [warp][expert][row]
+    float (*part_s)[kMaxCandSlots][16] = reinterpret_cast<float (*)[kMaxCandSlots][16]>(dyn_smem);   // [warp][expert][row]
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int expert_base = blockIdx.x * epc;
+    const int group = blockIdx.x / k_parts, kp = blockIdx.x % k_parts;
+    const int expert_base = group * epc;
     const int n_exp = min(epc, e - expert_base);
-    const int nvec = h / 8;
+    const int kpart_len = h / k_parts, nvec = kpart_len / 8, kbase = kp * kpart_len;
     const int v0 = threadIdx.x, v1 = threadIdx.x + kThreads;
-    const bool has1 = v1 < nvec;                    // h <= 4096
+    const bool has0 = v0 < nvec, has1 = kTwoVec && v1 < nvec;
     stamp(stamps, 7);
-    uint4 w0[kCandSlots], w1[kCandSlots];
+    uint4 w0[kMaxExp], w1[kTwoVec ? kMaxExp : 1];
     #pragma unroll
-    for (int i = 0; i < kCandSlots; ++i) {
-        w0[i] = make_uint4(0u, 0u, 0u, 0u); w1[i] = w0[i];
+    for (int i = 0; i < kMaxExp; ++i) {
+        w0[i] = make_uint4(0u, 0u, 0u, 0u);
+        if (kTwoVec) w1[i] = w0[i];
         if (i < n_exp) {
-            const __nv_bfloat16* wr = router_weight + static_cast<int64_t>(expert_base + i) * h;
-            w0[i] = ld_nc_na_16(wr + v0 * 8);
+            const __nv_bfloat16* wr = router_weight + static_cast<int64_t>(expert_base + i) * h + kbase;
+            if (has0) w0[i] = ld_nc_na_16(wr + v0 * 8);
             if (has1) w1[i] = ld_nc_na_16(wr + v1 * 8);
         }
     }
     stamp(stamps, 5);
-    // Overlapped activation quantisation while the weight vectors are in flight.
     if (static_cast<int>(blockIdx.x) < m) {
         quant_role<kMode>(hidden, x_bytes, x_sf, blockIdx.x, h);
         stamp(stamps, 4);
     }
     for (int r = 0; r < m; ++r) {
-        const __nv_bfloat16* xr = hidden + static_cast<int64_t>(r) * h;
-        const uint4 x0 = ld_nc_na_16(xr + v0 * 8);
+        const __nv_bfloat16* xr = hidden + static_cast<int64_t>(r) * h + kbase;
+        const uint4 x0 = has0 ? ld_nc_na_16(xr + v0 * 8) : make_uint4(0u, 0u, 0u, 0u);
         const uint4 x1 = has1 ? ld_nc_na_16(xr + v1 * 8) : make_uint4(0u, 0u, 0u, 0u);
         #pragma unroll
-        for (int i = 0; i < kCandSlots; ++i) {
+        for (int i = 0; i < kMaxExp; ++i) {
             float acc = dot8_bf16(w0[i], x0, 0.0f);
-            if (has1) acc = dot8_bf16(w1[i], x1, acc);
-            if (r == 0 && i == 0) stamp(stamps, 1);            // first weight/activation bytes consumed
+            if (kTwoVec) acc = dot8_bf16(w1[i], x1, acc);
+            if (r == 0 && i == 0) stamp(stamps, 1);
             acc = warp_sum(acc);
             if (lane == 0) part_s[warp][i][r] = acc;
         }
     }
     __syncthreads();
     stamp(stamps, 2);
-    {
-        const int r = threadIdx.x / 16, c = threadIdx.x % 16;
-        if (r < m && c < kCandSlots) {
-            float v = 0.0f;
-            #pragma unroll
-            for (int w = 0; w < kThreads / 32; ++w) v += part_s[w][c][r];
-            const int ex = expert_base + c;
-            const uint32_t key = c < n_exp ? topk_key(round_bf16(v), ex) : 1u;
-            cand[(static_cast<int64_t>(r) * num_router_ctas + blockIdx.x) * kCandSlots + c] = key;
-        }
+    const int r = threadIdx.x / 16, c = threadIdx.x % 16;
+    float v = 0.0f;
+    if (c < kMaxExp) {
+        #pragma unroll
+        for (int w = 0; w < kThreads / 32; ++w) v += part_s[w][c][r];
     }
+    v = kpart_combine(v, partials, flags, k_parts, kp, r, c, stamps);
+    if (kp == 0) emit_keys(v, cand, m, n_exp, expert_base, groups, group, cand_slots);
 }
 
 // Merger CTA: one warp per token (m <= 16 -> <= 2 tokens per warp). Lane l owns
@@ -712,9 +750,9 @@ __device__ __forceinline__ void router_role_fullk_fma(
 template <int kTopK, int kSlotsPerLane>
 __device__ __forceinline__ void merger_role(
         uint32_t* __restrict__ cand, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
-        unsigned long long* stamps, int m, int num_router_ctas) {
+        unsigned long long* stamps, int m, int groups, int cand_slots) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int nslots = num_router_ctas * kCandSlots;
+    const int nslots = groups * cand_slots;
     for (int t = warp; t < m; t += kThreads / 32) {
         uint32_t* base = cand + static_cast<int64_t>(t) * nslots;
         uint32_t pending = 0u;
@@ -803,22 +841,33 @@ __global__ void __launch_bounds__(kThreads, kFma ? 1 : (kFullK ? 2 : (kTiny ? 3 
         int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
         int* __restrict__ ticket, float* __restrict__ logits,
         unsigned long long* stamps,
-        int m, int h, int e, int topk, int num_router_ctas, int w_hint, int pdl_mode, int epc) {
+        int m, int h, int e, int topk, int num_router_ctas, int w_hint, int pdl_mode, int epc, int k_parts) {
     stamp(stamps, 0);
     stamp_smid(stamps);
     if constexpr (kFullK) {
         if (pdl_mode == 1) pdl_trigger();
         uint32_t* cand = reinterpret_cast<uint32_t*>(logits);
+        float* partials = reinterpret_cast<float*>(reinterpret_cast<char*>(logits) + kFullKPartialsOff);
+        int* flags = reinterpret_cast<int*>(reinterpret_cast<char*>(logits) + kFullKFlagsOff);
+        const int groups = num_router_ctas / k_parts;
+        const int cand_slots = epc <= kCandSlots ? kCandSlots : kMaxCandSlots;
         if (static_cast<int>(blockIdx.x) >= num_router_ctas) {
-            if (num_router_ctas * kCandSlots <= 20 * 32)      // H20: 77 x 8 = 616 slots -> 20 per lane
-                merger_role<kMaxTopK, 20>(cand, topk_idx, topk_weights, stamps, m, num_router_ctas);
+            const int nslots = groups * cand_slots;
+            if (nslots <= 20 * 32)          // H20 full-K: 77 x 8 = 616 slots -> 20 per lane
+                merger_role<kMaxTopK, 20>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots);
+            else if (nslots <= 32 * 32)
+                merger_role<kMaxTopK, 32>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots);
             else
-                merger_role<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, stamps, m, num_router_ctas);
+                merger_role<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots);
         } else {
-            if constexpr (kFma)
-                router_role_fullk_fma<kMode>(hidden, router_weight, cand, x_bytes, x_sf, stamps, m, h, e, epc, num_router_ctas);
-            else
-                router_role_fullk<kMode>(hidden, router_weight, cand, x_bytes, x_sf, stamps, m, h, e, epc, num_router_ctas, w_hint);
+            if constexpr (kFma) {
+                if (cand_slots == kCandSlots)
+                    router_role_fullk_fma<kMode, kCandSlots, true>(hidden, router_weight, cand, partials, flags, x_bytes, x_sf, stamps, m, h, e, epc, k_parts, groups, cand_slots);
+                else
+                    router_role_fullk_fma<kMode, kMaxCandSlots, false>(hidden, router_weight, cand, partials, flags, x_bytes, x_sf, stamps, m, h, e, epc, k_parts, groups, cand_slots);
+            } else {
+                router_role_fullk<kMode>(hidden, router_weight, cand, partials, flags, x_bytes, x_sf, stamps, m, h, e, epc, k_parts, groups, cand_slots, w_hint);
+            }
             stamp(stamps, 3);
         }
         if (pdl_mode == 2) pdl_trigger();
@@ -920,25 +969,29 @@ static int num_sms_cached() {
     return n;
 }
 // Full-K plan: target T CTAs in total (T = SM count when grid <= 0, else grid);
-// one merger CTA, epc = ceil(e / (T - 1)) clamped to [1, kCandSlots], router
-// CTAs = ceil(e / epc) (the last one may own fewer experts).
-static void fullk_plan(int e, int grid, int& epc, int& router_ctas) {
+// one merger CTA; groups = floor((T - 1) / k_parts) expert groups of epc = ceil(e /
+// groups) experts (<= 16), re-packed to groups = ceil(e / epc); router CTAs = groups x
+// k_parts (H20, k_parts 1: 77 x 5; k_parts 2: 35 groups x 11 x 2 = 70; T = 97,
+// k_parts 4: 24 x 16 x 4 = 96).
+static void fullk_plan(int e, int grid, int k_parts, int& epc, int& router_ctas) {
     const int target = (grid <= 0 ? num_sms_cached() : grid) - 1;
-    epc = (e + std::max(target, 1) - 1) / std::max(target, 1);
-    epc = std::min(std::max(epc, 1), kCandSlots);
-    router_ctas = (e + epc - 1) / epc;
+    const int groups0 = std::max(target / k_parts, 1);
+    epc = (e + groups0 - 1) / groups0;
+    epc = std::min(std::max(epc, 1), kMaxCandSlots);
+    const int groups = (e + epc - 1) / epc;
+    router_ctas = groups * k_parts;
 }
 
 template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma = false>
 void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
             int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-            int m, int h, int e, int topk, int l2_persist, int pdl_mode, int grid, cudaStream_t stream) {
+            int m, int h, int e, int topk, int l2_persist, int pdl_mode, int grid, int k_parts, cudaStream_t stream) {
     using Cfg = RouterCfg<kMTiles, kTiny>;
     int epc = kExpertsPerCTA, router_ctas = ((e + kExpertsPerCTA - 1) / kExpertsPerCTA) * Cfg::kKSplitCTAs;
     int smem_bytes = Cfg::kDynSmemBytes, num_ctas = router_ctas + m;
     if constexpr (kFullK) {
-        fullk_plan(e, grid, epc, router_ctas);
-        smem_bytes = kFma ? (kThreads / 32) * kCandSlots * 16 * 4 : fullk_smem_bytes(m, epc);
+        fullk_plan(e, grid, k_parts, epc, router_ctas);
+        smem_bytes = kFma ? (kThreads / 32) * kMaxCandSlots * 16 * 4 : fullk_smem_bytes(m, h / k_parts);
         num_ctas = router_ctas + 1;
         // DG_FE_FULLK_1PERSM (default 1): when the grid fits the SM count, request
         // enough dynamic smem that only one CTA fits per SM, so the block scheduler
@@ -950,7 +1003,7 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     if (!attr_set) {
         cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             kFullK ? std::max(fullk_smem_bytes(16, kCandSlots), 116 * 1024) : Cfg::kDynSmemBytes);
+                             kFullK ? std::max(fullk_smem_bytes(16, 3072), 116 * 1024) : Cfg::kDynSmemBytes);
         attr_set = true;
     }
     const size_t w_bytes = static_cast<size_t>(e) * h * sizeof(__nv_bfloat16);
@@ -977,23 +1030,30 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     }
     const int w_hint = l2_persist == 2 ? 1 : 0;
     cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma>,
-                       hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc);
+                       hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);
 }
 
 template <int kMode>
 void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
                  int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-                 int m, int h, int e, int topk, bool tiny, int l2_persist, int pdl_mode, int grid, int mma, cudaStream_t stream) {
-    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && h % kChunkK == 0 && h / kChunkK <= kFullKStages) {
-        if (mma == 1 && h <= 8 * 2 * kThreads)   // fma: thread owns <= 2 vectors per row
-            launch<1, kMode, true, true, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
-        else
-            launch<1, kMode, true, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
+                 int m, int h, int e, int topk, bool tiny, int l2_persist, int pdl_mode, int grid, int mma, int k_parts, cudaStream_t stream) {
+    k_parts = (k_parts == 2 || k_parts == 4) ? k_parts : 1;
+    const int kpart_len = h / k_parts;
+    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && kpart_len % kChunkK == 0 && kpart_len <= 3072 && h % k_parts == 0) {
+        int epc = 0, rc = 0;
+        fullk_plan(e, grid, k_parts, epc, rc);
+        // fma: <= 8 experts -> 2 vectors/thread (kpart_len <= 4096); > 8 experts -> 1 vector/thread (kpart_len <= 2048)
+        const bool fma_ok = mma == 1 && (epc <= kCandSlots ? kpart_len <= 8 * 2 * kThreads : kpart_len <= 8 * kThreads);
+        if (rc <= kMaxRouterCTAs && (rc / k_parts) * (epc <= kCandSlots ? kCandSlots : kMaxCandSlots) <= kMaxSlotsPerLane * 32) {
+            if (fma_ok) launch<1, kMode, true, true, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+            else launch<1, kMode, true, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+            return;
+        }
     }
-    else if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
-    else if (m <= 16) launch<1, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
-    else if (m <= 32) launch<2, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
-    else launch<4, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
+    if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream);
+    else if (m <= 16) launch<1, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream);
+    else if (m <= 32) launch<2, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream);
+    else launch<4, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream);
 }
 
 }  // namespace
@@ -1002,11 +1062,12 @@ size_t router_quant_topk_frontend_workspace_bytes(int e) {
     return kFrontendStampsOffsetBase + static_cast<size_t>(4) * 64 * e * 4 + kFrontendStampsBytes;
 }
 
-int router_quant_topk_frontend_router_ctas(int m, int h, int e, int topk, int tiny, int grid) {
-    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && h % kChunkK == 0 && h / kChunkK <= kFullKStages) {
+int router_quant_topk_frontend_router_ctas(int m, int h, int e, int topk, int tiny, int grid, int k_parts) {
+    k_parts = (k_parts == 2 || k_parts == 4) ? k_parts : 1;
+    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && (h / k_parts) % kChunkK == 0 && h / k_parts <= 3072) {
         int epc = 0, router_ctas = 0;
-        fullk_plan(e, grid, epc, router_ctas);
-        return router_ctas;
+        fullk_plan(e, grid, k_parts, epc, router_ctas);
+        if (router_ctas <= kMaxRouterCTAs) return router_ctas;
     }
     const int groups = (e + kExpertsPerCTA - 1) / kExpertsPerCTA;
     return groups * (m <= 16 ? 4 : 2);
@@ -1016,7 +1077,7 @@ void launch_router_quant_topk_frontend(
         const void* hidden, const void* router_weight,
         void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
         void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-        int tiny, int stamps_on, int l2_persist, int pdl_mode, int grid, int mma, cudaStream_t stream) {
+        int tiny, int stamps_on, int l2_persist, int pdl_mode, int grid, int mma, int k_parts, cudaStream_t stream) {
     int* ticket = static_cast<int*>(workspace);
     float* logits = reinterpret_cast<float*>(static_cast<char*>(workspace) + kFrontendStampsOffsetBase);
     unsigned long long* stamps = nullptr;
@@ -1029,9 +1090,9 @@ void launch_router_quant_topk_frontend(
     if (mode == 0)
         launch_mode<0>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, grid, mma, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, grid, mma, k_parts, stream);
     else
         launch_mode<1>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, grid, mma, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, grid, mma, k_parts, stream);
 }

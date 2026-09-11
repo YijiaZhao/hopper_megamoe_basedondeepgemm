@@ -30,9 +30,12 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 // `mma` (DG_FE_TINYM_MMA, full-K only): 0 = WMMA bf16 m16n16k16 (TMA row pieces
 // into smem); 1 = CUDA-core fp32 FMA straight from global (ld.global.nc 16 B).
 // Router CTA count the launch will use (bench / stamp attribution helper).
-int router_quant_topk_frontend_router_ctas(int m, int h, int e, int topk, int tiny, int grid);
+// `k_parts` (DG_FE_TINYM_KPARTS, full-K grid only): 1 | 2 | 4 K-parts per expert
+// group (grid=97,k_parts=4 = the legacy 24 x 16 x 4 layout inside the full-K
+// framework; grid=78,k_parts=2 = 35 groups x 11 experts x 2 = 70 + 1 CTAs).
+int router_quant_topk_frontend_router_ctas(int m, int h, int e, int topk, int tiny, int grid, int k_parts);
 void launch_router_quant_topk_frontend(
     const void* hidden, const void* router_weight,
     void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
     void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-    int tiny, int stamps_on, int l2_persist, int pdl_mode, int grid, int mma, cudaStream_t stream);
+    int tiny, int stamps_on, int l2_persist, int pdl_mode, int grid, int mma, int k_parts, cudaStream_t stream);

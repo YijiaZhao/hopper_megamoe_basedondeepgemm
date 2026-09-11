@@ -111,6 +111,7 @@ def main():
     pdl = int(os.environ.get("DG_FE_PDL", "0"))
     grid_env = os.environ.get("DG_FE_TINYM_GRID", "auto")
     mma_env = os.environ.get("DG_FE_TINYM_MMA", "wmma")
+    kparts_env = os.environ.get("DG_FE_TINYM_KPARTS", "1")
     hot_hidden = int(os.environ.get("DG_BENCH_HOT_HIDDEN", "0"))
     buffer, launch_moe = prepare_backend(args, rank, local_rows, group)
     try:
@@ -174,7 +175,7 @@ def main():
         if rank == 0:
             print(f"== frontend direct timing: quant={args.quant} M={args.global_tokens} "
                   f"(rows/rank={local_rows}) backend={args.backend} DG_FE_TINYM={tinym} "
-                  f"DG_FE_TINYM_GRID={grid_env} (router CTAs={n_router}, full-K={int(fullk)}) DG_FE_TINYM_MMA={mma_env} "
+                  f"DG_FE_TINYM_GRID={grid_env} (router CTAs={n_router}, full-K={int(fullk)}) DG_FE_TINYM_MMA={mma_env} DG_FE_TINYM_KPARTS={kparts_env} "
                   f"DG_FE_ROUTER_L2_PERSIST={l2_persist} DG_FE_PDL={pdl} DG_BENCH_HOT_HIDDEN={hot_hidden} "
                   f"iters={args.iters} GPU0 ==")
             for name in timed:

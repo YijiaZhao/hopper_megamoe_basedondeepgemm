@@ -613,16 +613,23 @@ def _fe_mma_from_env(mma):
     return int(mma)
 
 
-def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tinym=None, grid=None) -> int:
+def _fe_kparts_from_env(k_parts):
+    """DG_FE_TINYM_KPARTS: 1 (default) | 2 | 4 K-parts per expert group (full-K grid only)."""
+    if k_parts is None:
+        k_parts = os.environ.get("DG_FE_TINYM_KPARTS", "1")
+    return int(k_parts)
+
+
+def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tinym=None, grid=None, k_parts=None) -> int:
     """Router CTA count the frontend launch uses for (m, h, e, topk) under the current knobs."""
     if tinym is None:
         tinym = int(os.environ.get("DG_FE_TINYM", "1"))
-    return _C.fable_frontend_router_ctas(m, h, e, topk, int(bool(tinym)), _fe_grid_from_env(grid))
+    return _C.fable_frontend_router_ctas(m, h, e, topk, int(bool(tinym)), _fe_grid_from_env(grid), _fe_kparts_from_env(k_parts))
 
 
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
                                      sym_buffer, quant: str = "mxfp4", tinym=None, stamps=None,
-                                     l2_persist=None, pdl=None, grid=None, mma=None):
+                                     l2_persist=None, pdl=None, grid=None, mma=None, k_parts=None):
     """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend.
 
     ``tinym`` (env ``DG_FE_TINYM``, default 1): for m <= 16 use the single-wave
@@ -643,6 +650,9 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     ``mma`` (env ``DG_FE_TINYM_MMA``, default ``wmma``; full-K grid only): ``wmma`` = TMA row
     pieces into smem + WMMA bf16 m16n16k16 fp32-accumulate; ``fma`` = CUDA-core fp32 FMA
     straight from global memory (16 B ld.global.nc, warp butterfly + 8-warp smem sum).
+    ``k_parts`` (env ``DG_FE_TINYM_KPARTS``, default 1; full-K grid only): 1 | 2 | 4 K-parts per
+    expert group; K-part CTAs exchange fp32 partials through the workspace (release/acquire
+    flag), the part-0 CTA sums in fixed order (part 0, 1, ..) and emits the keys.
     """
     assert quant in ("mxfp4", "qoq")
     m = hidden.size(0)
@@ -657,6 +667,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
         pdl = int(os.environ.get("DG_FE_PDL", "0"))
     grid = _fe_grid_from_env(grid)
     mma = _fe_mma_from_env(mma)
+    k_parts = _fe_kparts_from_env(k_parts)
     cache = getattr(sym_buffer, "_fable_frontend_cache", None)
     if cache is None:
         cache = sym_buffer._fable_frontend_cache = {}
@@ -670,7 +681,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
                             sym_buffer.topk_idx[:m], sym_buffer.topk_weights[:m])
     _C.fable_router_quant_topk_frontend(
         hidden, router_weight, views[0], views[1], views[2], views[3], workspace,
-        0 if quant == "mxfp4" else 1, int(bool(tinym)), int(bool(stamps)), int(l2_persist), int(pdl), grid, mma)
+        0 if quant == "mxfp4" else 1, int(bool(tinym)), int(bool(stamps)), int(l2_persist), int(pdl), grid, mma, k_parts)
 
 
 def fable_frontend_stamps(sym_buffer, e: int) -> torch.Tensor:
