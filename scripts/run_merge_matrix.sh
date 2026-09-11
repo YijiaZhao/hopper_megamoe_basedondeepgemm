@@ -85,12 +85,12 @@ case "$MODE" in
     git checkout -- "$F"; echo "restored: $(git status --short -- "$F" | wc -l) dirty files (expect 0)"
     if [ "$rc" -ne 0 ]; then echo "REVERT_PROOF=FAILS_AS_EXPECTED"; else echo "REVERT_PROOF=UNEXPECTED_PASS"; fi ;;
   fe78)
-    MM=$1; SEEDS=$2; GPU=${3:-7}; shift 3 || shift $#
+    MM=$1; SEEDS=$2; GPU=${3:-7}; OFF=${4:-0}; shift 4 || shift $#
     ROWS=${*:-1 2 8 16}
     case "$MM" in cc) EXTRA="--grid auto --mma cc" ;; auto) EXTRA="--mma auto" ;; *) EXTRA="--grid 96 --mma swapab --wlayout fragment" ;; esac
-    log="$RES/fe78_${MM}_s$SEEDS.log"
-    CUDA_VISIBLE_DEVICES=$GPU timeout 3600 python3 tests/test_frontend_fe78.py --seeds "$SEEDS" $EXTRA --rows $ROWS > "$log" 2>&1
-    echo "== fe78 $MM seeds=$SEEDS rows=$ROWS rc=$?"; grep -E "new-scheme|full-K vs legacy|MISMATCH|WEIGHT DIFF|^PASS|^FAIL|Error" "$log" | tail -5 ;;
+    log="$RES/fe78_${MM}_s${SEEDS}_o$OFF.log"
+    CUDA_VISIBLE_DEVICES=$GPU timeout 3600 python3 tests/test_frontend_fe78.py --seeds "$SEEDS" --seed-offset "$OFF" $EXTRA --rows $ROWS > "$log" 2>&1
+    echo "== fe78 $MM seeds=$SEEDS offset=$OFF rows=$ROWS rc=$?"; grep -E "new-scheme|full-K vs legacy|MISMATCH|WEIGHT DIFF|^PASS|^FAIL|Error" "$log" | tail -5 ;;
   capture)
     OUTDIR=$1; TOK=${2:-"2 8 16"}
     mkdir -p "$(dirname "$OUTDIR")"
@@ -107,9 +107,21 @@ case "$MODE" in
       bash "$0" corrfe 2
       bash "$0" mx 128 512
       wait_idle fe78; drop_marker
-      bash "$0" fe78 swapab 500 6 > "$RES/fe78_swapab.out" 2>&1 &
-      bash "$0" fe78 cc 500 7 > "$RES/fe78_cc.out" 2>&1 &
+      bash "$0" fe78 swapab 500 6 0 > "$RES/fe78_swapab.out" 2>&1 &
+      bash "$0" fe78 cc 500 7 0 > "$RES/fe78_cc.out" 2>&1 &
       wait; cat "$RES/fe78_swapab.out" "$RES/fe78_cc.out"
       echo "CHAIN1_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
+  chain2)   # after the FE default flip (DG_FE_TINYM_MMA=auto): FE equality of the defaults, 8-rank
+            # correctness (T=1 2 -> cc router; 8 16 -> swapab), --frontend fe at T=1/2, 3 customer captures
+    C="$RES/chain2.log"; : > "$C"
+    { echo "start $(git rev-parse --short HEAD) $(date -u +%FT%TZ)"
+      wait_idle fe78auto; drop_marker
+      bash "$0" fe78 auto 500 6 0 1 2 8 16 > "$RES/fe78_auto_a.out" 2>&1 &
+      bash "$0" fe78 auto 500 7 500 1 2 8 16 > "$RES/fe78_auto_b.out" 2>&1 &
+      wait; cat "$RES/fe78_auto_a.out" "$RES/fe78_auto_b.out"
+      bash "$0" corr 1 2 8 16
+      bash "$0" corrref 1 2
+      for p in 1 2 3; do bash "$0" capture "$RES/cap/p$p" "2 8 16"; done
+      echo "CHAIN2_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
   *) echo "usage: see header" >&2; exit 2 ;;
 esac
