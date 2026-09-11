@@ -25,9 +25,9 @@ FE78="timeout 7200 python3 tests/test_frontend_fe78.py --seeds $SEEDS --rows 1 2
 ( CUDA_VISIBLE_DEVICES=1 $FE78 --grid auto --mma cc > "$OUT/eq_auto_cc.log" 2>&1; echo "GPU1_EXIT=$?" >> "$OUT/STATUS.log" ) &
 ( CUDA_VISIBLE_DEVICES=2 $FE78 --grid 96 --mma swapab --wlayout fragment > "$OUT/eq_96_swapab_fragment.log" 2>&1; echo "GPU2_EXIT=$?" >> "$OUT/STATUS.log" ) &
 ( export CUDA_VISIBLE_DEVICES=3
-  DG_FE_TINYM_GRID=96 DG_FE_TINYM_MMA=wmma timeout 3600 python3 tests/test_frontend_tinym.py --seeds 200 > "$OUT/bitid_96_wmma.log" 2>&1; echo "GPU3a_EXIT=$?" >> "$OUT/STATUS.log"
-  timeout 3600 python3 tests/test_frontend_tinym.py --seeds 200 > "$OUT/bitid_defaults.log" 2>&1; echo "GPU3b_EXIT=$?" >> "$OUT/STATUS.log"
-  timeout 3600 python3 tests/test_frontend_tinym.py --seeds 200 --l2-persist 1 > "$OUT/bitid_defaults_persist1.log" 2>&1; echo "GPU3c_EXIT=$?" >> "$OUT/STATUS.log" ) &
+  DG_FE_TINYM_GRID=96 DG_FE_TINYM_MMA=wmma timeout 3600 python3 tests/test_frontend_tinym.py --seeds 200 --rows 1 2 4 8 16 32 64 > "$OUT/bitid_96_wmma.log" 2>&1; echo "GPU3a_EXIT=$?" >> "$OUT/STATUS.log"
+  timeout 3600 python3 tests/test_frontend_tinym.py --seeds 200 --rows 1 2 4 8 16 32 64 > "$OUT/bitid_defaults.log" 2>&1; echo "GPU3b_EXIT=$?" >> "$OUT/STATUS.log"
+  timeout 3600 python3 tests/test_frontend_tinym.py --seeds 200 --rows 1 2 4 8 16 32 64 --l2-persist 1 > "$OUT/bitid_defaults_persist1.log" 2>&1; echo "GPU3c_EXIT=$?" >> "$OUT/STATUS.log" ) &
 wait
 for f in "$OUT"/eq_*.log "$OUT"/bitid_*.log; do echo "## $(basename "$f")"; grep -E "library defaults|new-scheme|full-K vs legacy|bit-identity|^PASS|^FAIL|Error" "$f" | tail -4; done >> "$OUT/SUMMARY.log"
 echo "ALL_DONE $(date)" >> "$OUT/STATUS.log"
