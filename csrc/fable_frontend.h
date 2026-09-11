@@ -33,13 +33,18 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 // mma.sync m16n8k16 bf16 -> fp32, weight A fragments ld.global.nc straight into registers,
 // activations staged once in smem; 3 = swapab with the router weights in A-fragment order
 // (DG_FE_ROUTER_WLAYOUT=fragment, host permutes once: one warp load = one contiguous 512 B).
-// H20-3e (.7) standalone, rows 1|2 x mxfp4|qoq, kernel-end stamp median (us):
-//   96 x 4 wmma 6.91 (all 4 cells) | 96 x 4 swapab row 6.66 (-0.25) | 96 x 4 swapab fragment
-//   6.14 (-0.77) | 78 full-K wmma 7.94-8.45 | 78 full-K swapab 6.40-6.91.
-//   NCU (96, rows 1, mxfp4): L2 read requests 49.1k (wmma) -> 37.7k (swapab row), read sectors
-//   113k -> 77k, LSU instructions 89k -> 29k; fragment layout: see README knob row.
-// Default stays 0 (row-major weights): swapab alone is < 0.3 us; the fragment variant needs the
-// caller to permute the router weight at weight-transform time (opt-in).
+// H20-3e (.7) standalone, rows 1|2 x mxfp4|qoq, kernel-end stamp median (us, 5 stamped launches,
+// 200-iter rerun; identical across the 4 cells unless a range is given):
+//   96 x 4 wmma 6.91 | 96 x 4 swapab row 6.66 (-0.25) | 96 x 4 swapab fragment 6.14 (-0.77)
+//   | 78 full-K wmma 7.94-8.45 | 78 full-K swapab 6.40-6.91.
+//   NCU (96 grid, rows 1, mxfp4, --clock-control none): L2 read requests 49.1k (wmma) -> 37.7k
+//   (swapab row, -23%) -> 19.0k (fragment, -61%); L2 read sectors 113.5k -> 77.0k -> 75.9k (-33%);
+//   LSU instructions 89.0k -> 29.1k; kernel 9.41 -> 8.90 -> 8.42 us under NCU.
+//   top-8 sets identical to the legacy WMMA path on 54k rows (1000 seeds x rows {1,2,8,16} x 2
+//   quants) for swapab row AND fragment, 0 weight flips; 8-rank four-API cos_min unchanged.
+// Default (python wrapper): mma = swapab, wlayout = fragment (the wrapper permutes a row-major
+// router weight once per tensor and caches it; pass wlayout = 'pre' with a pre-permuted weight
+// to make it a weight-transform-time cost). DG_FE_TINYM_MMA=wmma DG_FE_ROUTER_WLAYOUT=row = legacy.
 // Router CTA count the launch will use (bench / stamp attribution helper).
 // `k_parts` (DG_FE_TINYM_KPARTS, full-K grid only): 1 | 2 | 4 K-parts per expert
 // group (grid=97,k_parts=4 = the legacy 24 x 16 x 4 layout inside the full-K

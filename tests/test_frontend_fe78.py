@@ -61,7 +61,7 @@ def main():
             ref = (hidden.float() @ w.float().t()).to(torch.bfloat16).float()      # [m, E]
             ref_sorted = ref.sort(dim=1, descending=True).values
             for quant in ("mxfp4", "qoq"):
-                old = run(buf_old, hidden, w, quant, 96)
+                old = run(buf_old, hidden, w, quant, 96, "wmma", "row")      # legacy reference
                 new = run(buf_new, hidden, w, quant, args.grid, args.mma, args.wlayout)
                 if not (torch.equal(old[0], new[0]) and torch.equal(old[1], new[1])):
                     quant_mismatch += 1

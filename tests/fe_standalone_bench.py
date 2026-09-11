@@ -25,7 +25,7 @@ def main():
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--grid", default=os.environ.get("DG_FE_TINYM_GRID", "96"))
-    ap.add_argument("--mma", default=os.environ.get("DG_FE_TINYM_MMA", "wmma"))
+    ap.add_argument("--mma", default=os.environ.get("DG_FE_TINYM_MMA", "swapab"))
     args = ap.parse_args()
     torch.manual_seed(20260805)
     w = (torch.randn(EXPERTS, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
@@ -36,7 +36,7 @@ def main():
     tinym = int(os.environ.get("DG_FE_TINYM", "1"))
     # DG_FE_ROUTER_WLAYOUT=fragment: permute ONCE here (weight-transform time) and pass wlayout="pre",
     # so the timed call has no wrapper-side lookup (the standalone event is CPU-launch-bound).
-    wlayout = os.environ.get("DG_FE_ROUTER_WLAYOUT", "row")
+    wlayout = os.environ.get("DG_FE_ROUTER_WLAYOUT", "fragment")
     if wlayout == "fragment":
         w = deep_gemm.fable_router_weight_fragment_layout(w)
         wlayout = "pre"

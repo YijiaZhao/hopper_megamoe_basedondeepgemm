@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--tinym", type=int, default=int(os.environ.get("DG_FE_TINYM", "1")))
     ap.add_argument("--grid", default=os.environ.get("DG_FE_TINYM_GRID", "96"),
                     help="DG_FE_TINYM_GRID: 96 = legacy split, auto = full-K SM-count grid, N = full-K N CTAs")
-    ap.add_argument("--mma", default=os.environ.get("DG_FE_TINYM_MMA", "wmma"), help="DG_FE_TINYM_MMA: wmma | fma")
+    ap.add_argument("--mma", default=os.environ.get("DG_FE_TINYM_MMA", "swapab"), help="DG_FE_TINYM_MMA: wmma | fma")
     ap.add_argument("--warmup", type=int, default=5, help="eager launches before the profiled one")
     ap.add_argument("--l2-flush", type=int, default=1, help="flush L2 (256 MB memset) before each launch")
     args = ap.parse_args()
