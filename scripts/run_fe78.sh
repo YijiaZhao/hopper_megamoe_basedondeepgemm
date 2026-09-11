@@ -99,7 +99,7 @@ if [ "$MODE" = capture ] || [ "$MODE" = all ]; then
   for G in $GRIDS; do
     OUTDIR="$RES/fe78_nsys_grid$G"
     echo "--- capture DG_FE_TINYM_GRID=$G -> $OUTDIR" >> "$LOG"
-    DG_FE_TINYM_GRID=$G TOKENS_LIST="2 8" OUT="$OUTDIR" LOCK_SM_CLOCK_MHZ=1830 CLOCK_LOCK_MODE=set FORCE=1 SCOPES=e2e BACKENDS=fused \
+    DG_FE_TINYM_GRID=$G TOKENS_LIST="2 8" OUT="$OUTDIR" LOCK_SM_CLOCK_MHZ=1830 FORCE=1 SCOPES=e2e BACKENDS=fused \
       run_gpu "capture g$G" timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUTDIR.log" 2>&1
     grep -A 20 "TIMELINE_TABLE\|frontend_us" "$OUTDIR/TIMELINE_TABLE.md" 2>/dev/null | head -30 >> "$LOG"
   done
