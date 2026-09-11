@@ -1100,9 +1100,14 @@ __device__ __forceinline__ void topk_finish(uint32_t run, int lane, int t, int64
         topk_weights[static_cast<int64_t>(t) * kTopK + lane] = ex / sum;
     }
 }
-// Last-arriver merge (cc, DG_FE_CC_MERGE=ticket): called by the router CTA whose ticket was the
-// last (every CTA: keys stored -> __threadfence -> atomicAdd). Warp t < m: read token t's 616
-// slots (5 x 16 B per lane, L2-hot), per-lane sorted top-8, one 8-round merge, softmax, write.
+// Last-arriver merge (cc, DG_FE_CC_MERGE=ticket, default): called by the router CTA whose
+// atom.acq_rel.gpu ticket was the last (every CTA: keys stored -> bar.sync -> thread 0 atomic;
+// the release orders the CTA's key stores, the acquire on the last CTA orders its reads).
+// Warp t < m: read token t's slots (5 x 16 B per lane, L2-hot) into registers, then 8 rounds of
+// {per-lane max over its 20 keys (independent ops), one redux.sync max, the owner lane clears
+// its copy} -> lanes 0..7 hold the top-8 descending (keys are unique: the expert id sits in the
+// low bits; the sentinel 1 never wins while >= 8 real keys exist). ~0.3 us vs ~0.5-0.6 for a
+// per-lane 20 x 8 sorted insertion chain + 8-round merge (serial dependent ALU chain in one warp).
 // Stamps go to the merger CTA's slots (1 ticket won / 2 keys read / 3 merge done / 4 written).
 template <int kTopK, int kSlotsPerLane>
 __device__ __forceinline__ void last_arriver_topk(
@@ -1114,9 +1119,6 @@ __device__ __forceinline__ void last_arriver_topk(
     if (warp >= m) return;
     const int t = warp;
     uint32_t* base = cand + static_cast<int64_t>(t) * nslots;
-    uint32_t loc[kTopK];
-    #pragma unroll
-    for (int j = 0; j < kTopK; ++j) loc[j] = 0u;
     uint4 q[kVecPerLane];
     #pragma unroll
     for (int i = 0; i < kVecPerLane; ++i) {
@@ -1124,24 +1126,33 @@ __device__ __forceinline__ void last_arriver_topk(
         if (4 * (lane + 32 * i) < nslots) q[i] = __ldcg(reinterpret_cast<const uint4*>(base + 4 * (lane + 32 * i)));
     }
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[2] = globaltimer_after(q[0].x);
+    uint32_t kv[kSlotsPerLane];
     #pragma unroll
-    for (int i = 0; i < kVecPerLane; ++i) {
-        const uint32_t kv[4] = {q[i].x, q[i].y, q[i].z, q[i].w};
+    for (int i = 0; i < kVecPerLane; ++i) { kv[4 * i] = q[i].x; kv[4 * i + 1] = q[i].y; kv[4 * i + 2] = q[i].z; kv[4 * i + 3] = q[i].w; }
+    uint32_t run = 0u;
+    #pragma unroll
+    for (int k = 0; k < kTopK; ++k) {
+        uint32_t mx = 0u;
         #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            uint32_t k = kv[u];
+        for (int i = 0; i < kSlotsPerLane; ++i) mx = max(mx, kv[i]);
+        const uint32_t best = warp_max_u32_redux(mx);
+        if (lane == k) run = best;
+        if (mx == best) {
             #pragma unroll
-            for (int j = 0; j < kTopK; ++j) { const uint32_t lo = min(k, loc[j]); loc[j] = max(k, loc[j]); k = lo; }
+            for (int i = 0; i < kSlotsPerLane; ++i) kv[i] = kv[i] == best ? 0u : kv[i];
         }
     }
-    uint32_t run = 0u;
-    merge8<kTopK>(run, loc, lane);
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
     topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[4] = globaltimer_ns();
     #pragma unroll
     for (int i = 0; i < kVecPerLane; ++i)      // slots back to 0 (the polling merger mode relies on it)
         if (4 * (lane + 32 * i) < nslots) *reinterpret_cast<uint4*>(base + 4 * (lane + 32 * i)) = make_uint4(0u, 0u, 0u, 0u);
+}
+__device__ __forceinline__ int atom_add_acq_rel_gpu(int* p, int v) {
+    int old;
+    asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+    return old;
 }
 // defer (DG_FE_MERGER_DEFER, cc default 1): no per-batch merge; every lane keeps the sorted
 // top-8 of ALL keys it has seen (a lane's top-8 is a superset of its contribution to the
@@ -1268,13 +1279,11 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
                 router_role_fullk_cc<kCC>(hidden, router_weight, cand, stamps, m, h, e, epc, groups, cand_slots);
                 if (w_hint & kTicketMergeBit) {
                     __shared__ int s_last;
-                    __threadfence();
-                    __syncthreads();
-                    if (threadIdx.x == 0) s_last = atomicAdd(ticket, 1) == num_router_ctas - 1;
+                    __syncthreads();                 // every key store of this CTA precedes thread 0's release
+                    if (threadIdx.x == 0) s_last = atom_add_acq_rel_gpu(ticket, 1) == num_router_ctas - 1;
                     __syncthreads();
                     stamp(stamps, 3);
                     if (s_last) {
-                        __threadfence();
                         unsigned long long* mstamps = stamps != nullptr ? stamps + static_cast<size_t>(num_router_ctas) * kStampSlots : nullptr;
                         if (mstamps != nullptr && threadIdx.x == 0) mstamps[1] = globaltimer_ns();
                         if (groups * cand_slots <= 20 * 32)
