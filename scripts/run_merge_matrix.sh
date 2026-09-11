@@ -173,6 +173,15 @@ case "$MODE" in
       DG_FE_TINYM_MMA=cc COSMIN=0.999 bash "$0" corrref 32
       COSMIN=0.999 bash "$0" corrref 8 16
       echo "LAND_DIAG_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
+  land_ab)    # round-3 cc (3.84 us stamps) vs swapab+fragment under the customer method, M=8 = 1 row/rank, 2 x 2 captures
+    C="$RES/land_ab.log"; : > "$C"
+    { echo "start $(git rev-parse --short HEAD) $(date -u +%FT%TZ)"
+      DG_FE_TINYM_MMA=cc bash "$0" capture "$RES/cap_land_ab/cc_r3" 8
+      DG_FE_TINYM_MMA=swapab bash "$0" capture "$RES/cap_land_ab/swapab" 8
+      DG_FE_TINYM_MMA=cc bash "$0" capture "$RES/cap_land_ab/cc_r3_b" 8
+      DG_FE_TINYM_MMA=swapab bash "$0" capture "$RES/cap_land_ab/swapab_b" 8
+      for d in cc_r3 swapab cc_r3_b swapab_b; do echo "## $d"; cut -d, -f1-4,6-8 "$RES/cap_land_ab/$d/TIMELINE_LAST3.csv"; done
+      echo "LAND_AB_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
   stop)     # stop OUR OWN jobs only: processes whose cwd is this worktree (run inside the same container)
     for pid in $(pgrep -f "run_merge_matrix.sh|capture_four_api_h20_timelines.sh|nsys profile|profile_four_api_h20.py|torchrun|test_four_api_correctness.py|test_frontend_fe78.py"); do
       [ "$pid" = "$$" ] && continue
