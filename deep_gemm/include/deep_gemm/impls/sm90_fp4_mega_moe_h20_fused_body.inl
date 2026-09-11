@@ -885,9 +885,11 @@
     // because the frontend kernel finished before this grid (or before griddepcontrol.wait).
     if (fe_keys != nullptr and warp_idx >= 4 and warp_idx - 4 < num_tokens and warp_idx - 4 < 8) {
         const uint32_t t = warp_idx - 4;
+        // DG_FE_CC_SELECT=pruned (host: -DDG_FE_CC_SELECT_PRUNED=1 in the JIT header): two-level threshold select
         fable_cc::select_topk8_compact384(fe_keys + t * kNumExperts, static_cast<int>(lane_idx), static_cast<int>(t),
                                           input_topk_idx_buffer.get_base_ptr<int64_t>(),
-                                          input_topk_weights_buffer.get_base_ptr<float>());
+                                          input_topk_weights_buffer.get_base_ptr<float>(),
+                                          DG_FE_CC_SELECT_PRUNED != 0);
         if (thread_idx == 4 * 32) stamp_max(16);       // slot 16: max FE-select-in-Mega done
     }
     // topk_idx / topk_weights loads: read-only (__ldg, ld.global.nc) when the frontend produced

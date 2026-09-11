@@ -538,6 +538,7 @@ __host__ __device__ constexpr int cc_block(int cc) { return cc > 0 ? cc_slots(cc
 constexpr int kTicketRelaxedBit = 128;
 constexpr int kSelectInMegaBit = 512;    // w_hint flag (cc, DG_FE_SELECT_IN_MEGA=1, mma 8): router CTAs end after storing their keys; the fused MegaMoE prologue selects (deep_gemm/impls/fable_cc_select.cuh)
 constexpr int kKeysCompactBit = 256;     // w_hint flag (cc ticket): keys in a compact [token][e] array (DG_FE_CC_KEYS=compact, default when e == 384)
+constexpr int kSelectPrunedBit = 1024;   // w_hint flag (cc ticket, compact keys): two-level threshold select (DG_FE_CC_SELECT=pruned, fable_cc::select_pruned)
 constexpr size_t kCCKeysOff = 64 * 1024; // workspace offset of the compact keys ([2][512] u32 max)
 constexpr int kCCW8Pad = 16;             // fp8 router weight row: h bytes e4m3 + fp32 row scale + pad (row stride h + 16)
 // globaltimer read predicated on `dep`: cannot be scheduled before the load producing it lands
@@ -947,11 +948,12 @@ __device__ __forceinline__ void last_arriver_topk(
     for (int i = 0; i < kVecPerLane; ++i)      // slots back to 0 (the polling merger mode relies on it)
         if (4 * (lane + 32 * i) < nslots) *reinterpret_cast<uint4*>(base + 4 * (lane + 32 * i)) = make_uint4(0u, 0u, 0u, 0u);
 }
-// Compact variant: token t's e (= 384) keys are contiguous -> 3 x 16 B per lane, insertion 12 x 8 + merge8.
+// Compact variant: token t's e (= 384) keys are contiguous -> 3 x 16 B per lane, insertion 12 x 8 + merge8
+// (pruned: fable_cc::select_pruned, DG_FE_CC_SELECT=pruned, same result).
 template <int kTopK>
 __device__ __forceinline__ void last_arriver_topk_compact(
         uint32_t* __restrict__ ckeys, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
-        unsigned long long* mstamps, int m, int e, bool relaxed) {
+        unsigned long long* mstamps, int m, int e, bool relaxed, bool pruned = false) {
     constexpr int kVec = 3;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     if (warp >= m) return;
@@ -973,10 +975,14 @@ __device__ __forceinline__ void last_arriver_topk_compact(
             if (!__any_sync(0xffffffffu, zero)) break;
         }
     }
-    uint32_t loc[kTopK];
-    fable_cc::insert_keys<kTopK, kVec>(q, loc);
     uint32_t run = 0u;
-    merge8<kTopK>(run, loc, lane);
+    if (pruned) {
+        fable_cc::select_pruned<kTopK>(q, lane, run);
+    } else {
+        uint32_t loc[kTopK];
+        fable_cc::insert_keys<kTopK, kVec>(q, loc);
+        merge8<kTopK>(run, loc, lane);
+    }
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
     topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[4] = globaltimer_ns();
@@ -1129,7 +1135,7 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
                         unsigned long long* mstamps = stamps != nullptr ? stamps + static_cast<size_t>(num_router_ctas) * kStampSlots : nullptr;
                         if (mstamps != nullptr && threadIdx.x == 0) mstamps[1] = globaltimer_ns();
                         if (compact)
-                            last_arriver_topk_compact<kMaxTopK>(ckeys, topk_idx, topk_weights, mstamps, m, e, (w_hint & kTicketRelaxedBit) != 0);
+                            last_arriver_topk_compact<kMaxTopK>(ckeys, topk_idx, topk_weights, mstamps, m, e, (w_hint & kTicketRelaxedBit) != 0, (w_hint & kSelectPrunedBit) != 0);
                         else if (groups * cand_slots <= 20 * 32)
                             last_arriver_topk<kMaxTopK, 20>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots, (w_hint & kSelectReduxBit) != 0, (w_hint & kTicketRelaxedBit) != 0);
                         else
@@ -1214,6 +1220,152 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
     __syncthreads();
     if (threadIdx.x == 0) atomicAdd(ticket, 1);
     stamp(stamps, 3);
+    if (pdl_mode == 2) pdl_trigger();
+}
+
+// ---------------------------------------------- lean cc kernel (DG_FE_CC_LEAN=1, round 5)
+// Same numerics and hand-off as router_quant_topk_kernel<1, kMode, true, true, false, 0, 44> with the
+// compact key array (e == 384, ticket merge), compiled as its own entry point. The generic cc44
+// instantiation is 10.6 K SASS instructions and its router role starts 73 KB into the kernel (the
+// entry branches over the polling-merger / slot-key / quant paths); after a 256 MB L2 flush (or the
+// Mega weight stream) every CTA fetches that code cold from DRAM (NCU top stall no_instruction).
+// Here the router CTA's hot path is the first code of the kernel and the cold paths (quant CTA,
+// last-arriver select) are __noinline__ functions, and the router role issues fewer instructions
+// after the weights land:
+//   * weight chunks issued first (the DRAM-latency critical stream), then the L2-hot activations;
+//   * activations converted to fp32 once, right after the loads (in the weight-latency shadow);
+//   * bf16 -> fp32 as one LOP3 (high half) / one shift (low half) per element;
+//   * row 1's conversion + FMA chain only when m == 2 (warp-uniform branch);
+//   * the inactive slot of the last CTA (4 experts) loads row expert_base (valid memory) and
+//     writes no key, instead of predicated loads.
+// Accumulation order unchanged (per lane: fma chain over the 8 bf16 of chunk c in element order,
+// c ascending; xor butterfly 16..1; K-part partials summed ks = 0..3; one bf16 rounding).
+__device__ __forceinline__ float bf16lo_f32(uint32_t w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bf16hi_f32(uint32_t w) { return __uint_as_float(w & 0xFFFF0000u); }
+template <int kMode>
+__device__ __noinline__ void lean_quant_cta(const __nv_bfloat16* __restrict__ hidden, uint8_t* __restrict__ x_bytes,
+                                            float* __restrict__ x_sf, int m, int h) {
+    for (int t = 0; t < m; ++t) quant_cta<kMode, cc_block(44)>(hidden, x_bytes, x_sf, t, h);
+}
+__device__ __noinline__ void lean_last_arriver(uint32_t* __restrict__ ckeys, int64_t* __restrict__ topk_idx,
+                                               float* __restrict__ topk_weights, unsigned long long* mstamps,
+                                               int m, int e, bool relaxed, bool pruned) {
+    last_arriver_topk_compact<kMaxTopK>(ckeys, topk_idx, topk_weights, mstamps, m, e, relaxed, pruned);
+}
+template <int kMode>
+__global__ void __launch_bounds__(cc_block(44), 1) router_cc_lean_kernel(
+        const __nv_bfloat16* __restrict__ hidden,
+        const __nv_bfloat16* __restrict__ router_weight,
+        uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
+        int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
+        int* __restrict__ ticket, float* __restrict__ logits,
+        unsigned long long* stamps,
+        int m, int h, int e, int topk, int num_router_ctas, int w_hint, int pdl_mode, int epc, int k_parts) {
+    constexpr int kSlots = cc_slots(44), kKS = cc_ks(44);                 // 5 experts x 4 K-part warps
+    constexpr int kKPart = kCCH / kKS, kChunks = kKPart / 8 / 32;         // 768 elements = 3 x 16 B chunks per lane
+    __shared__ float part_s[kSlots][kCCMaxM][kKS];
+    __shared__ int s_last;
+    stamp(stamps, 0);
+    stamp_smid(stamps);
+    if (pdl_mode == 1) pdl_trigger();
+    uint32_t* ckeys = reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(logits) + kCCKeysOff);
+    if (static_cast<int>(blockIdx.x) >= num_router_ctas) {                // spare CTA: quantise the m rows
+        lean_quant_cta<kMode>(hidden, x_bytes, x_sf, m, h);
+        stamp(stamps, 5);
+        if (pdl_mode == 2) pdl_trigger();
+        return;
+    }
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int slot = warp / kKS, ks = warp % kKS;
+    const int expert_base = blockIdx.x * epc;
+    const int n_exp = min(epc, e - expert_base);
+    const int wslot = slot < n_exp ? slot : 0;
+    const int kbase = ks * kKPart + lane * 8;
+    stamp(stamps, 7);
+    const __nv_bfloat16* wr = router_weight + static_cast<int64_t>(expert_base + wslot) * h + kbase;
+    uint4 wv[kChunks];
+    #pragma unroll
+    for (int c = 0; c < kChunks; ++c) wv[c] = ld_nc_na_16(wr + 256 * c);
+    const bool two = m > 1;
+    uint4 xv[kCCMaxM][kChunks];
+    #pragma unroll
+    for (int c = 0; c < kChunks; ++c) xv[0][c] = ld_nc_na_16(hidden + kbase + 256 * c);
+    #pragma unroll
+    for (int c = 0; c < kChunks; ++c) {
+        xv[1][c] = make_uint4(0u, 0u, 0u, 0u);
+        if (two) xv[1][c] = ld_nc_na_16(hidden + h + kbase + 256 * c);
+    }
+    stamp(stamps, 5);
+    if (stamps != nullptr && threadIdx.x == 0) stamps[blockIdx.x * kStampSlots + 1] = globaltimer_after(wv[0].x);
+    float xf[kCCMaxM][kChunks][8];
+    #pragma unroll
+    for (int c = 0; c < kChunks; ++c) {
+        const uint32_t xw[4] = {xv[0][c].x, xv[0][c].y, xv[0][c].z, xv[0][c].w};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) { xf[0][c][2 * j] = bf16lo_f32(xw[j]); xf[0][c][2 * j + 1] = bf16hi_f32(xw[j]); }
+    }
+    if (two) {
+        #pragma unroll
+        for (int c = 0; c < kChunks; ++c) {
+            const uint32_t xw[4] = {xv[1][c].x, xv[1][c].y, xv[1][c].z, xv[1][c].w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) { xf[1][c][2 * j] = bf16lo_f32(xw[j]); xf[1][c][2 * j + 1] = bf16hi_f32(xw[j]); }
+        }
+    }
+    float acc0 = 0.0f, acc1 = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < kChunks; ++c) {
+        const uint32_t ww[4] = {wv[c].x, wv[c].y, wv[c].z, wv[c].w};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc0 = fmaf(bf16lo_f32(ww[j]), xf[0][c][2 * j], acc0);
+            acc0 = fmaf(bf16hi_f32(ww[j]), xf[0][c][2 * j + 1], acc0);
+        }
+    }
+    if (two) {
+        #pragma unroll
+        for (int c = 0; c < kChunks; ++c) {
+            const uint32_t ww[4] = {wv[c].x, wv[c].y, wv[c].z, wv[c].w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                acc1 = fmaf(bf16lo_f32(ww[j]), xf[1][c][2 * j], acc1);
+                acc1 = fmaf(bf16hi_f32(ww[j]), xf[1][c][2 * j + 1], acc1);
+            }
+        }
+    }
+    acc0 = warp_sum(acc0);
+    if (lane == 0) part_s[slot][0][ks] = acc0;
+    if (two) {
+        acc1 = warp_sum(acc1);
+        if (lane == 0) part_s[slot][1][ks] = acc1;
+    }
+    __syncthreads();
+    stamp(stamps, 2);
+    if (static_cast<int>(threadIdx.x) < kSlots * kCCMaxM) {
+        const int r = threadIdx.x / kSlots, c = threadIdx.x % kSlots;
+        if (r < m && c < n_exp) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < kKS; ++k) v += part_s[c][r][k];
+            ckeys[static_cast<int64_t>(r) * e + expert_base + c] = topk_key(round_bf16(v), expert_base + c);
+        }
+    }
+    if (w_hint & kSelectInMegaBit) {          // select in Mega: kernel completion publishes the keys
+        stamp(stamps, 3);
+        if (pdl_mode == 2) pdl_trigger();
+        return;
+    }
+    const bool relaxed = (w_hint & kTicketRelaxedBit) != 0;
+    __syncthreads();                          // every key store of this CTA is issued before thread 0's ticket
+    if (threadIdx.x == 0) s_last = (relaxed ? atomicAdd(ticket, 1) : atom_add_acq_rel_gpu(ticket, 1)) == num_router_ctas - 1;
+    __syncthreads();
+    stamp(stamps, 3);
+    if (s_last) {
+        unsigned long long* mstamps = stamps != nullptr ? stamps + static_cast<size_t>(num_router_ctas) * kStampSlots : nullptr;
+        if (mstamps != nullptr && threadIdx.x == 0) mstamps[1] = globaltimer_ns();
+        lean_last_arriver(ckeys, topk_idx, topk_weights, mstamps, m, e, relaxed, (w_hint & kSelectPrunedBit) != 0);
+        if (threadIdx.x == 0) *ticket = 0;
+    }
     if (pdl_mode == 2) pdl_trigger();
 }
 
@@ -1334,6 +1486,23 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         static const bool slots = getenv("DG_FE_CC_KEYS") && strcmp(getenv("DG_FE_CC_KEYS"), "slots") == 0;
         if (kCC > 0 && !slots && e == 384) w_hint |= kKeysCompactBit;
         if (kCC > 0 && mma == 8) w_hint |= kSelectInMegaBit | kKeysCompactBit | kTicketMergeBit;   // spare CTA only quantises
+        // round 5: DG_FE_CC_SELECT=pruned (two-level threshold select, compact keys only; same result)
+        static const bool pruned_sel = getenv("DG_FE_CC_SELECT") && strcmp(getenv("DG_FE_CC_SELECT"), "pruned") == 0;
+        if (kCC > 0 && pruned_sel && (w_hint & kKeysCompactBit)) w_hint |= kSelectPrunedBit;
+    }
+    if constexpr (kCC == 44 && !kW8) {
+        // round 5: DG_FE_CC_LEAN=1 -> dedicated cc44 entry point (hot path first, cold paths out of line, leaner FMA body)
+        static const bool lean = getenv("DG_FE_CC_LEAN") ? atoi(getenv("DG_FE_CC_LEAN")) != 0 : false;
+        if (lean && (w_hint & kKeysCompactBit) && (w_hint & kTicketMergeBit)) {
+            static bool lean_attr = false;
+            if (!lean_attr) {
+                cudaFuncSetAttribute(router_cc_lean_kernel<kMode>, cudaFuncAttributeMaxDynamicSharedMemorySize, 116 * 1024);
+                lean_attr = true;
+            }
+            cudaLaunchKernelEx(&cfg, router_cc_lean_kernel<kMode>,
+                               hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);
+            return;
+        }
     }
     cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC, kW8>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);
