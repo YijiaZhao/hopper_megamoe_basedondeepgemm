@@ -25,6 +25,7 @@ import torch.distributed as dist
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import profile_four_api_h20 as P  # noqa: E402
+import deep_gemm  # noqa: E402
 
 INT64_MAX = (1 << 63) - 1
 MIN_SLOTS = (0, 3, 33)
@@ -148,6 +149,8 @@ def main():
     ap.add_argument("--no-graph", action="store_true")
     ap.add_argument("--fuse-fe", action="store_true",
                     help="run the Fable frontend inside the kernel (needs DG_FP4_FUSE_FE=1); routing from the FE")
+    ap.add_argument("--fe-routing", action="store_true",
+                    help="knob-0 reference for --fuse-fe: the standalone FE runs eagerly before every replay (same routing / quant), the graph holds Mega only")
     ap.add_argument("--no-stamps", action="store_true",
                     help="launch without phase_stamps (wall-time only) to measure probe overhead")
     args = ap.parse_args()
@@ -187,10 +190,15 @@ def main():
             buffer.topk_weights[:active_rows].fill_(1.0 / P.TOPK)
         y = torch.empty(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
         frontend = None
-        if args.fuse_fe:
+        router_weight = None
+        if args.fuse_fe or args.fe_routing:
             torch.manual_seed(20260805)
             router_weight = (torch.randn(P.EXPERTS, P.HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
+        if args.fuse_fe:
             frontend = (x, router_weight)
+        elif args.fe_routing:
+            deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant)
+            torch.cuda.synchronize()
 
         def launch():
             kernel(y, *weights, buffer, cumulative_local_expert_recv_stats=None,
@@ -218,6 +226,8 @@ def main():
         for i in range(args.warmup + args.iters):
             reset(stamps)
             P.flush_l2_cache()
+            if args.fe_routing:
+                deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant)
             torch.cuda.synchronize()
             dist.barrier(group=group)
             start.record()
