@@ -794,8 +794,9 @@ __device__ __forceinline__ void merger_role(
 
 // kTiny: <= 85 regs/thread so 3 CTAs (59 KB smem each) fit per SM -> single wave.
 // kFullK: <= 128 regs (merger warp holds 32 keys), 2 CTAs/SM cap; grid <= SM count anyway.
+// kFma: 16 x uint4 weight vectors live in registers -> 1 CTA/SM bound (255 regs), no spills.
 template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma>
-__global__ void __launch_bounds__(kThreads, kFullK ? 2 : (kTiny ? 3 : 1)) router_quant_topk_kernel(
+__global__ void __launch_bounds__(kThreads, kFma ? 1 : (kFullK ? 2 : (kTiny ? 3 : 1))) router_quant_topk_kernel(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
         uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,

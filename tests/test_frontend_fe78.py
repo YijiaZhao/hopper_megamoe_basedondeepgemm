@@ -36,6 +36,7 @@ def run(buf, hidden, w, quant, grid, mma="wmma"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=40)
+    ap.add_argument("--seed-offset", type=int, default=0, help="first seed index (split a long run over GPUs/hosts)")
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 2, 8, 16])
     ap.add_argument("--grid", default="auto", help="new-scheme DG_FE_TINYM_GRID value (auto or N)")
     ap.add_argument("--weight-tol", type=float, default=1e-6)
@@ -46,7 +47,7 @@ def main():
     n_router = deep_gemm.fable_frontend_router_ctas(1, EXPERTS, HIDDEN, TOPK, 1, args.grid)
     print(f"full-K grid={args.grid} mma={args.mma}: router CTAs={n_router} (+1 merger) vs legacy 96+m; "
           f"device={torch.cuda.get_device_name()} SMs={torch.cuda.get_device_properties(0).multi_processor_count}")
-    for seed in range(args.seeds):
+    for seed in range(args.seed_offset, args.seed_offset + args.seeds):
         torch.manual_seed(5000 + seed)
         w = (torch.randn(EXPERTS, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.05)
         if seed % 4 == 3:   # coarse weights/activations -> exact logit ties
@@ -87,7 +88,7 @@ def main():
     print(f"full-K vs legacy: rows={rows} per quant mode ({2 * rows} row-evaluations); "
           f"top-8 index-set mismatches={set_mismatch} (near-tie {near_tie}, other {set_mismatch - near_tie}); "
           f"weight diffs > {args.weight_tol:g}={weight_flip}; ordering-only differences={idx_order_diff - set_mismatch}; "
-          f"x/x_sf mismatches={quant_mismatch}")
+          f"x/x_sf mismatches={quant_mismatch} (seeds {args.seed_offset}..{args.seed_offset + args.seeds - 1}, mma={args.mma})")
     ok = quant_mismatch == 0 and (set_mismatch - near_tie) == 0
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
