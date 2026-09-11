@@ -123,6 +123,15 @@ case "$MODE" in
       bash "$0" corrref 1 2
       for p in 1 2 3; do bash "$0" capture "$RES/cap/p$p" "2 8 16"; done
       echo "CHAIN2_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
+  chain3)   # final defaults (cc + auto grid + L2 persist for rows <= 2): 8-rank correctness matrix + 3 customer captures
+    C="$RES/chain3.log"; : > "$C"
+    { echo "start $(git rev-parse --short HEAD) $(date -u +%FT%TZ)"
+      bash "$0" corr 1 2 8 16
+      bash "$0" corrref 1 2
+      bash "$0" corrfe 2
+      bash "$0" mx 128 512
+      for p in 1 2 3; do bash "$0" capture "$RES/cap_final/p$p" "2 8 16"; done
+      echo "CHAIN3_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
   stop)     # stop OUR OWN jobs only: processes whose cwd is this worktree (run inside the same container)
     for pid in $(pgrep -f "run_merge_matrix.sh|capture_four_api_h20_timelines.sh|nsys profile|profile_four_api_h20.py|torchrun|test_four_api_correctness.py|test_frontend_fe78.py"); do
       [ "$pid" = "$$" ] && continue
