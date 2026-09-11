@@ -82,7 +82,7 @@ if [ "$MODE" = corr ] || [ "$MODE" = all ]; then
 fi
 if [ "$MODE" = ncu ] || [ "$MODE" = all ]; then
   echo "--- ncu full-K rows=1 mxfp4 (fe_fullkauto_M8_mxfp4)" >> "$LOG"
-  OUT="$RES/ncu_fe"; TAG=fe_fullkauto_M8_mxfp4
+  OUT="$RES/ncu_fe"; TAG=${NCU_TAG:-fe_fullkauto_M8_mxfp4}
   run_gpu ncu env CUDA_VISIBLE_DEVICES=7 DG_FE_TINYM_GRID=auto timeout 900 ncu --target-processes application-only \
     --kernel-name regex:router_quant_topk_kernel --launch-skip 5 --launch-count 1 \
     --set full --import-source no --clock-control none -f -o "$OUT/$TAG" \
