@@ -275,17 +275,18 @@ the customer comparison column (targets M2 < 53, M8 < 61, M16 < 85: all met).
 | QOQ   | 8  | 7.7 (8.6 wmma, 14.8 legacy) | 80.2–90.3   | **54.9–59.3** |
 | QOQ   | 16 | 7.9 (8.7 wmma, 14.9 legacy) | 94.9–109.3  | **74.0–77.4** |
 
-FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16) with the
-swapped-operand router MMA and the fragment weight layout (`DG_FE_TINYM_MMA=auto` ->
-`swapab`, kernel-end stamps 6.14 us): M2/M8/M16 are the medians of three
-independent customer-method captures of this tip (`/raid/kimi/results/merge/cap_swapab`,
-per-capture FE medians 7.42–8.00 us; E2E medians 85.1 / 85.5 / 96.4 MXFP4 and 76.2 / 108.5 /
-98.6 QOQ, one QOQ M8 capture at 232 us from host skew). The wmma value in parentheses
-is the previous default (96 x 4 WMMA, nsys span 8.3–8.7 us); the legacy frontend value
-is the pre-tiny-M kernel. M4 was not re-captured. The CUDA-core router (`DG_FE_TINYM_MMA=cc`)
-has the shortest kernel-end stamps (3.84 us) but the longest customer-method span
-(9.0–9.7 us in three captures as the default) and stays opt-in -- see the knob table.
-E2E ranges span captures with different host launch skew.
+FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16). The M2/M8/M16
+values are the medians of three independent customer-method captures of this tip with the
+swapped-operand router MMA + fragment weight layout (`DG_FE_TINYM_MMA=swapab`, kernel-end
+stamps 6.14 us; `/raid/kimi/results/merge/cap_swapab`, per-capture FE medians 7.42–8.00 us;
+E2E medians 85.1 / 85.5 / 96.4 MXFP4 and 76.2 / 108.5 / 98.6 QOQ, one QOQ M8 capture at 232 us
+from host skew). The shipped default for m <= 2 rows/rank (= every point of this table) is the
+round-3 CUDA-core router (`DG_FE_TINYM_MMA=auto` -> `cc`, kernel-end stamps 3.84 us), which in
+the same-session A/B at M=8 measured 6.88/7.78 and 7.49/7.49 us (mxfp4/qoq) vs 8.13/7.84 swapab;
+its three full captures (`scripts/run_merge_matrix.sh chain6` -> `cap_cc3`) are queued behind a
+foreign capture marker on .7 and will replace this column. The wmma value in parentheses is the
+previous default (96 x 4 WMMA, nsys span 8.3–8.7 us); the legacy frontend value is the pre-tiny-M
+kernel. M4 was not re-captured. E2E ranges span captures with different host launch skew.
 
 M2/M4 values are medians over five independent captures (branch tip with
 `DG_FP4_STREAMK` default on); M8/M16 are the range over the r4/r5 captures
