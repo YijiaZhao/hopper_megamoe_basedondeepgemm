@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--tinym", type=int, default=int(os.environ.get("DG_FE_TINYM", "1")))
     ap.add_argument("--grid", default=os.environ.get("DG_FE_TINYM_GRID", "auto"),
                     help="DG_FE_TINYM_GRID: 96 = legacy split, auto = full-K SM-count grid, N = full-K N CTAs")
+    ap.add_argument("--mma", default=os.environ.get("DG_FE_TINYM_MMA", "wmma"), help="DG_FE_TINYM_MMA: wmma | fma")
     ap.add_argument("--warmup", type=int, default=5, help="eager launches before the profiled one")
     ap.add_argument("--l2-flush", type=int, default=1, help="flush L2 (256 MB memset) before each launch")
     args = ap.parse_args()
@@ -49,10 +50,10 @@ def main():
         if scratch is not None:
             scratch.zero_()
         deep_gemm.fable_router_quant_topk_frontend(hidden, w, buf, quant=args.quant,
-                                                   tinym=args.tinym, stamps=0, grid=args.grid)
+                                                   tinym=args.tinym, stamps=0, grid=args.grid, mma=args.mma)
         torch.cuda.synchronize()
     m = args.rows
-    print(f"fe standalone: quant={args.quant} rows={m} tinym={args.tinym} grid={args.grid} launches={args.warmup + 1} "
+    print(f"fe standalone: quant={args.quant} rows={m} tinym={args.tinym} grid={args.grid} mma={args.mma} launches={args.warmup + 1} "
           f"device={torch.cuda.get_device_name()} topk_idx[0]={buf.topk_idx[0].tolist()}")
 
 

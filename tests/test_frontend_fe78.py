@@ -23,10 +23,10 @@ import deep_gemm  # noqa: E402
 from test_frontend_tinym import HIDDEN, EXPERTS, TOPK, make_buffer  # noqa: E402
 
 
-def run(buf, hidden, w, quant, grid):
+def run(buf, hidden, w, quant, grid, mma="wmma"):
     buf.x.view(torch.uint8).fill_(0xAB); buf.x_sf.fill_(-1.0)
     buf.topk_idx.fill_(-7); buf.topk_weights.fill_(-1.0)
-    deep_gemm.fable_router_quant_topk_frontend(hidden, w, buf, quant=quant, tinym=1, stamps=0, grid=grid)
+    deep_gemm.fable_router_quant_topk_frontend(hidden, w, buf, quant=quant, tinym=1, stamps=0, grid=grid, mma=mma)
     torch.cuda.synchronize()
     m = hidden.size(0)
     return (buf.x[:m].view(torch.uint8).clone(), buf.x_sf[:m].clone(),
@@ -39,11 +39,12 @@ def main():
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 2, 8, 16])
     ap.add_argument("--grid", default="auto", help="new-scheme DG_FE_TINYM_GRID value (auto or N)")
     ap.add_argument("--weight-tol", type=float, default=1e-6)
+    ap.add_argument("--mma", default="wmma", choices=("wmma", "fma"), help="new-scheme DG_FE_TINYM_MMA value")
     args = ap.parse_args()
     buf_old, buf_new = make_buffer(64), make_buffer(64)
     rows = set_mismatch = near_tie = weight_flip = quant_mismatch = idx_order_diff = 0
     n_router = deep_gemm.fable_frontend_router_ctas(1, EXPERTS, HIDDEN, TOPK, 1, args.grid)
-    print(f"full-K grid={args.grid}: router CTAs={n_router} (+1 merger) vs legacy 96+m; "
+    print(f"full-K grid={args.grid} mma={args.mma}: router CTAs={n_router} (+1 merger) vs legacy 96+m; "
           f"device={torch.cuda.get_device_name()} SMs={torch.cuda.get_device_properties(0).multi_processor_count}")
     for seed in range(args.seeds):
         torch.manual_seed(5000 + seed)
@@ -59,7 +60,7 @@ def main():
             ref_sorted = ref.sort(dim=1, descending=True).values
             for quant in ("mxfp4", "qoq"):
                 old = run(buf_old, hidden, w, quant, 96)
-                new = run(buf_new, hidden, w, quant, args.grid)
+                new = run(buf_new, hidden, w, quant, args.grid, args.mma)
                 if not (torch.equal(old[0], new[0]) and torch.equal(old[1], new[1])):
                     quant_mismatch += 1
                     print(f"QUANT MISMATCH seed={seed} m={m} quant={quant}")

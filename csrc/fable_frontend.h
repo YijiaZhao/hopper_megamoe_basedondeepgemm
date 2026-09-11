@@ -27,10 +27,12 @@ constexpr size_t kFrontendStampsBytes = kFrontendMaxCTAs * 8 * sizeof(unsigned l
 // with N CTAs in total. Full-K outputs are deterministic but not bit-identical to
 // the legacy split (different fp32 accumulation order before the bf16 rounding).
 size_t router_quant_topk_frontend_workspace_bytes(int e);
+// `mma` (DG_FE_TINYM_MMA, full-K only): 0 = WMMA bf16 m16n16k16 (TMA row pieces
+// into smem); 1 = CUDA-core fp32 FMA straight from global (ld.global.nc 16 B).
 // Router CTA count the launch will use (bench / stamp attribution helper).
 int router_quant_topk_frontend_router_ctas(int m, int h, int e, int topk, int tiny, int grid);
 void launch_router_quant_topk_frontend(
     const void* hidden, const void* router_weight,
     void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
     void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-    int tiny, int stamps_on, int l2_persist, int pdl_mode, int grid, cudaStream_t stream);
+    int tiny, int stamps_on, int l2_persist, int pdl_mode, int grid, int mma, cudaStream_t stream);

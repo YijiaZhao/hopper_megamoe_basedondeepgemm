@@ -19,6 +19,7 @@ RES=${RES:-/raid/kimi/results}
 TOKENS_LIST=${TOKENS_LIST:-"8 16"}
 ITERS=${ITERS:-100}
 GRIDS=${GRIDS:-"96 auto"}
+MMAS=${MMAS:-"wmma"}
 export PYTHONPATH="$ROOT"
 export CUDA_HOME=/usr/local/cuda
 export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -60,16 +61,18 @@ run_gpu() {
 echo "=== FE78 $MODE $(git rev-parse --short HEAD) $(date)" >> "$LOG"
 if [ "$MODE" = ident ] || [ "$MODE" = all ]; then
   echo "--- ident (96 vs auto)" >> "$LOG"
-  run_gpu ident env CUDA_VISIBLE_DEVICES=7 timeout 900 python3 tests/test_frontend_fe78.py --seeds 40 >> "$LOG" 2>&1
+  for MM in $MMAS; do
+    run_gpu ident env CUDA_VISIBLE_DEVICES=7 timeout 900 python3 tests/test_frontend_fe78.py --seeds 40 --mma "$MM" >> "$LOG" 2>&1
+  done
 fi
 if [ "$MODE" = bench ] || [ "$MODE" = all ]; then
   for M in $TOKENS_LIST; do
     for Q in mxfp4 qoq; do
-      for G in $GRIDS; do
-        echo "--- bench M=$M quant=$Q DG_FE_TINYM_GRID=$G" >> "$LOG"
-        DG_FE_TINYM_GRID=$G DG_FE_STAMPS=1 run_gpu "bench M=$M $Q g$G" timeout 900 "$TR" --standalone --nproc_per_node=8 \
+      for G in $GRIDS; do for MM in $MMAS; do
+        echo "--- bench M=$M quant=$Q DG_FE_TINYM_GRID=$G DG_FE_TINYM_MMA=$MM" >> "$LOG"
+        DG_FE_TINYM_GRID=$G DG_FE_TINYM_MMA=$MM DG_FE_STAMPS=1 run_gpu "bench M=$M $Q g$G $MM" timeout 900 "$TR" --standalone --nproc_per_node=8 \
           tests/bench_frontend_tinym.py --quant "$Q" --global-tokens "$M" --iters "$ITERS" >> "$LOG" 2>&1
-      done
+      done; done
     done
   done
 fi

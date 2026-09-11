@@ -612,6 +612,95 @@ __device__ __forceinline__ void router_role_fullk(
     }
 }
 
+// CUDA-core variant of the full-K router (DG_FE_TINYM_MMA=fma): no smem ring, no
+// TMA, no WMMA fragments, no per-stage __syncthreads. Thread t owns the 16 B
+// vectors t and t + 256 (h = 3072 -> 384 vectors per row, so threads < 128 own two)
+// of every row; it issues ALL its expert weight vectors up front (<= 8 experts x 2
+// = 16 x ld.global.nc.L1::no_allocate, each thread >= 5 loads in flight, the CTA
+// ~36 KB) and then, per token row, loads the row's 2 activation vectors (L2-hot,
+// every CTA reads the same rows) and FMAs. Accumulation order (fixed, documented):
+// per thread and expert, acc = fma chain over the 8 bf16 pairs of vector t in
+// element order, continued over the 8 pairs of vector t + 256; then the 32 lane
+// partials are summed by the xor-butterfly (16, 8, 4, 2, 1); then the 8 warp
+// partials are summed in warp order 0..7 through smem; one bf16 rounding.
+__device__ __forceinline__ uint4 ld_nc_na_16(const void* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ float dot8_bf16(const uint4& w, const uint4& x, float acc) {
+    const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&w);
+    const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&x);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 a = __bfloat1622float2(wp[j]), b = __bfloat1622float2(xp[j]);
+        acc = fmaf(a.x, b.x, acc);
+        acc = fmaf(a.y, b.y, acc);
+    }
+    return acc;
+}
+template <int kMode>
+__device__ __forceinline__ void router_role_fullk_fma(
+        const __nv_bfloat16* __restrict__ hidden,
+        const __nv_bfloat16* __restrict__ router_weight,
+        uint32_t* __restrict__ cand,
+        uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
+        unsigned long long* stamps,
+        int m, int h, int e, int epc, int num_router_ctas) {
+    extern __shared__ __align__(128) uint8_t dyn_smem[];
+    float (*part_s)[kCandSlots][16] = reinterpret_cast<float (*)[kCandSlots][16]>(dyn_smem);   // [warp][expert][row]
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int expert_base = blockIdx.x * epc;
+    const int n_exp = min(epc, e - expert_base);
+    const int nvec = h / 8;
+    const int v0 = threadIdx.x, v1 = threadIdx.x + kThreads;
+    const bool has1 = v1 < nvec;                    // h <= 4096
+    stamp(stamps, 7);
+    uint4 w0[kCandSlots], w1[kCandSlots];
+    #pragma unroll
+    for (int i = 0; i < kCandSlots; ++i) {
+        w0[i] = make_uint4(0u, 0u, 0u, 0u); w1[i] = w0[i];
+        if (i < n_exp) {
+            const __nv_bfloat16* wr = router_weight + static_cast<int64_t>(expert_base + i) * h;
+            w0[i] = ld_nc_na_16(wr + v0 * 8);
+            if (has1) w1[i] = ld_nc_na_16(wr + v1 * 8);
+        }
+    }
+    stamp(stamps, 5);
+    // Overlapped activation quantisation while the weight vectors are in flight.
+    if (static_cast<int>(blockIdx.x) < m) {
+        quant_role<kMode>(hidden, x_bytes, x_sf, blockIdx.x, h);
+        stamp(stamps, 4);
+    }
+    for (int r = 0; r < m; ++r) {
+        const __nv_bfloat16* xr = hidden + static_cast<int64_t>(r) * h;
+        const uint4 x0 = ld_nc_na_16(xr + v0 * 8);
+        const uint4 x1 = has1 ? ld_nc_na_16(xr + v1 * 8) : make_uint4(0u, 0u, 0u, 0u);
+        #pragma unroll
+        for (int i = 0; i < kCandSlots; ++i) {
+            float acc = dot8_bf16(w0[i], x0, 0.0f);
+            if (has1) acc = dot8_bf16(w1[i], x1, acc);
+            if (r == 0 && i == 0) stamp(stamps, 1);            // first weight/activation bytes consumed
+            acc = warp_sum(acc);
+            if (lane == 0) part_s[warp][i][r] = acc;
+        }
+    }
+    __syncthreads();
+    stamp(stamps, 2);
+    {
+        const int r = threadIdx.x / 16, c = threadIdx.x % 16;
+        if (r < m && c < kCandSlots) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < kThreads / 32; ++w) v += part_s[w][c][r];
+            const int ex = expert_base + c;
+            const uint32_t key = c < n_exp ? topk_key(round_bf16(v), ex) : 1u;
+            cand[(static_cast<int64_t>(r) * num_router_ctas + blockIdx.x) * kCandSlots + c] = key;
+        }
+    }
+}
+
 // Merger CTA: one warp per token (m <= 16 -> <= 2 tokens per warp). Lane l owns
 // slots l, l+32, ... of cand[token] (coalesced 128 B polls; a CTA's 8 keys land in
 // 8 consecutive lanes). Register-lean streaming merge (no per-slot key array -> no
@@ -705,7 +794,7 @@ __device__ __forceinline__ void merger_role(
 
 // kTiny: <= 85 regs/thread so 3 CTAs (59 KB smem each) fit per SM -> single wave.
 // kFullK: <= 128 regs (merger warp holds 32 keys), 2 CTAs/SM cap; grid <= SM count anyway.
-template <int kMTiles, int kMode, bool kTiny, bool kFullK>
+template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma>
 __global__ void __launch_bounds__(kThreads, kFullK ? 2 : (kTiny ? 3 : 1)) router_quant_topk_kernel(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
@@ -725,7 +814,10 @@ __global__ void __launch_bounds__(kThreads, kFullK ? 2 : (kTiny ? 3 : 1)) router
             else
                 merger_role<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, stamps, m, num_router_ctas);
         } else {
-            router_role_fullk<kMode>(hidden, router_weight, cand, x_bytes, x_sf, stamps, m, h, e, epc, num_router_ctas, w_hint);
+            if constexpr (kFma)
+                router_role_fullk_fma<kMode>(hidden, router_weight, cand, x_bytes, x_sf, stamps, m, h, e, epc, num_router_ctas);
+            else
+                router_role_fullk<kMode>(hidden, router_weight, cand, x_bytes, x_sf, stamps, m, h, e, epc, num_router_ctas, w_hint);
             stamp(stamps, 3);
         }
         if (pdl_mode == 2) pdl_trigger();
@@ -836,7 +928,7 @@ static void fullk_plan(int e, int grid, int& epc, int& router_ctas) {
     router_ctas = (e + epc - 1) / epc;
 }
 
-template <int kMTiles, int kMode, bool kTiny, bool kFullK>
+template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma = false>
 void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
             int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
             int m, int h, int e, int topk, int l2_persist, int pdl_mode, int grid, cudaStream_t stream) {
@@ -845,7 +937,7 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     int smem_bytes = Cfg::kDynSmemBytes, num_ctas = router_ctas + m;
     if constexpr (kFullK) {
         fullk_plan(e, grid, epc, router_ctas);
-        smem_bytes = fullk_smem_bytes(m, epc);
+        smem_bytes = kFma ? (kThreads / 32) * kCandSlots * 16 * 4 : fullk_smem_bytes(m, epc);
         num_ctas = router_ctas + 1;
         // DG_FE_FULLK_1PERSM (default 1): when the grid fits the SM count, request
         // enough dynamic smem that only one CTA fits per SM, so the block scheduler
@@ -855,7 +947,7 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     }
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK>,
+        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              kFullK ? std::max(fullk_smem_bytes(16, kCandSlots), 116 * 1024) : Cfg::kDynSmemBytes);
         attr_set = true;
@@ -883,16 +975,20 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         a.val.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
     }
     const int w_hint = l2_persist == 2 ? 1 : 0;
-    cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK>,
+    cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc);
 }
 
 template <int kMode>
 void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
                  int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-                 int m, int h, int e, int topk, bool tiny, int l2_persist, int pdl_mode, int grid, cudaStream_t stream) {
-    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && h % kChunkK == 0 && h / kChunkK <= kFullKStages)
-        launch<1, kMode, true, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
+                 int m, int h, int e, int topk, bool tiny, int l2_persist, int pdl_mode, int grid, int mma, cudaStream_t stream) {
+    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && h % kChunkK == 0 && h / kChunkK <= kFullKStages) {
+        if (mma == 1 && h <= 8 * 2 * kThreads)   // fma: thread owns <= 2 vectors per row
+            launch<1, kMode, true, true, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
+        else
+            launch<1, kMode, true, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
+    }
     else if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
     else if (m <= 16) launch<1, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
     else if (m <= 32) launch<2, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
@@ -919,7 +1015,7 @@ void launch_router_quant_topk_frontend(
         const void* hidden, const void* router_weight,
         void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
         void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-        int tiny, int stamps_on, int l2_persist, int pdl_mode, int grid, cudaStream_t stream) {
+        int tiny, int stamps_on, int l2_persist, int pdl_mode, int grid, int mma, cudaStream_t stream) {
     int* ticket = static_cast<int*>(workspace);
     float* logits = reinterpret_cast<float*>(static_cast<char*>(workspace) + kFrontendStampsOffsetBase);
     unsigned long long* stamps = nullptr;
@@ -932,9 +1028,9 @@ void launch_router_quant_topk_frontend(
     if (mode == 0)
         launch_mode<0>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, grid, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, grid, mma, stream);
     else
         launch_mode<1>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, grid, stream);
+                       ticket, logits, stamps, m, h, e, topk, use_tiny, l2_persist, pdl_mode, grid, mma, stream);
 }
