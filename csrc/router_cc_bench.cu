@@ -202,9 +202,9 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     uint4 wv[kEPW][kChunks];
     if constexpr (kLoad == 4) {          // FE layout: CTA b owns experts b*5 .. b*5+4 = one contiguous 30 KB
         if (threadIdx.x == 0) {
-            const int n = min(kExpertsPerCTA, e - static_cast<int>(blockIdx.x) * kExpertsPerCTA);
+            const int n = max(0, min(kExpertsPerCTA, e - static_cast<int>(blockIdx.x) * kExpertsPerCTA));
             mbar_arrive_expect_tx(&w_bar[0], n * kH * 2);
-            tma_bulk_g2s(w_s, w + static_cast<int64_t>(blockIdx.x) * kExpertsPerCTA * kH, n * kH * 2, &w_bar[0]);
+            if (n > 0) tma_bulk_g2s(w_s, w + static_cast<int64_t>(blockIdx.x) * kExpertsPerCTA * kH, n * kH * 2, &w_bar[0]);
         }
     } else if constexpr (kLoad == 3) {
         if (lane == 0 && any) {

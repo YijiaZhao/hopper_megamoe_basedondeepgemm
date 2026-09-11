@@ -1464,7 +1464,9 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     if constexpr (kFullK) {
         static const int defer = getenv("DG_FE_MERGER_DEFER") ? atoi(getenv("DG_FE_MERGER_DEFER")) : (kCC > 0 ? 1 : 0);
         if (defer) w_hint |= kMergerDeferBit;
-        static const bool ticket_merge = getenv("DG_FE_CC_MERGE") && strcmp(getenv("DG_FE_CC_MERGE"), "ticket") == 0;
+        // cc default: ticket (last-arriver merge). H20 kernel end rows 1|2 x mxfp4|qoq: polling merger 5.12-5.63 us,
+        // ticket 4.86-5.12 (fence + atomic 0.3-0.5 after the last keys, read 0.25, fold + merge 0.5, softmax + write 0.25).
+        static const bool ticket_merge = getenv("DG_FE_CC_MERGE") ? strcmp(getenv("DG_FE_CC_MERGE"), "ticket") == 0 : true;
         if (kCC > 0 && ticket_merge) w_hint |= kTicketMergeBit;
     }
     cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC>,
