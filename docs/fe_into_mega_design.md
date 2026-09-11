@@ -167,5 +167,10 @@ e.g. all 4 K-parts of an expert group on one CTA with a per-group candidate top-
 bandwidth-bound ~1 us, hand-off of 192 keys instead of 1536 partials), the quant on the loader
 warps, and the crew code kept out of the math role's register allocation without an ABI call
 (separate warps: not available -- the 8 math warps are the only 256-thread group with registers).
-Customer-method nsys captures (knob 0 vs 1, e2e fused, M=2/8/16) are in
-`/raid/kimi/results/fefuse/run3/CAPTURE_SUMMARY.md`.
+Customer-method nsys captures (knob 0 vs 1, e2e fused, M=2/8/16, 3 each) were NOT obtained: on
+2026-09-11 the node was shared with another agent's jobs (single-GPU FE experiments, later an 8-GPU
+job) and `scripts/capture_four_api_h20_timelines.sh` correctly refuses / drops reports when another
+GPU process appears. When the node is exclusive:
+`for p in 1 2 3; do bash scripts/run_fe_fuse.sh capture /raid/kimi/results/fefuse/cap_k0/p$p "2 8 16" -- DG_FP4_FUSE_FE=0; bash scripts/run_fe_fuse.sh capture /raid/kimi/results/fefuse/cap_k1/p$p "2 8 16" -- DG_FP4_FUSE_FE=1; done; python3 scripts/summarize_knob_captures.py --knob 0 .../cap_k0/p* --knob 1 .../cap_k1/p* --fused-only`.
+The CUDA-event A/B above (two independent passes, +4.8..+7.6 us at every point) already decides the
+default; the customer method measures the same graph span (frontend + MegaMoE).
