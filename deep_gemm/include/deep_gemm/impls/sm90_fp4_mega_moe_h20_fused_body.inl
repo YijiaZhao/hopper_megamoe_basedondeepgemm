@@ -3075,10 +3075,16 @@
                                 const uint32_t accum_offset = (hp * kUnitHalves + half) * kSwapABHalfAccumPerThread + i * 4;
                                 #pragma unroll
                                 for (uint32_t j = 0; j < 4; ++ j) {
-                                    swap_accum_t v = acc[0][half][0][j];
+                                    // Accumulator i * 4 + j holds token (i * 8 + col_idx * 2 + (j & 1))
+                                    // of weight row (j < 2 ? r_0 : r_1), like `promote_stage_rf`.
+                                    // (Indexing `acc[..][j]` here made every token group i > 0 of a
+                                    // BM16 / BM24 block, i.e. rows 8.. of a block with > 8 valid
+                                    // rows, re-use group 0's sums under their own activation scale:
+                                    // the QoQ T=32 / T=64 cos_min < 0 failures of 2026-09-11.)
+                                    swap_accum_t v = acc[0][half][0][i * 4 + j];
                                     #pragma unroll
                                     for (uint32_t c = 1; c < kAccChains; ++ c)
-                                        v += acc[0][half][c][j];
+                                        v += acc[0][half][c][i * 4 + j];
                                     // |v| < 2^26 exceeds the 2^22 magic-constant range: one
                                     // exact I2F per element, 32 per thread per TASK.
                                     final_accum[accum_offset + j] += act_scale[i][j & 1] * static_cast<float>(v);
