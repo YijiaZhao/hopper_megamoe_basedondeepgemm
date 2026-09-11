@@ -7,6 +7,7 @@
 #   corrfe  <log> <tokens...> -- [ENV=..] : --frontend fused: FE+Mega vs fused-FE bit-equality + reference (T <= 2)
 #   stress  <log> <M> -- [ENV=..]         : 200-iter graph replay of FE / Mega / FE+Mega / FEinMega, both quants
 #   bench   <log> <M...> -- [ENV=..]      : CUDA-event E2E, FE+Mega (knob 0) vs FEinMega (knob 1), n=100, both quants
+#   debug   <log> <M> -- [ENV=..]         : tests/debug_fe_fuse.py (determinism / equality diagnostics), both quants
 #   capture <outdir> <tokens_list> -- [ENV=..] : one official e2e/fused capture (customer method)
 #   chain   <results_root>                : the whole A/B
 set -uo pipefail
@@ -99,6 +100,16 @@ case "$MODE" in
       done
     done
     echo "BENCH_RC=$rc" >> "$LOG"; drop_marker ;;
+  debug)
+    LOG=${POS[0]}; M=${POS[1]:-8}; : > "$LOG"
+    for Q in mxfp4 qoq; do
+      echo "--- debug $Q M=$M DG_FP4_FUSE_FE=1 (${ENVS[*]:-})" >> "$LOG"
+      wait_idle "debug $Q"
+      DG_FP4_FUSE_FE=1 run_env timeout 900 "$TR" --standalone --nproc_per_node=8 tests/debug_fe_fuse.py \
+        --quant "$Q" --global-tokens "$M" >> "$LOG" 2>&1
+      echo "DEBUG_EXIT=$?" >> "$LOG"
+    done
+    drop_marker ;;
   capture)
     OUTDIR=${POS[0]}; TOK=${POS[1]}
     mkdir -p "$(dirname "$OUTDIR")"
