@@ -2114,6 +2114,18 @@
             uint64_t* fe_mbar = reinterpret_cast<uint64_t*>(fe_key_s + fable_fe::kMaxExperts);
             DG_TRAP_ONLY_DEVICE_ASSERT(num_tokens <= 16 && num_tokens <= kNumSMs);
             if (fe_tid == 0) stamp_min(33);   // FE crew start (registers allocated)
+            // Per-CTA phase durations (max over CTAs, ns): 58 issue, 59 land, 60 WMMA+store,
+            // 61 release, 62 top-k CTA: wait for all units, 63 top-k compute + write
+            unsigned long long fe_t_prev = 0ull;
+            const auto fe_now = [&]() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; };
+            const auto fe_dur_max = [&](const uint32_t slot) {
+                if (phase_stamps != nullptr && fe_tid == 0) {
+                    const unsigned long long t = fe_now();
+                    atomicMax(phase_stamps + slot, t - fe_t_prev);
+                    fe_t_prev = t;
+                }
+            };
+            if (phase_stamps != nullptr && fe_tid == 0) fe_t_prev = fe_now();
             // Units of this CTA: u0 = kNumSMs - 1 - sm_idx, u0 + kNumSMs, ... < kFENumUnits
             // (the two-unit CTAs are the high ones, the top-k CTAs 0..m-1 carry one).
             const uint32_t fe_u0 = kNumSMs - 1 - sm_idx;
@@ -2131,6 +2143,7 @@
                 fable_fe::mbar_expect_tx(fe_mbar, fe_tx_bytes);
                 stamp_max(49);   // router loads issued
             }
+            fe_dur_max(58);
             // (2) token sm_idx's activation quantisation while the router loads land
             if (sm_idx < num_tokens) {
                 fable_fe::quant_role<kQoQ ? 1 : 0>(fe_hidden_bf,
@@ -2142,12 +2155,14 @@
             fable_fe::mbar_wait(fe_mbar, 0u);
             fe_sync();   // padding-row zero stores of every thread visible too
             if (fe_tid == 0) stamp_max(51);   // router loads landed
+            fe_dur_max(59);
             #pragma unroll
             for (uint32_t i = 0; i < kFEMaxUnitsPerCTA; ++ i)
                 if (fe_u0 + i * kNumSMs < kFENumUnits)
                     fable_fe::router_unit_compute<1, true>(fe_logits, fe_m, fe_h, fe_e,
                         static_cast<int>(fe_u0 + i * kNumSMs), fe_tid, smem_fe_base + i * kFEUnitSmemBytes, fe_sync);
             if (fe_tid == 0) stamp_max(52);   // router WMMA + partial stores done
+            fe_dur_max(60);
             // CTA barrier, then ONE release.gpu atomic by thread 0 (cumulative over the
             // crew's partial stores, like the push-dispatch DONE ticket)
             fe_sync();
@@ -2155,12 +2170,14 @@
                 ptx::atomic_add_rel(fe_counters + 8, 1u);
                 stamp_max(45);   // router units of this CTA done
             }
+            fe_dur_max(61);
             // (4) top-k + softmax of token sm_idx once every unit landed
             if (sm_idx < num_tokens) {
                 if (fe_tid == 0) {
                     DG_SPIN_WHILE(ptx::ld_acq(fe_counters + 8) < kNumSMs, 4101);
                     stamp_max(54);   // top-k CTA saw every router unit
                 }
+                fe_dur_max(62);
                 fe_sync();
                 fable_fe::topk_softmax_token_tiny<fe_cfg_t::kKSplitCTAs, kFETopkPerLane, 8>(
                     fe_logits, input_topk_idx_buffer.get_base_ptr<int64_t>(), input_topk_weights_buffer.get_base_ptr<float>(),
@@ -2170,6 +2187,7 @@
                     ptx::atomic_add_rel(fe_counters + 9, 1u);
                     stamp_max(46);   // top-k of this token written
                 }
+                fe_dur_max(63);
             }
         }
 

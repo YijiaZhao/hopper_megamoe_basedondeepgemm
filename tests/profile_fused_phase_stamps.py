@@ -58,6 +58,8 @@ REPORT = [
 # SM0-only accumulators (per launch after reset): 13 = entry->after NVLink barrier#1,
 # 16 = time spent inside NVLink barrier#1 (includes cross-rank launch skew).
 ACCUM = [(13, "SM0: entry->after barrier1"), (16, "SM0: barrier1 wait incl. skew")]
+FE_DUR = [(58, "FE per-CTA: issue (max us)"), (59, "FE per-CTA: land (max us)"), (60, "FE per-CTA: WMMA+store (max us)"),
+          (61, "FE per-CTA: release (max us)"), (62, "FE top-k CTA: wait units (max us)"), (63, "FE top-k CTA: compute+write (max us)")]
 # K-loop stage probe (SM0 thread0, SM cycles @1830MHz): per-stage ns = cycles / count / 1.83
 # BM8 MXFP4 (kKBlocksPerStage == 2): one "stage" = two K128 blocks (12 stages per L1
 # task); 18 = both decodes of the stage, 19 = wait<1> + wait<0> drains.
@@ -263,6 +265,10 @@ def main():
             for slot, name in ACCUM:
                 v = [r[slot] for r in rows]
                 print(f"{slot:>4} {name:<32} {statistics.median(v):>9.2f} {min(v):>9.2f} {max(v):>9.2f}")
+            if args.fuse_fe:
+                for slot, name in FE_DUR:
+                    v = [sr[slot] / 1000.0 for sr in raw_rows]
+                    print(f"{slot:>4} {name:<32} {statistics.median(v):>9.2f} {min(v):>9.2f} {max(v):>9.2f}")
             n_st = statistics.median(r[21] for r in rows)
             print(f"--- K-loop stage probe (SM0 thread0), {n_st:.0f} L1 stages/launch, ns per stage ---")
             for slot, name in STAGE:
