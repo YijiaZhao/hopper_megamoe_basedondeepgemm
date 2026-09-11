@@ -8,6 +8,7 @@
 #   corrref <log> <tokens...> -- [ENV=..] : --frontend fe: standalone FE routing + Mega vs the exact reference (per-slot check)
 #   stress  <log> <M> -- [ENV=..]         : 200-iter graph replay of FE / Mega / FE+Mega / FEinMega, both quants
 #   bench   <log> <M...> -- [ENV=..]      : CUDA-event E2E, FE+Mega (knob 0) vs FEinMega (knob 1), n=100, both quants
+#   probe   <tag> <M> -- [ENV=..]         : phase-stamp probe with the FE fused in (both quants) -> $RES/fefuse/probe_<tag>_*.log
 #   debug   <log> <M> -- [ENV=..]         : tests/debug_fe_fuse.py (determinism / equality diagnostics), both quants
 #   capture <outdir> <tokens_list> -- [ENV=..] : one official e2e/fused capture (customer method)
 #   chain   <results_root>                : the whole A/B
@@ -119,6 +120,15 @@ case "$MODE" in
       done
     done
     echo "BENCH_RC=$rc" >> "$LOG"; drop_marker ;;
+  probe)
+    TAG=${POS[0]}; M=${POS[1]:-8}
+    for Q in mxfp4 qoq; do
+      wait_idle "probe $Q M=$M"
+      DG_FP4_FUSE_FE=1 run_env timeout 900 "$TR" --standalone --nproc_per_node=8 tests/profile_fused_phase_stamps.py \
+        --quant "$Q" --global-tokens "$M" --iters 20 --fuse-fe > "$RES/fefuse/probe_${TAG}_${Q}_m$M.log" 2>&1
+      echo "PROBE_EXIT=$?" >> "$RES/fefuse/probe_${TAG}_${Q}_m$M.log"
+    done
+    drop_marker ;;
   debug)
     LOG=${POS[0]}; M=${POS[1]:-8}; : > "$LOG"
     for Q in mxfp4 qoq; do
