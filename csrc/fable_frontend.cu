@@ -440,11 +440,11 @@ __device__ __forceinline__ void quant_role(
 // ceil(e / (T - 1)), router CTAs = ceil(e / epc) (H20: 5 experts x 77 CTAs +
 // 1 merger CTA = 78 = one CTA per SM). Each CTA owns its experts over the FULL
 // K, so it produces FINAL logits: no K-part partial reduction, no ticket.
-//   * all h/256 K chunks (12 for H=3072) are issued up front as TMA 1D bulk
-//     copies (one 512 B cp.async.bulk per row-chunk, one mbarrier per chunk) into a
-//     12-stage smem ring (stage = m rows of hidden + epc rows of weights, rounded
-//     to even rows so WMMA tiles stay 32 B aligned; m=1: 67 KB -> 3 CTAs/SM fit,
-//     m=16: 219 KB -> 1 CTA/SM) -> only the first chunk's HBM round trip is exposed;
+//   * the whole K of every row (m hidden rows + epc weight rows) is issued up
+//     front as TMA 1D bulk copies into row-contiguous smem (kFullKLd stride): 1-3
+//     pieces per row (mbarrier per piece, <= ~24 copies per CTA -- the bulk-copy
+//     queue is shallow), so only the first piece's HBM round trip is exposed and
+//     WMMA on piece i overlaps the landing of pieces i+1..;
 //   * accumulation order: warp w owns K-slice [32w, 32w+32) of every 256-chunk
 //     and accumulates the 12 chunks (24 WMMA m16n16k16 bf16 -> fp32 steps, chunk
 //     order) in ONE fp32 accumulator; the 8 warp partials are then summed in
@@ -463,8 +463,13 @@ __device__ __forceinline__ void quant_role(
 //     legacy k = 0..7 order; then it zeroes the slots for the next launch.
 //   * quantisation: router CTA t < m quantises token t between issuing its
 //     chunk loads and consuming them (overlapped with the chunk-0 round trip).
-__host__ __device__ constexpr int fullk_smem_bytes(int m, int epc) {
-    return (kFullKStages * (((m + 1) & ~1) + ((epc + 1) & ~1)) + 16) * kSmemLd * 2 + (kThreads / 32) * 256 * 4;
+// Row-contiguous smem: row r = one token (r < m) or one expert (m <= r < m + n_exp)
+// over the full K, stride kFullKLd bf16 (6176 B: 32 B aligned for WMMA, 2-way bank
+// spread), so a TMA piece of a row is one contiguous copy. 16 rows of tail after the
+// weight rows keep the (discarded) B-tile rows inside the allocation.
+constexpr int kFullKLd = 3072 + 16;
+__host__ __device__ constexpr int fullk_smem_bytes(int m, int /*epc*/) {
+    return (m + 16) * kFullKLd * 2 + (kThreads / 32) * 256 * 4;
 }
 __device__ __forceinline__ uint32_t smid_u32() {
     uint32_t v;
@@ -513,18 +518,6 @@ __device__ __forceinline__ uint32_t warp_max_u32_redux(uint32_t v) {
     return warp_max_u32(v);
 #endif
 }
-template <int N>
-__device__ __forceinline__ uint32_t tree_max_u32(const uint32_t (&v)[N]) {
-    uint32_t t[N];
-    #pragma unroll
-    for (int i = 0; i < N; ++i) t[i] = v[i];
-    #pragma unroll
-    for (int w = N; w > 1; w = (w + 1) / 2) {
-        #pragma unroll
-        for (int i = 0; i < w / 2; ++i) t[i] = max(t[i], t[w - 1 - i]);
-    }
-    return t[0];
-}
 __device__ __forceinline__ uint32_t ld_cv_u32(const uint32_t* p) {
     uint32_t v;
     asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
@@ -541,45 +534,45 @@ __device__ __forceinline__ void router_role_fullk(
         int m, int h, int e, int epc, int num_router_ctas, int w_hint) {
     using namespace nvcuda;
     extern __shared__ __align__(128) uint8_t dyn_smem[];
-    const int m_rows = (m + 1) & ~1, w_rows = (epc + 1) & ~1, stage_rows = m_rows + w_rows;
-    auto stage_h = [&](int st) {
-        return reinterpret_cast<__nv_bfloat16 (*)[kSmemLd]>(dyn_smem + st * stage_rows * kSmemLd * 2);
-    };
-    auto stage_w = [&](int st) {
-        return reinterpret_cast<__nv_bfloat16 (*)[kSmemLd]>(dyn_smem + (st * stage_rows + m_rows) * kSmemLd * 2);
-    };
-    float (*part_s)[256] = reinterpret_cast<float (*)[256]>(
-        dyn_smem + (kFullKStages * stage_rows + 16) * kSmemLd * 2);
+    auto row_s = [&](int r) { return reinterpret_cast<__nv_bfloat16*>(dyn_smem) + static_cast<int>(r) * kFullKLd; };
+    float (*part_s)[256] = reinterpret_cast<float (*)[256]>(dyn_smem + (m + 16) * kFullKLd * 2);
     constexpr int kKSplit = kThreads / 32;                      // 8 warps = 8 K-slices per chunk
     constexpr int kKPerWarp = kChunkK / kKSplit;                // 32
-    const int warp = threadIdx.x >> 5;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int expert_base = blockIdx.x * epc;
     const int n_exp = min(epc, e - expert_base);
     const int num_chunks = h / kChunkK;
+    const int n_rows = m + n_exp;
+    // TMA pieces per row: the bulk-copy queue is shallow (72 x 512 B copies per CTA
+    // took ~2.5 us to *issue* on H20), so keep the copy count <= ~24: 3 pieces when
+    // <= 6 rows, 2 when <= 12, else 1 (m = 16 -> 23 whole-row copies).
+    int parts = n_rows <= 6 ? 3 : (n_rows <= 12 ? 2 : 1);
+    while (num_chunks % parts) --parts;
+    const int chunks_per_part = num_chunks / parts;
+    const uint32_t piece_bytes = static_cast<uint32_t>(chunks_per_part * kChunkK * 2);
     const uint64_t w_policy = w_hint ? l2_evict_last_policy() : 0ull;
     // Rows >= m of the A tile and >= n_exp of the B tile are never loaded: they
-    // read whatever the neighbouring stage holds, which only feeds output rows /
+    // read whatever the neighbouring rows hold, which only feeds output rows /
     // columns that are discarded (C[r][c] depends on A row r and B column c only).
-    __shared__ __align__(8) uint64_t chunk_bar[kFullKStages];
-    if (threadIdx.x < num_chunks) mbar_init(&chunk_bar[threadIdx.x], 1);
+    __shared__ __align__(8) uint64_t piece_bar[3];
+    if (threadIdx.x < parts) mbar_init(&piece_bar[threadIdx.x], 1);
     mbar_fence_init();
     __syncthreads();
     stamp(stamps, 7);        // prologue done (mbarrier init + fence + sync), about to issue
-    // Lane c of warp 0 issues chunk c: (m + n_exp) bulk copies of 512 B each, all
-    // chunks in flight at once (h <= 3072 -> num_chunks <= kFullKStages, no reuse).
-    if (threadIdx.x < num_chunks) {
-        const int c = threadIdx.x, k0 = c * kChunkK;
-        mbar_arrive_expect_tx(&chunk_bar[c], static_cast<uint32_t>((m + n_exp) * kChunkK * 2));
-        for (int r = 0; r < m; ++r)
-            tma_bulk_g2s(&stage_h(c)[r][0], hidden + static_cast<int64_t>(r) * h + k0, kChunkK * 2, &chunk_bar[c]);
-        for (int r = 0; r < n_exp; ++r) {
-            const __nv_bfloat16* src = router_weight + static_cast<int64_t>(expert_base + r) * h + k0;
-            if (w_hint) tma_bulk_g2s_hint(&stage_w(c)[r][0], src, kChunkK * 2, &chunk_bar[c], w_policy);
-            else tma_bulk_g2s(&stage_w(c)[r][0], src, kChunkK * 2, &chunk_bar[c]);
+    if (warp == 0) {
+        if (lane < parts) mbar_arrive_expect_tx(&piece_bar[lane], static_cast<uint32_t>(n_rows) * piece_bytes);
+        __syncwarp();
+        // flat (piece, row) list spread over the 32 lanes: <= 3 copies per lane
+        for (int i = lane; i < parts * n_rows; i += 32) {
+            const int pc = i / n_rows, r = i % n_rows, k0 = pc * chunks_per_part * kChunkK;
+            const __nv_bfloat16* src = r < m ? hidden + static_cast<int64_t>(r) * h + k0
+                                             : router_weight + static_cast<int64_t>(expert_base + r - m) * h + k0;
+            if (w_hint && r >= m) tma_bulk_g2s_hint(row_s(r) + k0, src, piece_bytes, &piece_bar[pc], w_policy);
+            else tma_bulk_g2s(row_s(r) + k0, src, piece_bytes, &piece_bar[pc]);
         }
     }
     stamp(stamps, 5);
-    // Overlapped activation quantisation: while this CTA's chunks are in flight.
+    // Overlapped activation quantisation: while this CTA's pieces are in flight.
     if (static_cast<int>(blockIdx.x) < m) {
         quant_role<kMode>(hidden, x_bytes, x_sf, blockIdx.x, h);
         stamp(stamps, 4);
@@ -587,15 +580,17 @@ __device__ __forceinline__ void router_role_fullk(
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
     wmma::fill_fragment(acc, 0.0f);
     for (int chunk = 0; chunk < num_chunks; ++chunk) {
-        mbar_wait_parity(&chunk_bar[chunk], 0u);     // chunk landed (async proxy -> visible to all threads)
-        if (chunk == 0) stamp(stamps, 1);
+        if (chunk % chunks_per_part == 0) {
+            mbar_wait_parity(&piece_bar[chunk / chunks_per_part], 0u);   // piece landed (async proxy -> all threads)
+            if (chunk == 0) stamp(stamps, 1);
+        }
         #pragma unroll
         for (int kk = 0; kk < kKPerWarp; kk += 16) {
-            const int k = warp * kKPerWarp + kk;
+            const int k = chunk * kChunkK + warp * kKPerWarp + kk;
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
-            wmma::load_matrix_sync(a, &stage_h(chunk)[0][k], kSmemLd);
-            wmma::load_matrix_sync(b, &stage_w(chunk)[0][k], kSmemLd);
+            wmma::load_matrix_sync(a, row_s(0) + k, kFullKLd);
+            wmma::load_matrix_sync(b, row_s(m) + k, kFullKLd);   // B(k, n) = w_s[n][k]
             wmma::mma_sync(acc, a, b, acc);
         }
     }
@@ -618,53 +613,71 @@ __device__ __forceinline__ void router_role_fullk(
 }
 
 // Merger CTA: one warp per token (m <= 16 -> <= 2 tokens per warp). Lane l owns
-// slots l, l+32, ... of cand[token] (coalesced 128 B polls). Running top-8 lives in
-// lanes 0..7 (`run`); every poll round that brings new keys is merged in.
+// slots l, l+32, ... of cand[token] (coalesced 128 B polls; a CTA's 8 keys land in
+// 8 consecutive lanes). Register-lean streaming merge (no per-slot key array -> no
+// local-memory spills): every poll round folds the newly-arrived keys into a
+// per-lane sorted top-8 `loc[]` (insertion), then, unless the batch maximum cannot
+// enter the running top-8 (early exit, the common case late in the stream), runs
+// 8 rounds of one redux.sync max over (running key in lanes 0..7, loc[0]) with the
+// winner popped -> new running top-8 in lanes 0..7, descending.
 template <int kTopK, int kSlotsPerLane>
 __device__ __forceinline__ void merger_role(
         uint32_t* __restrict__ cand, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
         unsigned long long* stamps, int m, int num_router_ctas) {
-    constexpr int kMaxSlotsPerLane = kSlotsPerLane;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nslots = num_router_ctas * kCandSlots;
     for (int t = warp; t < m; t += kThreads / 32) {
         uint32_t* base = cand + static_cast<int64_t>(t) * nslots;
-        uint32_t key[kMaxSlotsPerLane];
         uint32_t pending = 0u;
         #pragma unroll
-        for (int i = 0; i < kMaxSlotsPerLane; ++i) {
-            key[i] = 0u;
+        for (int i = 0; i < kSlotsPerLane; ++i)
             if (lane + 32 * i < nslots) pending |= 1u << i;
-        }
-        uint32_t run = 0u;
+        uint32_t run = 0u;                 // lanes 0..7: running top-8 (descending), else 0
+        uint32_t loc[kTopK];               // this lane's sorted (desc) keys of the current batch
+        #pragma unroll
+        for (int j = 0; j < kTopK; ++j) loc[j] = 0u;
         bool first = true;
         while (true) {
-            // issue every pending poll first (one L2 round trip per poll round), then check
-            uint32_t v[kMaxSlotsPerLane];
+            // issue every pending poll first (one L2 round trip per poll round), then fold in
+            uint32_t v[kSlotsPerLane];
             #pragma unroll
-            for (int i = 0; i < kMaxSlotsPerLane; ++i)
+            for (int i = 0; i < kSlotsPerLane; ++i)
                 v[i] = (pending & (1u << i)) ? ld_cv_u32(base + lane + 32 * i) : 0u;
             bool got = false;
             #pragma unroll
-            for (int i = 0; i < kMaxSlotsPerLane; ++i)
-                if (v[i] != 0u) { key[i] = v[i]; pending &= ~(1u << i); got = true; }
+            for (int i = 0; i < kSlotsPerLane; ++i) {
+                if (v[i] != 0u) {
+                    pending &= ~(1u << i); got = true;
+                    uint32_t k = v[i];
+                    #pragma unroll
+                    for (int j = 0; j < kTopK; ++j) {       // sorted insertion, drops the smallest
+                        const uint32_t lo = min(k, loc[j]);
+                        loc[j] = max(k, loc[j]); k = lo;
+                    }
+                }
+            }
             if (__any_sync(0xffffffffu, got)) {
                 if (t == 0) { if (first) stamp(stamps, 1); stamp(stamps, 2); }
                 first = false;
-                // batch merge: top-8 of (running 8 + newly arrived keys), descending
-                uint32_t out = 0u;
-                #pragma unroll
-                for (int k = 0; k < kTopK; ++k) {
-                    uint32_t best = max(run, tree_max_u32(key));
-                    best = warp_max_u32_redux(best);
-                    if (lane == k) out = best;
-                    if (run == best) run = 0u;
+                const uint32_t batch_max = warp_max_u32_redux(loc[0]);
+                const uint32_t run8 = __shfl_sync(0xffffffffu, run, kTopK - 1);   // current 8th best (0 if < 8 yet)
+                if (batch_max > run8) {
+                    uint32_t out = 0u;
                     #pragma unroll
-                    for (int i = 0; i < kMaxSlotsPerLane; ++i) key[i] = key[i] == best ? 0u : key[i];
+                    for (int k = 0; k < kTopK; ++k) {
+                        const uint32_t best = warp_max_u32_redux(max(run, loc[0]));
+                        if (lane == k) out = best;
+                        if (run == best) run = 0u;
+                        if (loc[0] == best) {                 // pop this lane's head
+                            #pragma unroll
+                            for (int j = 0; j < kTopK - 1; ++j) loc[j] = loc[j + 1];
+                            loc[kTopK - 1] = 0u;
+                        }
+                    }
+                    run = lane < kTopK ? out : 0u;
                 }
-                run = lane < kTopK ? out : 0u;
                 #pragma unroll
-                for (int i = 0; i < kMaxSlotsPerLane; ++i) key[i] = 0u;   // losers can never re-enter
+                for (int j = 0; j < kTopK; ++j) loc[j] = 0u;   // losers can never re-enter
             }
             if (__all_sync(0xffffffffu, pending == 0u)) break;
         }
@@ -683,7 +696,7 @@ __device__ __forceinline__ void merger_role(
         if (t == 0) stamp(stamps, 4);
         // reset the slots for the next launch (every writer has been consumed)
         #pragma unroll
-        for (int i = 0; i < kMaxSlotsPerLane; ++i)
+        for (int i = 0; i < kSlotsPerLane; ++i)
             if (lane + 32 * i < nslots) base[lane + 32 * i] = 0u;
     }
 }
