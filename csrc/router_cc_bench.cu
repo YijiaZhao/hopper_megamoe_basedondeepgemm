@@ -140,7 +140,7 @@ __device__ __forceinline__ float dot8_bf16(const uint4& w, const uint4& x, float
 template <int kWarps, int kEPW, int kKS, int kLoad, int kXMode, int kM>
 __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
         const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
-        float* __restrict__ logits, int* __restrict__ flags, unsigned long long* stamps, int e, int epoch) {
+        float* __restrict__ logits, int* __restrict__ flags, unsigned long long* stamps, int e, int epoch, int contig) {
     static_assert(kChunksPerRow % kKS == 0 && kWarps % kKS == 0, "K split must divide 12 chunks and the warp count");
     constexpr int kChunks = kChunksPerRow / kKS;           // chunks per lane for this warp's K-part
     constexpr int kKPart = kH / kKS;                       // elements
@@ -160,7 +160,10 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     int ex[kEPW];
     bool any = false;
     #pragma unroll
-    for (int j = 0; j < kEPW; ++j) { ex[j] = (slot * kEPW + j) * gridDim.x + blockIdx.x; any |= ex[j] < e; }
+    for (int j = 0; j < kEPW; ++j) {   // contig (FE layout): CTA b owns experts b*E/grid ..; else round-robin
+        ex[j] = contig ? blockIdx.x * kExpertsPerCTA + slot * kEPW + j : (slot * kEPW + j) * gridDim.x + blockIdx.x;
+        any |= ex[j] < e;
+    }
 
     // probe: an idle last warp (no expert) issues ONE load of the CTA's first weight chunk (same
     // sector warp 0 loads) and stamps its landing -> true "first bytes landed" (slot 1), not
@@ -263,7 +266,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     __syncthreads();
     if (threadIdx.x < kSlots * kEPW * kM) {
         const int r = threadIdx.x % kM, je = threadIdx.x / kM, s = je / kEPW, j = je % kEPW;
-        const int exo = (s * kEPW + j) * gridDim.x + blockIdx.x;
+        const int exo = contig ? blockIdx.x * kExpertsPerCTA + s * kEPW + j : (s * kEPW + j) * gridDim.x + blockIdx.x;
         if (exo < e) {
             float v = 0.0f;
             #pragma unroll
@@ -284,13 +287,13 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
 struct Variant {
     const char* name;
     int grid;
-    void (*launch)(int grid, const __nv_bfloat16*, const __nv_bfloat16*, float*, int*, unsigned long long*, int, int, cudaStream_t);
+    void (*launch)(int grid, const __nv_bfloat16*, const __nv_bfloat16*, float*, int*, unsigned long long*, int, int, int, cudaStream_t);
     const char* desc;
 };
 template <int kWarps, int kEPW, int kKS, int kLoad, int kXMode, int kM>
 void launch_v(int grid, const __nv_bfloat16* x, const __nv_bfloat16* w, float* logits, int* flags,
-              unsigned long long* stamps, int e, int epoch, cudaStream_t st) {
-    router_cc_kernel<kWarps, kEPW, kKS, kLoad, kXMode, kM><<<grid, kWarps * 32, 0, st>>>(x, w, logits, flags, stamps, e, epoch);
+              unsigned long long* stamps, int e, int epoch, int contig, cudaStream_t st) {
+    router_cc_kernel<kWarps, kEPW, kKS, kLoad, kXMode, kM><<<grid, kWarps * 32, 0, st>>>(x, w, logits, flags, stamps, e, epoch, contig);
 }
 template <int kM>
 std::vector<Variant> variants() {
@@ -321,7 +324,7 @@ uint16_t f_to_bf16(float f) { uint32_t u; memcpy(&u, &f, 4); uint32_t lsb = (u >
 
 int main(int argc, char** argv) {
     std::string vname = "a";
-    int rows = 1, iters = 100, warmup = 5, nstamps = 5, grid_override = 0, e = 384, check = 1, flush = 1;
+    int rows = 1, iters = 100, warmup = 5, nstamps = 5, grid_override = 0, e = 384, check = 1, flush = 1, contig = 0;
     for (int i = 1; i < argc; ++i) {
         auto arg = [&](const char* k) { return strcmp(argv[i], k) == 0 && i + 1 < argc; };
         if (arg("--variant")) vname = argv[++i];
@@ -332,6 +335,7 @@ int main(int argc, char** argv) {
         else if (arg("--grid")) grid_override = atoi(argv[++i]);
         else if (arg("--check")) check = atoi(argv[++i]);
         else if (arg("--flush")) flush = atoi(argv[++i]);
+        else if (arg("--contig")) contig = atoi(argv[++i]);
         else if (strcmp(argv[i], "--list") == 0) { for (auto& v : variants<1>()) printf("%-5s grid %3d  %s\n", v.name, v.grid, v.desc); return 0; }
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
     }
@@ -357,8 +361,8 @@ int main(int argc, char** argv) {
     cudaFuncAttributes fa = {};
     // (attributes are per instantiation; query through a tiny launch-free trick is not available -> print after first launch via cudaFuncGetAttributes on the symbol is variant-specific; skip)
     cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0));
-    printf("== router_cc_bench variant=%s grid=%d rows=%d E=%d K=%d device=%s SMs=%d iters=%d flush=%d ==\n  %s\n",
-           V->name, grid, rows, e, kH, prop.name, prop.multiProcessorCount, iters, flush, V->desc);
+    printf("== router_cc_bench variant=%s grid=%d rows=%d E=%d K=%d contig=%d device=%s SMs=%d iters=%d flush=%d ==\n  %s\n",
+           V->name, grid, rows, e, kH, contig, prop.name, prop.multiProcessorCount, iters, flush, V->desc);
     (void)fa;
 
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
@@ -369,7 +373,7 @@ int main(int argc, char** argv) {
         CK(cudaDeviceSynchronize());
         ++epoch;
         CK(cudaEventRecord(e0));
-        V->launch(grid, dx, dw, dlog, dflags, nullptr, e, epoch, 0);
+        V->launch(grid, dx, dw, dlog, dflags, nullptr, e, epoch, contig, 0);
         CK(cudaEventRecord(e1));
         CK(cudaDeviceSynchronize());
         float ms; CK(cudaEventElapsedTime(&ms, e0, e1));
@@ -415,7 +419,7 @@ int main(int argc, char** argv) {
             CK(cudaMemset(dst, 0, hs.size() * 8));
             CK(cudaDeviceSynchronize());
             ++epoch;
-            V->launch(grid, dx, dw, dlog, dflags, dst, e, epoch, 0);
+            V->launch(grid, dx, dw, dlog, dflags, dst, e, epoch, contig, 0);
             CK(cudaDeviceSynchronize());
             CK(cudaMemcpy(hs.data(), dst, hs.size() * 8, cudaMemcpyDeviceToHost));
             unsigned long long t0 = ~0ull;

@@ -541,6 +541,16 @@ __device__ __forceinline__ uint32_t ld_cv_u32(const uint32_t* p) {
     asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p));
     return v;
 }
+// merger poll load (DG_FE_MERGER_LD, w_hint bits 5..6): 0 = ld.global.cv (volatile: re-fetched
+// past L2 every round), 1 = ld.relaxed.gpu (L2, the coherence point of the writers' st.global),
+// 2 = ld.global.cg (L2). cc default 1.
+__device__ __forceinline__ uint32_t ld_poll_u32(const uint32_t* p, int mode) {
+    uint32_t v;
+    if (mode == 1) asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    else if (mode == 2) asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    else asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
 
 __device__ __forceinline__ int ld_acquire_gpu(const int* p) {
     int v;
@@ -774,6 +784,8 @@ __device__ __forceinline__ void router_role_fullk_fma(
 // cand[token][group][8] (sentinel 1 for slots >= n_exp), the merger polls the slots.
 constexpr int kCCSlots = 5;
 constexpr int kMergerDeferBit = 16;      // w_hint flag: merger defers the top-8 merge to one pass (DG_FE_MERGER_DEFER)
+constexpr int kMergerLdShift = 5;        // w_hint bits 5..6: merger poll load mode (DG_FE_MERGER_LD)
+constexpr int kMergerFlagsMask = 15;     // w_hint bits below the merger flags
 constexpr int kCCMaxM = 2;
 constexpr int kCCH = 3072;
 __host__ __device__ constexpr int cc_block(int ks) { return ks > 0 ? kCCSlots * ks * 32 : kThreads; }
@@ -1084,7 +1096,7 @@ __device__ __forceinline__ void merge8(uint32_t& run, uint32_t (&loc)[kTopK], in
 template <int kTopK, int kSlotsPerLane>
 __device__ __forceinline__ void merger_role(
         uint32_t* __restrict__ cand, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
-        unsigned long long* stamps, int m, int groups, int cand_slots, bool defer) {
+        unsigned long long* stamps, int m, int groups, int cand_slots, bool defer, int poll_mode) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nslots = groups * cand_slots;
     for (int t = warp; t < m; t += kThreads / 32) {
@@ -1105,7 +1117,7 @@ __device__ __forceinline__ void merger_role(
             uint32_t v[kSlotsPerLane];
             #pragma unroll
             for (int i = 0; i < kSlotsPerLane; ++i)
-                v[i] = (pending & (1u << i)) ? ld_cv_u32(base + lane + 32 * i) : 0u;
+                v[i] = (pending & (1u << i)) ? ld_poll_u32(base + lane + 32 * i, poll_mode) : 0u;
             bool got = false;
             #pragma unroll
             for (int i = 0; i < kSlotsPerLane; ++i) {
@@ -1185,13 +1197,14 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
                 }
             }
             const bool defer = (w_hint & kMergerDeferBit) != 0;
+            const int poll_mode = (w_hint >> kMergerLdShift) & 3;
             const int nslots = groups * cand_slots;
             if (nslots <= 20 * 32)          // H20 full-K: 77 x 8 = 616 slots -> 20 per lane
-                merger_role<kMaxTopK, 20>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots, defer);
+                merger_role<kMaxTopK, 20>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots, defer, poll_mode);
             else if (nslots <= 32 * 32)
-                merger_role<kMaxTopK, 32>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots, defer);
+                merger_role<kMaxTopK, 32>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots, defer, poll_mode);
             else
-                merger_role<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots, defer);
+                merger_role<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots, defer, poll_mode);
         } else {
             if constexpr (kCC > 0) {
                 router_role_fullk_cc<kCC>(hidden, router_weight, cand, stamps, m, h, e, epc, groups, cand_slots);
@@ -1203,7 +1216,7 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
                 else
                     router_role_fullk_fma<kMode, kMaxCandSlots, false>(hidden, router_weight, cand, partials, flags, x_bytes, x_sf, stamps, m, h, e, epc, k_parts, groups, cand_slots);
             } else {
-                router_role_fullk<kMode>(hidden, router_weight, cand, partials, flags, x_bytes, x_sf, stamps, m, h, e, epc, k_parts, groups, cand_slots, w_hint & ~kMergerDeferBit);
+                router_role_fullk<kMode>(hidden, router_weight, cand, partials, flags, x_bytes, x_sf, stamps, m, h, e, epc, k_parts, groups, cand_slots, w_hint & kMergerFlagsMask);
             }
             stamp(stamps, 3);
         }
@@ -1373,6 +1386,8 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     if constexpr (kFullK) {
         static const int defer = getenv("DG_FE_MERGER_DEFER") ? atoi(getenv("DG_FE_MERGER_DEFER")) : (kCC > 0 ? 1 : 0);
         if (defer) w_hint |= kMergerDeferBit;
+        static const int poll_ld = getenv("DG_FE_MERGER_LD") ? atoi(getenv("DG_FE_MERGER_LD")) : (kCC > 0 ? 1 : 0);
+        w_hint |= (poll_ld & 3) << kMergerLdShift;
     }
     cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);

@@ -8,5 +8,5 @@ VARS="${*:-a asx b c d1 d2 e f h h2 c78 h3 h4 h6 h12 h4b h4x}"
 BIN=/tmp/router_cc_bench_$(id -u)
 nvcc -O3 -std=c++17 -gencode arch=compute_90a,code=sm_90a -Xptxas -v -o "$BIN" "$ROOT/csrc/router_cc_bench.cu" 2>&1 | grep -E "registers|spill|error" | sort | uniq -c | head -40
 for v in $VARS; do
-  timeout 600 "$BIN" --variant "$v" --rows "$ROWS" --iters 100 --stamps 5
+  timeout 600 "$BIN" --variant "$v" --rows "$ROWS" --iters 100 --stamps 5 --contig "${CONTIG:-0}"
 done
