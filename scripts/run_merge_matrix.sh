@@ -10,7 +10,9 @@
 #   mx T...           mxfp4 only
 #   fe78 MMA SEEDS [GPU] [ROWS...]  tests/test_frontend_fe78.py equality (single GPU)
 #   capture DIR       customer-method capture SCOPES=e2e BACKENDS=fused TOKENS_LIST="2 8 16"
-# Every 8-GPU run waits for idle GPUs + no foreign *_RUNNING marker, holds CAPTURE_MERGE_RUNNING.
+#   land_diag         triage of the chain4 corrref T=32 qoq failure: default-routing qoq T=64/128,
+#                     --frontend fe T=32 under DG_FE_TINYM_MMA=cc, --frontend fe T=8/16
+# Every 8-GPU run waits for idle GPUs + no foreign *_RUNNING marker, holds $MARKER (CAPTURE_MERGE_RUNNING).
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
@@ -29,7 +31,7 @@ mkdir -p "$RES"
 # cache shared with other worktrees could hand back binaries built from other header revisions.
 export DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR:-$RES/jit}
 TR=$(command -v torchrun)
-MARKER=/raid/kimi/results/CAPTURE_MERGE_RUNNING
+MARKER=${MARKER:-/raid/kimi/results/CAPTURE_MERGE_RUNNING}   # override: MARKER=/raid/kimi/results/CAPTURE_LAND_RUNNING
 MODE=${1:-}; shift || true
 foreign_marker() {
   local f age
@@ -164,6 +166,13 @@ case "$MODE" in
       for p in 1 2 3; do bash "$0" capture "$RES/cap_cc3/p$p" "2 8 16"; done
       for p in 1 2 3; do echo "## p$p"; cut -d, -f1-4,6-8 "$RES/cap_cc3/p$p/TIMELINE_LAST3.csv"; done
       echo "CHAIN6_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
+  land_diag)  # chain4 corrref T=32 qoq failure triage (see README FE section)
+    C="$RES/land_diag.log"; : > "$C"
+    { echo "start $(git rev-parse --short HEAD) $(date -u +%FT%TZ)"
+      bash "$0" corrq 64 128
+      DG_FE_TINYM_MMA=cc COSMIN=0.999 bash "$0" corrref 32
+      COSMIN=0.999 bash "$0" corrref 8 16
+      echo "LAND_DIAG_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
   stop)     # stop OUR OWN jobs only: processes whose cwd is this worktree (run inside the same container)
     for pid in $(pgrep -f "run_merge_matrix.sh|capture_four_api_h20_timelines.sh|nsys profile|profile_four_api_h20.py|torchrun|test_four_api_correctness.py|test_frontend_fe78.py"); do
       [ "$pid" = "$$" ] && continue

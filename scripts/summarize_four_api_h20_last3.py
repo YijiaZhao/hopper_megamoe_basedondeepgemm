@@ -68,22 +68,25 @@ def main():
         "| Precision | M | FE Fused | FE Split | E2E Mega Fused | E2E Mega Split | E2E Fused | E2E Split | Mega-only Fused | Mega-only Split |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    def cell(scope, precision, m_value, backend, key):
+        # Sub-matrix captures (SCOPES=e2e BACKENDS=fused) leave cells empty -> "-".
+        row = index.get((scope, precision, m_value, backend))
+        return fmt(None if row is None else row[key])
+
     for precision in ("mxfp4", "qoq"):
         for m_value in m_values:
-            e2e_fused = index[("e2e", precision, m_value, "fused")]
-            e2e_split = index[("e2e", precision, m_value, "split")]
-            mega_fused = index[("mega", precision, m_value, "fused")]
-            mega_split = index[("mega", precision, m_value, "split")]
+            if not any(k[1] == precision and k[2] == m_value for k in index):
+                continue
             lines.append(
                 f"| {precision.upper()} | {m_value} | "
-                f"{fmt(e2e_fused['frontend_median_us'])} | "
-                f"{fmt(e2e_split['frontend_median_us'])} | "
-                f"{fmt(e2e_fused['mega_median_us'])} | "
-                f"{fmt(e2e_split['mega_median_us'])} | "
-                f"**{fmt(e2e_fused['target_median_us'])}** | "
-                f"**{fmt(e2e_split['target_median_us'])}** | "
-                f"{fmt(mega_fused['mega_median_us'])} | "
-                f"{fmt(mega_split['mega_median_us'])} |"
+                f"{cell('e2e', precision, m_value, 'fused', 'frontend_median_us')} | "
+                f"{cell('e2e', precision, m_value, 'split', 'frontend_median_us')} | "
+                f"{cell('e2e', precision, m_value, 'fused', 'mega_median_us')} | "
+                f"{cell('e2e', precision, m_value, 'split', 'mega_median_us')} | "
+                f"**{cell('e2e', precision, m_value, 'fused', 'target_median_us')}** | "
+                f"**{cell('e2e', precision, m_value, 'split', 'target_median_us')}** | "
+                f"{cell('mega', precision, m_value, 'fused', 'mega_median_us')} | "
+                f"{cell('mega', precision, m_value, 'split', 'mega_median_us')} |"
             )
 
     text = "\n".join(lines) + "\n"
