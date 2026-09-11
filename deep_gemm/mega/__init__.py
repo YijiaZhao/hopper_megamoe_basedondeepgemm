@@ -640,28 +640,25 @@ def fable_router_weight_fragment_layout(router_weight: torch.Tensor) -> torch.Te
     return v.permute(0, 3, 1, 2, 4, 5).contiguous().view(e, k)          # [G][b][half][g][t][8]
 
 
-_fe_fragment_weight_cache = weakref.WeakKeyDictionary()
+_fe_fragment_weight_cache = {}        # id(weight tensor) -> (version, permuted copy); entry purged when the tensor dies
 
 
 def _fe_router_weight_for_layout(router_weight, wlayout):
-    """Cached one-time fragment permutation, keyed by the source tensor OBJECT (weak ref, so a
-    freed weight tensor whose address is reused by a new one -- e.g. per-seed weights in the
-    tests -- cannot hit a stale entry) plus its in-place version counter. Production callers
-    should permute once at weight-transform time (fable_router_weight_fragment_layout) instead."""
+    """Cached one-time fragment permutation. Keyed by id() of the source tensor OBJECT with a
+    weakref.finalize purge (a freed weight whose address / id is reused by a new tensor -- the
+    per-seed weights of the tests -- cannot hit a stale entry; tensor keys themselves are unusable
+    because dict key comparison would call Tensor.__eq__) plus the in-place version counter.
+    Production callers should permute once at weight-transform time
+    (fable_router_weight_fragment_layout) and pass wlayout='pre'."""
     if wlayout == 0:
         return router_weight
-    hit = _fe_fragment_weight_cache.get(router_weight)
+    key = id(router_weight)
+    hit = _fe_fragment_weight_cache.get(key)
     if hit is None or hit[0] != router_weight._version:
-        hit = (router_weight._version, fable_router_weight_fragment_layout(router_weight))
-        _fe_fragment_weight_cache[router_weight] = hit
+        if hit is None:
+            weakref.finalize(router_weight, _fe_fragment_weight_cache.pop, key, None)
+        hit = _fe_fragment_weight_cache[key] = (router_weight._version, fable_router_weight_fragment_layout(router_weight))
     return hit[1]
-
-
-def _fe_kparts_from_env(k_parts):
-    """DG_FE_TINYM_KPARTS: 1 (default) | 2 | 4 K-parts per expert group (full-K grid only)."""
-    if k_parts is None:
-        k_parts = os.environ.get("DG_FE_TINYM_KPARTS", "1")
-    return int(k_parts)
 
 
 def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tinym=None, grid=None, k_parts=None) -> int:
