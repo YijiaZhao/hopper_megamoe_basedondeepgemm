@@ -263,7 +263,13 @@ def _run(api, args, rank, group):
                     k = part[slot, t]
                     c = torch.nn.functional.cosine_similarity(k, r, dim=0).item() if r.abs().max() > 0 else 1.0
                     if c < 0.999:
-                        bad.append(f"t{t}s{slot}:e{e_idx}@r{e_idx // local_experts}:cos={c:.4f}:w={float(topk_weights[t, slot]):.4f}:|ref|={r.abs().max().item():.3g}:|ker|={k.abs().max().item():.3g}")
+                        # rows the destination expert received (global token ids), incl. this one
+                        sharers = (idx_all == e_idx).nonzero()[:, 0].tolist()
+                        bad.append(f"t{t}s{slot}:e{e_idx}@r{e_idx // local_experts}:cos={c:.4f}:w={float(topk_weights[t, slot]):.4f}"
+                                   f":|ref|={r.abs().max().item():.3g}:|ker|={k.abs().max().item():.3g}:rows={sharers}")
+            n_active = int(torch.unique(idx_all[(idx_all // local_experts) == rank]).numel())
+            multi = int((torch.bincount(idx_all.flatten().clamp_min(0), minlength=args.experts)[rank * local_experts:(rank + 1) * local_experts] > 1).sum())
+            bad.insert(0, f"[local active experts={n_active}, with >1 rows={multi}]")
             reports = [None] * world
             dist.all_gather_object(reports, f"rank{rank}: " + (" ".join(bad) if bad else "all slots cos>=0.999"), group=group)
             if rank == 0:
