@@ -40,6 +40,9 @@ def main():
         launch_moe(y1); torch.cuda.synchronize(); dist.barrier(group=group)
         idx1 = buffer.topk_idx[:local_rows]; wt1 = buffer.topk_weights[:local_rows]
         bad_idx += int((idx0 != idx1).any(dim=1).sum()); bad_w += int((wt0 != wt1).any(dim=1).sum())
+        if rank == 0 and seed < 2:
+            print(f"rank0 seed {seed} row0 knob0 idx {idx0[0].tolist()} w {[round(v, 4) for v in wt0[0].tolist()]}\n"
+                  f"                   knob1 idx {idx1[0].tolist()} w {[round(v, 4) for v in wt1[0].tolist()]}")
         cos = torch.nn.functional.cosine_similarity(y0.float(), y1.float(), dim=1)
         cos_min = min(cos_min, float(cos.min())); dmax = max(dmax, float((y0.float() - y1.float()).abs().max()))
     t = torch.tensor([bad_idx, bad_w], device="cuda"); dist.all_reduce(t, group=group)

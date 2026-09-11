@@ -589,7 +589,7 @@ from .fused import FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe, transfor
 
 
 _FRONTEND_STAMPS_BYTES = 256 * 8 * 8
-_FRONTEND_CC_KEYS_OFF = 64 * 1024      # kCCKeysOff: compact [token][e] u32 keys of the cc router (fable_frontend.cu)
+_FRONTEND_CC_KEYS_OFF = 256 + 64 * 1024   # ticket area (256 B) + kCCKeysOff: compact [token][e] u32 keys of the cc router (fable_frontend.cu, ckeys = logits + kCCKeysOff, logits = workspace + 256)
 
 
 def fable_frontend_workspace_bytes(e: int) -> int:
@@ -779,7 +779,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     required = fable_frontend_workspace_bytes(e)
     if workspace is None or workspace.numel() < required:
         workspace = cache["workspace"] = torch.zeros(required, dtype=torch.uint8, device=hidden.device)
-        cache["keys"] = workspace[_FRONTEND_CC_KEYS_OFF:_FRONTEND_CC_KEYS_OFF + 2 * 512 * 4].view(torch.int32).view(2, 512)
+        cache["keys"] = workspace[_FRONTEND_CC_KEYS_OFF:_FRONTEND_CC_KEYS_OFF + 2 * 512 * 4].view(torch.int32)   # flat, token t at [t * e, (t + 1) * e)
     cache["keys_active"] = cache["keys"] if mma == 8 else None
     views = cache.get(m)
     if views is None:
@@ -791,8 +791,8 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
 
 
 def fable_frontend_keys(sym_buffer) -> torch.Tensor:
-    """[2, 512] int32 view of the cc router's compact key array (token t, expert x at [t, x]) in
-    this buffer's frontend workspace; the array the fused Mega selects from under DG_FE_SELECT_IN_MEGA=1."""
+    """Flat [1024] int32 view of the cc router's compact key array (token t, expert x at [t * e + x], e = 384)
+    in this buffer's frontend workspace; the array the fused Mega selects from under DG_FE_SELECT_IN_MEGA=1."""
     return sym_buffer._fable_frontend_cache["keys"]
 
 

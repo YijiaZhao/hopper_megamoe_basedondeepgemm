@@ -855,6 +855,15 @@
                                           input_topk_weights_buffer.get_base_ptr<float>());
         if (thread_idx == 4 * 32) stamp_max(16);       // slot 16: max FE-select-in-Mega done
     }
+    // topk_idx / topk_weights loads: read-only (__ldg, ld.global.nc) when the frontend produced
+    // them; under DG_FE_SELECT_IN_MEGA the prologue warps of THIS kernel wrote them, so the
+    // non-coherent path may return stale data -> ld.global.cg (L2-coherent) instead.
+    const auto ld_topk_idx = [&](const int64_t* p) -> int64_t {
+        return fe_keys != nullptr ? static_cast<int64_t>(__ldcg(reinterpret_cast<const long long*>(p))) : __ldg(p);
+    };
+    const auto ld_topk_weight = [&](const float* p) -> float {
+        return fe_keys != nullptr ? __ldcg(p) : __ldg(p);
+    };
     // Fast NVLink-barrier epilogue: every thread snapshots the done count BEFORE
     // the kernel-start __syncthreads (see fused_comm::nvlink_barrier for why this
     // is race-free: SM0's first write of the word this launch is ordered after the
@@ -1116,7 +1125,7 @@
                     int expert_idx = -1;
                     if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
                         expert_idx = static_cast<int>(
-                            __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
+                            ld_topk_idx(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
                         if (expert_idx >= 0)
                             process(i * kNumTopk + lane_idx, expert_idx);
                     }
@@ -1183,7 +1192,7 @@
                      r += kNumSMs * kNumActiveDispatchWarps) {
                     const uint32_t src_token_idx = r / kNumTopk, src_topk_idx = r % kNumTopk;
                     const int expert_idx = static_cast<int>(
-                        __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + r));
+                        ld_topk_idx(input_topk_idx_buffer.get_base_ptr<int64_t>() + r));
                     if (expert_idx < 0)
                         continue;
                     const uint32_t dr = static_cast<uint32_t>(expert_idx) / kNumExpertsPerRank;
@@ -1199,7 +1208,7 @@
                         row[c] = __ldg(src_token + c * 32 + lane_idx);
                     const float sf = lane_idx < kNumSFFloats ?
                         __ldg(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>() + lane_idx) : 0.0f;
-                    const float weight = __ldg(input_topk_weights_buffer.get_base_ptr<float>() + r);
+                    const float weight = ld_topk_weight(input_topk_weights_buffer.get_base_ptr<float>() + r);
                     row_idx = __shfl_sync(0xffffffff, row_idx, 0);
                     DG_TRAP_ONLY_DEVICE_ASSERT(row_idx < kPushBlocksPerExpert * BLOCK_M);
                     const uint32_t pool_token_idx = de * kPushBlocksPerExpert * BLOCK_M + row_idx;
@@ -5183,7 +5192,7 @@
             next_combine_token();
         for (; token_idx < num_tokens; next_combine_token()) {
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
-                static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
+                static_cast<int>(ld_topk_idx(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             if constexpr (kFineCombine) {
