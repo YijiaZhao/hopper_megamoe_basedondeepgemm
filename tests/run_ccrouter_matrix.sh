@@ -8,6 +8,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export DG_CUTLASS_INCLUDE_PATH=${DG_CUTLASS_INCLUDE_PATH:-/raid/kimi/dg_dev/third-party/cutlass/include}
+# setup.py hard-codes third-party/cutlass: point the (empty submodule) directory at the shared checkout
+if [ ! -e third-party/cutlass/include/cute ]; then rmdir third-party/cutlass 2>/dev/null || rm -rf third-party/cutlass; ln -sfn "$(dirname "$DG_CUTLASS_INCLUDE_PATH")" third-party/cutlass; fi
+# pick one idle GPU (other agents run on this box) unless the caller pinned one
+if [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+  export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits | awk -F', ' '$2 == 0 && $3 < 200 {g=$1} END {print g}')
+  [ -n "$CUDA_VISIBLE_DEVICES" ] || { echo "no idle GPU"; exit 1; }
+fi
+echo "using GPU $CUDA_VISIBLE_DEVICES"
 if [ "${1:-1}" = "1" ]; then
   ln -sfn "$DG_CUTLASS_INCLUDE_PATH/cutlass" deep_gemm/include/cutlass
   ln -sfn "$DG_CUTLASS_INCLUDE_PATH/cute" deep_gemm/include/cute
