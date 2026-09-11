@@ -23,10 +23,10 @@ import deep_gemm  # noqa: E402
 from test_frontend_tinym import HIDDEN, EXPERTS, TOPK, make_buffer  # noqa: E402
 
 
-def run(buf, hidden, w, quant, grid, mma="wmma"):
+def run(buf, hidden, w, quant, grid, mma="wmma", wlayout="row"):
     buf.x.view(torch.uint8).fill_(0xAB); buf.x_sf.fill_(-1.0)
     buf.topk_idx.fill_(-7); buf.topk_weights.fill_(-1.0)
-    deep_gemm.fable_router_quant_topk_frontend(hidden, w, buf, quant=quant, tinym=1, stamps=0, grid=grid, mma=mma)
+    deep_gemm.fable_router_quant_topk_frontend(hidden, w, buf, quant=quant, tinym=1, stamps=0, grid=grid, mma=mma, wlayout=wlayout)
     torch.cuda.synchronize()
     m = hidden.size(0)
     return (buf.x[:m].view(torch.uint8).clone(), buf.x_sf[:m].clone(),
@@ -40,12 +40,13 @@ def main():
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 2, 8, 16])
     ap.add_argument("--grid", default="auto", help="new-scheme DG_FE_TINYM_GRID value (auto or N)")
     ap.add_argument("--weight-tol", type=float, default=1e-6)
-    ap.add_argument("--mma", default="wmma", choices=("wmma", "fma"), help="new-scheme DG_FE_TINYM_MMA value")
+    ap.add_argument("--mma", default="wmma", choices=("wmma", "fma", "swapab"), help="new-scheme DG_FE_TINYM_MMA value")
+    ap.add_argument("--wlayout", default="row", choices=("row", "fragment"), help="new-scheme DG_FE_ROUTER_WLAYOUT (swapab only)")
     args = ap.parse_args()
     buf_old, buf_new = make_buffer(64), make_buffer(64)
     rows = set_mismatch = near_tie = weight_flip = quant_mismatch = idx_order_diff = 0
     n_router = deep_gemm.fable_frontend_router_ctas(1, EXPERTS, HIDDEN, TOPK, 1, args.grid)
-    print(f"full-K grid={args.grid} mma={args.mma}: router CTAs={n_router} (+1 merger) vs legacy 96+m; "
+    print(f"new-scheme grid={args.grid} mma={args.mma} wlayout={args.wlayout}: router CTAs={n_router} (+1 merger) vs legacy 96+m; "
           f"device={torch.cuda.get_device_name()} SMs={torch.cuda.get_device_properties(0).multi_processor_count}")
     for seed in range(args.seed_offset, args.seed_offset + args.seeds):
         torch.manual_seed(5000 + seed)
@@ -61,7 +62,7 @@ def main():
             ref_sorted = ref.sort(dim=1, descending=True).values
             for quant in ("mxfp4", "qoq"):
                 old = run(buf_old, hidden, w, quant, 96)
-                new = run(buf_new, hidden, w, quant, args.grid, args.mma)
+                new = run(buf_new, hidden, w, quant, args.grid, args.mma, args.wlayout)
                 if not (torch.equal(old[0], new[0]) and torch.equal(old[1], new[1])):
                     quant_mismatch += 1
                     print(f"QUANT MISMATCH seed={seed} m={m} quant={quant}")
@@ -88,7 +89,7 @@ def main():
     print(f"full-K vs legacy: rows={rows} per quant mode ({2 * rows} row-evaluations); "
           f"top-8 index-set mismatches={set_mismatch} (near-tie {near_tie}, other {set_mismatch - near_tie}); "
           f"weight diffs > {args.weight_tol:g}={weight_flip}; ordering-only differences={idx_order_diff - set_mismatch}; "
-          f"x/x_sf mismatches={quant_mismatch} (seeds {args.seed_offset}..{args.seed_offset + args.seeds - 1}, mma={args.mma})")
+          f"x/x_sf mismatches={quant_mismatch} (seeds {args.seed_offset}..{args.seed_offset + args.seeds - 1}, grid={args.grid} mma={args.mma} wlayout={args.wlayout})")
     ok = quant_mismatch == 0 and (set_mismatch - near_tie) == 0
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

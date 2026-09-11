@@ -739,6 +739,214 @@ __device__ __forceinline__ void router_role_fullk_fma(
     if (kp == 0) emit_keys(v, cand, m, n_exp, expert_base, groups, group, cand_slots);
 }
 
+// ------------------------------------------------------- swapped-operand MMA
+// DG_FE_TINYM_MMA=swapab: the router product is computed as
+//   D[16 experts x 8 tokens] += A[16 experts x k16] (weights) . B[k16 x 8 tokens] (activations)
+// with mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32, i.e. the experts sit on
+// the MMA M dimension (one m16 tile = the CTA's 16 experts) and the tokens on N
+// (rows pad to 8, not 16; m in 9..16 -> a second n8 tile). The A (weight)
+// fragments are loaded straight from global memory into registers (no smem, no
+// ldmatrix); the B (activation) rows are staged once in smem (cp.async, <= m rows x
+// K-part) and read as one 16 B vector per lane and k32 block.
+// Fragment / offset design (K permuted inside every k32 block, identically for A
+// and B, so the dot product is unchanged): lane l = (g = l / 4, t = l % 4).
+//   * A fragment of the m16n8k16 (PTX): {a0,a1} = A[g][2t, 2t+1], {a2,a3} = A[g+8][2t, 2t+1],
+//     {a4,a5} = A[g][2t+8, 2t+9], {a6,a7} = A[g+8][2t+8, 2t+9]; B: {b0,b1} = B[2t, 2t+1][g],
+//     {b2,b3} = B[2t+8, 2t+9][g]; D: {c0,c1} = D[g][2t, 2t+1], {c2,c3} = D[g+8][2t, 2t+1].
+//   * a k32 block at K offset k0 is consumed as two k16 steps s = 0, 1. Lane (g, t)
+//     loads ONE 16 B vector per row it owns: W[expert g][k0 + 8t .. k0 + 8t + 7] (wg),
+//     W[expert g+8][same] (wg8), X[token g][same] (xb). 32-bit word w of such a
+//     vector holds physical K elements k0 + 8t + 2w, +1. Step s uses words 2s
+//     (as the logical pair {2t, 2t+1}) and 2s+1 (as the logical pair {2t+8, 2t+9}):
+//     A regs = {wg.word[2s], wg8.word[2s], wg.word[2s+1], wg8.word[2s+1]},
+//     B regs = {xb.word[2s], xb.word[2s+1]}. Logical k = 2t + i + 8p <-> physical
+//     k0 + 8t + 4s + 2p + i is a bijection for each s and depends on (t, p, i) only,
+//     so A and B agree on every product; both steps together cover the 32 K values.
+//   * per warp the 8 rows g and 8 rows g+8 x 4 lanes t = 16 experts x 32 K per block:
+//     4 consecutive lanes read 64 contiguous bytes of one weight row (two 32 B
+//     sectors; the neighbouring 64 B of the 128 B line belong to another warp's
+//     block of the same CTA).
+// Global offsets are precomputed per lane once (row base + 8t), the block loop only
+// adds k0. All kBlk weight vectors of the lane are issued up front (kBlk = K-part /
+// 256 blocks per warp = 6 * kBlk k16 steps in flight; 3 -> 6 steps in the legacy 96 x 4
+// grid, 12 -> 24 steps in the 78 full-K grid) before the first MMA.
+// K ownership / accumulation order (fixed, documented): warp w owns K-slice
+// [32w, 32w + 32) of every 256-wide chunk of its K-part, block j = chunk j; the
+// warp accumulates its blocks in order j = 0..kBlk-1 (steps s = 0, 1 each) in ONE
+// fp32 accumulator (the 16-product sum inside one m16n8k16 is the hardware order);
+// the 8 warp partials are summed in warp order 0..7 through smem; then (legacy) the
+// 4 K-part partials in order ks = 0..3 in the top-k CTA, or (full-K) k_parts in order
+// 0..k_parts-1 in the part-0 CTA; one bf16 rounding of the logit. Deterministic, not
+// bit-identical to the WMMA paths.
+__device__ __forceinline__ void mma_m16n8k16_bf16(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                  uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+// smem layout for the swapped path: x rows [n_tiles * 8][ld] bf16 (ld = kpart_len + 8:
+// row stride 2 * ld B = 16 mod 128 -> the 8 rows g of a warp's 16 B reads hit 8 disjoint
+// 4-bank groups, conflict-free), then part_s[8 warps][256] fp32.
+__host__ __device__ constexpr int swapab_smem_bytes(int m, int kpart_len) {
+    return ((m + 7) / 8) * 8 * (kpart_len + 8) * 2 + (kThreads / 32) * 256 * 4;
+}
+template <int kBlk>
+struct SwapABRouter {
+    uint4 wg[kBlk], wg8[kBlk];
+    // Issue every weight vector of this lane (rows g / g+8 of the CTA's 16-expert tile
+    // over the K-part; rows >= n_exp are zeros, never loaded) and the cp.async of the
+    // activation rows into smem (caller commits / waits: cp_async_wait<0> + __syncthreads).
+    // wlayout 0: row-major [e][h] weights -- a warp's block load touches 8 rows x 64 B
+    // (8 half lines, 16 sectors). wlayout 1 (DG_FE_ROUTER_WLAYOUT=fragment, host-side
+    // one-time permutation, fable_router_weight_fragment_layout): the same bytes stored
+    // in A-fragment order [e/16 groups][h/32 blocks][half: rows g | g+8][lane][8 bf16], so
+    // lane l reads element offset ((G * (h/32) + b) * 2 + half) * 256 + 8 l and one warp
+    // instruction is ONE contiguous 512 B run = exactly 4 full 128 B lines (16 sectors,
+    // 4 line requests instead of 8). Same values into the same registers -> identical
+    // numerics. Requires the CTA's experts to be an aligned 16-group (expert_base % 16 == 0).
+    __device__ __forceinline__ void issue(const __nv_bfloat16* __restrict__ router_weight,
+                                          const __nv_bfloat16* __restrict__ hidden, __nv_bfloat16* x_s,
+                                          int m, int h, int expert_base, int n_exp, int kbase, int kpart_len, int wlayout) {
+        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+        const __nv_bfloat16* wrow;
+        const __nv_bfloat16* wrow8;
+        int64_t jstride;
+        if (wlayout == 0) {
+            const int64_t kofs = kbase + warp * 32 + t * 8;
+            wrow = router_weight + static_cast<int64_t>(expert_base + g) * h + kofs;
+            wrow8 = wrow + static_cast<int64_t>(8) * h;
+            jstride = kChunkK;
+        } else {
+            const int64_t b0 = static_cast<int64_t>(expert_base / 16) * (h / 32) + kbase / 32 + warp;
+            wrow = router_weight + b0 * 512 + lane * 8;
+            wrow8 = wrow + 256;
+            jstride = static_cast<int64_t>(8) * 512;             // next block of this warp = 8 blocks further
+        }
+        #pragma unroll
+        for (int j = 0; j < kBlk; ++j) {
+            wg[j] = g < n_exp ? ld_nc_na_16(wrow + j * jstride) : make_uint4(0u, 0u, 0u, 0u);
+            wg8[j] = g + 8 < n_exp ? ld_nc_na_16(wrow8 + j * jstride) : make_uint4(0u, 0u, 0u, 0u);
+        }
+        const int ld = kpart_len + 8, nvec = kpart_len / 8, n_pad = ((m + 7) / 8) * 8;
+        for (int i = threadIdx.x; i < m * nvec; i += kThreads) {
+            const int r = i / nvec, c = (i % nvec) * 8;
+            cp_async_16(x_s + r * ld + c, hidden + static_cast<int64_t>(r) * h + kbase + c);
+        }
+        cp_async_commit();
+        for (int i = threadIdx.x; i < (n_pad - m) * nvec; i += kThreads) {      // zero the padding tokens
+            const int r = m + i / nvec, c = (i % nvec) * 8;
+            *reinterpret_cast<uint4*>(x_s + r * ld + c) = make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
+    // Blocks j = 0..kBlk-1 (steps s = 0, 1) into one fp32 accumulator per n8 tile, then
+    // part_s[warp][token * 16 + expert] (the same [row][col] layout the WMMA paths store).
+    __device__ __forceinline__ void compute(const __nv_bfloat16* x_s, float (*part_s)[256], int m, int kpart_len,
+                                            unsigned long long* stamps) {
+        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+        const int ld = kpart_len + 8, n_tiles = (m + 7) / 8;
+        float acc[2][4];
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[nt][i] = 0.0f;
+        }
+        #pragma unroll
+        for (int j = 0; j < kBlk; ++j) {
+            const int k0 = j * kChunkK + warp * 32 + t * 8;
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                if (nt < n_tiles) {
+                    const uint4 xb = *reinterpret_cast<const uint4*>(x_s + (nt * 8 + g) * ld + k0);
+                    mma_m16n8k16_bf16(acc[nt], wg[j].x, wg8[j].x, wg[j].y, wg8[j].y, xb.x, xb.y);   // s = 0
+                    mma_m16n8k16_bf16(acc[nt], wg[j].z, wg8[j].z, wg[j].w, wg8[j].w, xb.z, xb.w);   // s = 1
+                }
+            }
+            if (j == 0) stamp(stamps, 1);
+        }
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            if (nt < n_tiles) {
+                const int tok = nt * 8 + 2 * t;
+                part_s[warp][tok * 16 + g] = acc[nt][0];
+                part_s[warp][(tok + 1) * 16 + g] = acc[nt][1];
+                part_s[warp][tok * 16 + g + 8] = acc[nt][2];
+                part_s[warp][(tok + 1) * 16 + g + 8] = acc[nt][3];
+            }
+        }
+    }
+};
+// Legacy 96 x 4 grid (24 groups x 16 experts x 4 K-parts, m quant/top-k CTAs, ticket)
+// with the swapped MMA: same CTA roles, partial logits [k_part][m][e] in fp32 as the
+// WMMA router_role; only the load / MMA path differs. h / 256 / 4 == kBlk required.
+template <int kBlk>
+__device__ __forceinline__ void router_role_swapab(
+        const __nv_bfloat16* __restrict__ hidden,
+        const __nv_bfloat16* __restrict__ router_weight,
+        float* __restrict__ logits,          // [k_part][m][e] workspace partials
+        unsigned long long* stamps,
+        int m, int h, int e, int wlayout) {
+    constexpr int kKSplitCTAs = RouterCfg<1, true>::kKSplitCTAs;
+    extern __shared__ __align__(128) uint8_t dyn_smem[];
+    const int kpart_len = h / kKSplitCTAs;
+    __nv_bfloat16* x_s = reinterpret_cast<__nv_bfloat16*>(dyn_smem);
+    float (*part_s)[256] = reinterpret_cast<float (*)[256]>(dyn_smem + ((m + 7) / 8) * 8 * (kpart_len + 8) * 2);
+    const int expert_base = (blockIdx.x / kKSplitCTAs) * kExpertsPerCTA;
+    const int k_part = blockIdx.x % kKSplitCTAs;
+    const int n_exp = min(kExpertsPerCTA, e - expert_base);
+    float* part_logits = logits + static_cast<int64_t>(k_part) * m * e;
+    SwapABRouter<kBlk> r;
+    r.issue(router_weight, hidden, x_s, m, h, expert_base, n_exp, k_part * kpart_len, kpart_len, wlayout);
+    stamp(stamps, 5);
+    cp_async_wait<0>();
+    __syncthreads();
+    r.compute(x_s, part_s, m, kpart_len, stamps);
+    __syncthreads();
+    stamp(stamps, 2);
+    const int row = threadIdx.x / 16, c = threadIdx.x % 16;
+    float v = 0.0f;
+    #pragma unroll
+    for (int ks = 0; ks < kThreads / 32; ++ks) v += part_s[ks][row * 16 + c];
+    const int ex = expert_base + c;
+    if (row < m && ex < e) part_logits[static_cast<int64_t>(row) * e + ex] = v;   // fp32 partial
+}
+// Full-K grid (DG_FE_TINYM_GRID=auto|N, K-parts 1|2|4) with the swapped MMA: the CTA's
+// <= 16 experts are the m16 tile (rows >= n_exp zero), kBlk = K-part / 256 blocks per warp.
+template <int kMode, int kBlk>
+__device__ __forceinline__ void router_role_fullk_swapab(
+        const __nv_bfloat16* __restrict__ hidden,
+        const __nv_bfloat16* __restrict__ router_weight,
+        uint32_t* __restrict__ cand, float* partials, int* flags,
+        uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
+        unsigned long long* stamps,
+        int m, int h, int e, int epc, int k_parts, int groups, int cand_slots, int wlayout) {
+    extern __shared__ __align__(128) uint8_t dyn_smem[];
+    const int kpart_len = h / k_parts;
+    __nv_bfloat16* x_s = reinterpret_cast<__nv_bfloat16*>(dyn_smem);
+    float (*part_s)[256] = reinterpret_cast<float (*)[256]>(dyn_smem + ((m + 7) / 8) * 8 * (kpart_len + 8) * 2);
+    const int group = blockIdx.x / k_parts, kp = blockIdx.x % k_parts;
+    const int expert_base = group * epc;
+    const int n_exp = min(epc, e - expert_base);
+    stamp(stamps, 7);
+    SwapABRouter<kBlk> r;
+    r.issue(router_weight, hidden, x_s, m, h, expert_base, n_exp, kp * kpart_len, kpart_len, wlayout);
+    stamp(stamps, 5);
+    if (static_cast<int>(blockIdx.x) < m) {
+        quant_role<kMode>(hidden, x_bytes, x_sf, blockIdx.x, h);
+        stamp(stamps, 4);
+    }
+    cp_async_wait<0>();
+    __syncthreads();
+    r.compute(x_s, part_s, m, kpart_len, stamps);
+    __syncthreads();
+    stamp(stamps, 2);
+    const int row = threadIdx.x / 16, c = threadIdx.x % 16;
+    float v = 0.0f;
+    #pragma unroll
+    for (int ks = 0; ks < kThreads / 32; ++ks) v += part_s[ks][row * 16 + c];
+    v = kpart_combine(v, partials, flags, k_parts, kp, row, c, stamps);
+    if (kp == 0) emit_keys(v, cand, m, n_exp, expert_base, groups, group, cand_slots);
+}
+
 // Merger CTA: one warp per token (m <= 16 -> <= 2 tokens per warp). Lane l owns
 // slots l, l+32, ... of cand[token] (coalesced 128 B polls; a CTA's 8 keys land in
 // 8 consecutive lanes). Register-lean streaming merge (no per-slot key array -> no
@@ -833,7 +1041,7 @@ __device__ __forceinline__ void merger_role(
 // kTiny: <= 85 regs/thread so 3 CTAs (59 KB smem each) fit per SM -> single wave.
 // kFullK: <= 128 regs (merger warp holds 32 keys), 2 CTAs/SM cap; grid <= SM count anyway.
 // kFma: 16 x uint4 weight vectors live in registers -> 1 CTA/SM bound (255 regs), no spills.
-template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma>
+template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma, int kSwapBlk>
 __global__ void __launch_bounds__(kThreads, kFma ? 1 : (kFullK ? 2 : (kTiny ? 3 : 1))) router_quant_topk_kernel(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
@@ -860,7 +1068,9 @@ __global__ void __launch_bounds__(kThreads, kFma ? 1 : (kFullK ? 2 : (kTiny ? 3 
             else
                 merger_role<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots);
         } else {
-            if constexpr (kFma) {
+            if constexpr (kSwapBlk > 0) {
+                router_role_fullk_swapab<kMode, kSwapBlk>(hidden, router_weight, cand, partials, flags, x_bytes, x_sf, stamps, m, h, e, epc, k_parts, groups, cand_slots, w_hint == 2 ? 1 : 0);
+            } else if constexpr (kFma) {
                 if (cand_slots == kCandSlots)
                     router_role_fullk_fma<kMode, kCandSlots, true>(hidden, router_weight, cand, partials, flags, x_bytes, x_sf, stamps, m, h, e, epc, k_parts, groups, cand_slots);
                 else
@@ -927,7 +1137,8 @@ __global__ void __launch_bounds__(kThreads, kFma ? 1 : (kFullK ? 2 : (kTiny ? 3 
         }
         return;
     }
-    router_role<kMTiles, kTiny>(hidden, router_weight, logits, stamps, m, h, e, w_hint);
+    if constexpr (kSwapBlk > 0) router_role_swapab<kSwapBlk>(hidden, router_weight, logits, stamps, m, h, e, w_hint == 2 ? 1 : 0);
+    else router_role<kMTiles, kTiny>(hidden, router_weight, logits, stamps, m, h, e, w_hint);
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) atomicAdd(ticket, 1);
@@ -982,16 +1193,17 @@ static void fullk_plan(int e, int grid, int k_parts, int& epc, int& router_ctas)
     router_ctas = groups * k_parts;
 }
 
-template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma = false>
+template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma = false, int kSwapBlk = 0>
 void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
             int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-            int m, int h, int e, int topk, int l2_persist, int pdl_mode, int grid, int k_parts, cudaStream_t stream) {
+            int m, int h, int e, int topk, int l2_persist, int pdl_mode, int grid, int k_parts, cudaStream_t stream, int mma = 0) {
     using Cfg = RouterCfg<kMTiles, kTiny>;
     int epc = kExpertsPerCTA, router_ctas = ((e + kExpertsPerCTA - 1) / kExpertsPerCTA) * Cfg::kKSplitCTAs;
     int smem_bytes = Cfg::kDynSmemBytes, num_ctas = router_ctas + m;
     if constexpr (kFullK) {
         fullk_plan(e, grid, k_parts, epc, router_ctas);
-        smem_bytes = kFma ? (kThreads / 32) * kMaxCandSlots * 16 * 4 : fullk_smem_bytes(m, h / k_parts);
+        smem_bytes = kSwapBlk > 0 ? swapab_smem_bytes(m, h / k_parts)
+                  : kFma ? (kThreads / 32) * kMaxCandSlots * 16 * 4 : fullk_smem_bytes(m, h / k_parts);
         num_ctas = router_ctas + 1;
         // DG_FE_FULLK_1PERSM (default 1): when the grid fits the SM count, request
         // enough dynamic smem that only one CTA fits per SM, so the block scheduler
@@ -1001,7 +1213,7 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     }
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma>,
+        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              kFullK ? std::max(fullk_smem_bytes(16, 3072), 116 * 1024) : Cfg::kDynSmemBytes);
         attr_set = true;
@@ -1028,8 +1240,10 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         a.val.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
         a.val.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
     }
-    const int w_hint = l2_persist == 2 ? 1 : 0;
-    cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma>,
+    // swapab paths reuse w_hint as the weight-layout flag: 2 = fragment layout (mma == 3);
+    // the L2::evict_last hint (l2_persist == 2) is not implemented for swapab.
+    const int w_hint = kSwapBlk > 0 ? (mma == 3 ? 2 : 0) : (l2_persist == 2 ? 1 : 0);
+    cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);
 }
 
@@ -1045,12 +1259,26 @@ void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x
         // fma: <= 8 experts -> 2 vectors/thread (kpart_len <= 4096); > 8 experts -> 1 vector/thread (kpart_len <= 2048)
         const bool fma_ok = mma == 1 && (epc <= kCandSlots ? kpart_len <= 8 * 2 * kThreads : kpart_len <= 8 * kThreads);
         if (rc <= kMaxRouterCTAs && (rc / k_parts) * (epc <= kCandSlots ? kCandSlots : kMaxCandSlots) <= kMaxSlotsPerLane * 32) {
-            if (fma_ok) launch<1, kMode, true, true, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+            // swapab: kBlk = K-part / 256 blocks per warp (h = 3072: 12 | 6 | 3); other shapes fall back to WMMA
+            const int blk = kpart_len / kChunkK;
+            if (mma == 3 && epc != kExpertsPerCTA) {
+                static bool warned = false;
+                if (!warned) { fprintf(stderr, "[fable_frontend] DG_FE_ROUTER_WLAYOUT=fragment needs 16-expert groups (epc=%d): using row layout\n", epc); warned = true; }
+                mma = 2;
+            }
+            const bool swap = mma == 2 || mma == 3;
+            if (swap && blk == 12) launch<1, kMode, true, true, false, 12>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream, mma);
+            else if (swap && blk == 6) launch<1, kMode, true, true, false, 6>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream, mma);
+            else if (swap && blk == 3) launch<1, kMode, true, true, false, 3>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream, mma);
+            else if (fma_ok) launch<1, kMode, true, true, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
             else launch<1, kMode, true, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
             return;
         }
     }
-    if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream);
+    // legacy 96 x 4 grid with the swapped MMA (h / 256 / 4 == 3 blocks per warp, i.e. h == 3072)
+    if (m <= 16 && tiny && topk == kMaxTopK && (mma == 2 || mma == 3) && h == 3 * kChunkK * RouterCfg<1, true>::kKSplitCTAs)
+        launch<1, kMode, true, false, false, 3>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream, mma);
+    else if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream);
     else if (m <= 16) launch<1, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream);
     else if (m <= 32) launch<2, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream);
     else launch<4, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, 1, stream);

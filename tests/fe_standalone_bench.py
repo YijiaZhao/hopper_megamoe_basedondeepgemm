@@ -49,7 +49,7 @@ def main():
     n_router = deep_gemm.fable_frontend_router_ctas(args.rows, EXPERTS, HIDDEN, TOPK, tinym, args.grid)
     fullk = bool(tinym) and args.rows <= 16 and str(args.grid).strip().lower() != "96"
     print(f"== FE standalone eager (L2 flush before each launch): quant={args.quant} rows={args.rows} "
-          f"DG_FE_TINYM_GRID={args.grid} DG_FE_TINYM_MMA={args.mma} DG_FE_TINYM_KPARTS={os.environ.get('DG_FE_TINYM_KPARTS', '1')} router CTAs={n_router} full-K={int(fullk)} "
+          f"DG_FE_TINYM_GRID={args.grid} DG_FE_TINYM_MMA={args.mma} DG_FE_ROUTER_WLAYOUT={os.environ.get('DG_FE_ROUTER_WLAYOUT', 'row')} DG_FE_TINYM_KPARTS={os.environ.get('DG_FE_TINYM_KPARTS', '1')} router CTAs={n_router} full-K={int(fullk)} "
           f"device={torch.cuda.get_device_name()} iters={args.iters} ==")
     print(fmt_stats("FE", times))
     collected = []

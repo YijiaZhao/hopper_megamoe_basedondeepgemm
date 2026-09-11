@@ -606,12 +606,51 @@ def _fe_grid_from_env(grid):
 
 
 def _fe_mma_from_env(mma):
-    """DG_FE_TINYM_MMA: 'wmma' (default) -> 0, 'fma' -> 1 (full-K grid only)."""
+    """DG_FE_TINYM_MMA: 'wmma' (default) -> 0, 'fma' -> 1 (full-K grid only), 'swapab' -> 2
+    (experts on the MMA M dimension, mma.sync m16n8k16, A fragments straight from global;
+    legacy 96 x 4 grid and full-K grid)."""
     if mma is None:
         mma = os.environ.get("DG_FE_TINYM_MMA", "wmma")
     if isinstance(mma, str):
-        mma = {"wmma": 0, "fma": 1, "0": 0, "1": 1}[mma.strip().lower()]
+        mma = {"wmma": 0, "fma": 1, "swapab": 2, "0": 0, "1": 1, "2": 2}[mma.strip().lower()]
     return int(mma)
+
+
+def _fe_wlayout_from_env(wlayout):
+    """DG_FE_ROUTER_WLAYOUT: 'row' (default) -> 0 = [e][h] router weights; 'fragment' -> 1 =
+    one-time host permutation into m16n8k16 A-fragment order (swapab only)."""
+    if wlayout is None:
+        wlayout = os.environ.get("DG_FE_ROUTER_WLAYOUT", "row")
+    if isinstance(wlayout, str):
+        wlayout = {"row": 0, "fragment": 1, "0": 0, "1": 1}[wlayout.strip().lower()]
+    return int(wlayout)
+
+
+def fable_router_weight_fragment_layout(router_weight: torch.Tensor) -> torch.Tensor:
+    """Permute [E, K] bf16 router weights (E % 16 == 0, K % 32 == 0) into the swapab
+    A-fragment order the frontend reads with DG_FE_ROUTER_WLAYOUT=fragment: same bytes,
+    laid out as [E/16 groups][K/32 blocks][half: rows g | g+8][lane = 4 g + t][8 bf16] where
+    lane (g, t) holds W[16 G + 8 half + g][32 b + 8 t .. + 7]. One warp load instruction of the
+    kernel (16 B per lane) then reads one contiguous 512 B run = 4 full 128 B lines. Returned
+    tensor has the same shape [E, K] (contiguous) so it drops into the frontend API unchanged."""
+    e, k = router_weight.shape
+    assert router_weight.dtype == torch.bfloat16 and e % 16 == 0 and k % 32 == 0
+    v = router_weight.contiguous().view(e // 16, 2, 8, k // 32, 4, 8)      # [G][half][g][b][t][8]
+    return v.permute(0, 3, 1, 2, 4, 5).contiguous().view(e, k)          # [G][b][half][g][t][8]
+
+
+_fe_fragment_weight_cache = {}
+
+
+def _fe_router_weight_for_layout(router_weight, wlayout):
+    """Cached one-time fragment permutation keyed by the source tensor's storage (weights are static)."""
+    if wlayout == 0:
+        return router_weight
+    key = (router_weight.data_ptr(), tuple(router_weight.shape), router_weight.device)
+    w = _fe_fragment_weight_cache.get(key)
+    if w is None:
+        w = _fe_fragment_weight_cache[key] = fable_router_weight_fragment_layout(router_weight)
+    return w
 
 
 def _fe_kparts_from_env(k_parts):
@@ -630,7 +669,7 @@ def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tin
 
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
                                      sym_buffer, quant: str = "mxfp4", tinym=None, stamps=None,
-                                     l2_persist=None, pdl=None, grid=None, mma=None, k_parts=None):
+                                     l2_persist=None, pdl=None, grid=None, mma=None, k_parts=None, wlayout=None):
     """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend.
 
     ``tinym`` (env ``DG_FE_TINYM``, default 1): for m <= 16 use the single-wave
@@ -650,7 +689,14 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     (different fp32 accumulation order before the bf16 logit rounding).
     ``mma`` (env ``DG_FE_TINYM_MMA``, default ``wmma``; full-K grid only): ``wmma`` = TMA row
     pieces into smem + WMMA bf16 m16n16k16 fp32-accumulate; ``fma`` = CUDA-core fp32 FMA
-    straight from global memory (16 B ld.global.nc, warp butterfly + 8-warp smem sum).
+    straight from global memory (16 B ld.global.nc, warp butterfly + 8-warp smem sum);
+    ``swapab`` (legacy 96 x 4 grid AND full-K) = experts on the MMA M dimension, tokens on N
+    (mma.sync m16n8k16 bf16 -> fp32, rows pad to 8), weight A fragments loaded straight from
+    global into registers, activation rows staged once in smem.
+    ``wlayout`` (env ``DG_FE_ROUTER_WLAYOUT``, default ``row``; swapab only): ``fragment`` =
+    the router weights are permuted ONCE on the host (``fable_router_weight_fragment_layout``,
+    cached per weight tensor) into m16n8k16 A-fragment order so every warp load instruction is
+    one contiguous 512 B run (4 full lines instead of 8 half lines); identical numerics.
     ``k_parts`` (env ``DG_FE_TINYM_KPARTS``, default 1; full-K grid only): 1 | 2 | 4 K-parts per
     expert group; K-part CTAs exchange fp32 partials through the workspace (release/acquire
     flag), the part-0 CTA sums in fixed order (part 0, 1, ..) and emits the keys.
@@ -669,6 +715,10 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     grid = _fe_grid_from_env(grid)
     mma = _fe_mma_from_env(mma)
     k_parts = _fe_kparts_from_env(k_parts)
+    wlayout = _fe_wlayout_from_env(wlayout)
+    if mma == 2 and wlayout == 1:
+        router_weight = _fe_router_weight_for_layout(router_weight, 1)
+        mma = 3          # swapab + fragment weight layout
     cache = getattr(sym_buffer, "_fable_frontend_cache", None)
     if cache is None:
         cache = sym_buffer._fable_frontend_cache = {}
