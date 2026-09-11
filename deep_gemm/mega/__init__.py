@@ -610,11 +610,14 @@ def _fe_mma_from_env(mma):
     """DG_FE_TINYM_MMA: 'wmma' (default) -> 0, 'fma' -> 1 (full-K grid only), 'swapab' -> 2
     (experts on the MMA M dimension, mma.sync m16n8k16, A fragments straight from global;
     legacy 96 x 4 grid and full-K grid), 'cc' -> 4 / 'cc6' -> 5 (full-K grid, m <= 2: CUDA-core
-    K-split router, 5 experts x 4 | 6 warps per CTA, weights straight into registers)."""
+    K-split router, 5 experts x 4 | 6 warps per CTA, weights straight into registers), 'tc16' -> 7 /
+    'tc16w3' -> 8 / 'tc16w2' -> 9 (full-K grid, m <= 2: padding-free tensor-core router, X viewed as a
+    16 x 192 A tile, 5 (segment, 16-expert group) units per CTA x 6 | 3 | 2 warps per unit)."""
     if mma is None:
         mma = os.environ.get("DG_FE_TINYM_MMA", "wmma")
     if isinstance(mma, str):
-        mma = {"wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "cc44": 6, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5, "6": 6}[mma.strip().lower()]
+        mma = {"wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "cc44": 6, "tc16": 7, "tc16w3": 8, "tc16w2": 9,
+               "0": 0, "1": 1, "2": 2, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9}[mma.strip().lower()]
     return int(mma)
 
 

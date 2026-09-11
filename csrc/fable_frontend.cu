@@ -1110,6 +1110,45 @@ __device__ __forceinline__ uint4 ld_cg_v4(const uint32_t* p) {
     asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
     return v;
 }
+// Warp-level top-kTopK over the kSlotsPerLane keys each lane holds in registers (keys are
+// unique, 0 = empty, sentinel 1 never wins while >= kTopK real keys exist). Returns the
+// descending result in lanes 0..kTopK-1 (0 elsewhere). redux_sel: kTopK rounds of {per-lane
+// tree max, redux.sync max, owner clears}; else per-lane sorted insertion + one 8-round merge.
+template <int kTopK, int kSlotsPerLane>
+__device__ __forceinline__ uint32_t topk_select_lane_keys(uint32_t (&kv)[kSlotsPerLane], int lane, bool redux_sel) {
+    uint32_t run = 0u;
+    if (redux_sel) {
+        #pragma unroll
+        for (int k = 0; k < kTopK; ++k) {
+            uint32_t tr[kSlotsPerLane];              // tree max (depth log2), not a serial chain
+            #pragma unroll
+            for (int i = 0; i < kSlotsPerLane; ++i) tr[i] = kv[i];
+            #pragma unroll
+            for (int st = 1; st < kSlotsPerLane; st *= 2)
+                #pragma unroll
+                for (int i = 0; i + st < kSlotsPerLane; i += 2 * st) tr[i] = max(tr[i], tr[i + st]);
+            const uint32_t mx = tr[0];
+            const uint32_t best = warp_max_u32_redux(mx);
+            if (lane == k) run = best;
+            if (mx == best) {
+                #pragma unroll
+                for (int i = 0; i < kSlotsPerLane; ++i) kv[i] = kv[i] == best ? 0u : kv[i];
+            }
+        }
+    } else {                                   // per-lane sorted top-8 (insertion) + one 8-round merge
+        uint32_t loc[kTopK];
+        #pragma unroll
+        for (int j = 0; j < kTopK; ++j) loc[j] = 0u;
+        #pragma unroll
+        for (int i = 0; i < kSlotsPerLane; ++i) {
+            uint32_t k = kv[i];
+            #pragma unroll
+            for (int j = 0; j < kTopK; ++j) { const uint32_t lo = min(k, loc[j]); loc[j] = max(k, loc[j]); k = lo; }
+        }
+        merge8<kTopK>(run, loc, lane);
+    }
+    return run;
+}
 // Last-arriver merge (cc, DG_FE_CC_MERGE=ticket, default): called by the router CTA whose
 // atom.acq_rel.gpu ticket was the last (every CTA: keys stored -> bar.sync -> thread 0 atomic;
 // the release orders the CTA's key stores, the acquire on the last CTA orders its reads).
@@ -1151,37 +1190,7 @@ __device__ __forceinline__ void last_arriver_topk(
     uint32_t kv[kSlotsPerLane];
     #pragma unroll
     for (int i = 0; i < kVecPerLane; ++i) { kv[4 * i] = q[i].x; kv[4 * i + 1] = q[i].y; kv[4 * i + 2] = q[i].z; kv[4 * i + 3] = q[i].w; }
-    uint32_t run = 0u;
-    if (redux_sel) {
-        #pragma unroll
-        for (int k = 0; k < kTopK; ++k) {
-            uint32_t tr[kSlotsPerLane];              // tree max (depth log2), not a serial chain
-            #pragma unroll
-            for (int i = 0; i < kSlotsPerLane; ++i) tr[i] = kv[i];
-            #pragma unroll
-            for (int st = 1; st < kSlotsPerLane; st *= 2)
-                #pragma unroll
-                for (int i = 0; i + st < kSlotsPerLane; i += 2 * st) tr[i] = max(tr[i], tr[i + st]);
-            const uint32_t mx = tr[0];
-            const uint32_t best = warp_max_u32_redux(mx);
-            if (lane == k) run = best;
-            if (mx == best) {
-                #pragma unroll
-                for (int i = 0; i < kSlotsPerLane; ++i) kv[i] = kv[i] == best ? 0u : kv[i];
-            }
-        }
-    } else {                                   // per-lane sorted top-8 (insertion) + one 8-round merge
-        uint32_t loc[kTopK];
-        #pragma unroll
-        for (int j = 0; j < kTopK; ++j) loc[j] = 0u;
-        #pragma unroll
-        for (int i = 0; i < kSlotsPerLane; ++i) {
-            uint32_t k = kv[i];
-            #pragma unroll
-            for (int j = 0; j < kTopK; ++j) { const uint32_t lo = min(k, loc[j]); loc[j] = max(k, loc[j]); k = lo; }
-        }
-        merge8<kTopK>(run, loc, lane);
-    }
+    const uint32_t run = topk_select_lane_keys<kTopK, kSlotsPerLane>(kv, lane, redux_sel);
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
     topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[4] = globaltimer_ns();
@@ -1189,6 +1198,183 @@ __device__ __forceinline__ void last_arriver_topk(
     for (int i = 0; i < kVecPerLane; ++i)      // slots back to 0 (the polling merger mode relies on it)
         if (4 * (lane + 32 * i) < nslots) *reinterpret_cast<uint4*>(base + 4 * (lane + 32 * i)) = make_uint4(0u, 0u, 0u, 0u);
 }
+
+// ------------------------------------- padding-free tensor-core router (mma = tc16 | tc16w3 | tc16w2)
+// DG_FE_TINYM_MMA=tc16 (full-K grid, k_parts 1, m <= 2, h = 3072, e % 16 == 0): the token row
+// X[3072] is viewed as the A tile A[16 x 192] (row r = K-segment r of X, real data in every
+// row, no padding). Work unit u = (expert group grp = u / 16 of 16 experts, segment seg =
+// u % 16): D[16 x 16] = A . B with B[k][n] = W[grp * 16 + n][seg * 192 + k]; only row `seg`
+// of D is X_seg . W_seg (the 15 other rows are discarded; the tensor cores were idle anyway).
+// The 16 segment partials of an expert are summed by the last-arriving CTA. Grid: e units
+// (16 segments x e / 16 groups = 384) over ceil(e / 5) = 77 router CTAs of kTCUnits = 5 units
+// (30 KB of weights per CTA, the same bytes / SM as the cc router) + 1 quant CTA = 78 = SMs.
+// CTA = 5 units x kWpu warps; warp (unit ui, part p) owns K' = [p * 192 / kWpu, +192 / kWpu)
+// of the unit's segment as kBpw = 6 / kWpu k32 blocks (tc16: kWpu 6 -> 30 warps x 1 block,
+// 960 threads, 2 weight + 2 m activation 16 B loads per lane; tc16w3: 15 warps x 2 blocks;
+// tc16w2: 10 x 3). Fragments (mma.sync m16n8k16 row.col bf16 -> fp32, the swapab K
+// permutation inside each k32 block, applied identically to A and B): lane (g, t) loads
+// A rows g / g + 8 = X[g * 192 + k'0 + 8 t .. + 7] / X[(g + 8) * 192 + ...] and B columns
+// n = g of the two n8 tiles = W[grp * 16 + g][seg * 192 + k'0 + 8 t ..] / W[grp * 16 + 8 + g][...];
+// step s uses words 2 s / 2 s + 1 of each vector (see the swapab notes). Every load is issued as
+// the kernel's first instructions (ld.global.nc.L1::no_allocate straight into registers, no
+// smem / TMA / barrier before the MMAs). Row `seg` of D lives in lanes g == seg % 8: c0, c1
+// (seg < 8) or c2, c3 (seg >= 8) = experts tile * 8 + 2 t, + 1.
+// Accumulation order (fixed, documented): per warp, blocks j = 0..kBpw-1 (steps s = 0, 1
+// each) into ONE fp32 accumulator (the 16-product sum inside a k16 step is the hardware
+// order); the kWpu part partials summed p = 0..kWpu-1 through smem; the 16 segment partials
+// summed seg = 0..15 by the last CTA; one bf16 rounding of the logit. Deterministic, not
+// bit-identical to the cc / WMMA paths (top-8 index sets identical up to bf16 rounding ties).
+// Hand-off = the cc ticket: partials[token][expert][seg] as order-preserving never-zero u32
+// (enc_f32; the data is the flag), bar.sync, relaxed atomic ticket; the last CTA re-reads
+// slots still 0, sums, rounds, builds the keys in smem, top-8 (insertion + merge8 or redux) +
+// softmax + write, zeroes the slots. The spare CTA quantises the m rows (as cc ticket mode).
+constexpr int kTCSegs = 16;                        // K segments = rows of the A tile
+constexpr int kTCUnits = 5;                        // (group, segment) units per router CTA
+constexpr int kTCSegLen = kCCH / kTCSegs;          // 192
+constexpr int kTCBlocks = kTCSegLen / 32;          // 6 k32 blocks per unit
+constexpr int kTCMaxE = 1024;                      // m x e x 16 x 4 B partials <= 128 KB (kFullKPartialsOff .. kFullKFlagsOff)
+__host__ __device__ constexpr int tc_block(int wpu) { return wpu * kTCUnits * 32; }
+__host__ __device__ constexpr int fe_block(int cc, int tc) { return tc > 0 ? tc_block(tc) : cc_block(cc); }
+__host__ __device__ constexpr int tc_router_ctas(int e) { return (e + kTCUnits - 1) / kTCUnits; }
+// order-preserving u32 encoding of an fp32 that is never 0 (0 only for the all-ones NaN 0xffffffff)
+__device__ __forceinline__ uint32_t enc_f32(float v) {
+    const uint32_t b = __float_as_uint(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+__device__ __forceinline__ float dec_f32(uint32_t o) {
+    return __uint_as_float((o & 0x80000000u) ? (o & 0x7fffffffu) : ~o);
+}
+template <int kWpu>
+__device__ __forceinline__ void router_role_tc16(
+        const __nv_bfloat16* __restrict__ hidden, const __nv_bfloat16* __restrict__ router_weight,
+        uint32_t* __restrict__ partials, unsigned long long* stamps, int m, int h, int e) {
+    static_assert(kTCBlocks % kWpu == 0, "k32 blocks per unit must split evenly over the unit's warps");
+    constexpr int kBpw = kTCBlocks / kWpu;
+    __shared__ float part_s[kTCUnits][kCCMaxM][kWpu][16];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int ui = warp / kWpu, p = warp % kWpu;
+    const int unit = blockIdx.x * kTCUnits + ui;
+    const bool active = unit < e;                        // e units in total
+    const int seg = unit % kTCSegs, grp = unit / kTCSegs;
+    const int ka = p * (kBpw * 32) + t * 8;              // this lane's first K' inside the segment
+    stamp(stamps, 7);
+    uint4 xa[kCCMaxM][kBpw], xa8[kCCMaxM][kBpw], wb0[kBpw], wb8[kBpw];
+    #pragma unroll
+    for (int r = 0; r < kCCMaxM; ++r) {
+        const __nv_bfloat16* xr = hidden + static_cast<int64_t>(r) * h + ka;
+        #pragma unroll
+        for (int j = 0; j < kBpw; ++j) {
+            xa[r][j] = make_uint4(0u, 0u, 0u, 0u); xa8[r][j] = make_uint4(0u, 0u, 0u, 0u);
+            if (active && r < m) {
+                xa[r][j] = ld_nc_na_16(xr + g * kTCSegLen + 32 * j);
+                xa8[r][j] = ld_nc_na_16(xr + (g + 8) * kTCSegLen + 32 * j);
+            }
+        }
+    }
+    const __nv_bfloat16* w0 = router_weight + static_cast<int64_t>(grp * 16 + g) * h + seg * kTCSegLen + ka;
+    const __nv_bfloat16* w8 = w0 + static_cast<int64_t>(8) * h;
+    #pragma unroll
+    for (int j = 0; j < kBpw; ++j) {
+        wb0[j] = make_uint4(0u, 0u, 0u, 0u); wb8[j] = make_uint4(0u, 0u, 0u, 0u);
+        if (active) { wb0[j] = ld_nc_na_16(w0 + 32 * j); wb8[j] = ld_nc_na_16(w8 + 32 * j); }
+    }
+    stamp(stamps, 5);
+    if (stamps != nullptr && threadIdx.x == 0) stamps[blockIdx.x * kStampSlots + 1] = globaltimer_after(wb0[0].x);
+    float acc[kCCMaxM][2][4];
+    #pragma unroll
+    for (int r = 0; r < kCCMaxM; ++r)
+        #pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[r][nt][i] = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < kBpw; ++j) {
+        #pragma unroll
+        for (int r = 0; r < kCCMaxM; ++r) {
+            if (r < m) {
+                mma_m16n8k16_bf16(acc[r][0], xa[r][j].x, xa8[r][j].x, xa[r][j].y, xa8[r][j].y, wb0[j].x, wb0[j].y);   // s = 0, tile 0
+                mma_m16n8k16_bf16(acc[r][1], xa[r][j].x, xa8[r][j].x, xa[r][j].y, xa8[r][j].y, wb8[j].x, wb8[j].y);   // s = 0, tile 1
+                mma_m16n8k16_bf16(acc[r][0], xa[r][j].z, xa8[r][j].z, xa[r][j].w, xa8[r][j].w, wb0[j].z, wb0[j].w);   // s = 1
+                mma_m16n8k16_bf16(acc[r][1], xa[r][j].z, xa8[r][j].z, xa[r][j].w, xa8[r][j].w, wb8[j].z, wb8[j].w);
+            }
+        }
+    }
+    if (g == (seg & 7)) {                                // row `seg` of D: c0, c1 (seg < 8) or c2, c3 (seg >= 8)
+        const int lo = seg < 8 ? 0 : 2;
+        #pragma unroll
+        for (int r = 0; r < kCCMaxM; ++r)
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                part_s[ui][r][p][nt * 8 + 2 * t] = acc[r][nt][lo];
+                part_s[ui][r][p][nt * 8 + 2 * t + 1] = acc[r][nt][lo + 1];
+            }
+    }
+    __syncthreads();
+    stamp(stamps, 2);
+    if (static_cast<int>(threadIdx.x) < kTCUnits * kCCMaxM * 16) {
+        const int u2 = threadIdx.x / (kCCMaxM * 16), r = (threadIdx.x / 16) % kCCMaxM, x = threadIdx.x % 16;
+        const int unit2 = blockIdx.x * kTCUnits + u2;
+        if (r < m && unit2 < e) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int q = 0; q < kWpu; ++q) v += part_s[u2][r][q][x];
+            const int seg2 = unit2 % kTCSegs, ex = (unit2 / kTCSegs) * 16 + x;
+            partials[(static_cast<int64_t>(r) * e + ex) * kTCSegs + seg2] = enc_f32(v);
+        }
+    }
+}
+// Last-arriving tc16 CTA: thread per (token, expert) reads the 16 encoded segment partials
+// (4 x 16 B, L2-hot; re-read while any word is still 0: relaxed ticket), sums seg = 0..15,
+// bf16-rounds, key into smem, zeroes the slots; then warp t < m selects token t's top-8 from
+// the smem keys (12 per lane for e = 384) and writes softmax weights + indices.
+template <int kTopK, int kBlock>
+__device__ __forceinline__ void tc16_last_arriver(
+        uint32_t* __restrict__ partials, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
+        unsigned long long* mstamps, int m, int e, bool redux_sel) {
+    __shared__ uint32_t key_s[kCCMaxM][kTCMaxE];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int i = threadIdx.x; i < m * e; i += kBlock) {
+        uint32_t* slot = partials + static_cast<int64_t>(i) * kTCSegs;
+        uint4 q[kTCSegs / 4];
+        #pragma unroll
+        for (int k = 0; k < kTCSegs / 4; ++k) q[k] = ld_cg_v4(slot + 4 * k);
+        while (true) {
+            bool zero = false;
+            #pragma unroll
+            for (int k = 0; k < kTCSegs / 4; ++k)
+                if (q[k].x == 0u || q[k].y == 0u || q[k].z == 0u || q[k].w == 0u) { q[k] = ld_cg_v4(slot + 4 * k); zero = true; }
+            if (!zero) break;
+        }
+        float v = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < kTCSegs / 4; ++k) {
+            v += dec_f32(q[k].x); v += dec_f32(q[k].y); v += dec_f32(q[k].z); v += dec_f32(q[k].w);
+        }
+        key_s[i / e][i % e] = topk_key(round_bf16(v), i % e);
+        #pragma unroll
+        for (int k = 0; k < kTCSegs / 4; ++k) *reinterpret_cast<uint4*>(slot + 4 * k) = make_uint4(0u, 0u, 0u, 0u);
+    }
+    __syncthreads();
+    if (mstamps != nullptr && threadIdx.x == 0) mstamps[2] = globaltimer_ns();
+    if (warp >= m) return;
+    const int t = warp;
+    uint32_t run;
+    if (e <= 12 * 32) {
+        uint32_t kv[12];
+        #pragma unroll
+        for (int i = 0; i < 12; ++i) kv[i] = lane + 32 * i < e ? key_s[t][lane + 32 * i] : 0u;
+        run = topk_select_lane_keys<kTopK, 12>(kv, lane, redux_sel);
+    } else {
+        uint32_t kv[kTCMaxE / 32];
+        #pragma unroll
+        for (int i = 0; i < kTCMaxE / 32; ++i) kv[i] = lane + 32 * i < e ? key_s[t][lane + 32 * i] : 0u;
+        run = topk_select_lane_keys<kTopK, kTCMaxE / 32>(kv, lane, redux_sel);
+    }
+    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
+    topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
+    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[4] = globaltimer_ns();
+}
+
 __device__ __forceinline__ int atom_add_acq_rel_gpu(int* p, int v) {
     int old;
     asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
@@ -1273,8 +1459,9 @@ __device__ __forceinline__ void merger_role(
 // kFullK: <= 128 regs (merger warp holds 32 keys), 2 CTAs/SM cap; grid <= SM count anyway.
 // kFma: 16 x uint4 weight vectors live in registers -> 1 CTA/SM bound (255 regs), no spills.
 // kCC (> 0 = K-split factor): CUDA-core router role, cc_block(kCC) threads, 1 CTA/SM.
-template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma, int kSwapBlk, int kCC = 0>
-__global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK ? 2 : (kTiny ? 3 : 1))) router_quant_topk_kernel(
+// kTC (> 0 = warps per unit): padding-free tensor-core router (tc16), tc_block(kTC) threads, 1 CTA/SM.
+template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma, int kSwapBlk, int kCC = 0, int kTC = 0>
+__global__ void __launch_bounds__(fe_block(kCC, kTC), (kFma || kCC > 0 || kTC > 0) ? 1 : (kFullK ? 2 : (kTiny ? 3 : 1))) router_quant_topk_kernel(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
         uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
@@ -1284,6 +1471,30 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
         int m, int h, int e, int topk, int num_router_ctas, int w_hint, int pdl_mode, int epc, int k_parts) {
     stamp(stamps, 0);
     stamp_smid(stamps);
+    if constexpr (kTC > 0) {
+        if (pdl_mode == 1) pdl_trigger();
+        uint32_t* partials = reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(logits) + kFullKPartialsOff);
+        if (static_cast<int>(blockIdx.x) >= num_router_ctas) {      // spare CTA: quantise the m rows
+            for (int t = 0; t < m; ++t) quant_role<kMode, tc_block(kTC)>(hidden, x_bytes, x_sf, t, h);
+            stamp(stamps, 5);
+            if (pdl_mode == 2) pdl_trigger();
+            return;
+        }
+        router_role_tc16<kTC>(hidden, router_weight, partials, stamps, m, h, e);
+        __shared__ int s_last;
+        __syncthreads();                 // every partial store of this CTA is issued before thread 0's ticket
+        if (threadIdx.x == 0) s_last = atomicAdd(ticket, 1) == num_router_ctas - 1;   // relaxed: the encoded partials are the flags
+        __syncthreads();
+        stamp(stamps, 3);
+        if (s_last) {
+            unsigned long long* mstamps = stamps != nullptr ? stamps + static_cast<size_t>(num_router_ctas) * kStampSlots : nullptr;
+            if (mstamps != nullptr && threadIdx.x == 0) mstamps[1] = globaltimer_ns();
+            tc16_last_arriver<kMaxTopK, tc_block(kTC)>(partials, topk_idx, topk_weights, mstamps, m, e, (w_hint & kSelectReduxBit) != 0);
+            if (threadIdx.x == 0) *ticket = 0;
+        }
+        if (pdl_mode == 2) pdl_trigger();
+        return;
+    }
     if constexpr (kFullK) {
         if (pdl_mode == 1) pdl_trigger();
         uint32_t* cand = reinterpret_cast<uint32_t*>(logits);
@@ -1461,7 +1672,7 @@ static void fullk_plan(int e, int grid, int k_parts, int& epc, int& router_ctas)
     router_ctas = groups * k_parts;
 }
 
-template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma = false, int kSwapBlk = 0, int kCC = 0>
+template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma = false, int kSwapBlk = 0, int kCC = 0, int kTC = 0>
 void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
             int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
             int m, int h, int e, int topk, int l2_persist, int pdl_mode, int grid, int k_parts, cudaStream_t stream, int mma = 0) {
@@ -1470,7 +1681,8 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     int smem_bytes = Cfg::kDynSmemBytes, num_ctas = router_ctas + m;
     if constexpr (kFullK) {
         fullk_plan(e, grid, k_parts, epc, router_ctas);
-        smem_bytes = kCC > 0 ? 0 : kSwapBlk > 0 ? swapab_smem_bytes(m, h / k_parts)
+        if constexpr (kTC > 0) router_ctas = tc_router_ctas(e);        // e (segment, group) units, kTCUnits per CTA
+        smem_bytes = (kCC > 0 || kTC > 0) ? 0 : kSwapBlk > 0 ? swapab_smem_bytes(m, h / k_parts)
                   : kFma ? (kThreads / 32) * kMaxCandSlots * 16 * 4 : fullk_smem_bytes(m, h / k_parts);
         num_ctas = router_ctas + 1;
         // DG_FE_FULLK_1PERSM (default 1): when the grid fits the SM count, request
@@ -1481,7 +1693,7 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     }
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC>,
+        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC, kTC>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              kFullK ? std::max(fullk_smem_bytes(16, 3072), 116 * 1024) : Cfg::kDynSmemBytes);
         attr_set = true;
@@ -1489,7 +1701,7 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     const size_t w_bytes = static_cast<size_t>(e) * h * sizeof(__nv_bfloat16);
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(num_ctas);
-    cfg.blockDim = dim3(cc_block(kCC));
+    cfg.blockDim = dim3(fe_block(kCC, kTC));
     cfg.dynamicSmemBytes = smem_bytes;
     cfg.stream = stream;
     cudaLaunchAttribute attrs[1];
@@ -1519,13 +1731,13 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         static const bool ticket_merge = getenv("DG_FE_CC_MERGE") ? strcmp(getenv("DG_FE_CC_MERGE"), "ticket") == 0 : true;
         if (kCC > 0 && ticket_merge) w_hint |= kTicketMergeBit;
         static const bool redux_sel = getenv("DG_FE_CC_SELECT") && strcmp(getenv("DG_FE_CC_SELECT"), "redux") == 0;
-        if (kCC > 0 && redux_sel) w_hint |= kSelectReduxBit;
+        if ((kCC > 0 || kTC > 0) && redux_sel) w_hint |= kSelectReduxBit;
         // ticket: relaxed (default) = atomicAdd right after the key stores, the last CTA re-reads slots still 0;
         // acqrel = atom.acq_rel.gpu (release drains this CTA's stores first: ~0.5 us more before the ticket)
         static const bool acqrel = getenv("DG_FE_CC_TICKET") && strcmp(getenv("DG_FE_CC_TICKET"), "acqrel") == 0;
         if (kCC > 0 && !acqrel) w_hint |= kTicketRelaxedBit;
     }
-    cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC>,
+    cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC, kTC>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);
 }
 
@@ -1548,7 +1760,19 @@ void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x
                 if (!warned) { fprintf(stderr, "[fable_frontend] DG_FE_ROUTER_WLAYOUT=fragment needs 16-expert groups (epc=%d): using row layout\n", epc); warned = true; }
                 mma = 2;
             }
-            // cc | cc6: CUDA-core K-split router (m <= 2, h = 3072, k_parts 1, epc <= 5); else WMMA
+            // tc16 | tc16w3 | tc16w2: padding-free tensor-core router (m <= 2, h = 3072, e % 16 == 0, k_parts 1,
+            // ceil(e / 5) + 1 CTAs <= SMs); else WMMA
+            if (mma == 7 || mma == 8 || mma == 9) {
+                if (m <= kCCMaxM && h == kCCH && k_parts == 1 && e % 16 == 0 && e <= kTCMaxE && tc_router_ctas(e) + 1 <= num_sms_cached()) {
+                    if (mma == 7) launch<1, kMode, true, true, false, 0, 0, 6>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+                    else if (mma == 8) launch<1, kMode, true, true, false, 0, 0, 3>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+                    else launch<1, kMode, true, true, false, 0, 0, 2>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+                    return;
+                }
+                static bool warned_tc = false;
+                if (!warned_tc) { fprintf(stderr, "[fable_frontend] DG_FE_TINYM_MMA=tc16 needs m <= %d, h = %d, k_parts 1, e %% 16 == 0, e <= %d, %d + 1 CTAs <= SMs (m=%d h=%d k_parts=%d e=%d): using WMMA\n", kCCMaxM, kCCH, kTCMaxE, tc_router_ctas(e), m, h, k_parts, e); warned_tc = true; }
+                mma = 0;
+            }
             if (mma == 4 || mma == 5 || mma == 6) {
                 const int cc = mma == 4 ? 44 : mma == 5 ? 46 : 36;      // slots * 8 + K-split
                 if (m <= kCCMaxM && h == kCCH && k_parts == 1 && epc <= cc_slots(cc)) {

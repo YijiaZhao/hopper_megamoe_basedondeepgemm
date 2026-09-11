@@ -40,7 +40,7 @@ def main():
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 2, 8, 16])
     ap.add_argument("--grid", default="auto", help="new-scheme DG_FE_TINYM_GRID value (auto or N)")
     ap.add_argument("--weight-tol", type=float, default=1e-6)
-    ap.add_argument("--mma", default="wmma", choices=("wmma", "fma", "swapab", "cc", "cc6", "cc44"), help="new-scheme DG_FE_TINYM_MMA value")
+    ap.add_argument("--mma", default="wmma", choices=("wmma", "fma", "swapab", "cc", "cc6", "cc44", "tc16", "tc16w3", "tc16w2"), help="new-scheme DG_FE_TINYM_MMA value")
     ap.add_argument("--wlayout", default="row", choices=("row", "fragment"), help="new-scheme DG_FE_ROUTER_WLAYOUT (swapab only)")
     args = ap.parse_args()
     buf_old, buf_new = make_buffer(64), make_buffer(64)
