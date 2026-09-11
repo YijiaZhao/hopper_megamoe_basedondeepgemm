@@ -32,7 +32,12 @@ REPORT = [
     (12, "init done"),
     # fused Fable frontend (DG_FP4_FUSE_FE=1 + --fuse-fe): FE crew timeline
     (33, "FE crew start (min)"),
+    (49, "FE router loads issued (max)"),
+    (50, "FE quant done (top-k CTAs, max)"),
+    (51, "FE router loads landed (max)"),
+    (52, "FE router WMMA+store done (max)"),
     (45, "FE router units done (max)"),
+    (54, "FE top-k saw all units (max)"),
     (46, "FE top-k written (max)"),
     (32, "dispatch saw top-k (max)"),
     (8, "expert-offset atomics"),
@@ -67,9 +72,9 @@ SM_GHZ = 1.83
 PROBE_EXP = int(os.environ.get("PROBE_EXP", "0"))  # 1 skip decode, 2 skip wgmma, 3 both (timing only)
 PROBE_DUMP = int(os.environ.get("PROBE_DUMP", "0"))
 # 1: rank0 prints the per-CTA task timeline of the last measured launch (kernel task log,
-# slots 48 + sm * 16 + ..., enabled by the magic word in slot 47; see the body).
+# slots 64 + sm * 16 + ..., enabled by the magic word in slot 47; see the body).
 PROBE_TASKLOG = int(os.environ.get("PROBE_TASKLOG", "0"))
-TASKLOG_BASE, TASKLOG_PER_CTA, TASKLOG_MAX_SMS, TASKLOG_MAGIC = 48, 16, 160, 0x5441534B
+TASKLOG_BASE, TASKLOG_PER_CTA, TASKLOG_MAX_SMS, TASKLOG_MAGIC = 64, 16, 160, 0x5441534B
 
 
 def print_tasklog(s, t0):
@@ -159,7 +164,7 @@ def main():
     kernel = (deep_gemm_fused_kernel(args.quant))
     weights = prepare_weights(args, rank, local_experts)
 
-    stamps = torch.zeros(48 + TASKLOG_MAX_SMS * TASKLOG_PER_CTA, dtype=torch.int64, device="cuda")
+    stamps = torch.zeros(TASKLOG_BASE + TASKLOG_MAX_SMS * TASKLOG_PER_CTA, dtype=torch.int64, device="cuda")
     try:
         torch.manual_seed(17000 + rank * 1000003 + args.global_tokens)
         x = torch.randn(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
@@ -251,7 +256,7 @@ def main():
             print(f"{'slot':>4} {'phase':<32} {'median':>9} {'min':>9} {'max':>9} {'delta':>9}")
             prev = 0.0
             for slot, name in REPORT:
-                if slot in (33, 45, 46, 32) and not args.fuse_fe:
+                if slot in (33, 49, 50, 51, 52, 45, 54, 46, 32) and not args.fuse_fe:
                     continue
                 print(f"{slot:>4} {name:<32} {med[slot]:>9.2f} {mn[slot]:>9.2f} {mx[slot]:>9.2f} {med[slot]-prev:>9.2f}")
                 prev = med[slot]

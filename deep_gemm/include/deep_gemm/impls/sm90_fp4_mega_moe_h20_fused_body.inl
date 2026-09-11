@@ -2123,19 +2123,24 @@
                     fable_fe::router_unit_issue_all<1, true>(fe_hidden_bf, fe_weight_bf, fe_m, fe_h,
                         static_cast<int>(fe_u0 + i * kNumSMs), fe_tid, smem_fe_base + i * kFEUnitSmemBytes);
             fable_fe::cp_async_commit();
+            if (fe_tid == 0) stamp_max(49);   // router loads issued
             // (2) token sm_idx's activation quantisation while the router loads land
-            if (sm_idx < num_tokens)
+            if (sm_idx < num_tokens) {
                 fable_fe::quant_role<kQoQ ? 1 : 0>(fe_hidden_bf,
                     input_token_buffer.get_base_ptr<uint8_t>(), input_sf_buffer.get_base_ptr<float>(),
                     static_cast<int>(sm_idx), fe_h, fe_tid, fe_warp_max, fe_sync);
+                if (fe_tid == 0) stamp_max(50);   // quant done (top-k CTAs)
+            }
             // (3) router units -> fp32 partial logits, then this CTA's arrival
             fable_fe::cp_async_wait<0>();
             fe_sync();
+            if (fe_tid == 0) stamp_max(51);   // router loads landed
             #pragma unroll
             for (uint32_t i = 0; i < kFEMaxUnitsPerCTA; ++ i)
                 if (fe_u0 + i * kNumSMs < kFENumUnits)
                     fable_fe::router_unit_compute<1, true>(fe_logits, fe_m, fe_h, fe_e,
                         static_cast<int>(fe_u0 + i * kNumSMs), fe_tid, smem_fe_base + i * kFEUnitSmemBytes, fe_sync);
+            if (fe_tid == 0) stamp_max(52);   // router WMMA + partial stores done
             __threadfence();
             fe_sync();
             if (fe_tid == 0) {
@@ -2147,6 +2152,7 @@
                 if (fe_tid == 0) {
                     DG_SPIN_WHILE(ptx::ld_acq(fe_counters + 8) < kNumSMs, 4101);
                     __threadfence();
+                    stamp_max(54);   // top-k CTA saw every router unit
                 }
                 fe_sync();
                 fable_fe::topk_softmax_token_tiny<fe_cfg_t::kKSplitCTAs, kFETopkPerLane, 8>(
@@ -5134,7 +5140,7 @@
         // = task t's (start, end) in ns since this CTA's kernel entry (low 32 bits), start
         // word high bits = meta (bit 31 L2, 30..24 pool block, 23..16 n block, 15..8 k split,
         // 7..0 num k splits); + 14 = this CTA's absolute entry globaltimer, + 15 = task count.
-        constexpr uint32_t kTaskLogBase = 48, kTaskLogPerCTA = 16, kTaskLogMaxTasks = 7, kTaskLogMaxSMs = 160;
+        constexpr uint32_t kTaskLogBase = 64, kTaskLogPerCTA = 16, kTaskLogMaxTasks = 7, kTaskLogMaxSMs = 160;
         uint32_t task_log_seq = 0;
         const bool task_log_on = (phase_stamps != nullptr) && (epilogue_thread_idx == 0) &&
                                  (sm_idx < kTaskLogMaxSMs) && (phase_stamps[47] == 0x5441534bull);
