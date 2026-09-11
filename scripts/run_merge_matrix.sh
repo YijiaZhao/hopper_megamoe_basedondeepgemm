@@ -142,6 +142,18 @@ case "$MODE" in
       bash "$0" mx 128 512
       for p in 1 2 3; do bash "$0" capture "$RES/cap_swapab/p$p" "2 8 16"; done
       echo "CHAIN4_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
+  corrq)   rc=0; for T in "$@"; do run_corr "corrq_t$T" --apis qoq_mega_moe_fused --tokens "$T" || rc=1; done; echo "CORRQ_RC=$rc" ;;
+  chain5)   # round-3 cc vs swapab under the customer method (M=8 = 1 row/rank) + qoq 32-row diagnostics
+    C="$RES/chain5.log"; : > "$C"
+    { echo "start $(git rev-parse --short HEAD) $(date -u +%FT%TZ)"
+      DG_FE_TINYM_MMA=cc bash "$0" capture "$RES/cap_ab3/cc_r3" 8
+      DG_FE_TINYM_MMA=swapab bash "$0" capture "$RES/cap_ab3/swapab" 8
+      DG_FE_TINYM_MMA=cc bash "$0" capture "$RES/cap_ab3/cc_r3_b" 8
+      DG_FE_TINYM_MMA=swapab bash "$0" capture "$RES/cap_ab3/swapab_b" 8
+      for d in cc_r3 swapab cc_r3_b swapab_b; do echo "## $d"; cut -d, -f1-4,6-8 "$RES/cap_ab3/$d/TIMELINE_LAST3.csv"; done
+      bash "$0" corrq 32
+      COSMIN=0.999 bash "$0" corrref 32
+      echo "CHAIN5_DONE $(date -u +%FT%TZ)"; } >> "$C" 2>&1 ;;
   stop)     # stop OUR OWN jobs only: processes whose cwd is this worktree (run inside the same container)
     for pid in $(pgrep -f "run_merge_matrix.sh|capture_four_api_h20_timelines.sh|nsys profile|profile_four_api_h20.py|torchrun|test_four_api_correctness.py|test_frontend_fe78.py"); do
       [ "$pid" = "$$" ] && continue
