@@ -72,7 +72,10 @@ def attribution(stamps_list, num_router_ctas, m, fullk=False):
         if rq.numel():
             print(line("router quant done", rq))
         print(line("router mma done", r[:, 2])); print(line("router keys written", r[:, 3]))
-        print(line("merger start", q[:, 0])); print(line("merger first CTA seen", q[:, 1]))
+        print(line("merger start", q[:, 0]))
+        if q[:, 5].max() > 0:
+            print(line("merger quant done (cc)", q[:, 5]))
+        print(line("merger first CTA seen", q[:, 1]))
         print(line("merger last CTA seen", q[:, 2])); print(line("merger merge done", q[:, 3]))
         print(line("topk written (end)", q[:, 4]))
         late = int((r[:, 0] > r[:, 3].min()).sum())

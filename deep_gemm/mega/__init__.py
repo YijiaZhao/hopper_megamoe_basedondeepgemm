@@ -609,11 +609,12 @@ def _fe_grid_from_env(grid):
 def _fe_mma_from_env(mma):
     """DG_FE_TINYM_MMA: 'wmma' (default) -> 0, 'fma' -> 1 (full-K grid only), 'swapab' -> 2
     (experts on the MMA M dimension, mma.sync m16n8k16, A fragments straight from global;
-    legacy 96 x 4 grid and full-K grid)."""
+    legacy 96 x 4 grid and full-K grid), 'cc' -> 4 / 'cc6' -> 5 (full-K grid, m <= 2: CUDA-core
+    K-split router, 5 experts x 4 | 6 warps per CTA, weights straight into registers)."""
     if mma is None:
         mma = os.environ.get("DG_FE_TINYM_MMA", "wmma")
     if isinstance(mma, str):
-        mma = {"wmma": 0, "fma": 1, "swapab": 2, "0": 0, "1": 1, "2": 2}[mma.strip().lower()]
+        mma = {"wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5}[mma.strip().lower()]
     return int(mma)
 
 

@@ -53,6 +53,14 @@ __device__ __forceinline__ unsigned long long globaltimer_ns() {
 __device__ __forceinline__ void stamp(unsigned long long* stamps, int slot) {
     if (stamps != nullptr && threadIdx.x == 0) stamps[blockIdx.x * kStampSlots + slot] = globaltimer_ns();
 }
+// globaltimer read that cannot be scheduled before `dep` has landed (predicated on it): an
+// empty asm with a register input emits no SASS, hence no scoreboard wait.
+__device__ __forceinline__ unsigned long long globaltimer_after(uint32_t dep) {
+    unsigned long long t;
+    asm volatile("{\n .reg .pred p;\n setp.ne.u32 p, %1, 0x7fffffff;\n @p mov.u64 %0, %%globaltimer;\n @!p mov.u64 %0, 0;\n}"
+                 : "=l"(t) : "r"(dep));
+    return t;
+}
 __device__ __forceinline__ void stamp_smid(unsigned long long* stamps) {
     if (stamps != nullptr && threadIdx.x == 0) {
         uint32_t v;
@@ -161,8 +169,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     const bool probe = stamps != nullptr && warp == kWarps - 1 && !any && kLoad != 3;
     if (probe && lane == 0) {
         const uint4 pv = ld_nc_na_16(w + static_cast<int64_t>(blockIdx.x) * kH);
-        asm volatile("" :: "r"(pv.x));
-        stamps[blockIdx.x * kStampSlots + 1] = globaltimer_ns();
+        stamps[blockIdx.x * kStampSlots + 1] = globaltimer_after(pv.x);
     }
     if constexpr (kLoad == 3 || kXMode == 1) {
         if (threadIdx.x < kWarps) mbar_init(&w_bar[threadIdx.x], 1);
@@ -223,16 +230,14 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
                 xv[r][c] = ld_shared_16(x_s + (static_cast<int>(r) * kH + kbase + (lane + 32 * c) * 8) * 2);
     }
     if (stamps != nullptr && threadIdx.x == 0) {   // warp 0 lane 0: activation chunk 0 landed
-        asm volatile("" :: "r"(xv[0][0].x));
-        stamps[blockIdx.x * kStampSlots + 4] = globaltimer_ns();
+        stamps[blockIdx.x * kStampSlots + 4] = globaltimer_after(xv[0][0].x);
     }
     if constexpr (kLoad == 3) {
         if (any) mbar_wait_parity(&w_bar[warp], 0u);
     }
     if (stamps != nullptr && threadIdx.x == 0) {   // warp 0 lane 0: first weight chunk consumed
-        if constexpr (kLoad == 3) asm volatile("" ::: "memory");
-        else asm volatile("" :: "r"(wv[0][0].x));
-        stamps[blockIdx.x * kStampSlots + 7] = globaltimer_ns();
+        if constexpr (kLoad == 3) stamps[blockIdx.x * kStampSlots + 7] = globaltimer_ns();
+        else stamps[blockIdx.x * kStampSlots + 7] = globaltimer_after(wv[0][0].x);
         if (kLoad == 3 || (kWarps - 1) * kEPW * static_cast<int>(gridDim.x) < e) stamps[blockIdx.x * kStampSlots + 1] = stamps[blockIdx.x * kStampSlots + 7];
     }
     // ---- FMA + butterfly per expert
