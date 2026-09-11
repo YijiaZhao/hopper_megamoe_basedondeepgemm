@@ -746,9 +746,14 @@ static void fable_router_quant_topk_frontend(
     const auto [m, h] = get_shape<2>(hidden);
     const auto [e, h_] = get_shape<2>(router_weight);
     const int topk = static_cast<int>(topk_idx.size(1));
-    DG_HOST_ASSERT(hidden.scalar_type() == torch::kBFloat16 and router_weight.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(hidden.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(hidden.is_contiguous() and router_weight.is_contiguous());
-    DG_HOST_ASSERT(h == h_ and h % 1024 == 0 and e % 16 == 0 and e <= 512 and topk >= 1 and topk <= 8);
+    if (mma == 7) {   // ccfp8: router weight packed [e][h + 16] uint8 (e4m3 row + fp32 scale + pad), see fable_router_weight_fp8
+        DG_HOST_ASSERT(router_weight.scalar_type() == torch::kUInt8 and h_ == h + 16);
+    } else {
+        DG_HOST_ASSERT(router_weight.scalar_type() == torch::kBFloat16 and h == h_);
+    }
+    DG_HOST_ASSERT(h % 1024 == 0 and e % 16 == 0 and e <= 512 and topk >= 1 and topk <= 8);
     DG_HOST_ASSERT(m >= 1 and m <= 64);
     DG_HOST_ASSERT(x.scalar_type() == torch::kFloat8_e4m3fn and x.size(0) >= m and x.size(1) == h);
     DG_HOST_ASSERT(x_sf.scalar_type() == torch::kFloat32 and x_sf.size(0) >= m and x_sf.size(1) == h / 128);
