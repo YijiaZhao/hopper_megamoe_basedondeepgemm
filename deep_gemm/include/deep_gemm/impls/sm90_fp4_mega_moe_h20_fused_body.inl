@@ -933,6 +933,12 @@
 
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
+    // `first_worker_idx` of a task that is NOT a stream-K segment (wave-scheduler task
+    // of a launch where stream-K is compiled in but inactive, e.g. >= kNumSMs L1 tasks
+    // under unbalanced routing): its split-K tail halves must use the split-K
+    // publisher/finisher protocol, not the stream-K per-worker slots (a genuine
+    // stream-K segment may have first worker 0, so 0 cannot mark "not stream-K").
+    constexpr uint32_t kNotStreamKWorker = 0xffffffffu;
 
     const auto for_each_static_selected_block = [&](auto&& func) {
         scheduler.fetch_expert_recv_count();
@@ -946,12 +952,12 @@
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear1>{},
                      local_expert_idx, L1_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, 0u);
+                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, kNotStreamKWorker);
             } else {
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear2>{},
                      local_expert_idx, L2_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, 0u);
+                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, kNotStreamKWorker);
             }
         }
     };
@@ -1005,7 +1011,7 @@
                  task_info.m_block_idx, task_info.n_block_idx,
                  task_info.pool_block_idx, task_info.valid_m,
                  k_split_idx, num_k_splits, k_block_begin,
-                 is_streamk ? task_info.get_first_worker_idx() : 0u);
+                 is_streamk ? task_info.get_first_worker_idx() : kNotStreamKWorker);
         } else {
             const uint32_t num_k_splits = (kSplitKL2 || kStreamK) ? task_info.get_num_k_splits() : 1u;
             const uint32_t k_split_idx = (kSplitKL2 || kStreamK) ? task_info.get_k_split_idx() : 0u;
@@ -1019,7 +1025,7 @@
                  task_info.m_block_idx, task_info.n_block_idx,
                  task_info.pool_block_idx, task_info.valid_m,
                  k_split_idx, num_k_splits, k_block_begin,
-                 is_streamk ? task_info.get_first_worker_idx() : 0u);
+                 is_streamk ? task_info.get_first_worker_idx() : kNotStreamKWorker);
         }
     };
 
@@ -4516,8 +4522,17 @@
             // role-free. Deadlock-free: no contributor waits on anything here.
             // L2 tail probe: 40 = max L2 epilogue start (K loop drained)
             if (kBlockIsL2 && epilogue_thread_idx == 0) stamp_max(40);
+            // Stream-K protocol only for stream-K segments; a split-K TAIL task of a
+            // wave-scheduled launch (stream-K compiled in but inactive: >= kNumSMs L1
+            // tasks, i.e. >= 8 active local experts at <= 8 global tokens under real,
+            // unbalanced routing) takes the split-K branch below. Before this
+            // distinction such tails wrote their partials to stream-K worker slots
+            // 0/1 shared by every concurrently running tail (wrong sums on the
+            // highest-index experts of those ranks; the balanced correctness test
+            // never reaches >= 78 L1 tasks with stream-K compiled in).
+            const bool streamk_reduce = kStreamK && first_worker_idx != kNotStreamKWorker;
             if constexpr (kStreamK) {
-                if (num_k_splits > 1) {
+                if (num_k_splits > 1 && streamk_reduce) {
                     constexpr uint32_t kNumPartialElems = kWGHalves * kSwapABTokenChunks * 4u;
                     DG_STATIC_ASSERT(!kStreamK ||
                                      kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
@@ -4587,8 +4602,9 @@
                         }
                     }
                 }
-            } else if constexpr ((kSplitKL1 && !kBlockIsL2) || (kSplitKL2 && kBlockIsL2)) {
-                if (num_k_splits > 1) {
+            }
+            if constexpr ((kSplitKL1 && !kBlockIsL2) || (kSplitKL2 && kBlockIsL2)) {
+                if (num_k_splits > 1 && !streamk_reduce) {
                     constexpr uint32_t kNumPartialElems = kWGHalves * kSwapABTokenChunks * 4u;
                     // (Guarded: this discarded branch is not template-dependent.)
                     // Wide tasks: the partial spans kPhaseTiles adjacent 8 KB slots (the
