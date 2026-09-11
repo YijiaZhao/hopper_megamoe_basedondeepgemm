@@ -23,11 +23,13 @@ if [ "${1:-1}" = "1" ]; then
   so=$(find build -name "*.so" -type f | head -n 1); [ -n "$so" ] || { echo BUILD FAILED; exit 1; }
   ln -sf "../$so" deep_gemm/; echo "BUILD OK $so"
 fi
+MMAS="${2:-cc cc6}"; TAG="${3:-}"; SEEDS="${4:-500}"
 for rows in 1 2; do for q in mxfp4 qoq; do
-  echo "### default rows=$rows quant=$q"; timeout 600 python3 tests/fe_standalone_bench.py --quant $q --rows $rows --grid 96 --mma wmma 2>&1 | grep -v "^  CTA placement"
-  for mma in cc cc6; do
-    echo "### $mma rows=$rows quant=$q"; DG_FE_TINYM_GRID=auto timeout 600 python3 tests/fe_standalone_bench.py --quant $q --rows $rows --grid auto --mma $mma 2>&1 | grep -v "^  CTA placement"
+  [ -z "$TAG" ] && { echo "### default rows=$rows quant=$q"; timeout 600 python3 tests/fe_standalone_bench.py --quant $q --rows $rows --grid 96 --mma wmma 2>&1 | grep -v "^  CTA placement"; }
+  for mma in $MMAS; do
+    echo "### $mma$TAG rows=$rows quant=$q"; DG_FE_TINYM_GRID=auto timeout 600 python3 tests/fe_standalone_bench.py --quant $q --rows $rows --grid auto --mma $mma 2>&1 | grep -v "^  CTA placement"
   done
 done; done
-echo "### equality wmma(96) vs cc"; timeout 600 python3 tests/test_frontend_fe78.py --seeds 500 --rows 1 2 --grid auto --mma cc 2>&1 | tail -4
-echo "### equality wmma(96) vs cc6"; timeout 600 python3 tests/test_frontend_fe78.py --seeds 100 --rows 1 2 --grid auto --mma cc6 2>&1 | tail -3
+for mma in $MMAS; do
+  echo "### equality wmma(96) vs $mma$TAG"; timeout 600 python3 tests/test_frontend_fe78.py --seeds $SEEDS --rows 1 2 --grid auto --mma $mma 2>&1 | tail -4
+done
