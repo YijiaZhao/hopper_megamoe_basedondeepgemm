@@ -539,6 +539,9 @@ __host__ __device__ constexpr int cc_slots(int cc) { return cc / 8; }
 __host__ __device__ constexpr int cc_ks(int cc) { return cc % 8; }
 __host__ __device__ constexpr int cc_block(int cc) { return cc > 0 ? cc_slots(cc) * cc_ks(cc) * 32 : kThreads; }
 constexpr int kTicketRelaxedBit = 128;   // w_hint flag (cc ticket): relaxed atomic ticket, the last CTA re-reads slots still 0 (DG_FE_CC_TICKET=relaxed)
+constexpr int kKeysCompactBit = 256;     // w_hint flag (cc ticket): keys in a compact [token][e] array (DG_FE_CC_KEYS=compact, default when e == 384)
+constexpr size_t kCCKeysOff = 64 * 1024; // workspace offset of the compact keys ([2][512] u32 max)
+constexpr int kCCW8Pad = 16;             // fp8 router weight row: h bytes e4m3 + fp32 row scale + pad (row stride h + 16)
 // globaltimer read predicated on `dep`: cannot be scheduled before the load producing it lands
 __device__ __forceinline__ unsigned long long globaltimer_after(uint32_t dep) {
     unsigned long long t;
@@ -546,34 +549,72 @@ __device__ __forceinline__ unsigned long long globaltimer_after(uint32_t dep) {
                  : "=l"(t) : "r"(dep));
     return t;
 }
-template <int kSlots, int kKS>
+// e4m3 x2 (low 16 bits of `v`) -> float2 via cvt.rn.f16x2.e4m3x2
+__device__ __forceinline__ float2 e4m3x2_to_float2(uint32_t v) {
+    uint32_t h2;
+    asm("{\n .reg .b16 lo;\n mov.b16 lo, %1;\n cvt.rn.f16x2.e4m3x2 %0, lo;\n}" : "=r"(h2) : "h"(static_cast<unsigned short>(v & 0xFFFFu)));
+    return __half22float2(*reinterpret_cast<__half2*>(&h2));
+}
+// acc += <16 e4m3 of w (scaled later), 16 bf16 of x (two uint4)>
+__device__ __forceinline__ float dot16_e4m3(const uint4& w, const uint4& x0, const uint4& x1, float acc) {
+    const uint32_t wd[4] = {w.x, w.y, w.z, w.w};
+    const __nv_bfloat162* xp0 = reinterpret_cast<const __nv_bfloat162*>(&x0);
+    const __nv_bfloat162* xp1 = reinterpret_cast<const __nv_bfloat162*>(&x1);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 a = e4m3x2_to_float2(wd[j]), b = e4m3x2_to_float2(wd[j] >> 16);
+        const float2 xa = __bfloat1622float2(j < 2 ? xp0[2 * j] : xp1[2 * (j - 2)]);
+        const float2 xb = __bfloat1622float2(j < 2 ? xp0[2 * j + 1] : xp1[2 * (j - 2) + 1]);
+        acc = fmaf(a.x, xa.x, acc); acc = fmaf(a.y, xa.y, acc);
+        acc = fmaf(b.x, xb.x, acc); acc = fmaf(b.y, xb.y, acc);
+    }
+    return acc;
+}
+// kW8 (DG_FE_ROUTER_WDTYPE=fp8 experiment, mma = ccfp8): router weights e4m3 with one fp32 scale per
+// expert row, packed [e][h + 16] bytes (host: fable_router_weight_fp8); a lane's 16 B chunk holds 16 K
+// elements, so kKS = 3 (K-part 1024 = 64 chunks = 2 per lane); the fp32 sum is scaled once at the end.
+template <int kSlots, int kKS, bool kW8>
 __device__ __forceinline__ void router_role_fullk_cc(
         const __nv_bfloat16* __restrict__ hidden, const __nv_bfloat16* __restrict__ router_weight,
-        uint32_t* __restrict__ cand, unsigned long long* stamps,
-        int m, int h, int e, int epc, int groups, int cand_slots) {
-    constexpr int kChunks = kCCH / 256 / kKS, kKPart = kCCH / kKS;
+        uint32_t* __restrict__ cand, uint32_t* __restrict__ ckeys, unsigned long long* stamps,
+        int m, int h, int e, int epc, int groups, int cand_slots, bool compact) {
+    constexpr int kKPart = kCCH / kKS;
+    constexpr int kChunks = kW8 ? kKPart / 16 / 32 : kKPart / 8 / 32;    // 16 B chunks per lane
+    static_assert(kChunks * 32 * (kW8 ? 16 : 8) == kKPart, "K-part must split into whole 16 B chunks per lane");
     __shared__ float part_s[kSlots][kCCMaxM][kKS];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int slot = warp / kKS, ks = warp % kKS;
     const int group = blockIdx.x, expert_base = group * epc;
     const int n_exp = min(epc, e - expert_base);
     const bool active = slot < n_exp;
-    const int kbase = ks * kKPart + lane * 8;
+    constexpr int kEPC = kW8 ? 16 : 8;                                    // K elements per 16 B weight chunk
+    const int kbase = ks * kKPart + lane * kEPC;                          // K element offset of this lane's chunk 0
     stamp(stamps, 7);
-    uint4 xv[kCCMaxM][kChunks], wv[kChunks];
+    uint4 xv[kCCMaxM][kChunks * (kW8 ? 2 : 1)], wv[kChunks];
     #pragma unroll
     for (int r = 0; r < kCCMaxM; ++r)
         #pragma unroll
         for (int c = 0; c < kChunks; ++c) {
-            xv[r][c] = make_uint4(0u, 0u, 0u, 0u);
-            if (active && r < m) xv[r][c] = ld_nc_na_16(hidden + static_cast<int64_t>(r) * h + kbase + 256 * c);
+            if constexpr (kW8) {
+                xv[r][2 * c] = xv[r][2 * c + 1] = make_uint4(0u, 0u, 0u, 0u);
+                if (active && r < m) {
+                    xv[r][2 * c] = ld_nc_na_16(hidden + static_cast<int64_t>(r) * h + kbase + 32 * kEPC * c);
+                    xv[r][2 * c + 1] = ld_nc_na_16(hidden + static_cast<int64_t>(r) * h + kbase + 32 * kEPC * c + 8);
+                }
+            } else {
+                xv[r][c] = make_uint4(0u, 0u, 0u, 0u);
+                if (active && r < m) xv[r][c] = ld_nc_na_16(hidden + static_cast<int64_t>(r) * h + kbase + 32 * kEPC * c);
+            }
         }
+    const uint8_t* wr8 = reinterpret_cast<const uint8_t*>(router_weight) + static_cast<int64_t>(expert_base + slot) * (h + kCCW8Pad) + kbase;
     const __nv_bfloat16* wr = router_weight + static_cast<int64_t>(expert_base + slot) * h + kbase;
     #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
         wv[c] = make_uint4(0u, 0u, 0u, 0u);
-        if (active) wv[c] = ld_nc_na_16(wr + 256 * c);
+        if (active) wv[c] = kW8 ? ld_nc_na_16(wr8 + 32 * 16 * c) : ld_nc_na_16(wr + 32 * kEPC * c);
     }
+    float wscale = 1.0f;
+    if constexpr (kW8) { if (active) wscale = __ldg(reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(router_weight) + static_cast<int64_t>(expert_base + slot) * (h + kCCW8Pad) + h)); }
     stamp(stamps, 5);
     if (stamps != nullptr && threadIdx.x == 0) stamps[blockIdx.x * kStampSlots + 1] = globaltimer_after(wv[0].x);
     float acc[kCCMaxM];
@@ -582,10 +623,13 @@ __device__ __forceinline__ void router_role_fullk_cc(
     #pragma unroll
     for (int c = 0; c < kChunks; ++c)
         #pragma unroll
-        for (int r = 0; r < kCCMaxM; ++r) acc[r] = dot8_bf16(wv[c], xv[r][c], acc[r]);
+        for (int r = 0; r < kCCMaxM; ++r) {
+            if constexpr (kW8) acc[r] = dot16_e4m3(wv[c], xv[r][2 * c], xv[r][2 * c + 1], acc[r]);
+            else acc[r] = dot8_bf16(wv[c], xv[r][c], acc[r]);
+        }
     #pragma unroll
     for (int r = 0; r < kCCMaxM; ++r) {
-        acc[r] = warp_sum(acc[r]);
+        acc[r] = warp_sum(acc[r]) * wscale;
         if (lane == 0 && slot < kSlots) part_s[slot][r][ks] = acc[r];
     }
     __syncthreads();
@@ -600,7 +644,8 @@ __device__ __forceinline__ void router_role_fullk_cc(
                 for (int k = 0; k < kKS; ++k) v += part_s[c][r][k];
                 key = topk_key(round_bf16(v), expert_base + c);
             }
-            cand[(static_cast<int64_t>(r) * groups + group) * cand_slots + c] = key;
+            if (compact) { if (c < n_exp) ckeys[static_cast<int64_t>(r) * e + expert_base + c] = key; }
+            else cand[(static_cast<int64_t>(r) * groups + group) * cand_slots + c] = key;
         }
     }
 }
@@ -936,6 +981,53 @@ __device__ __forceinline__ void last_arriver_topk(
     for (int i = 0; i < kVecPerLane; ++i)      // slots back to 0 (the polling merger mode relies on it)
         if (4 * (lane + 32 * i) < nslots) *reinterpret_cast<uint4*>(base + 4 * (lane + 32 * i)) = make_uint4(0u, 0u, 0u, 0u);
 }
+// Compact variant: token t's e (= 384) keys are contiguous -> 3 x 16 B per lane, insertion 12 x 8 + merge8.
+template <int kTopK>
+__device__ __forceinline__ void last_arriver_topk_compact(
+        uint32_t* __restrict__ ckeys, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
+        unsigned long long* mstamps, int m, int e, bool relaxed) {
+    constexpr int kVec = 3;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (warp >= m) return;
+    const int t = warp;
+    uint32_t* base = ckeys + static_cast<int64_t>(t) * e;
+    uint4 q[kVec];
+    #pragma unroll
+    for (int i = 0; i < kVec; ++i) q[i] = ld_cg_v4(base + 4 * (lane + 32 * i));
+    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[2] = globaltimer_after(q[0].x);
+    if (relaxed) {
+        while (true) {
+            bool zero = false;
+            #pragma unroll
+            for (int i = 0; i < kVec; ++i)
+                if (q[i].x == 0u || q[i].y == 0u || q[i].z == 0u || q[i].w == 0u) {
+                    q[i] = ld_cg_v4(base + 4 * (lane + 32 * i));
+                    zero |= q[i].x == 0u || q[i].y == 0u || q[i].z == 0u || q[i].w == 0u;
+                }
+            if (!__any_sync(0xffffffffu, zero)) break;
+        }
+    }
+    uint32_t loc[kTopK];
+    #pragma unroll
+    for (int j = 0; j < kTopK; ++j) loc[j] = 0u;
+    #pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+        const uint32_t kv[4] = {q[i].x, q[i].y, q[i].z, q[i].w};
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            uint32_t k = kv[u];
+            #pragma unroll
+            for (int j = 0; j < kTopK; ++j) { const uint32_t lo = min(k, loc[j]); loc[j] = max(k, loc[j]); k = lo; }
+        }
+    }
+    uint32_t run = 0u;
+    merge8<kTopK>(run, loc, lane);
+    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
+    topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
+    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[4] = globaltimer_ns();
+    #pragma unroll
+    for (int i = 0; i < kVec; ++i) *reinterpret_cast<uint4*>(base + 4 * (lane + 32 * i)) = make_uint4(0u, 0u, 0u, 0u);
+}
 __device__ __forceinline__ int atom_add_acq_rel_gpu(int* p, int v) {
     int old;
     asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
@@ -1020,7 +1112,7 @@ __device__ __forceinline__ void merger_role(
 // kFullK: <= 128 regs (merger warp holds 32 keys), 2 CTAs/SM cap; grid <= SM count anyway.
 // kFma: 16 x uint4 weight vectors live in registers -> 1 CTA/SM bound (255 regs), no spills.
 // kCC (> 0 = K-split factor): CUDA-core router role, cc_block(kCC) threads, 1 CTA/SM.
-template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma, int kSwapBlk, int kCC = 0>
+template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma, int kSwapBlk, int kCC = 0, bool kW8 = false>
 __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK ? 2 : (kTiny ? 3 : 1))) router_quant_topk_kernel(
         const __nv_bfloat16* __restrict__ hidden,
         const __nv_bfloat16* __restrict__ router_weight,
@@ -1063,7 +1155,9 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
                 merger_role<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots, defer);
         } else {
             if constexpr (kCC > 0) {
-                router_role_fullk_cc<cc_slots(kCC), cc_ks(kCC)>(hidden, router_weight, cand, stamps, m, h, e, epc, groups, cand_slots);
+                uint32_t* ckeys = reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(logits) + kCCKeysOff);
+                const bool compact = (w_hint & kKeysCompactBit) != 0;
+                router_role_fullk_cc<cc_slots(kCC), cc_ks(kCC), kW8>(hidden, router_weight, cand, ckeys, stamps, m, h, e, epc, groups, cand_slots, compact);
                 if (w_hint & kTicketMergeBit) {
                     __shared__ int s_last;
                     const bool relaxed = (w_hint & kTicketRelaxedBit) != 0;
@@ -1074,7 +1168,9 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
                     if (s_last) {
                         unsigned long long* mstamps = stamps != nullptr ? stamps + static_cast<size_t>(num_router_ctas) * kStampSlots : nullptr;
                         if (mstamps != nullptr && threadIdx.x == 0) mstamps[1] = globaltimer_ns();
-                        if (groups * cand_slots <= 20 * 32)
+                        if (compact)
+                            last_arriver_topk_compact<kMaxTopK>(ckeys, topk_idx, topk_weights, mstamps, m, e, (w_hint & kTicketRelaxedBit) != 0);
+                        else if (groups * cand_slots <= 20 * 32)
                             last_arriver_topk<kMaxTopK, 20>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots, (w_hint & kSelectReduxBit) != 0, (w_hint & kTicketRelaxedBit) != 0);
                         else
                             last_arriver_topk<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots, (w_hint & kSelectReduxBit) != 0, (w_hint & kTicketRelaxedBit) != 0);
@@ -1208,7 +1304,7 @@ static void fullk_plan(int e, int grid, int k_parts, int& epc, int& router_ctas)
     router_ctas = groups * k_parts;
 }
 
-template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma = false, int kSwapBlk = 0, int kCC = 0>
+template <int kMTiles, int kMode, bool kTiny, bool kFullK, bool kFma = false, int kSwapBlk = 0, int kCC = 0, bool kW8 = false>
 void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
             int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
             int m, int h, int e, int topk, int l2_persist, int pdl_mode, int grid, int k_parts, cudaStream_t stream, int mma = 0) {
@@ -1228,12 +1324,15 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     }
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC>,
+        cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC, kW8>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              kFullK ? std::max(fullk_smem_bytes(16, 3072), 116 * 1024) : Cfg::kDynSmemBytes);
         attr_set = true;
     }
-    const size_t w_bytes = static_cast<size_t>(e) * h * sizeof(__nv_bfloat16);
+    const size_t w_bytes = kW8 ? static_cast<size_t>(e) * (h + kCCW8Pad) : static_cast<size_t>(e) * h * sizeof(__nv_bfloat16);
+    // cc default: router weights in the persisting L2 set-aside (measured -0.25..-0.5 us kernel end on H20);
+    // DG_FE_ROUTER_L2_PERSIST=0 opts out explicitly.
+    if (kCC > 0 && l2_persist == 0 && getenv("DG_FE_ROUTER_L2_PERSIST") == nullptr) l2_persist = 1;
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(num_ctas);
     cfg.blockDim = dim3(cc_block(kCC));
@@ -1271,8 +1370,11 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         // acqrel = atom.acq_rel.gpu (release drains this CTA's stores first: ~0.5 us more before the ticket)
         static const bool acqrel = getenv("DG_FE_CC_TICKET") && strcmp(getenv("DG_FE_CC_TICKET"), "acqrel") == 0;
         if (kCC > 0 && !acqrel) w_hint |= kTicketRelaxedBit;
+        // keys: compact [token][e] array (default when e == 384: 12 keys per lane for the last arriver) | slots
+        static const bool slots = getenv("DG_FE_CC_KEYS") && strcmp(getenv("DG_FE_CC_KEYS"), "slots") == 0;
+        if (kCC > 0 && !slots && e == 384) w_hint |= kKeysCompactBit;
     }
-    cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC>,
+    cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC, kW8>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);
 }
 
@@ -1296,10 +1398,11 @@ void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x
                 mma = 2;
             }
             // cc | cc6: CUDA-core K-split router (m <= 2, h = 3072, k_parts 1, epc <= 5); else WMMA
-            if (mma == 4 || mma == 5 || mma == 6) {
-                const int cc = mma == 4 ? 44 : mma == 5 ? 46 : 36;      // slots * 8 + K-split
+            if (mma == 4 || mma == 5 || mma == 6 || mma == 7) {
+                const int cc = mma == 4 ? 44 : mma == 5 ? 46 : mma == 6 ? 36 : 43;      // slots * 8 + K-split (ccfp8: 5 x 3)
                 if (m <= kCCMaxM && h == kCCH && k_parts == 1 && epc <= cc_slots(cc)) {
-                    if (cc == 44) launch<1, kMode, true, true, false, 0, 44>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+                    if (cc == 43) launch<1, kMode, true, true, false, 0, 43, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+                    else if (cc == 44) launch<1, kMode, true, true, false, 0, 44>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
                     else if (cc == 46) launch<1, kMode, true, true, false, 0, 46>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
                     else launch<1, kMode, true, true, false, 0, 36>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
                     return;

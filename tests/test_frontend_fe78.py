@@ -40,7 +40,7 @@ def main():
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 2, 8, 16])
     ap.add_argument("--grid", default="auto", help="new-scheme DG_FE_TINYM_GRID value (auto or N)")
     ap.add_argument("--weight-tol", type=float, default=1e-6)
-    ap.add_argument("--mma", default="wmma", choices=("auto", "wmma", "fma", "swapab", "cc", "cc6", "cc44"),
+    ap.add_argument("--mma", default="wmma", choices=("auto", "wmma", "fma", "swapab", "cc", "cc6", "cc44", "ccfp8"),
                     help="new-scheme DG_FE_TINYM_MMA value; auto = the library defaults (grid/mma/wlayout all None: "
                          "cc on the SM-count grid for rows <= 2, swapab+fragment on the 96 grid otherwise)")
     ap.add_argument("--wlayout", default="row", choices=("row", "fragment"), help="new-scheme DG_FE_ROUTER_WLAYOUT (swapab only)")

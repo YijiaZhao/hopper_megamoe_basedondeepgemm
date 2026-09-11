@@ -294,6 +294,11 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     (void)kExpertsPerCTA;
 }
 
+// launch-ramp probe: a 1-block kernel stamps its end; an EMPTY 78 x 640 kernel stamps every CTA's start.
+__global__ void stamp_end_kernel(unsigned long long* out) { if (threadIdx.x == 0) *out = globaltimer_ns(); }
+__global__ void __launch_bounds__(640, 1) empty_kernel(unsigned long long* stamps) {
+    if (threadIdx.x == 0) { stamps[blockIdx.x * kStampSlots] = globaltimer_ns(); }
+}
 struct Variant {
     const char* name;
     int grid;
@@ -350,6 +355,27 @@ int main(int argc, char** argv) {
         else if (arg("--contig")) contig = atoi(argv[++i]);
         else if (strcmp(argv[i], "--list") == 0) { for (auto& v : variants<1>()) printf("%-5s grid %3d  %s\n", v.name, v.grid, v.desc); return 0; }
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
+    }
+    if (vname == "empty") {          // launch ramp: event time of an empty 78 x 640 kernel; CTA start spread; gap after a preceding kernel
+        unsigned long long* st; CK(cudaMalloc(&st, (78 * kStampSlots + 8) * 8));
+        cudaEvent_t a, b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+        std::vector<float> ev; std::vector<double> spread, gap;
+        for (int it = 0; it < 30; ++it) {
+            CK(cudaMemset(st, 0, (78 * kStampSlots + 8) * 8)); CK(cudaDeviceSynchronize());
+            stamp_end_kernel<<<1, 32>>>(st + 78 * kStampSlots);
+            CK(cudaEventRecord(a)); empty_kernel<<<78, 640>>>(st); CK(cudaEventRecord(b)); CK(cudaDeviceSynchronize());
+            float ms; CK(cudaEventElapsedTime(&ms, a, b));
+            std::vector<unsigned long long> hs(78 * kStampSlots + 8);
+            CK(cudaMemcpy(hs.data(), st, hs.size() * 8, cudaMemcpyDeviceToHost));
+            unsigned long long mn = ~0ull, mx = 0;
+            for (int c = 0; c < 78; ++c) { mn = std::min(mn, hs[c * kStampSlots]); mx = std::max(mx, hs[c * kStampSlots]); }
+            if (it >= 5) { ev.push_back(ms * 1e3f); spread.push_back((mx - mn) * 1e-3); gap.push_back((static_cast<double>(mn) - static_cast<double>(hs[78 * kStampSlots])) * 1e-3); }
+        }
+        auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+        std::vector<double> evd(ev.begin(), ev.end());
+        printf("empty 78 x 640: event us med %.2f min %.2f | CTA start spread (first..last CTA) med %.2f us | first CTA start - previous kernel end med %.2f us\n",
+               med(evd), *std::min_element(evd.begin(), evd.end()), med(spread), med(gap));
+        return 0;
     }
     if (rows != 1 && rows != 2) { fprintf(stderr, "rows must be 1 or 2\n"); return 1; }
     auto vs = rows == 1 ? variants<1>() : variants<2>();

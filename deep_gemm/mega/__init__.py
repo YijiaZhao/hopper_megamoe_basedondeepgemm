@@ -617,8 +617,8 @@ def _fe_mma_from_env(mma):
     if mma is None:
         mma = os.environ.get("DG_FE_TINYM_MMA", "auto")
     if isinstance(mma, str):
-        mma = {"auto": -1, "wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "cc44": 6,
-               "-1": -1, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5, "6": 6}[mma.strip().lower()]
+        mma = {"auto": -1, "wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "cc44": 6, "ccfp8": 7,
+               "-1": -1, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5, "6": 6, "7": 7}[mma.strip().lower()]
     return int(mma)
 
 
@@ -637,10 +637,10 @@ def _fe_resolve_knobs(m, grid=None, mma=None, k_parts=None, l2_persist=None):
     if mma == -1:
         mma = 2
     if grid is None:
-        grid = 0 if mma in (4, 5, 6) else 96
+        grid = 0 if mma in (4, 5, 6, 7) else 96
     if l2_persist is None:
         l2_persist = os.environ.get("DG_FE_ROUTER_L2_PERSIST")
-        l2_persist = (1 if mma in (4, 5, 6) else 0) if l2_persist is None else int(l2_persist)
+        l2_persist = (1 if mma in (4, 5, 6, 7) else 0) if l2_persist is None else int(l2_persist)
     return grid, mma, k_parts, int(l2_persist)
 
 
@@ -686,6 +686,34 @@ def _fe_router_weight_for_layout(router_weight, wlayout):
         if hit is None:
             weakref.finalize(router_weight, _fe_fragment_weight_cache.pop, key, None)
         hit = _fe_fragment_weight_cache[key] = (router_weight._version, fable_router_weight_fragment_layout(router_weight))
+    return hit[1]
+
+
+_fe_fp8_weight_cache = {}
+
+
+def fable_router_weight_fp8(router_weight: torch.Tensor) -> torch.Tensor:
+    """EXPERIMENT (DG_FE_TINYM_MMA=ccfp8): router weights [E, K] bf16 -> packed uint8 [E, K + 16]:
+    e4m3 row (scale = row amax / 448) followed by the fp32 row scale and 12 pad bytes (16 B row
+    alignment). Numeric effect vs bf16 is reported by tests/test_frontend_fe78.py --mma ccfp8."""
+    assert router_weight.dtype == torch.bfloat16 and router_weight.dim() == 2
+    e, k = router_weight.shape
+    w = router_weight.float()
+    scale = (w.abs().amax(dim=1) / 448.0).clamp_min(1e-30)
+    q = (w / scale[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
+    packed = torch.zeros(e, k + 16, dtype=torch.uint8, device=router_weight.device)
+    packed[:, :k] = q
+    packed[:, k:k + 4] = scale.view(torch.uint8).view(e, 4)
+    return packed.contiguous()
+
+
+def _fe_router_weight_fp8_cached(router_weight):
+    key = id(router_weight)
+    hit = _fe_fp8_weight_cache.get(key)
+    if hit is None or hit[0] != router_weight._version:
+        if hit is None:
+            weakref.finalize(router_weight, _fe_fp8_weight_cache.pop, key, None)
+        hit = _fe_fp8_weight_cache[key] = (router_weight._version, fable_router_weight_fp8(router_weight))
     return hit[1]
 
 
@@ -783,6 +811,8 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
         elif wlayout == 2:
             raise ValueError("wlayout='pre' (fragment-layout router weight) needs the legacy 96 tiny-M grid: "
                              f"tinym={tinym} m={m} grid={grid} h={hidden.size(1)} topk={sym_buffer.topk_idx.size(1)}")
+    elif mma == 7 and router_weight.dtype == torch.bfloat16:
+        router_weight = _fe_router_weight_fp8_cached(router_weight)     # ccfp8 experiment: e4m3 + row scale, cached
     workspace = fable_frontend_workspace(sym_buffer, e, hidden.device)
     cache = sym_buffer._fable_frontend_cache
     views = cache.get(m)
