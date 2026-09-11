@@ -80,8 +80,8 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 // test_four_api_correctness (fused mxfp4 + qoq, tokens/rank 1, 2, 8): cos_min 0.99999 / 0.99993.
 // ROUND 4 (2026-09-11, H20-3e .7, tests/fe_repro_cc.py, tests/ncu_fe_cc.sh, tests/run_selmega_e2e.sh):
 // * Reproducibility of the 3.84: it holds ONLY for back-to-back launches (flush -> launch -> stamp clone,
-//   fe_standalone_bench protocol): 10 fresh processes x 100 launches, rows 1|2 x mxfp4|qoq give median
-//   3.58-3.84 (see REPRO_TABLE in docs/fe_cc_round4.md). Any millisecond-scale host gap between two
+//   fe_standalone_bench protocol): 30 fresh processes x 100 launches: rows 1 3.58, rows 2 3.84 in every
+//   process, both quants (table in docs/fe_cc_round4.md). Any millisecond-scale host gap between two
 //   launches (a per-launch D2H reduction, or a 5 ms sleep) makes the SAME kernel 5.4-5.9 us: the router
 //   CTAs' weight loads straggle (keys written max 3.84 instead of 2.82) and the relaxed-ticket last
 //   arriver waits for them (merge done 5.12). Inside the FE+Mega graph (after the previous Mega) the
@@ -99,7 +99,10 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 //   arriver, no topk write); the fused Mega's prologue selects (deep_gemm/impls/fable_cc_select.cuh, one
 //   idle warp per token, ld.global.cg of the keys, before the dispatch __syncthreads; dispatch reads the
 //   topk with ld.global.cg instead of ld.global.nc since the same kernel wrote them). E2E verdict:
-//   SELMEGA_E2E_PLACEHOLDER
+//   8-rank FE+Mega graph event (us, knob 0 v1 -> knob 1): mxfp4 M2/8/16 80.4/81.0/100.7 -> 77.4/76.8/97.4,
+//   qoq 78.5/79.5/97.7 -> 75.5/76.3/95.7 (-1..-4 us, the knob-0 baseline itself moves 2-3 us run to run); gate
+//   8 ranks x 50 seeds x M 2|16 x both quants: topk_idx/topk_weights bit-identical, y max|dy| 0. Knob default 0
+//   (a standalone FE launch with it on writes no topk_idx); set DG_FE_SELECT_IN_MEGA=1 in the FE+Mega pipeline.
 // Router CTA count the launch will use (bench / stamp attribution helper).
 // `k_parts` (DG_FE_TINYM_KPARTS, full-K grid only): 1 | 2 | 4 K-parts per expert
 // group (grid=97,k_parts=4 = the legacy 24 x 16 x 4 layout inside the full-K
