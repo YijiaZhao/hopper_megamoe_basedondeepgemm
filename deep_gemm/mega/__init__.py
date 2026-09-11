@@ -623,7 +623,7 @@ def _fe_wlayout_from_env(wlayout):
     if wlayout is None:
         wlayout = os.environ.get("DG_FE_ROUTER_WLAYOUT", "row")
     if isinstance(wlayout, str):
-        wlayout = {"row": 0, "fragment": 1, "0": 0, "1": 1}[wlayout.strip().lower()]
+        wlayout = {"row": 0, "fragment": 1, "pre": 2, "0": 0, "1": 1, "2": 2}[wlayout.strip().lower()]
     return int(wlayout)
 
 
@@ -700,7 +700,8 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     ``wlayout`` (env ``DG_FE_ROUTER_WLAYOUT``, default ``row``; swapab only): ``fragment`` =
     the router weights are permuted ONCE on the host (``fable_router_weight_fragment_layout``,
     cached per weight tensor) into m16n8k16 A-fragment order so every warp load instruction is
-    one contiguous 512 B run (4 full lines instead of 8 half lines); identical numerics.
+    one contiguous 512 B run (4 full lines instead of 8 half lines); identical numerics; ``pre`` =
+    the caller already passes the permuted tensor (no per-call work in this wrapper).
     ``k_parts`` (env ``DG_FE_TINYM_KPARTS``, default 1; full-K grid only): 1 | 2 | 4 K-parts per
     expert group; K-part CTAs exchange fp32 partials through the workspace (release/acquire
     flag), the part-0 CTA sums in fixed order (part 0, 1, ..) and emits the keys.
@@ -722,7 +723,9 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     wlayout = _fe_wlayout_from_env(wlayout)
     if mma == 2 and wlayout == 1:
         router_weight = _fe_router_weight_for_layout(router_weight, 1)
-        mma = 3          # swapab + fragment weight layout
+        mma = 3          # swapab + fragment weight layout (permuted here, cached)
+    elif mma == 2 and wlayout == 2:
+        mma = 3          # 'pre': router_weight is ALREADY in fragment layout (transformed at weight-prep time)
     cache = getattr(sym_buffer, "_fable_frontend_cache", None)
     if cache is None:
         cache = sym_buffer._fable_frontend_cache = {}

@@ -34,10 +34,16 @@ def main():
     buf = make_buffer(64)
     scratch = torch.empty(256 << 20, device="cuda", dtype=torch.uint8)
     tinym = int(os.environ.get("DG_FE_TINYM", "1"))
+    # DG_FE_ROUTER_WLAYOUT=fragment: permute ONCE here (weight-transform time) and pass wlayout="pre",
+    # so the timed call has no wrapper-side lookup (the standalone event is CPU-launch-bound).
+    wlayout = os.environ.get("DG_FE_ROUTER_WLAYOUT", "row")
+    if wlayout == "fragment":
+        w = deep_gemm.fable_router_weight_fragment_layout(w)
+        wlayout = "pre"
 
     def fe(st=0):
         deep_gemm.fable_router_quant_topk_frontend(x, w, buf, quant=args.quant, tinym=tinym, stamps=st,
-                                                   grid=args.grid, mma=args.mma)
+                                                   grid=args.grid, mma=args.mma, wlayout=wlayout)
 
     times = []
     for it in range(args.warmup + args.iters):
