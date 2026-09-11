@@ -695,9 +695,9 @@ __device__ __forceinline__ void merger_role(
         }
         if (t == 0) stamp(stamps, 3);
         // softmax over the 8 selected bf16 logits, legacy order (k = 0..7 sequential sum)
-        const float v = lane < kTopK ? topk_key_value(run) : -INFINITY;
-        const float mx = warp_max(v);
-        const float ex = lane < kTopK ? expf(v - mx) : 0.0f;
+        const float sel_v = lane < kTopK ? topk_key_value(run) : -INFINITY;
+        const float mx = warp_max(sel_v);
+        const float ex = lane < kTopK ? expf(sel_v - mx) : 0.0f;
         float sum = 0.0f;
         #pragma unroll
         for (int k = 0; k < kTopK; ++k) sum += __shfl_sync(0xffffffffu, ex, k);
