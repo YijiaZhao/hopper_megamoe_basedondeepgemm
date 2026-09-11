@@ -40,7 +40,7 @@ def main():
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 2, 8, 16])
     ap.add_argument("--grid", default="auto", help="new-scheme DG_FE_TINYM_GRID value (auto or N)")
     ap.add_argument("--weight-tol", type=float, default=1e-6)
-    ap.add_argument("--mma", default="wmma", choices=("auto", "wmma", "fma", "swapab", "cc", "cc6"),
+    ap.add_argument("--mma", default="wmma", choices=("auto", "wmma", "fma", "swapab", "cc", "cc6", "cc44"),
                     help="new-scheme DG_FE_TINYM_MMA value; auto = the library defaults (grid/mma/wlayout all None: "
                          "cc on the SM-count grid for rows <= 2, swapab+fragment on the 96 grid otherwise)")
     ap.add_argument("--wlayout", default="row", choices=("row", "fragment"), help="new-scheme DG_FE_ROUTER_WLAYOUT (swapab only)")
@@ -50,7 +50,7 @@ def main():
     if args.mma == "auto":
         args.grid = args.wlayout = None
         print("library defaults per row count: " + ", ".join(
-            f"m={m}: grid/mma/k_parts={deep_gemm.mega._fe_resolve_knobs(m)}" for m in args.rows))
+            f"m={m}: grid/mma/k_parts/l2_persist={deep_gemm.mega._fe_resolve_knobs(m)}" for m in args.rows))
     n_router = deep_gemm.fable_frontend_router_ctas(1, EXPERTS, HIDDEN, TOPK, 1, args.grid, None, None if args.mma == "auto" else args.mma)
     print(f"new-scheme grid={args.grid} mma={args.mma} wlayout={args.wlayout}: router CTAs={n_router} (+1 merger) vs legacy 96+m; "
           f"device={torch.cuda.get_device_name()} SMs={torch.cuda.get_device_properties(0).multi_processor_count}")

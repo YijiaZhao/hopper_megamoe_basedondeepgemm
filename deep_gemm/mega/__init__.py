@@ -617,36 +617,29 @@ def _fe_mma_from_env(mma):
     if mma is None:
         mma = os.environ.get("DG_FE_TINYM_MMA", "auto")
     if isinstance(mma, str):
-        mma = {"auto": -1, "wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5,
-               "-1": -1, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5}[mma.strip().lower()]
+        mma = {"auto": -1, "wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "cc44": 6,
+               "-1": -1, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5, "6": 6}[mma.strip().lower()]
     return int(mma)
 
 
-def _fe_resolve_knobs(m, grid=None, mma=None, k_parts=None):
-    """Resolve (grid, mma, k_parts) for m rows. Default scheme (DG_FE_TINYM_MMA=auto): m <= 2 rows
-    -> the CUDA-core K-split router on the SM-count grid (cc + DG_FE_TINYM_GRID=auto: H20 kernel
-    end 4.61 / 4.86 us vs 6.14 swapab+fragment); rows > 2, an explicit 96 grid or K-parts > 1 ->
-    swapab (+ fragment layout) as before. Explicit knobs pass through unchanged; an unset grid
-    follows the MMA (cc -> auto, everything else -> the legacy 96 grid)."""
+def _fe_resolve_knobs(m, grid=None, mma=None, k_parts=None, l2_persist=None):
+    """Resolve (grid, mma, k_parts, l2_persist) for m rows. Default scheme (DG_FE_TINYM_MMA=auto):
+    m <= 2 rows -> the CUDA-core K-split router on the SM-count grid with the router weights pinned
+    in L2 (cc + DG_FE_TINYM_GRID=auto + DG_FE_ROUTER_L2_PERSIST=1: H20 kernel end 4.35 / 4.61 us vs
+    6.14 swapab+fragment); rows > 2, an explicit 96 grid or K-parts > 1 -> swapab (+ fragment
+    layout), no L2 persistence, as before. Explicit knobs / env values pass through unchanged; an
+    unset grid follows the MMA (cc -> auto, everything else -> the legacy 96 grid)."""
     grid = _fe_grid_from_env(grid)
     mma = _fe_mma_from_env(mma)
     k_parts = _fe_kparts_from_env(k_parts)
     if mma == -1:
         mma = 4 if (m <= 2 and grid in (None, 0) and k_parts == 1) else 2
     if grid is None:
-        grid = 0 if mma in (4, 5) else 96
-    return grid, mma, k_parts
-
-
-def _fe_wlayout_from_env(wlayout):
-    """DG_FE_ROUTER_WLAYOUT: 'row' -> 0 = [e][h] router weights; 'fragment' (default) -> 1 =
-    one-time host permutation into m16n8k16 A-fragment order (swapab only; cached per weight
-    tensor); 'pre' -> 2 = the caller already passes the permuted tensor."""
-    if wlayout is None:
-        wlayout = os.environ.get("DG_FE_ROUTER_WLAYOUT", "fragment")
-    if isinstance(wlayout, str):
-        wlayout = {"row": 0, "fragment": 1, "pre": 2, "0": 0, "1": 1, "2": 2}[wlayout.strip().lower()]
-    return int(wlayout)
+        grid = 0 if mma in (4, 5, 6) else 96
+    if l2_persist is None:
+        l2_persist = os.environ.get("DG_FE_ROUTER_L2_PERSIST")
+        l2_persist = (1 if mma in (4, 5, 6) else 0) if l2_persist is None else int(l2_persist)
+    return grid, mma, k_parts, int(l2_persist)
 
 
 def fable_router_weight_fragment_layout(router_weight: torch.Tensor) -> torch.Tensor:
@@ -694,7 +687,7 @@ def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tin
     """Router CTA count the frontend launch uses for (m, h, e, topk) under the current knobs."""
     if tinym is None:
         tinym = int(os.environ.get("DG_FE_TINYM", "1"))
-    grid, mma, k_parts = _fe_resolve_knobs(m, grid, mma, k_parts)
+    grid, mma, k_parts, _ = _fe_resolve_knobs(m, grid, mma, k_parts)
     return _C.fable_frontend_router_ctas(m, h, e, topk, int(bool(tinym)), grid, k_parts)
 
 
@@ -721,7 +714,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     3-stage configuration (bit-identical outputs, ~4x lower latency on 78-SM H20).
     ``stamps`` (env ``DG_FE_STAMPS``, default 0): record per-CTA %globaltimer phase
     stamps into the workspace; read them back with ``fable_frontend_stamps``.
-    ``l2_persist`` (env ``DG_FE_ROUTER_L2_PERSIST``, default 0): 1 = pin the router
+    ``l2_persist`` (env ``DG_FE_ROUTER_L2_PERSIST``, default 1 with the cc router, else 0): 1 = pin the router
     weights in L2 with the persisting-L2 set-aside (access policy window launch
     attribute), 2 = PTX ``L2::evict_last`` hint on the router weight loads.
     ``pdl`` (env ``DG_FE_PDL``, default 0): programmatic-dependent-launch trigger for
@@ -733,10 +726,10 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     ``96`` = legacy 24 expert groups x 4 K-parts + m quant/top-k CTAs; ``N`` = full-K
     scheme with N CTAs in total. Full-K is deterministic but not bit-identical to 96
     (different fp32 accumulation order before the bf16 logit rounding).
-    ``mma`` (env ``DG_FE_TINYM_MMA``, default ``auto`` = ``cc`` on the ``auto`` grid for m <= 2 rows,
-    ``swapab`` otherwise): ``cc`` = CUDA-core K-split router (5 experts x 4 warps per CTA, weights
-    straight into registers, last-arriving CTA does top-8 + softmax; H20 kernel end 4.61 / 4.86 us
-    for rows 1 / 2); ``wmma`` = legacy cp.async ring / TMA row
+    ``mma`` (env ``DG_FE_TINYM_MMA``, default ``auto`` = ``cc`` on the ``auto`` grid with L2-pinned
+    router weights for m <= 2 rows, ``swapab`` otherwise): ``cc`` = CUDA-core K-split router (5 experts
+    x 4 warps per CTA, weights straight into registers, last-arriving CTA does top-8 + softmax; H20
+    kernel end 4.35 / 4.61 us for rows 1 / 2 with ``l2_persist=1``); ``wmma`` = legacy cp.async ring / TMA row
     pieces into smem + WMMA bf16 m16n16k16 fp32-accumulate; ``fma`` = CUDA-core fp32 FMA
     straight from global memory (16 B ld.global.nc, warp butterfly + 8-warp smem sum);
     ``swapab`` (legacy 96 x 4 grid AND full-K) = experts on the MMA M dimension, tokens on N
@@ -758,11 +751,9 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
         tinym = int(os.environ.get("DG_FE_TINYM", "1"))
     if stamps is None:
         stamps = int(os.environ.get("DG_FE_STAMPS", "0"))
-    if l2_persist is None:
-        l2_persist = int(os.environ.get("DG_FE_ROUTER_L2_PERSIST", "0"))
     if pdl is None:
         pdl = int(os.environ.get("DG_FE_PDL", "0"))
-    grid, mma, k_parts = _fe_resolve_knobs(m, grid, mma, k_parts)
+    grid, mma, k_parts, l2_persist = _fe_resolve_knobs(m, grid, mma, k_parts, l2_persist)
     wlayout = _fe_wlayout_from_env(wlayout)
     if mma == 2 and wlayout == 1:
         router_weight = _fe_router_weight_for_layout(router_weight, 1)

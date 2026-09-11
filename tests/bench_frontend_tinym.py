@@ -151,8 +151,8 @@ def main():
 
         both(); torch.cuda.synchronize(); dist.barrier(group=group)
         n_router = deep_gemm.fable_frontend_router_ctas(local_rows, EXPERTS, HIDDEN, 8, tinym)
-        grid_res, mma_res, _ = deep_gemm.mega._fe_resolve_knobs(local_rows)
-        grid_env = f"{grid_env}->{grid_res}"; mma_env = f"{mma_env}->{mma_res}"
+        grid_res, mma_res, _, l2_res = deep_gemm.mega._fe_resolve_knobs(local_rows)
+        grid_env = f"{grid_env}->{grid_res}"; mma_env = f"{mma_env}->{mma_res}"; l2_persist = f"{l2_persist}->{l2_res}"
         fullk = bool(tinym) and local_rows <= 16 and grid_res != 96
         if fuse_fe:
             fe_in_mega(); torch.cuda.synchronize(); dist.barrier(group=group)
