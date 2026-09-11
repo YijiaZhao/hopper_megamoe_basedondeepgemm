@@ -780,14 +780,18 @@ __device__ __forceinline__ void router_role_fullk_fma(
 // Quantisation of the m rows runs on the merger CTA (idle until the first keys land) instead
 // of router CTAs 0..m-1, so no router CTA carries extra loads. Hand-off unchanged: keys into
 // cand[token][group][8] (sentinel 1 for slots >= n_exp), the merger polls the slots.
-constexpr int kCCSlots = 5;
 constexpr int kMergerDeferBit = 16;      // w_hint flag: merger defers the top-8 merge to one pass (DG_FE_MERGER_DEFER)
 constexpr int kTicketMergeBit = 32;      // w_hint flag (cc): no polling merger; the LAST router CTA (atomic ticket) merges (DG_FE_CC_MERGE=ticket)
 constexpr int kSelectReduxBit = 64;      // w_hint flag (cc ticket): top-8 by 8 redux rounds over register keys instead of insertion + merge8 (DG_FE_CC_SELECT=redux)
 constexpr int kMergerFlagsMask = 15;     // w_hint bits below the merger flags
 constexpr int kCCMaxM = 2;
 constexpr int kCCH = 3072;
-__host__ __device__ constexpr int cc_block(int ks) { return ks > 0 ? kCCSlots * ks * 32 : kThreads; }
+// kCC encodes the cc CTA shape: slots * 8 + K-split (44 = 5 experts x 4 warps = 640 threads, 46 = 5 x 6 = 960,
+// 36 = 4 x 4 = 512 threads for a 96 + 1 CTA grid)
+__host__ __device__ constexpr int cc_slots(int cc) { return cc / 8; }
+__host__ __device__ constexpr int cc_ks(int cc) { return cc % 8; }
+__host__ __device__ constexpr int cc_block(int cc) { return cc > 0 ? cc_slots(cc) * cc_ks(cc) * 32 : kThreads; }
+constexpr int kTicketRelaxedBit = 128;   // w_hint flag (cc ticket): relaxed atomic ticket, the last CTA re-reads slots still 0 (DG_FE_CC_TICKET=relaxed)
 // globaltimer read predicated on `dep`: cannot be scheduled before the load producing it lands
 __device__ __forceinline__ unsigned long long globaltimer_after(uint32_t dep) {
     unsigned long long t;
@@ -795,13 +799,13 @@ __device__ __forceinline__ unsigned long long globaltimer_after(uint32_t dep) {
                  : "=l"(t) : "r"(dep));
     return t;
 }
-template <int kKS>
+template <int kSlots, int kKS>
 __device__ __forceinline__ void router_role_fullk_cc(
         const __nv_bfloat16* __restrict__ hidden, const __nv_bfloat16* __restrict__ router_weight,
         uint32_t* __restrict__ cand, unsigned long long* stamps,
         int m, int h, int e, int epc, int groups, int cand_slots) {
     constexpr int kChunks = kCCH / 256 / kKS, kKPart = kCCH / kKS;
-    __shared__ float part_s[kCCSlots][kCCMaxM][kKS];
+    __shared__ float part_s[kSlots][kCCMaxM][kKS];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int slot = warp / kKS, ks = warp % kKS;
     const int group = blockIdx.x, expert_base = group * epc;
@@ -835,7 +839,7 @@ __device__ __forceinline__ void router_role_fullk_cc(
     #pragma unroll
     for (int r = 0; r < kCCMaxM; ++r) {
         acc[r] = warp_sum(acc[r]);
-        if (lane == 0 && slot < kCCSlots) part_s[slot][r][ks] = acc[r];
+        if (lane == 0 && slot < kSlots) part_s[slot][r][ks] = acc[r];
     }
     __syncthreads();
     stamp(stamps, 2);
@@ -1113,7 +1117,7 @@ __device__ __forceinline__ void topk_finish(uint32_t run, int lane, int t, int64
 template <int kTopK, int kSlotsPerLane>
 __device__ __forceinline__ void last_arriver_topk(
         uint32_t* __restrict__ cand, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
-        unsigned long long* mstamps, int m, int groups, int cand_slots, bool redux_sel) {
+        unsigned long long* mstamps, int m, int groups, int cand_slots, bool redux_sel, bool relaxed) {
     constexpr int kVecPerLane = kSlotsPerLane / 4;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nslots = groups * cand_slots;
@@ -1124,9 +1128,21 @@ __device__ __forceinline__ void last_arriver_topk(
     #pragma unroll
     for (int i = 0; i < kVecPerLane; ++i) {
         q[i] = make_uint4(0u, 0u, 0u, 0u);
-        if (4 * (lane + 32 * i) < nslots) q[i] = __ldcg(reinterpret_cast<const uint4*>(base + 4 * (lane + 32 * i)));
+        if (4 * (lane + 32 * i) < nslots) q[i] = ld_cg_v4(base + 4 * (lane + 32 * i));
     }
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[2] = globaltimer_after(q[0].x);
+    if (relaxed) {           // relaxed ticket: a slot may not be visible yet -> data is the flag, re-read zeros
+        while (true) {
+            bool zero = false;
+            #pragma unroll
+            for (int i = 0; i < kVecPerLane; ++i)
+                if (4 * (lane + 32 * i) < nslots && (q[i].x == 0u || q[i].y == 0u || q[i].z == 0u || q[i].w == 0u)) {
+                    q[i] = ld_cg_v4(base + 4 * (lane + 32 * i));
+                    zero |= q[i].x == 0u || q[i].y == 0u || q[i].z == 0u || q[i].w == 0u;
+                }
+            if (!__any_sync(0xffffffffu, zero)) break;
+        }
+    }
     uint32_t kv[kSlotsPerLane];
     #pragma unroll
     for (int i = 0; i < kVecPerLane; ++i) { kv[4 * i] = q[i].x; kv[4 * i + 1] = q[i].y; kv[4 * i + 2] = q[i].z; kv[4 * i + 3] = q[i].w; }
@@ -1134,9 +1150,14 @@ __device__ __forceinline__ void last_arriver_topk(
     if (redux_sel) {
         #pragma unroll
         for (int k = 0; k < kTopK; ++k) {
-            uint32_t mx = 0u;
+            uint32_t tr[kSlotsPerLane];              // tree max (depth log2), not a serial chain
             #pragma unroll
-            for (int i = 0; i < kSlotsPerLane; ++i) mx = max(mx, kv[i]);
+            for (int i = 0; i < kSlotsPerLane; ++i) tr[i] = kv[i];
+            #pragma unroll
+            for (int st = 1; st < kSlotsPerLane; st *= 2)
+                #pragma unroll
+                for (int i = 0; i + st < kSlotsPerLane; i += 2 * st) tr[i] = max(tr[i], tr[i + st]);
+            const uint32_t mx = tr[0];
             const uint32_t best = warp_max_u32_redux(mx);
             if (lane == k) run = best;
             if (mx == best) {
@@ -1162,6 +1183,11 @@ __device__ __forceinline__ void last_arriver_topk(
     #pragma unroll
     for (int i = 0; i < kVecPerLane; ++i)      // slots back to 0 (the polling merger mode relies on it)
         if (4 * (lane + 32 * i) < nslots) *reinterpret_cast<uint4*>(base + 4 * (lane + 32 * i)) = make_uint4(0u, 0u, 0u, 0u);
+}
+__device__ __forceinline__ uint4 ld_cg_v4(const uint32_t* p) {
+    uint4 v;
+    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory");
+    return v;
 }
 __device__ __forceinline__ int atom_add_acq_rel_gpu(int* p, int v) {
     int old;
@@ -1290,20 +1316,21 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
                 merger_role<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, stamps, m, groups, cand_slots, defer);
         } else {
             if constexpr (kCC > 0) {
-                router_role_fullk_cc<kCC>(hidden, router_weight, cand, stamps, m, h, e, epc, groups, cand_slots);
+                router_role_fullk_cc<cc_slots(kCC), cc_ks(kCC)>(hidden, router_weight, cand, stamps, m, h, e, epc, groups, cand_slots);
                 if (w_hint & kTicketMergeBit) {
                     __shared__ int s_last;
-                    __syncthreads();                 // every key store of this CTA precedes thread 0's release
-                    if (threadIdx.x == 0) s_last = atom_add_acq_rel_gpu(ticket, 1) == num_router_ctas - 1;
+                    const bool relaxed = (w_hint & kTicketRelaxedBit) != 0;
+                    __syncthreads();                 // every key store of this CTA is issued before thread 0's ticket
+                    if (threadIdx.x == 0) s_last = (relaxed ? atomicAdd(ticket, 1) : atom_add_acq_rel_gpu(ticket, 1)) == num_router_ctas - 1;
                     __syncthreads();
                     stamp(stamps, 3);
                     if (s_last) {
                         unsigned long long* mstamps = stamps != nullptr ? stamps + static_cast<size_t>(num_router_ctas) * kStampSlots : nullptr;
                         if (mstamps != nullptr && threadIdx.x == 0) mstamps[1] = globaltimer_ns();
                         if (groups * cand_slots <= 20 * 32)
-                            last_arriver_topk<kMaxTopK, 20>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots, (w_hint & kSelectReduxBit) != 0);
+                            last_arriver_topk<kMaxTopK, 20>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots, (w_hint & kSelectReduxBit) != 0, (w_hint & kTicketRelaxedBit) != 0);
                         else
-                            last_arriver_topk<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots, (w_hint & kSelectReduxBit) != 0);
+                            last_arriver_topk<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots, (w_hint & kSelectReduxBit) != 0, (w_hint & kTicketRelaxedBit) != 0);
                         if (threadIdx.x == 0) *ticket = 0;
                     }
                     if (pdl_mode == 2) pdl_trigger();
@@ -1493,6 +1520,10 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         if (kCC > 0 && ticket_merge) w_hint |= kTicketMergeBit;
         static const bool redux_sel = getenv("DG_FE_CC_SELECT") && strcmp(getenv("DG_FE_CC_SELECT"), "redux") == 0;
         if (kCC > 0 && redux_sel) w_hint |= kSelectReduxBit;
+        // ticket: relaxed (default) = atomicAdd right after the key stores, the last CTA re-reads slots still 0;
+        // acqrel = atom.acq_rel.gpu (release drains this CTA's stores first: ~0.5 us more before the ticket)
+        static const bool acqrel = getenv("DG_FE_CC_TICKET") && strcmp(getenv("DG_FE_CC_TICKET"), "acqrel") == 0;
+        if (kCC > 0 && !acqrel) w_hint |= kTicketRelaxedBit;
     }
     cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);
@@ -1518,14 +1549,16 @@ void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x
                 mma = 2;
             }
             // cc | cc6: CUDA-core K-split router (m <= 2, h = 3072, k_parts 1, epc <= 5); else WMMA
-            if (mma == 4 || mma == 5) {
-                if (m <= kCCMaxM && h == kCCH && k_parts == 1 && epc <= kCCSlots) {
-                    if (mma == 4) launch<1, kMode, true, true, false, 0, 4>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
-                    else launch<1, kMode, true, true, false, 0, 6>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+            if (mma == 4 || mma == 5 || mma == 6) {
+                const int cc = mma == 4 ? 44 : mma == 5 ? 46 : 36;      // slots * 8 + K-split
+                if (m <= kCCMaxM && h == kCCH && k_parts == 1 && epc <= cc_slots(cc)) {
+                    if (cc == 44) launch<1, kMode, true, true, false, 0, 44>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+                    else if (cc == 46) launch<1, kMode, true, true, false, 0, 46>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
+                    else launch<1, kMode, true, true, false, 0, 36>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, k_parts, stream);
                     return;
                 }
                 static bool warned_cc = false;
-                if (!warned_cc) { fprintf(stderr, "[fable_frontend] DG_FE_TINYM_MMA=cc needs m <= %d, h = %d, k_parts 1, epc <= %d (m=%d h=%d k_parts=%d epc=%d): using WMMA\n", kCCMaxM, kCCH, kCCSlots, m, h, k_parts, epc); warned_cc = true; }
+                if (!warned_cc) { fprintf(stderr, "[fable_frontend] DG_FE_TINYM_MMA=cc needs m <= %d, h = %d, k_parts 1, epc <= %d (m=%d h=%d k_parts=%d epc=%d): using WMMA\n", kCCMaxM, kCCH, cc_slots(cc), m, h, k_parts, epc); warned_cc = true; }
                 mma = 0;
             }
             const bool swap = mma == 2 || mma == 3;
