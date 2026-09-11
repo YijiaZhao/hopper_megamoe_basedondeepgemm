@@ -4,6 +4,7 @@
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
 #include <cstdint>
+#include <deep_gemm/impls/fable_cc_select.cuh>
 #include <type_traits>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
@@ -27,6 +28,7 @@
 #include <deep_gemm/ptx/utils.cuh>
 #include <deep_gemm/ptx/wgmma.cuh>
 #include <deep_gemm/quantization/fp4_fused_dequant.cuh>
+#include <deep_gemm/impls/fable_frontend_device.cuh>
 
 namespace deep_gemm {
 namespace nvfp4 {
@@ -422,6 +424,115 @@ __device__ __forceinline__ void dequant_smem_b_from_packed_qoq_shiftxor(
 
 }  // namespace nvfp4
 
+// Fused Fable frontend crew (kFuseFE, docs/fe_into_mega_design.md): executed by the
+// kNumCrewThreads (256) math threads of every CTA at kernel start. __noinline__ on
+// purpose: inlined into the math role, this code degraded the RF K-loop's code
+// generation (H20 same-routing probe: RF decode+LUT 574 -> 1213 ns per stage).
+// Phase stamps (max over CTAs unless noted): 49 loads issued, 50 quant done, 51 loads
+// landed, 52 WMMA + stores, 45 router units released, 54 top-k saw all units, 46
+// top-k written; 58-63 per-CTA durations (issue / land / WMMA / release / top-k wait /
+// top-k compute) as max over CTAs.
+template <bool kQoQ, uint32_t kNumSMs, uint32_t kNumExperts, uint32_t kHidden, uint32_t kNumCrewThreads,
+          uint32_t kMaxUnitsPerCTA, uint32_t kUnitSmemBytes, uint32_t kTopkPerLane>
+__device__ __noinline__ void fused_fe_crew(
+        const void* __restrict__ fe_hidden, const void* __restrict__ fe_router_weight, void* __restrict__ fe_workspace,
+        uint8_t* __restrict__ x_bytes, float* __restrict__ x_sf,
+        int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
+        uint8_t* smem_fe_base, const uint32_t num_tokens, const uint32_t sm_idx, const uint32_t crew_tid,
+        unsigned long long* phase_stamps) {
+    using fe_cfg_t = fable_fe::RouterCfg<1, true>;
+    constexpr uint32_t kNumUnits = (kNumExperts / fable_fe::kExpertsPerCTA) * fe_cfg_t::kKSplitCTAs;
+    constexpr uint32_t kFEBarrierIdx = 10;
+    const auto fe_sync = [&]() { ptx::sync_aligned(kNumCrewThreads, kFEBarrierIdx); };
+    const auto stamp_max = [&](const uint32_t slot) {
+        if (phase_stamps != nullptr && crew_tid == 0) {
+            unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+            atomicMax(phase_stamps + slot, t);
+        }
+    };
+    unsigned long long fe_t_prev = 0ull;
+    const auto fe_dur_max = [&](const uint32_t slot) {
+        if (phase_stamps != nullptr && crew_tid == 0) {
+            unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+            atomicMax(phase_stamps + slot, t - fe_t_prev);
+            fe_t_prev = t;
+        }
+    };
+    if (phase_stamps != nullptr && crew_tid == 0)
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(fe_t_prev));
+
+    const int fe_tid = static_cast<int>(crew_tid);
+    const int fe_m = static_cast<int>(num_tokens), fe_h = static_cast<int>(kHidden), fe_e = static_cast<int>(kNumExperts);
+    const auto* fe_hidden_bf = static_cast<const nv_bfloat16*>(fe_hidden);
+    const auto* fe_weight_bf = static_cast<const nv_bfloat16*>(fe_router_weight);
+    auto* fe_counters = static_cast<uint32_t*>(fe_workspace);
+    auto* fe_logits = reinterpret_cast<float*>(static_cast<uint8_t*>(fe_workspace) + 256);
+    float* fe_warp_max = reinterpret_cast<float*>(smem_fe_base + kMaxUnitsPerCTA * kUnitSmemBytes);
+    uint32_t* fe_key_s = reinterpret_cast<uint32_t*>(fe_warp_max + 32);
+    uint64_t* fe_mbar = reinterpret_cast<uint64_t*>(fe_key_s + fable_fe::kMaxExperts);
+    DG_TRAP_ONLY_DEVICE_ASSERT(num_tokens <= 16 && num_tokens <= kNumSMs);
+    // Units of this CTA: u0 = kNumSMs - 1 - sm_idx, u0 + kNumSMs, ... < kNumUnits
+    // (the two-unit CTAs are the high ones, the top-k CTAs 0..m-1 carry one).
+    const uint32_t fe_u0 = kNumSMs - 1 - sm_idx;
+    // (1) every chunk of every unit in flight at once: one 512 B bulk copy per
+    // (unit, chunk, row) on one transaction mbarrier (thread 0 expects the total)
+    if (fe_tid == 0) fable_fe::mbar_init(fe_mbar, 1u);
+    fe_sync();
+    uint32_t fe_tx_bytes = 0;
+    #pragma unroll
+    for (uint32_t i = 0; i < kMaxUnitsPerCTA; ++ i)
+        if (fe_u0 + i * kNumSMs < kNumUnits)
+            fe_tx_bytes += fable_fe::router_unit_issue_all_bulk<1, true>(fe_hidden_bf, fe_weight_bf, fe_m, fe_h,
+                static_cast<int>(fe_u0 + i * kNumSMs), fe_tid, smem_fe_base + i * kUnitSmemBytes, fe_mbar);
+    if (fe_tid == 0) {
+        fable_fe::mbar_expect_tx(fe_mbar, fe_tx_bytes);
+        stamp_max(49);
+    }
+    fe_dur_max(58);
+    // (2) token sm_idx's activation quantisation while the router loads land
+    if (sm_idx < num_tokens) {
+        fable_fe::quant_role<kQoQ ? 1 : 0>(fe_hidden_bf, x_bytes, x_sf, static_cast<int>(sm_idx), fe_h, fe_tid, fe_warp_max, fe_sync);
+        stamp_max(50);
+    }
+    // (3) router units -> fp32 partial logits, then this CTA's arrival
+    fable_fe::mbar_wait(fe_mbar, 0u);
+    fe_sync();   // padding-row zero stores of every thread visible too
+    stamp_max(51);
+    fe_dur_max(59);
+    #pragma unroll
+    for (uint32_t i = 0; i < kMaxUnitsPerCTA; ++ i)
+        if (fe_u0 + i * kNumSMs < kNumUnits)
+            fable_fe::router_unit_compute<1, true>(fe_logits, fe_m, fe_h, fe_e,
+                static_cast<int>(fe_u0 + i * kNumSMs), fe_tid, smem_fe_base + i * kUnitSmemBytes, fe_sync);
+    stamp_max(52);
+    fe_dur_max(60);
+    // CTA barrier, then ONE release.gpu atomic by thread 0 (cumulative over the
+    // crew's partial stores, like the push-dispatch DONE ticket)
+    fe_sync();
+    if (fe_tid == 0) {
+        ptx::atomic_add_rel(fe_counters + 8, 1u);
+        stamp_max(45);
+    }
+    fe_dur_max(61);
+    // (4) top-k + softmax of token sm_idx once every unit landed
+    if (sm_idx < num_tokens) {
+        if (fe_tid == 0) {
+            DG_SPIN_WHILE(ptx::ld_acq(fe_counters + 8) < kNumSMs, 4101);
+            stamp_max(54);
+        }
+        fe_dur_max(62);
+        fe_sync();
+        fable_fe::topk_softmax_token_tiny<fe_cfg_t::kKSplitCTAs, kTopkPerLane, 8>(
+            fe_logits, topk_idx, topk_weights, nullptr, static_cast<int>(sm_idx), fe_m, fe_e, fe_tid, fe_key_s, fe_sync);
+        fe_sync();
+        if (fe_tid == 0) {
+            ptx::atomic_add_rel(fe_counters + 9, 1u);
+            stamp_max(46);
+        }
+        fe_dur_max(63);
+    }
+}
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kNumExpertsPerWave,
@@ -563,7 +674,13 @@ template <
     // DG_FP4_BN512_MIN_M / DG_FP4_BN512_MAX_M on the global token count): packed
     // 256-row weight tiles per L1 / L2 task (1 or 2). See `kWideTiles` in the body.
     uint32_t kL1TaskTiles = 1,
-    uint32_t kL2TaskTiles = 1
+    uint32_t kL2TaskTiles = 1,
+    // Fable frontend fused in (host env DG_FP4_FUSE_FE, tiny M only; kernel `kFuseFE`,
+    // docs/fe_into_mega_design.md): the math warps compute router logits / top-k /
+    // activation quantisation for the rank's rows at kernel start from `fe_hidden` and
+    // `fe_router_weight` (hand-off through `fe_workspace`), the dispatch warps wait for
+    // the top-k before routing. Off: today's kernel, the three pointers are unused.
+    bool kFuseFERequested = false
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(
@@ -585,7 +702,12 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
         // MXFP4: required per-(expert, weight row) scale [E, N] = 2^e_ref * global.
         const float* __restrict__ l1_global_scales,
         const float* __restrict__ l2_global_scales,
-        unsigned long long* __restrict__ phase_stamps) {
+        unsigned long long* __restrict__ phase_stamps,
+        const void* __restrict__ fe_hidden,
+        const void* __restrict__ fe_router_weight,
+        void* __restrict__ fe_workspace,
+        // DG_FE_SELECT_IN_MEGA=1: the Fable cc frontend's compact [token][384] u32 key array (nullptr = topk from the frontend)
+        const uint32_t* __restrict__ fe_keys) {
     constexpr uint32_t kHidden = 3072;
     constexpr uint32_t kIntermediateHidden = 1280;
     constexpr uint32_t kNumExperts = 384;

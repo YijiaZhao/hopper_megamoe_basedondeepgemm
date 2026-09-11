@@ -31,7 +31,7 @@
     // Optional phase timestamps (globaltimer, ns). Slots:
     //   0 min kernel entry | 1 max dispatch routing done | 2 max dispatch pull done
     //   3 min first math task | 4 max last L1 task end | 5 max last L2 task end
-    //   6 max after combine NVLink barrier | 7 max combine end
+    //   6 max after combine NVLink barrier | 7 max combine end | 16 max DG_FE_SELECT_IN_MEGA select done
     const auto stamp_min = [&](const uint32_t slot) {
         if (phase_stamps != nullptr) {
             unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -458,6 +458,33 @@
         kDenseWeightTiles && kUseInterleavedScheduler && !kHalfTileTasks && !kL2HalfRowTasks;
     DG_STATIC_ASSERT(!kTinyMGemv || (!kSplitKL1 && !kSplitKL2 && !kStreamK),
                      "TinyM GEMV owns the split-K scratch; the host disables split-K / stream-K");
+    // Fable frontend fused in (kFuseFE; host env DG_FP4_FUSE_FE, gated on <= 16 global
+    // tokens; docs/fe_into_mega_design.md). The 8 math warps of every CTA ("FE crew",
+    // idle until the first task) compute the frontend before their first sync with the
+    // dispatch warps: 96 router units (16 experts x one 768-wide K-part, WMMA bf16 ->
+    // fp32, unit u on CTA kNumSMs - 1 - u % kNumSMs), token t's quantisation and top-k
+    // + softmax on CTA t, grid-wide hand-off through two counters in `fe_workspace`
+    // (word 8: router units done, word 9: tokens with top-k written; SM0 resets both
+    // in the cleanup) and the fp32 partial logits behind them. The dispatch warps wait
+    // for word 9 == num_tokens and read topk_idx / weights / x / x_sf with ld.cg. The
+    // device code is the standalone FE's (fable_frontend_device.cuh), bit-identical.
+    constexpr bool kFuseFE = kFuseFERequested && kUseInterleavedScheduler;
+    DG_STATIC_ASSERT(!kFuseFE || !kTinyMGemv, "Fused FE borrows the pipeline stages: not with the tiny-M GEMV");
+    DG_STATIC_ASSERT(!kFuseFE || (kNumTopk == 8 && kNumExperts % fable_fe::kExpertsPerCTA == 0 &&
+                                  kNumExperts <= fable_fe::kMaxExperts && kHidden % 1024 == 0),
+                     "Fused FE: top-8, E % 16 == 0, E <= 512, H % 1024 == 0");
+    using fe_cfg_t = fable_fe::RouterCfg<1, true>;
+    DG_STATIC_ASSERT(!kFuseFE || (kHidden / fable_fe::kChunkK / fe_cfg_t::kKSplitCTAs <= fe_cfg_t::kStages),
+                     "Fused FE: every K-chunk of a unit needs its own stage (issue-all)");
+    constexpr uint32_t kFENumUnits = (kNumExperts / fable_fe::kExpertsPerCTA) * fe_cfg_t::kKSplitCTAs;
+    constexpr uint32_t kFEMaxUnitsPerCTA = math::constexpr_ceil_div(kFENumUnits, kNumSMs);
+    constexpr uint32_t kFEUnitSmemBytes = math::constexpr_align<uint32_t>(fe_cfg_t::kDynSmemBytes, 128u);
+    constexpr uint32_t kFETopkPerLane = kNumExperts <= 384 ? 12u : fable_fe::kMaxExperts / 32;
+    // Frontend outputs are produced inside this kernel by other SMs when fused: read
+    // them through L2 (ld.global.cg), never through the non-coherent nc path.
+    const auto fe_ld = [](const auto* ptr) {
+        if constexpr (kFuseFE) return __ldcg(ptr); else return __ldg(ptr);
+    };
     DG_STATIC_ASSERT(!(kRFDecode && kSwapPipelineDecode),
                      "RF decode is only implemented for the serial swapAB main loop");
     // K128 blocks per pipeline stage. The tiny-M (BM8) RF swapAB path carries
@@ -722,6 +749,14 @@
     auto smem_sfa = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<float*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
     });
+    // Fused FE crew smem: borrows the (still idle) pipeline stage region [smem_a[0],
+    // sf_start_ptr): kFEMaxUnitsPerCTA router units + 32 quant warp maxima + kMaxExperts
+    // top-k keys (see the design note for why no task can touch a stage before it).
+    constexpr uint32_t kFEStageRegionBytes =
+        kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_PACKED_B_SIZE_PER_STAGE) + kNumDecodedBStages * SMEM_B_SIZE_PER_STAGE;
+    constexpr uint32_t kFESmemBytes = kFEMaxUnitsPerCTA * kFEUnitSmemBytes + 128u + fable_fe::kMaxExperts * 4u + 16u;
+    DG_STATIC_ASSERT(!kFuseFE || kFESmemBytes <= kFEStageRegionBytes, "Fused FE does not fit the pipeline stage region");
+    auto smem_fe_base = reinterpret_cast<uint8_t*>(smem_a[0]);
     // Barriers live after SF.
     auto smem_ksplit_reduce = reinterpret_cast<float*>(
         sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE);
@@ -842,6 +877,28 @@
     #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;" ::: "memory");
     #endif
+    // DG_FE_SELECT_IN_MEGA=1 (fe_keys != nullptr): the frontend ended after its router CTAs
+    // stored the 384 keys per token; one otherwise idle prologue warp per token (warps 4..,
+    // warps 0..2 are busy with the smem / m-barrier init above) selects the top-8 + softmax
+    // and writes THIS rank's topk_idx / topk_weights (every CTA writes the same values; the
+    // dispatch warps read them after the __syncthreads below). Frontend keys are complete
+    // because the frontend kernel finished before this grid (or before griddepcontrol.wait).
+    if (fe_keys != nullptr and warp_idx >= 4 and warp_idx - 4 < num_tokens and warp_idx - 4 < 8) {
+        const uint32_t t = warp_idx - 4;
+        fable_cc::select_topk8_compact384(fe_keys + t * kNumExperts, static_cast<int>(lane_idx), static_cast<int>(t),
+                                          input_topk_idx_buffer.get_base_ptr<int64_t>(),
+                                          input_topk_weights_buffer.get_base_ptr<float>());
+        if (thread_idx == 4 * 32) stamp_max(16);       // slot 16: max FE-select-in-Mega done
+    }
+    // topk_idx / topk_weights loads: read-only (__ldg, ld.global.nc) when the frontend produced
+    // them; under DG_FE_SELECT_IN_MEGA the prologue warps of THIS kernel wrote them, so the
+    // non-coherent path may return stale data -> ld.global.cg (L2-coherent) instead.
+    const auto ld_topk_idx = [&](const int64_t* p) -> int64_t {
+        return (fe_keys != nullptr || kFuseFE) ? static_cast<int64_t>(__ldcg(reinterpret_cast<const long long*>(p))) : __ldg(p);
+    };
+    const auto ld_topk_weight = [&](const float* p) -> float {
+        return (fe_keys != nullptr || kFuseFE) ? __ldcg(p) : __ldg(p);
+    };
     // Fast NVLink-barrier epilogue: every thread snapshots the done count BEFORE
     // the kernel-start __syncthreads (see fused_comm::nvlink_barrier for why this
     // is race-free: SM0's first write of the word this launch is ordered after the
@@ -898,6 +955,12 @@
 
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
+    // `first_worker_idx` of a task that is NOT a stream-K segment (wave-scheduler task
+    // of a launch where stream-K is compiled in but inactive, e.g. >= kNumSMs L1 tasks
+    // under unbalanced routing): its split-K tail halves must use the split-K
+    // publisher/finisher protocol, not the stream-K per-worker slots (a genuine
+    // stream-K segment may have first worker 0, so 0 cannot mark "not stream-K").
+    constexpr uint32_t kNotStreamKWorker = 0xffffffffu;
 
     const auto for_each_static_selected_block = [&](auto&& func) {
         scheduler.fetch_expert_recv_count();
@@ -911,12 +974,12 @@
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear1>{},
                      local_expert_idx, L1_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, 0u);
+                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, kNotStreamKWorker);
             } else {
                 func(std::integral_constant<fused_sched::BlockPhase, fused_sched::BlockPhase::Linear2>{},
                      local_expert_idx, L2_SHAPE_K / BLOCK_K, m_block_idx, n_block_idx,
                      scheduler.get_current_pool_block_offset() + m_block_idx,
-                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, 0u);
+                     scheduler.template get_valid_m<false>(), 0u, 1u, 0u, kNotStreamKWorker);
             }
         }
     };
@@ -970,7 +1033,7 @@
                  task_info.m_block_idx, task_info.n_block_idx,
                  task_info.pool_block_idx, task_info.valid_m,
                  k_split_idx, num_k_splits, k_block_begin,
-                 is_streamk ? task_info.get_first_worker_idx() : 0u);
+                 is_streamk ? task_info.get_first_worker_idx() : kNotStreamKWorker);
         } else {
             const uint32_t num_k_splits = (kSplitKL2 || kStreamK) ? task_info.get_num_k_splits() : 1u;
             const uint32_t k_split_idx = (kSplitKL2 || kStreamK) ? task_info.get_k_split_idx() : 0u;
@@ -984,7 +1047,7 @@
                  task_info.m_block_idx, task_info.n_block_idx,
                  task_info.pool_block_idx, task_info.valid_m,
                  k_split_idx, num_k_splits, k_block_begin,
-                 is_streamk ? task_info.get_first_worker_idx() : 0u);
+                 is_streamk ? task_info.get_first_worker_idx() : kNotStreamKWorker);
         }
     };
 
@@ -1022,6 +1085,15 @@
                 // Next launch's DONE target (see `kPushDoneFlags`)
                 if (thread_idx == 0)
                     *workspace.get_push_epoch_ptr() = ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u;
+            }
+            if constexpr (kFuseFE) {
+                // Fused FE hand-off counters (every reader passed: the top-k CTAs before
+                // releasing word 9, every dispatch warp before routing)
+                if (thread_idx == 0) {
+                    auto* fe_counters = static_cast<uint32_t*>(fe_workspace);
+                    fe_counters[8] = 0u;
+                    fe_counters[9] = 0u;
+                }
             }
             if constexpr (kCombineDynamic) {
                 // Next dynamic-combine launch's ticket word (see `kCombineDynamic`)
@@ -1086,6 +1158,15 @@
     if (warp_idx < kNumDispatchWarps) {
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
+        if constexpr (kFuseFE) {
+            // Wait until the FE crews wrote every local token's top-k (word 9), then
+            // route exactly as before (loads below go through `fe_ld` == ld.cg).
+            const auto* fe_topk_done = static_cast<const uint32_t*>(fe_workspace) + 9;
+            if (lane_idx == 0)
+                DG_SPIN_WHILE(ptx::ld_acq(fe_topk_done) < num_tokens, 4102);
+            __syncwarp();
+        }
+
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
         const auto read_topk_idx = [&](const auto& process) {
@@ -1097,7 +1178,7 @@
                     int expert_idx = -1;
                     if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
                         expert_idx = static_cast<int>(
-                            __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
+                            ld_topk_idx(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
                         if (expert_idx >= 0)
                             process(i * kNumTopk + lane_idx, expert_idx);
                     }
@@ -1164,7 +1245,7 @@
                      r += kNumSMs * kNumActiveDispatchWarps) {
                     const uint32_t src_token_idx = r / kNumTopk, src_topk_idx = r % kNumTopk;
                     const int expert_idx = static_cast<int>(
-                        __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + r));
+                        ld_topk_idx(input_topk_idx_buffer.get_base_ptr<int64_t>() + r));
                     if (expert_idx < 0)
                         continue;
                     const uint32_t dr = static_cast<uint32_t>(expert_idx) / kNumExpertsPerRank;
@@ -1177,10 +1258,10 @@
                     uint4 row[kNumTokenChunksPerLane];
                     #pragma unroll
                     for (uint32_t c = 0; c < kNumTokenChunksPerLane; ++ c)
-                        row[c] = __ldg(src_token + c * 32 + lane_idx);
+                        row[c] = fe_ld(src_token + c * 32 + lane_idx);
                     const float sf = lane_idx < kNumSFFloats ?
-                        __ldg(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>() + lane_idx) : 0.0f;
-                    const float weight = __ldg(input_topk_weights_buffer.get_base_ptr<float>() + r);
+                        fe_ld(input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>() + lane_idx) : 0.0f;
+                    const float weight = ld_topk_weight(input_topk_weights_buffer.get_base_ptr<float>() + r);
                     row_idx = __shfl_sync(0xffffffff, row_idx, 0);
                     DG_TRAP_ONLY_DEVICE_ASSERT(row_idx < kPushBlocksPerExpert * BLOCK_M);
                     const uint32_t pool_token_idx = de * kPushBlocksPerExpert * BLOCK_M + row_idx;
@@ -2036,6 +2117,19 @@
                          (WG_BLOCK_M == L1WGMMA::M and WG_BLOCK_N == L1WGMMA::N),
                          "Split-N WGs must each run one M64N128 WGMMA per K-block");
 
+        if constexpr (kFuseFE) {
+            // FE crew (docs/fe_into_mega_design.md): the frontend for this rank's rows,
+            // before this CTA's first sync with the dispatch warps. Kept in a separate
+            // __noinline__ function: inlined into the math role its WMMA / bulk-copy /
+            // top-k code degraded the RF K-loop's code generation (H20 probe, same
+            // routing: RF decode+LUT 574 -> 1213 ns per stage, head-to-head 983 -> 1747).
+            fused_fe_crew<kQoQ, kNumSMs, kNumExperts, kHidden, kNumEpilogueThreads, kFEMaxUnitsPerCTA,
+                          kFEUnitSmemBytes, kFETopkPerLane>(
+                fe_hidden, fe_router_weight, fe_workspace,
+                input_token_buffer.get_base_ptr<uint8_t>(), input_sf_buffer.get_base_ptr<float>(),
+                input_topk_idx_buffer.get_base_ptr<int64_t>(), input_topk_weights_buffer.get_base_ptr<float>(),
+                smem_fe_base, num_tokens, sm_idx, epilogue_thread_idx, phase_stamps);
+        }
         // Sync with dispatch
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
@@ -4398,8 +4492,17 @@
             // role-free. Deadlock-free: no contributor waits on anything here.
             // L2 tail probe: 40 = max L2 epilogue start (K loop drained)
             if (kBlockIsL2 && epilogue_thread_idx == 0) stamp_max(40);
+            // Stream-K protocol only for stream-K segments; a split-K TAIL task of a
+            // wave-scheduled launch (stream-K compiled in but inactive: >= kNumSMs L1
+            // tasks, i.e. >= 8 active local experts at <= 8 global tokens under real,
+            // unbalanced routing) takes the split-K branch below. Before this
+            // distinction such tails wrote their partials to stream-K worker slots
+            // 0/1 shared by every concurrently running tail (wrong sums on the
+            // highest-index experts of those ranks; the balanced correctness test
+            // never reaches >= 78 L1 tasks with stream-K compiled in).
+            const bool streamk_reduce = kStreamK && first_worker_idx != kNotStreamKWorker;
             if constexpr (kStreamK) {
-                if (num_k_splits > 1) {
+                if (num_k_splits > 1 && streamk_reduce) {
                     constexpr uint32_t kNumPartialElems = kWGHalves * kSwapABTokenChunks * 4u;
                     DG_STATIC_ASSERT(!kStreamK ||
                                      kNumPartialElems * kNumEpilogueThreads * sizeof(float) ==
@@ -4469,8 +4572,9 @@
                         }
                     }
                 }
-            } else if constexpr ((kSplitKL1 && !kBlockIsL2) || (kSplitKL2 && kBlockIsL2)) {
-                if (num_k_splits > 1) {
+            }
+            if constexpr ((kSplitKL1 && !kBlockIsL2) || (kSplitKL2 && kBlockIsL2)) {
+                if (num_k_splits > 1 && !streamk_reduce) {
                     constexpr uint32_t kNumPartialElems = kWGHalves * kSwapABTokenChunks * 4u;
                     // (Guarded: this discarded branch is not template-dependent.)
                     // Wide tasks: the partial spans kPhaseTiles adjacent 8 KB slots (the
@@ -4999,7 +5103,7 @@
         // = task t's (start, end) in ns since this CTA's kernel entry (low 32 bits), start
         // word high bits = meta (bit 31 L2, 30..24 pool block, 23..16 n block, 15..8 k split,
         // 7..0 num k splits); + 14 = this CTA's absolute entry globaltimer, + 15 = task count.
-        constexpr uint32_t kTaskLogBase = 48, kTaskLogPerCTA = 16, kTaskLogMaxTasks = 7, kTaskLogMaxSMs = 160;
+        constexpr uint32_t kTaskLogBase = 64, kTaskLogPerCTA = 16, kTaskLogMaxTasks = 7, kTaskLogMaxSMs = 160;
         uint32_t task_log_seq = 0;
         const bool task_log_on = (phase_stamps != nullptr) && (epilogue_thread_idx == 0) &&
                                  (sm_idx < kTaskLogMaxSMs) && (phase_stamps[47] == 0x5441534bull);
@@ -5154,7 +5258,7 @@
             next_combine_token();
         for (; token_idx < num_tokens; next_combine_token()) {
             const int stored_topk_slot_idx = lane_idx < kNumTopk ?
-                static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
+                static_cast<int>(ld_topk_idx(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             if constexpr (kFineCombine) {

@@ -742,13 +742,18 @@ static void fable_router_quant_topk_frontend(
         const torch::Tensor& x, const torch::Tensor& x_sf,
         const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
         const torch::Tensor& workspace, const int& mode, const int& tiny, const int& stamps,
-        const int& l2_persist, const int& pdl_mode) {
+        const int& l2_persist, const int& pdl_mode, const int& grid, const int& mma, const int& k_parts) {
     const auto [m, h] = get_shape<2>(hidden);
     const auto [e, h_] = get_shape<2>(router_weight);
     const int topk = static_cast<int>(topk_idx.size(1));
-    DG_HOST_ASSERT(hidden.scalar_type() == torch::kBFloat16 and router_weight.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(hidden.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(hidden.is_contiguous() and router_weight.is_contiguous());
-    DG_HOST_ASSERT(h == h_ and h % 1024 == 0 and e % 16 == 0 and e <= 512 and topk >= 1 and topk <= 8);
+    if (mma == 7) {   // ccfp8: router weight packed [e][h + 16] uint8 (e4m3 row + fp32 scale + pad), see fable_router_weight_fp8
+        DG_HOST_ASSERT(router_weight.scalar_type() == torch::kUInt8 and h_ == h + 16);
+    } else {
+        DG_HOST_ASSERT(router_weight.scalar_type() == torch::kBFloat16 and h == h_);
+    }
+    DG_HOST_ASSERT(h % 1024 == 0 and e % 16 == 0 and e <= 512 and topk >= 1 and topk <= 8);
     DG_HOST_ASSERT(m >= 1 and m <= 64);
     DG_HOST_ASSERT(x.scalar_type() == torch::kFloat8_e4m3fn and x.size(0) >= m and x.size(1) == h);
     DG_HOST_ASSERT(x_sf.scalar_type() == torch::kFloat32 and x_sf.size(0) >= m and x_sf.size(1) == h / 128);
@@ -762,12 +767,18 @@ static void fable_router_quant_topk_frontend(
         hidden.data_ptr(), router_weight.data_ptr(), x.data_ptr(), x_sf.data_ptr(),
         topk_idx.data_ptr(), topk_weights.data_ptr(), workspace.data_ptr(), workspace.nbytes(),
         static_cast<int>(m), static_cast<int>(h), static_cast<int>(e), topk, mode, tiny, stamps,
-        l2_persist, pdl_mode, at::cuda::getCurrentCUDAStream().stream());
+        l2_persist, pdl_mode, grid, mma, k_parts, at::cuda::getCurrentCUDAStream().stream());
+}
+
+static int fable_frontend_router_ctas(const int& m, const int& h, const int& e, const int& topk,
+                                      const int& tiny, const int& grid, const int& k_parts) {
+    return router_quant_topk_frontend_router_ctas(m, h, e, topk, tiny, grid, k_parts);
 }
 
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("fable_router_quant_topk_frontend", &fable_router_quant_topk_frontend);
+    m.def("fable_frontend_router_ctas", &fable_frontend_router_ctas);
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_ring_limit_for_mega_moe", &get_ring_limit_for_mega_moe);
     m.def("get_legacy_pool_tokens_for_mega_moe", &get_legacy_pool_tokens_for_mega_moe);

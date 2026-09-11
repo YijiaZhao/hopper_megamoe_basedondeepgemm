@@ -63,6 +63,7 @@ public:
         bool split_k_l2_all;
         int l1_task_tiles;
         int l2_task_tiles;
+        bool fuse_fe;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -81,6 +82,10 @@ public:
         const float* l1_global_scales;
         const float* l2_global_scales;
         unsigned long long* phase_stamps;
+        const void* fe_hidden;
+        const void* fe_router_weight;
+        void* fe_workspace;
+        const uint32_t* fe_keys;
         LaunchArgs launch_args;
     };
 
@@ -136,7 +141,8 @@ public:
             "        /* kSplitKL1All */ {},\n"
             "        /* kSplitKL2All */ {},\n"
             "        /* kL1TaskTiles */ {},\n"
-            "        /* kL2TaskTiles */ {}",
+            "        /* kL2TaskTiles */ {},\n"
+            "        /* kFuseFERequested */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -175,7 +181,8 @@ public:
             args.split_k_l1_all ? "true" : "false",
             args.split_k_l2_all ? "true" : "false",
             args.l1_task_tiles,
-            args.l2_task_tiles);
+            args.l2_task_tiles,
+            args.fuse_fe ? "true" : "false");
         return fmt::format(R"(
 {}
 
@@ -229,7 +236,11 @@ static void __instantiate_kernel() {{
             args.l2_weights_ptr,
             args.l1_global_scales,
             args.l2_global_scales,
-            args.phase_stamps));
+            args.phase_stamps,
+            args.fe_hidden,
+            args.fe_router_weight,
+            args.fe_workspace,
+            args.fe_keys));
     }
 };
 
@@ -250,7 +261,13 @@ static void sm90_fp4_h20_fused_mega_moe(
     const bool& fast_math,
     const bool& mxfp4 = false,
     const std::optional<torch::Tensor>& phase_stamps = std::nullopt,
-    const bool& qoq = false
+    const bool& qoq = false,
+    // Fused Fable frontend (DG_FP4_FUSE_FE, see below): bf16 hidden [num_tokens, hidden],
+    // bf16 router weight [num_experts, hidden], the Fable frontend workspace tensor.
+    const std::optional<torch::Tensor>& fe_hidden = std::nullopt,
+    const std::optional<torch::Tensor>& fe_router_weight = std::nullopt,
+    const std::optional<torch::Tensor>& fe_workspace = std::nullopt,
+    const std::optional<torch::Tensor>& fe_keys = std::nullopt
 ) {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const int num_experts = num_experts_per_rank * num_ranks;
@@ -432,6 +449,14 @@ static void sm90_fp4_h20_fused_mega_moe(
     // all-split L2 additionally doubles the L2 tail. Numerics identical (T=2/8/8/16 both
     // quants, mxfp4 128/512: same cos_min digits as knob off).
     const bool m16_rows = num_tokens == 2 && num_ranks == 8;
+    // QoQ inline s2 (kernel `kQoQInlineS2`, DG_FP4_QOQ_INLINE_S2 default 1) is gated to launches
+    // where no local expert can receive more than one BM8 pool block: with > 8 rows on one expert
+    // the inline-s2 L1 path produces wrong partials for the rows of the second block (8-rank
+    // tests/test_four_api_correctness.py qoq: --frontend fe T=32 cos_min 0.0007, default routing
+    // T=64 / 128 cos_min < 0; DG_FP4_QOQ_INLINE_S2=0 passes, every other knob fails; 2026-09-11).
+    // Max rows per expert = num_tokens x num_ranks (all routes of every token on one expert).
+    const bool qoq_inline_s2 = qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0 &&
+        num_tokens * num_ranks <= 8;
     // (Not with wide tasks: all-task splits measured +3.7..+7.3 us at M=16; wide L1 uses
     // a 3-way TAIL split instead, see the kernel.)
     const bool split_k_l1_all = split_k_l1 && m16_rows && !wide_tiles &&
@@ -631,6 +656,36 @@ static void sm90_fp4_h20_fused_mega_moe(
         get_sm90_fp4_h20_bm8_k_blocks_per_stage() == 2 &&
         get_env<int>("DG_FP4_FUSE_L1L2", 0) != 0 &&
         num_global_tokens_upper <= get_env<int>("DG_FP4_FUSE_L1L2_MAX_M", 16);
+    // Fused Fable frontend (kernel `kFuseFE`, docs/fe_into_mega_design.md): with
+    // DG_FP4_FUSE_FE=1 and the frontend tensors passed by the caller, the kernel computes
+    // router logits / top-k / softmax / activation quantisation for its own rows at
+    // kernel start (math warps, hand-off through the frontend workspace) and the FE
+    // launch is skipped. Tiny M only (<= DG_FP4_FUSE_FE_MAX_M global tokens, default
+    // 16, and <= num_sms local rows); MXFP4 (fp8 e4m3 + per-K128 SF) and QoQ (int8 +
+    // per-row scale) exactly like the standalone FE. Default 0: H20 2026-09-11 A/B
+    // (CUDA-event E2E, FE+Mega graph vs fused-only graph, GPU0 median, n=100) is a loss
+    // at every M -- MXFP4 M2 +4.8, M8 +4.8, M16 +4.8; QoQ M2 +5.0, M8 +6.4, M16 +4.9 us
+    // (best variant: bulk-copy loads, __noinline__ crew). The in-kernel crew reaches the
+    // top-k only ~11-15 us after kernel entry (load issue 2-5 us, top-k 2.5-5.5 us on 8
+    // warps vs 96 dedicated FE CTAs) while the standalone FE + gap costs the graph ~9-10 us
+    // and overlaps the Mega prologue; inlined, the crew also degraded the RF K-loop codegen
+    // (+3.6 us L1 phase). Outputs are bit-identical to FE + Mega (see the design note).
+    const bool fuse_fe_requested = fe_hidden.has_value() && get_env<int>("DG_FP4_FUSE_FE", 0) != 0;
+    const bool fuse_fe = fuse_fe_requested && (mxfp4 || qoq) && plan.use_interleaved_scheduler &&
+        !tinym && num_global_tokens_upper <= get_env<int>("DG_FP4_FUSE_FE_MAX_M", 16) && num_tokens <= num_sms;
+    DG_HOST_ASSERT(!fuse_fe_requested || fuse_fe);   // caller asked for the fused FE: refuse silently falling back
+    if (fuse_fe) {
+        DG_HOST_ASSERT(fe_router_weight.has_value() && fe_workspace.has_value());
+        DG_HOST_ASSERT(fe_hidden->scalar_type() == torch::kBFloat16 && fe_hidden->is_contiguous() &&
+                       fe_hidden->dim() == 2 && fe_hidden->size(0) == num_tokens && fe_hidden->size(1) == hidden);
+        DG_HOST_ASSERT(fe_router_weight->scalar_type() == torch::kBFloat16 && fe_router_weight->is_contiguous() &&
+                       fe_router_weight->dim() == 2 && fe_router_weight->size(0) == num_experts &&
+                       fe_router_weight->size(1) == hidden);
+        DG_HOST_ASSERT(num_topk == 8 && num_experts % 16 == 0 && num_experts <= 512 && hidden % 1024 == 0);
+        DG_HOST_ASSERT(fe_workspace->nbytes() >= static_cast<size_t>(256 + 4 * 64 * num_experts * 4));
+        DG_HOST_ASSERT(fe_hidden->device() == y.device() && fe_router_weight->device() == y.device() &&
+                       fe_workspace->device() == y.device());
+    }
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n * l1_task_tiles;
     constexpr int kL1ScaleGranK = 128;
     // L2 activation scale granularity (kernel kL2ActsSFGranK): per 64 on the BM128/BN128
@@ -753,7 +808,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         // int32 set (one promote by the per-token activation scale at task end)
         // instead of a per-K128 promote (which forced an accumulator readout /
         // tensor-pipe drain per block). 0 = the per-block promote path.
-        .qoq_inline_s2 = qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0,
+        .qoq_inline_s2 = qoq_inline_s2,
         // DG_FP4_QIS2_FRAGS (2|3|4, default 2): A-fragment register buffers of the
         // inline s2 loop (wait_group lag = frags - 1); 3/4 cost +32/+64 regs.
         .qoq_inline_s2_frags = std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4),
@@ -819,6 +874,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         .split_k_l2_all = split_k_l2_all && !tinym && !stream_k && !fuse_l1l2,
         .l1_task_tiles = l1_task_tiles,
         .l2_task_tiles = l2_task_tiles,
+        .fuse_fe = fuse_fe,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -837,6 +893,11 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l2_global_scales = l2_global_scales_ptr,
         .phase_stamps = phase_stamps.has_value() ?
             reinterpret_cast<unsigned long long*>(phase_stamps->data_ptr()) : nullptr,
+        .fe_hidden = fuse_fe ? fe_hidden->data_ptr() : nullptr,
+        .fe_router_weight = fuse_fe ? fe_router_weight->data_ptr() : nullptr,
+        .fe_workspace = fuse_fe ? fe_workspace->data_ptr() : nullptr,
+        // DG_FE_SELECT_IN_MEGA=1: Fable cc frontend compact key array ([token][384] u32)
+        .fe_keys = fe_keys.has_value() ? reinterpret_cast<const uint32_t*>(fe_keys->data_ptr()) : nullptr,
         // DG_FE_PDL=1: programmatic dependent launch on the Fable frontend (the
         // kernel executes griddepcontrol.wait before touching frontend outputs).
         .launch_args = LaunchArgs(
@@ -858,14 +919,15 @@ static void sm90_fp4_h20_fused_mega_moe(
         (push_done_flags ? "_pdf" : "") +
         (strided_pool_debug ? "_stridedbg" : "") +
         (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "") +
-        ((qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0) ? "_qis2" : "") +
+        (qoq_inline_s2 ? "_qis2" : "") +
         ((qoq && std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4) != 2) ?
             fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0) ? "_rawu8" : "") +
         (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "") +
-        (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "");
+        (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "") +
+        (fuse_fe ? "_fefuse" : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

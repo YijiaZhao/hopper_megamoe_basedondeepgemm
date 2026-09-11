@@ -266,18 +266,49 @@ the customer comparison column (targets M2 < 53, M8 < 61, M16 < 85: all met).
 
 | Precision | M | FE Fused | E2E Fused (FE + Mega) | Mega-only Fused |
 |---|---:|---:|---:|---:|
-| MXFP4 | 2  | 8.3 (13.9 legacy) | 74.5–96.8   | **42.9** |
+| MXFP4 | 2 | 4.1 (7.8 swapab, 8.3 wmma, 13.9 legacy) | 68.4–119.4 | **42.9** |
 | MXFP4 | 4  | 8.3 (13.8 legacy) | 81.5–88.3   | **~49** |
-| MXFP4 | 8  | 8.3 (13.9 legacy) | 75.5–89.2   | **56.4–59.1** |
-| MXFP4 | 16 | 8.7 (14.0 legacy) | 108.5–117.0 | **74.0–82.6** |
-| QOQ   | 2  | 8.7 (14.5 legacy) | 73.5–94.3   | **44.1** |
+| MXFP4 | 8 | 4.2 (7.6 swapab, 8.3 wmma, 13.9 legacy) | 83.6–95.9 | **56.4–59.1** |
+| MXFP4 | 16 | 4.1 (8.0 swapab, 8.7 wmma, 14.0 legacy) | 95.8–113.5 | **74.0–82.6** |
+| QOQ | 2 | 4.0 (7.6 swapab, 8.7 wmma, 14.5 legacy) | 66.9–116.2 | **44.1** |
 | QOQ   | 4  | 8.5 (14.6 legacy) | 84.9–87.1   | **48.0** |
-| QOQ   | 8  | 8.6 (14.8 legacy) | 80.2–90.3   | **54.9–59.3** |
-| QOQ   | 16 | 8.7 (14.9 legacy) | 94.9–109.3  | **74.0–77.4** |
+| QOQ | 8 | 4.1 (7.7 swapab, 8.6 wmma, 14.8 legacy) | 77.5–169.3 | **54.9–59.3** |
+| QOQ | 16 | 3.9 (7.9 swapab, 8.7 wmma, 14.9 legacy) | 90.6–97.2 | **74.0–77.4** |
 
-FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16;
-kernel time 6.9 us, nsys span 8.3–8.7 us); the legacy frontend value is in
-parentheses.  E2E ranges span captures with different host launch skew.
+FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16). Library default
+`DG_FE_TINYM_MMA=auto`: rows <= 2 per rank (every customer point: M2/M8 = 1 row, M16 = 2 rows) run
+the round-3 CUDA-core K-split router (`cc`, SM-count grid, compact 384-key array, kernel-end
+stamps 3.84 us); rows > 2 run the swapped-operand MMA router + fragment weight layout (`swapab`,
+96 grid). In the PIPELINE (FE immediately followed by the fused Mega: `tests/profile_four_api_h20.py`
+E2E scope, `tests/bench_frontend_tinym.py` FE+Mega) the FE additionally runs with
+`DG_FE_SELECT_IN_MEGA=1`: the router CTAs end after storing their 384 keys per token and the fused
+Mega prologue does the top-8 + softmax. Customer method (nsys `router_quant_topk_kernel` span, GPU 0,
+1830 MHz, medians of 3 captures, `/raid/kimi/results/merge/cap_land`): FE 4.1 / 4.2 / 4.1 us MXFP4 and
+4.0 / 4.1 / 3.9 us QOQ at M2 / M8 / M16, against 7.4-8.0 us for the swapab default captured the same
+day (`cap_swapab`), i.e. -3.6..-3.9 us per FE launch; round-4 in-graph CUDA-event timing of the FE
+alone gives 3.1-3.3 us (6.4 us without select-in-Mega; 3.6-3.8 us standalone back-to-back) and
+FE+Mega gains ~2-3 us in every M x quant cell (E2E medians here: MXFP4 85.4 / 84.9 / 98.5, QOQ
+94.1 / 85.1 / 93.5 us, within the host-skew spread of the swapab captures 85.1 / 85.5 / 96.4 and
+76.2 / 108.5 / 98.6)
+(`tests/test_select_in_mega.py`: 8 ranks, 50 seeds, 0 top-8 mismatches, y bit-identical). The
+library default of `select_in_mega` stays 0 so standalone FE calls still produce
+`topk_idx`/`topk_weights`. M2/M8/M16 FE values above are those medians (the value in parentheses: swapab default, same-day
+captures); the wmma
+value in parentheses is the previous default (96 x 4 WMMA, nsys span 8.3-8.7 us), the legacy value
+the pre-tiny-M kernel. Round-4 finding: `DG_FE_ROUTER_L2_PERSIST=1` does not keep the router weights
+resident across the Mega weight stream (no in-graph gain; the stamps-only win was a cold/warm-L2
+artefact). E2E ranges span captures with different host launch skew.
+
+QoQ correctness note (2026-09-11): `tests/test_four_api_correctness.py --frontend fe --tokens 32`
+(real routing, 256 global tokens) failed for `qoq_mega_moe_fused` only (cos_min 0.0007, mxfp4 fine).
+Root cause is NOT the frontend: the QoQ inline-s2 L1 path (`DG_FP4_QOQ_INLINE_S2`, default 1) gives
+wrong partials for the rows of an expert's SECOND BM8 pool block (exactly rows - 8 bad (token, slot)
+pairs per expert with > 8 rows, per SLOT_CHECK), and it reproduces without any frontend (default
+balanced routing qoq T=64 / T=128: cos_min < 0). `DG_FP4_QOQ_INLINE_S2=0` passes; STREAMK / SPLITK_L1 /
+LEAN_ROUTING / FINE_COMBINE / COMBINE_DYNAMIC = 0 all still fail. The host now enables inline s2 only
+when `num_tokens x num_ranks <= 8` (no local expert can receive a second pool block: all customer
+M <= 8 launches keep it; M16 and larger run the per-K128 promote path). The kernel-side defect in the
+inline-s2 second-block promote is still open.
 
 M2/M4 values are medians over five independent captures (branch tip with
 `DG_FP4_STREAMK` default on); M8/M16 are the range over the r4/r5 captures
@@ -338,12 +369,20 @@ has an env override documented in `csrc/jit_kernels/impls/sm90_fp4_mega_moe_h20_
 | stream-K for M <= 4 (units spread over all 78 SMs) | `DG_FP4_STREAMK` (`_MAX_M`) | MXFP4 M2 49.7 -> 42.9 |
 | Wide L1 tasks (BN=512, 1 K-block/stage, 3-way tail split) for M >= 16 | `DG_FP4_L1_BN` (`DG_FP4_BN512_MIN_M`) | M16 Mega-only 5-capture medians MXFP4 84.1 -> 82.6, QoQ 80.4 -> 77.4 |
 | Tiny-M Fable frontend (3 smem stages -> 3 CTAs/SM single wave; 256-thread partial fetch; warp-0 32-bit-key top-8) | `DG_FE_TINYM` | FE 13.8–14.9 -> 8.3–8.7 us (nsys span), bit-identical outputs |
+| FE swapped-operand router MMA: experts on the MMA M dimension (mma.sync m16n8k16 bf16, tokens pad to 8), weight A fragments ld.global.nc straight into registers (whole K-part in flight, no smem ring / TMA), activations staged once in smem; router weights permuted ONCE into A-fragment order so one warp load = one contiguous 512 B = 4 full lines (`deep_gemm.fable_router_weight_fragment_layout`, cached per weight tensor or pass `wlayout='pre'`) | `DG_FE_TINYM_MMA=auto` (default) = `swapab` on the 96 grid for rows > 2 (rows <= 2: cc row below; `wmma` = legacy), `DG_FE_ROUTER_WLAYOUT=fragment` (default) `|row|pre` (the permuted layout is applied only where the legacy-96 tiny-M swapab kernel reads it: m <= 16, top-8, h 3072; tinym=0 / m > 16 / full-K launches get row-major weights) | ON by default: customer method (nsys `router_quant_topk_kernel` span, 1830 MHz, M=8 = 1 row/rank, mxfp4/qoq) swapab+fragment 7.68/7.52 us vs wmma 8.00/8.74 (same session A/B); H20-3e kernel end (stamps, rows 1/2 x mxfp4/qoq) 96x4 wmma 6.91 -> swapab row 6.66 -> swapab+fragment 6.14 us (-0.77); 78 full-K swapab 6.40-6.91 (vs 7.94-8.45 full-K wmma); NCU 96/rows 1: L2 read requests 49.1k -> 37.7k (-23%) -> 19.0k (-61%), read sectors 113k -> 77k (-32%), LSU inst 89k -> 29k; top-8 sets identical on 54k rows for both swapab row and fragment (0 mismatches, 0 weight flips), 8-rank cos_min unchanged; standalone CUDA-event FE (~19.4-20.9 us) is CPU-launch-bound and shows no signal |
+| FE SM-count grid: full-K router CTAs (H20 77 x 5 experts, TMA row pieces + WMMA or CUDA-core FMA), 32-bit-key slots as flags, one streaming-merge CTA, quant on router CTAs, K-parts 1/2/4 | `DG_FE_TINYM_GRID=96|auto|N`, `DG_FE_TINYM_MMA=wmma|fma`, `DG_FE_TINYM_KPARTS`, `DG_FE_FULLK_1PERSM` | kept OFF (default 96): kernel end 96x4 6.9 us vs 78 full-K wmma 7.4–7.9 / fma 7.4–7.7, 78x2 wmma 8.2 / fma 9.7, 97x4 wmma 9.2; nsys FE span 8.66 (96) vs 8.77–9.15 (auto) us; top-8 sets identical on 27k rows |
+| FE CUDA-core K-split router (full-K grid, m <= 2): CTA = 5 experts x 4 warps (640 threads), one warp = one expert x one quarter of K, all weight chunks `ld.global.nc` straight into registers as the first instructions; last-arriving router CTA (`atom.acq_rel.gpu` ticket) reads the 616 key slots and does top-8 + softmax (no polling merger CTA); the spare CTA quantises the rows | `DG_FE_TINYM_GRID=auto DG_FE_TINYM_MMA=cc` (`cc6` = 6 warps/expert; `DG_FE_CC_MERGE=ticket|poll`, `DG_FE_CC_SELECT=insert|redux`) | kept OFF pending the customer bench: H20-3e kernel end (stamps, rows 1/2 x mxfp4/qoq) 96x4 wmma 6.91/7.17/6.66/6.91 -> cc 3.84 in all four cells (-2.8..-3.3 us; defaults: relaxed atomic ticket, compact 384-key array, router weights in the persisting L2 set-aside; steps: slots cold 4.61-4.86 -> persist 4.35-4.61 -> compact keys 3.84); chain rows 1: logits 1.79, ticket 2.82, keys read 3.07, select 3.58, written 3.84; `ccfp8` (e4m3 weights) 4.35 us and 18% top-8 set flips = rejected; microkernel (`csrc/router_cc_bench.cu`) all 384 logits at 2.05 us, the SM's outstanding-request capacity bounds the 2.36 MB stream (TMA bulk variants 2.75-3.4 us, slower); top-8 sets identical on 4200 row-evaluations (2 bf16 flips), x/x_sf bit-identical; 8-rank fused correctness cos_min 0.99999 (mxfp4) / 0.99993 (qoq); ROUND 4 (docs/fe_cc_round4.md): the 3.84 holds only for back-to-back launches (10 fresh processes x 100 launches: 3.58-3.84 median, all 4 cells); any ms-scale host gap between launches -> 5.4-5.9 (straggling weight loads + relaxed-ticket wait), inside the FE+Mega graph 6.4; NCU key table in h20_fused_official/ncu/ncu_fe_cc (issue 23 %, occupancy 31 %, top stall no_instruction, L2 persist not keeping the matrix resident); `DG_FE_SELECT_IN_MEGA=1` (FE ends after the keys, Mega prologue selects, topk bit-identical): FE kernel 2.05-2.30 standalone / 3.3 in-graph, FE+Mega graph -1..-4 us in all 6 cells (knob, default 0) |
+| Split-K tail tasks of a wave-scheduled launch use the split-K (not the stream-K) reduction slots | – (fix) | real, unbalanced routing at M <= 8 with >= 8 active local experts: cos_min 0.67 -> 0.99999 (`tests/test_four_api_correctness.py --frontend fe`) |
+| QoQ inline s2 gated to launches with <= 8 possible rows per local expert (`num_tokens x num_ranks <= 8`) | `DG_FP4_QOQ_INLINE_S2` (default 1, now host-gated) | fix: with > 8 rows on one expert (two BM8 pool blocks) the inline-s2 L1 path returns wrong partials for the second block's rows; found by `--frontend fe` T=32 (qoq cos_min 0.0007), reproduced with default routing T=64/128 (cos_min < 0), `DG_FP4_QOQ_INLINE_S2=0` passes; no perf change at M <= 8 (1 row/rank), M16 loses the inline promote |
+| FE select-in-Mega: the cc router stops after its 384 keys per token, the fused Mega prologue selects top-8 + softmax (`deep_gemm/impls/fable_cc_select.cuh`) | `DG_FE_SELECT_IN_MEGA` (library default 0; pipeline drivers default 1 for the fused backend) | ON in the pipeline: FE ~3.1-3.3 us in-graph (6.4 without), FE+Mega -1.1..-4.2 us in all 6 cells; 8-rank 50 seeds 0 mismatches, y bit-identical; round-4 fixes: key-array view offset, `ld.global.cg` for prologue-written topk |
 
 Measured and kept off (documented negative results): 4 K-blocks per stage,
 per-M knob sweep, tiny-M CUDA-core GEMV path (`DG_FP4_TINYM`), whole-expert L2
 weight prefetch (`DG_FP4_L2_PREFETCH_ALL`), two-layer L1/L2 fusion
 (`DG_FP4_FUSE_L1L2`), dynamic combine claim (`DG_FP4_COMBINE_DYNAMIC`), L2
-tail split-K, all-task L1/L2 split-K at M16, wide L2 tasks (BN=512), third math warpgroup (`DG_FP4_MATH_WGS=3`), deterministic push slots (`DG_FP4_PUSH_DET_SLOTS`), FE router-weight L2 persistence and FE->Mega PDL, raw-u8 deferred affine dequant.
+tail split-K, all-task L1/L2 split-K at M16, wide L2 tasks (BN=512), third math warpgroup (`DG_FP4_MATH_WGS=3`), deterministic push slots (`DG_FP4_PUSH_DET_SLOTS`), FE router-weight L2 persistence and FE->Mega PDL, raw-u8 deferred affine dequant, FE SM-count router grid (`DG_FE_TINYM_GRID=auto`: 78 full-K CTAs, also 78x2 / 97x4 K-parts, WMMA and CUDA-core FMA, 2 CTAs/SM grids 117/156 -- every variant is bounded by the ~2.5 us it takes one SM to get ~36 KB of router weights in flight after the L2 flush, so the balanced 31 KB/SM grid loses to the legacy 26 KB/SM + 19 doubled SMs; stamp tables in `scripts/run_fe78*.sh` outputs),
+Fable frontend fused into the MegaMoE kernel (`DG_FP4_FUSE_FE`, docs/fe_into_mega_design.md: bit-identical outputs, E2E +4.8..+7.6 us at M=2/8/16),
+round-2 CUDA-core FE router (slot keys) as the default (kernel-end stamps 6.91 -> 4.35 us, but nsys kernel span 8.9-9.7 vs 7.5-7.7 us swapab under the customer method; superseded by round 3 = compact keys, which is the default for rows <= 2).
 
 ## Relevant source files
 
