@@ -449,14 +449,14 @@ static void sm90_fp4_h20_fused_mega_moe(
     // all-split L2 additionally doubles the L2 tail. Numerics identical (T=2/8/8/16 both
     // quants, mxfp4 128/512: same cos_min digits as knob off).
     const bool m16_rows = num_tokens == 2 && num_ranks == 8;
-    // QoQ inline s2 (kernel `kQoQInlineS2`, DG_FP4_QOQ_INLINE_S2 default 1) is gated to launches
-    // where no local expert can receive more than one BM8 pool block: with > 8 rows on one expert
-    // the inline-s2 L1 path produces wrong partials for the rows of the second block (8-rank
-    // tests/test_four_api_correctness.py qoq: --frontend fe T=32 cos_min 0.0007, default routing
-    // T=64 / 128 cos_min < 0; DG_FP4_QOQ_INLINE_S2=0 passes, every other knob fails; 2026-09-11).
-    // Max rows per expert = num_tokens x num_ranks (all routes of every token on one expert).
+    // QoQ inline s2 (kernel `kQoQInlineS2`, DG_FP4_QOQ_INLINE_S2 default 1) on every QoQ swapAB
+    // launch. The 2026-09-11 T=32 / T=64 failures (rows 8.. of a BM16 / BM24 block with > 8 valid
+    // rows got token group 0's sums) were a `promote_task_rf` accumulator index (kernel, fixed);
+    // the interim host gate (num_tokens x num_ranks <= 8) is kept as a knob: DG_FP4_QIS2_MAX_GTOK
+    // bounds num_tokens x num_ranks (0 = no bound, default).
+    const int qis2_max_gtok = get_env<int>("DG_FP4_QIS2_MAX_GTOK", 0);
     const bool qoq_inline_s2 = qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0 &&
-        num_tokens * num_ranks <= 8;
+        (qis2_max_gtok <= 0 || num_tokens * num_ranks <= qis2_max_gtok);
     // (Not with wide tasks: all-task splits measured +3.7..+7.3 us at M=16; wide L1 uses
     // a 3-way TAIL split instead, see the kernel.)
     const bool split_k_l1_all = split_k_l1 && m16_rows && !wide_tiles &&

@@ -113,6 +113,11 @@ def _run(api, args, rank, group):
     assert args.topk == world
     token_ids = rank * args.tokens + torch.arange(args.tokens, device="cuda")
     offsets = (token_ids[:, None] * args.topk + slots[None, :] * 7) % local_experts
+    # --hot-rows N: the first N global tokens (all on rank 0 when N <= tokens) send every
+    # route to local expert 0, so local expert 0 of every rank receives N rows from ONE
+    # source rank (N > 8 = a second BM8 pool block at tiny M).
+    if args.hot_rows > 0:
+        offsets = torch.where(token_ids[:, None] < args.hot_rows, torch.zeros_like(offsets), offsets)
     topk_idx = slots[None, :] * local_experts + offsets
     topk_weights = torch.full(
         (args.tokens, args.topk), 1.0 / args.topk,
@@ -251,7 +256,7 @@ def _run(api, args, rank, group):
         dist.all_reduce(routes, op=dist.ReduceOp.SUM, group=group)
         ref_all = routes.sum(dim=1).to(torch.bfloat16).float()
         ref = ref_all[rank * args.tokens:(rank + 1) * args.tokens]
-        if use_fe and is_fused:
+        if (use_fe or args.slot_check) and is_fused:
             # Per-(token, slot) kernel partials (the scattered L2 outputs the combine sums) vs the
             # reference route: pinpoints a wrong slot (expert / destination rank) on this rank.
             part = buffer.combine_partials[:, :args.tokens].float()          # [slot, token, hidden]
@@ -265,8 +270,18 @@ def _run(api, args, rank, group):
                     if c < 0.999:
                         # rows the destination expert received (global token ids), incl. this one
                         sharers = (idx_all == e_idx).nonzero()[:, 0].tolist()
+                        # Best match among the routes of the tokens sharing this expert (a
+                        # permuted token mapping shows as cos ~ 1 against another row).
+                        best = ""
+                        if args.slot_check:
+                            hits = (idx_all == e_idx).nonzero().tolist()
+                            cands = [(torch.nn.functional.cosine_similarity(k, routes[tt, ss], dim=0).item(), tt)
+                                     for tt, ss in hits if routes[tt, ss].abs().max() > 0]
+                            if cands:
+                                bc, bt = max(cands)
+                                best = f":best=t{bt}({bc:.4f})"
                         bad.append(f"t{t}s{slot}:e{e_idx}@r{e_idx // local_experts}:cos={c:.4f}:w={float(topk_weights[t, slot]):.4f}"
-                                   f":|ref|={r.abs().max().item():.3g}:|ker|={k.abs().max().item():.3g}:rows={sharers}")
+                                   f":|ref|={r.abs().max().item():.3g}:|ker|={k.abs().max().item():.3g}{best}:rows={sharers}")
             n_active = int(torch.unique(idx_all[(idx_all // local_experts) == rank]).numel())
             multi = int((torch.bincount(idx_all.flatten().clamp_min(0), minlength=args.experts)[rank * local_experts:(rank + 1) * local_experts] > 1).sum())
             bad.insert(0, f"[local active experts={n_active}, with >1 rows={multi}]")
@@ -313,6 +328,10 @@ def main():
     parser.add_argument("--cosine-min", type=float, default=0.99)
     parser.add_argument("--norm-ratio-min", type=float, default=0.97)
     parser.add_argument("--norm-ratio-max", type=float, default=1.03)
+    parser.add_argument("--hot-rows", type=int, default=0,
+                        help="route every slot of the first N global tokens to local expert 0 (N > 8: a second BM8 pool block)")
+    parser.add_argument("--slot-check", action="store_true",
+                        help="fused APIs: per-(token, slot) partial check (SLOT_CHECK) also without --frontend, with best-match row")
     parser.add_argument("--frontend", choices=("none", "fe", "fused"), default="none",
                         help="fused APIs: route/quantise with the Fable frontend (fe), and also run the fused-FE kernel and require bit-identical outputs (fused)")
     args = parser.parse_args()

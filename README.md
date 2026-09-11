@@ -300,15 +300,22 @@ resident across the Mega weight stream (no in-graph gain; the stamps-only win wa
 artefact). E2E ranges span captures with different host launch skew.
 
 QoQ correctness note (2026-09-11): `tests/test_four_api_correctness.py --frontend fe --tokens 32`
-(real routing, 256 global tokens) failed for `qoq_mega_moe_fused` only (cos_min 0.0007, mxfp4 fine).
-Root cause is NOT the frontend: the QoQ inline-s2 L1 path (`DG_FP4_QOQ_INLINE_S2`, default 1) gives
-wrong partials for the rows of an expert's SECOND BM8 pool block (exactly rows - 8 bad (token, slot)
-pairs per expert with > 8 rows, per SLOT_CHECK), and it reproduces without any frontend (default
-balanced routing qoq T=64 / T=128: cos_min < 0). `DG_FP4_QOQ_INLINE_S2=0` passes; STREAMK / SPLITK_L1 /
-LEAN_ROUTING / FINE_COMBINE / COMBINE_DYNAMIC = 0 all still fail. The host now enables inline s2 only
-when `num_tokens x num_ranks <= 8` (no local expert can receive a second pool block: all customer
-M <= 8 launches keep it; M16 and larger run the per-K128 promote path). The kernel-side defect in the
-inline-s2 second-block promote is still open.
+(real routing, 256 global tokens) failed for `qoq_mega_moe_fused` only (cos_min 0.0007, mxfp4 fine),
+and so did the default balanced routing at qoq T=32 / T=64 (cos_min < 0). Root cause (fixed on this
+branch): `promote_task_rf` of the QoQ inline-s2 RF loop (`kInlineS2`, `DG_FP4_QOQ_INLINE_S2`) read
+accumulator `acc[..][j]` instead of `acc[..][i * 4 + j]`, so every token group `i > 0` of the RS
+wgmma N dimension (tokens 8.. of a BM16 / BM24 block with > 8 valid rows, i.e. the T=32 / T=64 tiers;
+BM8 tiers have a single group and were bit-exact) was promoted with token group 0's int32 sums under
+its own activation scale. Localised with `--slot-check --hot-rows 12` at T=32: tokens 8..11 of the
+hot expert matched the reference rows 0..3 (cos 0.9999) instead of their own. The interim host
+gate (inline s2 only when `num_tokens x num_ranks <= 8`) is lifted; `DG_FP4_QIS2_MAX_GTOK` (default
+0 = no bound) keeps it as a knob. Gates after the fix (8-rank, this branch): qoq T=2/8/8/16/32/64
+cos_min 0.99993/0.99993/0.99993/0.99993/0.99993/0.99993 (T=128 is not a QoQ tier: host assert
+`!qoq || plan.swap_ab`), `--frontend fe --tokens 32` qoq 0.99992 with a clean SLOT_CHECK, mxfp4
+T=8/128/512 0.99997/0.99995/0.99990 (unchanged), 200-replay FE+Mega graph at M=16 qoq clean.
+QoQ M16 with inline s2 back on (probe, rank 0): L1 phase 47.6 -> 43.3 us, L1 stage head-to-head
+1424 -> 1265 ns; customer method (mega fused qoq M16, GPU0 median of last 3 spans): 77.2 us with the
+gate vs 74.9 / 75.3 / 79.3 us over three captures with it lifted.
 
 M2/M4 values are medians over five independent captures (branch tip with
 `DG_FP4_STREAMK` default on); M8/M16 are the range over the r4/r5 captures
