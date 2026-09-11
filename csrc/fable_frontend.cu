@@ -783,6 +783,7 @@ __device__ __forceinline__ void router_role_fullk_fma(
 constexpr int kCCSlots = 5;
 constexpr int kMergerDeferBit = 16;      // w_hint flag: merger defers the top-8 merge to one pass (DG_FE_MERGER_DEFER)
 constexpr int kTicketMergeBit = 32;      // w_hint flag (cc): no polling merger; the LAST router CTA (atomic ticket) merges (DG_FE_CC_MERGE=ticket)
+constexpr int kSelectReduxBit = 64;      // w_hint flag (cc ticket): top-8 by 8 redux rounds over register keys instead of insertion + merge8 (DG_FE_CC_SELECT=redux)
 constexpr int kMergerFlagsMask = 15;     // w_hint bits below the merger flags
 constexpr int kCCMaxM = 2;
 constexpr int kCCH = 3072;
@@ -1112,7 +1113,7 @@ __device__ __forceinline__ void topk_finish(uint32_t run, int lane, int t, int64
 template <int kTopK, int kSlotsPerLane>
 __device__ __forceinline__ void last_arriver_topk(
         uint32_t* __restrict__ cand, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
-        unsigned long long* mstamps, int m, int groups, int cand_slots) {
+        unsigned long long* mstamps, int m, int groups, int cand_slots, bool redux_sel) {
     constexpr int kVecPerLane = kSlotsPerLane / 4;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nslots = groups * cand_slots;
@@ -1130,17 +1131,30 @@ __device__ __forceinline__ void last_arriver_topk(
     #pragma unroll
     for (int i = 0; i < kVecPerLane; ++i) { kv[4 * i] = q[i].x; kv[4 * i + 1] = q[i].y; kv[4 * i + 2] = q[i].z; kv[4 * i + 3] = q[i].w; }
     uint32_t run = 0u;
-    #pragma unroll
-    for (int k = 0; k < kTopK; ++k) {
-        uint32_t mx = 0u;
+    if (redux_sel) {
         #pragma unroll
-        for (int i = 0; i < kSlotsPerLane; ++i) mx = max(mx, kv[i]);
-        const uint32_t best = warp_max_u32_redux(mx);
-        if (lane == k) run = best;
-        if (mx == best) {
+        for (int k = 0; k < kTopK; ++k) {
+            uint32_t mx = 0u;
             #pragma unroll
-            for (int i = 0; i < kSlotsPerLane; ++i) kv[i] = kv[i] == best ? 0u : kv[i];
+            for (int i = 0; i < kSlotsPerLane; ++i) mx = max(mx, kv[i]);
+            const uint32_t best = warp_max_u32_redux(mx);
+            if (lane == k) run = best;
+            if (mx == best) {
+                #pragma unroll
+                for (int i = 0; i < kSlotsPerLane; ++i) kv[i] = kv[i] == best ? 0u : kv[i];
+            }
         }
+    } else {                                   // per-lane sorted top-8 (insertion) + one 8-round merge
+        uint32_t loc[kTopK];
+        #pragma unroll
+        for (int j = 0; j < kTopK; ++j) loc[j] = 0u;
+        #pragma unroll
+        for (int i = 0; i < kSlotsPerLane; ++i) {
+            uint32_t k = kv[i];
+            #pragma unroll
+            for (int j = 0; j < kTopK; ++j) { const uint32_t lo = min(k, loc[j]); loc[j] = max(k, loc[j]); k = lo; }
+        }
+        merge8<kTopK>(run, loc, lane);
     }
     if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
     topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
@@ -1287,9 +1301,9 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
                         unsigned long long* mstamps = stamps != nullptr ? stamps + static_cast<size_t>(num_router_ctas) * kStampSlots : nullptr;
                         if (mstamps != nullptr && threadIdx.x == 0) mstamps[1] = globaltimer_ns();
                         if (groups * cand_slots <= 20 * 32)
-                            last_arriver_topk<kMaxTopK, 20>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots);
+                            last_arriver_topk<kMaxTopK, 20>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots, (w_hint & kSelectReduxBit) != 0);
                         else
-                            last_arriver_topk<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots);
+                            last_arriver_topk<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots, (w_hint & kSelectReduxBit) != 0);
                         if (threadIdx.x == 0) *ticket = 0;
                     }
                     if (pdl_mode == 2) pdl_trigger();
@@ -1477,6 +1491,8 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         // ticket 4.86-5.12 (fence + atomic 0.3-0.5 after the last keys, read 0.25, fold + merge 0.5, softmax + write 0.25).
         static const bool ticket_merge = getenv("DG_FE_CC_MERGE") ? strcmp(getenv("DG_FE_CC_MERGE"), "ticket") == 0 : true;
         if (kCC > 0 && ticket_merge) w_hint |= kTicketMergeBit;
+        static const bool redux_sel = getenv("DG_FE_CC_SELECT") && strcmp(getenv("DG_FE_CC_SELECT"), "redux") == 0;
+        if (kCC > 0 && redux_sel) w_hint |= kSelectReduxBit;
     }
     cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);
