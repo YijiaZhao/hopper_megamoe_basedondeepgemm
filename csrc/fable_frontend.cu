@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <algorithm>
 
 namespace {
@@ -781,6 +782,7 @@ __device__ __forceinline__ void router_role_fullk_fma(
 // cand[token][group][8] (sentinel 1 for slots >= n_exp), the merger polls the slots.
 constexpr int kCCSlots = 5;
 constexpr int kMergerDeferBit = 16;      // w_hint flag: merger defers the top-8 merge to one pass (DG_FE_MERGER_DEFER)
+constexpr int kTicketMergeBit = 32;      // w_hint flag (cc): no polling merger; the LAST router CTA (atomic ticket) merges (DG_FE_CC_MERGE=ticket)
 constexpr int kMergerFlagsMask = 15;     // w_hint bits below the merger flags
 constexpr int kCCMaxM = 2;
 constexpr int kCCH = 3072;
@@ -1084,6 +1086,63 @@ __device__ __forceinline__ void merge8(uint32_t& run, uint32_t (&loc)[kTopK], in
     }
     run = lane < kTopK ? out : 0u;
 }
+// softmax over the 8 selected bf16 logits (lanes 0..7 of run), legacy order (k = 0..7 sequential sum)
+template <int kTopK>
+__device__ __forceinline__ void topk_finish(uint32_t run, int lane, int t, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights) {
+    const float sel_v = lane < kTopK ? topk_key_value(run) : -INFINITY;
+    const float mx = warp_max(sel_v);
+    const float ex = lane < kTopK ? expf(sel_v - mx) : 0.0f;
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < kTopK; ++k) sum += __shfl_sync(0xffffffffu, ex, k);
+    if (lane < kTopK) {
+        topk_idx[static_cast<int64_t>(t) * kTopK + lane] = topk_key_index(run);
+        topk_weights[static_cast<int64_t>(t) * kTopK + lane] = ex / sum;
+    }
+}
+// Last-arriver merge (cc, DG_FE_CC_MERGE=ticket): called by the router CTA whose ticket was the
+// last (every CTA: keys stored -> __threadfence -> atomicAdd). Warp t < m: read token t's 616
+// slots (5 x 16 B per lane, L2-hot), per-lane sorted top-8, one 8-round merge, softmax, write.
+// Stamps go to the merger CTA's slots (1 ticket won / 2 keys read / 3 merge done / 4 written).
+template <int kTopK, int kSlotsPerLane>
+__device__ __forceinline__ void last_arriver_topk(
+        uint32_t* __restrict__ cand, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
+        unsigned long long* mstamps, int m, int groups, int cand_slots) {
+    constexpr int kVecPerLane = kSlotsPerLane / 4;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nslots = groups * cand_slots;
+    if (warp >= m) return;
+    const int t = warp;
+    uint32_t* base = cand + static_cast<int64_t>(t) * nslots;
+    uint32_t loc[kTopK];
+    #pragma unroll
+    for (int j = 0; j < kTopK; ++j) loc[j] = 0u;
+    uint4 q[kVecPerLane];
+    #pragma unroll
+    for (int i = 0; i < kVecPerLane; ++i) {
+        q[i] = make_uint4(0u, 0u, 0u, 0u);
+        if (4 * (lane + 32 * i) < nslots) q[i] = __ldcg(reinterpret_cast<const uint4*>(base + 4 * (lane + 32 * i)));
+    }
+    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[2] = globaltimer_after(q[0].x);
+    #pragma unroll
+    for (int i = 0; i < kVecPerLane; ++i) {
+        const uint32_t kv[4] = {q[i].x, q[i].y, q[i].z, q[i].w};
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            uint32_t k = kv[u];
+            #pragma unroll
+            for (int j = 0; j < kTopK; ++j) { const uint32_t lo = min(k, loc[j]); loc[j] = max(k, loc[j]); k = lo; }
+        }
+    }
+    uint32_t run = 0u;
+    merge8<kTopK>(run, loc, lane);
+    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
+    topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
+    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[4] = globaltimer_ns();
+    #pragma unroll
+    for (int i = 0; i < kVecPerLane; ++i)      // slots back to 0 (the polling merger mode relies on it)
+        if (4 * (lane + 32 * i) < nslots) *reinterpret_cast<uint4*>(base + 4 * (lane + 32 * i)) = make_uint4(0u, 0u, 0u, 0u);
+}
 // defer (DG_FE_MERGER_DEFER, cc default 1): no per-batch merge; every lane keeps the sorted
 // top-8 of ALL keys it has seen (a lane's top-8 is a superset of its contribution to the
 // global top-8) and ONE 8-round merge runs after the last slot arrived. The router CTAs of the
@@ -1150,17 +1209,7 @@ __device__ __forceinline__ void merger_role(
         }
         if (defer) merge8<kTopK>(run, loc, lane);
         if (t == 0) stamp(stamps, 3);
-        // softmax over the 8 selected bf16 logits, legacy order (k = 0..7 sequential sum)
-        const float sel_v = lane < kTopK ? topk_key_value(run) : -INFINITY;
-        const float mx = warp_max(sel_v);
-        const float ex = lane < kTopK ? expf(sel_v - mx) : 0.0f;
-        float sum = 0.0f;
-        #pragma unroll
-        for (int k = 0; k < kTopK; ++k) sum += __shfl_sync(0xffffffffu, ex, k);
-        if (lane < kTopK) {
-            topk_idx[static_cast<int64_t>(t) * kTopK + lane] = topk_key_index(run);
-            topk_weights[static_cast<int64_t>(t) * kTopK + lane] = ex / sum;
-        }
+        topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
         if (t == 0) stamp(stamps, 4);
         // reset the slots for the next launch (every writer has been consumed)
         #pragma unroll
@@ -1193,6 +1242,12 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
         const int cand_slots = epc <= kCandSlots ? kCandSlots : kMaxCandSlots;
         if (static_cast<int>(blockIdx.x) >= num_router_ctas) {
             if constexpr (kCC > 0) {      // cc: the merger CTA's idle warps (8..) quantise the m rows while warps 0..7 poll
+                if (w_hint & kTicketMergeBit) {      // ticket mode: this CTA only quantises (the last router CTA merges)
+                    for (int t = 0; t < m; ++t) quant_role<kMode, cc_block(kCC)>(hidden, x_bytes, x_sf, t, h);
+                    stamp(stamps, 5);
+                    if (pdl_mode == 2) pdl_trigger();
+                    return;
+                }
                 if (threadIdx.x >= kThreads) {
                     constexpr int kQ = cc_block(kCC) - kThreads;
                     for (int t = 0; t < m; ++t) quant_role_range<kMode>(hidden, x_bytes, x_sf, t, h, threadIdx.x - kThreads, kQ, 1);
@@ -1211,6 +1266,26 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
         } else {
             if constexpr (kCC > 0) {
                 router_role_fullk_cc<kCC>(hidden, router_weight, cand, stamps, m, h, e, epc, groups, cand_slots);
+                if (w_hint & kTicketMergeBit) {
+                    __shared__ int s_last;
+                    __threadfence();
+                    __syncthreads();
+                    if (threadIdx.x == 0) s_last = atomicAdd(ticket, 1) == num_router_ctas - 1;
+                    __syncthreads();
+                    stamp(stamps, 3);
+                    if (s_last) {
+                        __threadfence();
+                        unsigned long long* mstamps = stamps != nullptr ? stamps + static_cast<size_t>(num_router_ctas) * kStampSlots : nullptr;
+                        if (mstamps != nullptr && threadIdx.x == 0) mstamps[1] = globaltimer_ns();
+                        if (groups * cand_slots <= 20 * 32)
+                            last_arriver_topk<kMaxTopK, 20>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots);
+                        else
+                            last_arriver_topk<kMaxTopK, kMaxSlotsPerLane>(cand, topk_idx, topk_weights, mstamps, m, groups, cand_slots);
+                        if (threadIdx.x == 0) *ticket = 0;
+                    }
+                    if (pdl_mode == 2) pdl_trigger();
+                    return;
+                }
             } else if constexpr (kSwapBlk > 0) {
                 router_role_fullk_swapab<kMode, kSwapBlk>(hidden, router_weight, cand, partials, flags, x_bytes, x_sf, stamps, m, h, e, epc, k_parts, groups, cand_slots, w_hint == 2 ? 1 : 0);
             } else if constexpr (kFma) {
@@ -1389,6 +1464,8 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
     if constexpr (kFullK) {
         static const int defer = getenv("DG_FE_MERGER_DEFER") ? atoi(getenv("DG_FE_MERGER_DEFER")) : (kCC > 0 ? 1 : 0);
         if (defer) w_hint |= kMergerDeferBit;
+        static const bool ticket_merge = getenv("DG_FE_CC_MERGE") && strcmp(getenv("DG_FE_CC_MERGE"), "ticket") == 0;
+        if (kCC > 0 && ticket_merge) w_hint |= kTicketMergeBit;
     }
     cudaLaunchKernelEx(&cfg, router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK, kFma, kSwapBlk, kCC>,
                        hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, router_ctas, w_hint, pdl_mode, epc, k_parts);

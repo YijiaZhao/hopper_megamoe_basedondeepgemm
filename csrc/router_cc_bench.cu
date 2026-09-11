@@ -147,7 +147,8 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     constexpr int kSlots = kWarps / kKS;                   // expert slots per CTA
     constexpr int kExpertsPerCTA = kSlots * kEPW;
     constexpr int kWBytesPerWarp = kEPW * kKPart * 2;      // smem for kLoad == 3
-    __shared__ __align__(128) uint8_t w_s[kLoad == 3 ? kWarps * kWBytesPerWarp : 16];
+    constexpr int kWBytesCTA = kExpertsPerCTA * kH * 2;     // smem for kLoad == 4 (one bulk copy per CTA, contiguous experts)
+    __shared__ __align__(128) uint8_t w_s[kLoad == 3 ? kWarps * kWBytesPerWarp : kLoad == 4 ? kWBytesCTA : 16];
     __shared__ __align__(128) uint8_t x_s[kXMode == 1 ? kM * kH * 2 : 16];
     __shared__ float part_s[kSlots][kEPW][kM][kKS];
     __shared__ __align__(8) uint64_t w_bar[kWarps];
@@ -169,12 +170,12 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     // sector warp 0 loads) and stamps its landing -> true "first bytes landed" (slot 1), not
     // ordered behind the issue loop. When every warp has an expert, slot 1 falls back to warp 0's
     // first chunk consumed after the issue loop (an upper bound).
-    const bool probe = stamps != nullptr && warp == kWarps - 1 && !any && kLoad != 3;
+    const bool probe = stamps != nullptr && warp == kWarps - 1 && !any && kLoad < 3;
     if (probe && lane == 0) {
         const uint4 pv = ld_nc_na_16(w + static_cast<int64_t>(blockIdx.x) * kH);
         stamps[blockIdx.x * kStampSlots + 1] = globaltimer_after(pv.x);
     }
-    if constexpr (kLoad == 3 || kXMode == 1) {
+    if constexpr (kLoad >= 3 || kXMode == 1) {
         if (threadIdx.x < kWarps) mbar_init(&w_bar[threadIdx.x], 1);
         if (threadIdx.x == 0) mbar_init(&x_bar, 1);
         mbar_fence_init();
@@ -199,7 +200,13 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     }
     // ---- weights: every chunk of every owned expert in flight now
     uint4 wv[kEPW][kChunks];
-    if constexpr (kLoad == 3) {
+    if constexpr (kLoad == 4) {          // FE layout: CTA b owns experts b*5 .. b*5+4 = one contiguous 30 KB
+        if (threadIdx.x == 0) {
+            const int n = min(kExpertsPerCTA, e - static_cast<int>(blockIdx.x) * kExpertsPerCTA);
+            mbar_arrive_expect_tx(&w_bar[0], n * kH * 2);
+            tma_bulk_g2s(w_s, w + static_cast<int64_t>(blockIdx.x) * kExpertsPerCTA * kH, n * kH * 2, &w_bar[0]);
+        }
+    } else if constexpr (kLoad == 3) {
         if (lane == 0 && any) {
             mbar_arrive_expect_tx(&w_bar[warp], kWBytesPerWarp);
             #pragma unroll
@@ -237,9 +244,11 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
     }
     if constexpr (kLoad == 3) {
         if (any) mbar_wait_parity(&w_bar[warp], 0u);
+    } else if constexpr (kLoad == 4) {
+        mbar_wait_parity(&w_bar[0], 0u);
     }
     if (stamps != nullptr && threadIdx.x == 0) {   // warp 0 lane 0: first weight chunk consumed
-        if constexpr (kLoad == 3) stamps[blockIdx.x * kStampSlots + 7] = globaltimer_ns();
+        if constexpr (kLoad >= 3) stamps[blockIdx.x * kStampSlots + 7] = globaltimer_ns();
         else stamps[blockIdx.x * kStampSlots + 7] = globaltimer_after(wv[0][0].x);
         if (kLoad == 3 || (kWarps - 1) * kEPW * static_cast<int>(gridDim.x) < e) stamps[blockIdx.x * kStampSlots + 1] = stamps[blockIdx.x * kStampSlots + 7];
     }
@@ -253,6 +262,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1) router_cc_kernel(
         for (int c = 0; c < kChunks; ++c) {
             uint4 wc;
             if constexpr (kLoad == 3) wc = ld_shared_16(w_s + warp * kWBytesPerWarp + j * kKPart * 2 + (lane + 32 * c) * 16);
+            else if constexpr (kLoad == 4) wc = ld_shared_16(w_s + (slot * kEPW + j) * kH * 2 + ks * kKPart * 2 + (lane + 32 * c) * 16);
             else wc = wv[j][c];
             #pragma unroll
             for (int r = 0; r < kM; ++r) acc[r] = dot8_bf16(wc, xv[r][c], acc[r]);
@@ -315,6 +325,8 @@ std::vector<Variant> variants() {
         {"h12", 192, launch_v<24, 1, 12, 0, 0, kM>, "192 CTA x 24 warps: 2 experts x 12 warps (1 chunk/lane), 2-3 CTAs per SM"},
         {"h4b",  78, launch_v<20, 1, 4, 3, 0, kM>, "h4 with weights via cp.async.bulk 1.5 KB/warp into smem"},
         {"h4x",  78, launch_v<20, 1, 4, 0, 1, kM>, "h4 with activation rows via cp.async.bulk into smem"},
+        {"h4B",  78, launch_v<20, 1, 4, 4, 0, kM>, "h4 with ONE cp.async.bulk of the CTA's 5 contiguous expert rows (30 KB) into smem (needs --contig 1)"},
+        {"hB",   78, launch_v<8, 1, 1, 4, 0, kM>,  "8 warps x 12 chunks, ONE 30 KB cp.async.bulk per CTA into smem (needs --contig 1)"},
     };
 }
 
@@ -345,6 +357,7 @@ int main(int argc, char** argv) {
     for (auto& v : vs) if (vname == v.name) V = &v;
     if (!V) { fprintf(stderr, "unknown variant %s\n", vname.c_str()); return 1; }
     const int grid = grid_override > 0 ? grid_override : V->grid;
+    if (vname == "h4B" || vname == "hB") contig = 1;
 
     std::mt19937 rng(20260805);
     std::normal_distribution<float> nd(0.0f, 1.0f);
