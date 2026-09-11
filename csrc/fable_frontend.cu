@@ -439,7 +439,8 @@ __device__ __forceinline__ void quant_role(
 // ceil(e / (T - 1)), router CTAs = ceil(e / epc) (H20: 5 experts x 77 CTAs +
 // 1 merger CTA = 78 = one CTA per SM). Each CTA owns its experts over the FULL
 // K, so it produces FINAL logits: no K-part partial reduction, no ticket.
-//   * all h/256 K chunks (12 for H=3072) are cp.async-issued up front into a
+//   * all h/256 K chunks (12 for H=3072) are issued up front as TMA 1D bulk
+//     copies (one 512 B cp.async.bulk per row-chunk, one mbarrier per chunk) into a
 //     12-stage smem ring (stage = m rows of hidden + epc rows of weights, rounded
 //     to even rows so WMMA tiles stay 32 B aligned; m=1: 67 KB -> 3 CTAs/SM fit,
 //     m=16: 219 KB -> 1 CTA/SM) -> only the first chunk's HBM round trip is exposed;
@@ -463,6 +464,44 @@ __device__ __forceinline__ void quant_role(
 //     chunk loads and consuming them (overlapped with the chunk-0 round trip).
 __host__ __device__ constexpr int fullk_smem_bytes(int m, int epc) {
     return (kFullKStages * (((m + 1) & ~1) + ((epc + 1) & ~1)) + 16) * kSmemLd * 2 + (kThreads / 32) * 256 * 4;
+}
+__device__ __forceinline__ uint32_t smid_u32() {
+    uint32_t v;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(v));
+    return v;
+}
+// stamp slot 6 of every CTA = %smid (placement / packing diagnostics, not a time)
+__device__ __forceinline__ void stamp_smid(unsigned long long* stamps) {
+    if (stamps != nullptr && threadIdx.x == 0) stamps[blockIdx.x * kStampSlots + 6] = smid_u32();
+}
+// TMA 1D bulk copies (cp.async.bulk, sm_90): one instruction per 512 B row-chunk,
+// completion tracked by an mbarrier tx-count, so the in-flight bytes are not
+// bounded by the LSU's per-thread cp.async tracking (with cp.async the 12-chunk
+// issue itself took ~3 us on H20: the loads were throttled at issue).
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+__device__ __forceinline__ void mbar_init(uint64_t* bar, uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(smem_u32(bar)), "r"(count) : "memory");
+}
+__device__ __forceinline__ void mbar_fence_init() {
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+__device__ __forceinline__ void mbar_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(smem_u32(bar)), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_wait_parity(uint64_t* bar, uint32_t parity) {
+    asm volatile("{\n .reg .pred p;\n WAIT_%=:\n"
+                 " mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+                 " @!p bra WAIT_%=;\n}" :: "r"(smem_u32(bar)), "r"(parity) : "memory");
+}
+__device__ __forceinline__ void tma_bulk_g2s(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)) : "memory");
+}
+__device__ __forceinline__ void tma_bulk_g2s_hint(void* dst, const void* src, uint32_t bytes, uint64_t* bar, uint64_t policy) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+                 :: "r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)), "l"(policy) : "memory");
 }
 __device__ __forceinline__ uint32_t ld_cv_u32(const uint32_t* p) {
     uint32_t v;
@@ -491,7 +530,6 @@ __device__ __forceinline__ void router_role_fullk(
         dyn_smem + (kFullKStages * stage_rows + 16) * kSmemLd * 2);
     constexpr int kKSplit = kThreads / 32;                      // 8 warps = 8 K-slices per chunk
     constexpr int kKPerWarp = kChunkK / kKSplit;                // 32
-    constexpr int kVecPerRow = kChunkK / 8;
     const int warp = threadIdx.x >> 5;
     const int expert_base = blockIdx.x * epc;
     const int n_exp = min(epc, e - expert_base);
@@ -500,52 +538,43 @@ __device__ __forceinline__ void router_role_fullk(
     // Rows >= m of the A tile and >= n_exp of the B tile are never loaded: they
     // read whatever the neighbouring stage holds, which only feeds output rows /
     // columns that are discarded (C[r][c] depends on A row r and B column c only).
-    auto issue_chunk = [&](int chunk) {
-        const int st = chunk % kFullKStages, k0 = chunk * kChunkK;
-        const int n_h = m * kVecPerRow, n_total = n_h + n_exp * kVecPerRow;
-        for (int i = threadIdx.x; i < n_total; i += kThreads) {
-            if (i < n_h) {
-                const int r = i / kVecPerRow, c = (i % kVecPerRow) * 8;
-                cp_async_16(&stage_h(st)[r][c], hidden + static_cast<int64_t>(r) * h + k0 + c);
-            } else {
-                const int j = i - n_h, r = j / kVecPerRow, c = (j % kVecPerRow) * 8;
-                const __nv_bfloat16* src = router_weight + static_cast<int64_t>(expert_base + r) * h + k0 + c;
-                if (w_hint) cp_async_16_hint(&stage_w(st)[r][c], src, w_policy);
-                else cp_async_16(&stage_w(st)[r][c], src);
-            }
+    __shared__ __align__(8) uint64_t chunk_bar[kFullKStages];
+    if (threadIdx.x < num_chunks) mbar_init(&chunk_bar[threadIdx.x], 1);
+    mbar_fence_init();
+    __syncthreads();
+    // Lane c of warp 0 issues chunk c: (m + n_exp) bulk copies of 512 B each, all
+    // chunks in flight at once (h <= 3072 -> num_chunks <= kFullKStages, no reuse).
+    if (threadIdx.x < num_chunks) {
+        const int c = threadIdx.x, k0 = c * kChunkK;
+        mbar_arrive_expect_tx(&chunk_bar[c], static_cast<uint32_t>((m + n_exp) * kChunkK * 2));
+        for (int r = 0; r < m; ++r)
+            tma_bulk_g2s(&stage_h(c)[r][0], hidden + static_cast<int64_t>(r) * h + k0, kChunkK * 2, &chunk_bar[c]);
+        for (int r = 0; r < n_exp; ++r) {
+            const __nv_bfloat16* src = router_weight + static_cast<int64_t>(expert_base + r) * h + k0;
+            if (w_hint) tma_bulk_g2s_hint(&stage_w(c)[r][0], src, kChunkK * 2, &chunk_bar[c], w_policy);
+            else tma_bulk_g2s(&stage_w(c)[r][0], src, kChunkK * 2, &chunk_bar[c]);
         }
-    };
-
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-    wmma::fill_fragment(acc, 0.0f);
-    #pragma unroll
-    for (int c = 0; c < kFullKStages - 1; ++c) {
-        if (c < num_chunks) issue_chunk(c);
-        cp_async_commit();
     }
+    stamp(stamps, 5);
     // Overlapped activation quantisation: while this CTA's chunks are in flight.
     if (static_cast<int>(blockIdx.x) < m) {
         quant_role<kMode>(hidden, x_bytes, x_sf, blockIdx.x, h);
         stamp(stamps, 4);
     }
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+    wmma::fill_fragment(acc, 0.0f);
     for (int chunk = 0; chunk < num_chunks; ++chunk) {
-        if (chunk + kFullKStages - 1 < num_chunks) issue_chunk(chunk + kFullKStages - 1);
-        cp_async_commit();
-        if (chunk == 0) stamp(stamps, 5);
-        cp_async_wait<kFullKStages - 1>();
-        __syncthreads();
+        mbar_wait_parity(&chunk_bar[chunk], 0u);     // chunk landed (async proxy -> visible to all threads)
         if (chunk == 0) stamp(stamps, 1);
-        const int st = chunk % kFullKStages;
         #pragma unroll
         for (int kk = 0; kk < kKPerWarp; kk += 16) {
             const int k = warp * kKPerWarp + kk;
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
-            wmma::load_matrix_sync(a, &stage_h(st)[0][k], kSmemLd);
-            wmma::load_matrix_sync(b, &stage_w(st)[0][k], kSmemLd);
+            wmma::load_matrix_sync(a, &stage_h(chunk)[0][k], kSmemLd);
+            wmma::load_matrix_sync(b, &stage_w(chunk)[0][k], kSmemLd);
             wmma::mma_sync(acc, a, b, acc);
         }
-        if (num_chunks > kFullKStages) __syncthreads();   // ring refill only when h > 3072
     }
     wmma::store_matrix_sync(part_s[warp], acc, 16, wmma::mem_row_major);
     __syncthreads();
@@ -649,6 +678,7 @@ __global__ void __launch_bounds__(kThreads, kFullK ? 2 : (kTiny ? 3 : 1)) router
         unsigned long long* stamps,
         int m, int h, int e, int topk, int num_router_ctas, int w_hint, int pdl_mode, int epc) {
     stamp(stamps, 0);
+    stamp_smid(stamps);
     if constexpr (kFullK) {
         if (pdl_mode == 1) pdl_trigger();
         uint32_t* cand = reinterpret_cast<uint32_t*>(logits);
@@ -777,12 +807,17 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         fullk_plan(e, grid, epc, router_ctas);
         smem_bytes = fullk_smem_bytes(m, epc);
         num_ctas = router_ctas + 1;
+        // DG_FE_FULLK_1PERSM (default 1): when the grid fits the SM count, request
+        // enough dynamic smem that only one CTA fits per SM, so the block scheduler
+        // cannot pack two router CTAs (and their in-flight loads) onto one SM.
+        static const int one_per_sm = getenv("DG_FE_FULLK_1PERSM") ? atoi(getenv("DG_FE_FULLK_1PERSM")) : 1;
+        if (one_per_sm && num_ctas <= num_sms_cached()) smem_bytes = std::max(smem_bytes, 116 * 1024);
     }
     static bool attr_set = false;
     if (!attr_set) {
         cudaFuncSetAttribute(router_quant_topk_kernel<kMTiles, kMode, kTiny, kFullK>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             kFullK ? fullk_smem_bytes(16, kCandSlots) : Cfg::kDynSmemBytes);
+                             kFullK ? std::max(fullk_smem_bytes(16, kCandSlots), 116 * 1024) : Cfg::kDynSmemBytes);
         attr_set = true;
     }
     const size_t w_bytes = static_cast<size_t>(e) * h * sizeof(__nv_bfloat16);
@@ -816,7 +851,7 @@ template <int kMode>
 void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
                  int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
                  int m, int h, int e, int topk, bool tiny, int l2_persist, int pdl_mode, int grid, cudaStream_t stream) {
-    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && h % kChunkK == 0)
+    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && h % kChunkK == 0 && h / kChunkK <= kFullKStages)
         launch<1, kMode, true, true>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
     else if (m <= 16 && tiny && topk == kMaxTopK) launch<1, kMode, true, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
     else if (m <= 16) launch<1, kMode, false, false>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, pdl_mode, grid, stream);
@@ -831,7 +866,7 @@ size_t router_quant_topk_frontend_workspace_bytes(int e) {
 }
 
 int router_quant_topk_frontend_router_ctas(int m, int h, int e, int topk, int tiny, int grid) {
-    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && h % kChunkK == 0) {
+    if (m <= 16 && tiny && topk == kMaxTopK && grid != 96 && h % kChunkK == 0 && h / kChunkK <= kFullKStages) {
         int epc = 0, router_ctas = 0;
         fullk_plan(e, grid, epc, router_ctas);
         return router_ctas;

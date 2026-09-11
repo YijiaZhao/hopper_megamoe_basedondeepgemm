@@ -47,8 +47,13 @@ def fmt_stats(name, v):
 def attribution(stamps_list, num_router_ctas, m, fullk=False):
     n_tail = 1 if fullk else m      # full-K: one merger CTA; legacy: m quant/top-k CTAs
     rs, qs = [], []
+    packing = []
     for st in stamps_list:
+        smid = st[: num_router_ctas + n_tail, 6]
+        cnt = torch.bincount(smid.clamp(min=0))
+        packing.append((int((cnt > 0).sum()), int(cnt.max())))
         st = st[: num_router_ctas + n_tail].double()
+        st[:, 6] = 0
         t0 = st[:, 0].min()
         st = torch.where(st > 0, (st - t0) / 1e3, torch.zeros_like(st))
         rs.append(st[:num_router_ctas]); qs.append(st[num_router_ctas:])
@@ -56,6 +61,7 @@ def attribution(stamps_list, num_router_ctas, m, fullk=False):
 
     def line(tag, col):
         return (f"    {tag:<22} median {col.median():6.2f}  min {col.min():6.2f}  max {col.max():6.2f} us")
+    print(f"  CTA placement (%smid): distinct SMs used / max CTAs on one SM per launch: {packing}")
     if fullk:
         print(f"  stamps over {len(stamps_list)} launches (us rel. earliest CTA start of each launch; "
               f"full-K router CTAs={num_router_ctas}, merger CTA=1, quant on router CTAs 0..{m - 1}):")
