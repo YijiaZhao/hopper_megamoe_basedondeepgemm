@@ -24,10 +24,10 @@ the FE kernel's `__syncthreads()`.
 
 | step | who | what |
 | --- | --- | --- |
-| 1 | FE crew of CTA `c` | issue the `cp.async` loads of its router units (all chunks of all units at once, one commit group) |
+| 1 | FE crew of CTA `c` | issue the loads of its router units: one 512 B `cp.async.bulk` per (unit, chunk, row) on one transaction mbarrier, all units at once (v1 used 32 x 16 B `cp.async` per row: LSU issue-bound, 2.3 us) |
 | 2 | FE crew of CTA `t < m` | quantise token `t` (`quant_role`, MXFP4: fp8 e4m3 + per-K128 fp32 SF, QoQ: int8 + per-row scale) into `buffer.x / x_sf` while the router loads are in flight |
-| 3 | FE crew of CTA `c` | `cp.async.wait_group 0`, barrier, WMMA of each unit (identical to the FE router CTA), store the fp32 partial logits `[k_part][m][E]` into the workspace; `membar.gl`, barrier, thread 0 `atom.release.gpu.add` `router_done += 1` |
-| 4 | FE crew of CTA `t < m` | thread 0 spins `ld.acquire.gpu router_done >= 78`, barrier, `topk_softmax_token_tiny` for token `t` (all 256 threads fetch the 4 partials per expert, warp 0 selects the top-8 + softmax), write `topk_idx / topk_weights`; `membar.gl`, barrier, thread 0 `atom.release.gpu.add topk_done += 1` |
+| 3 | FE crew of CTA `c` | mbarrier wait, barrier, WMMA of each unit (identical to the FE router CTA), store the fp32 partial logits `[k_part][m][E]` into the workspace; barrier, thread 0 `atom.release.gpu.add router_done += 1` (cumulative over the crew's stores, like the push DONE ticket) |
+| 4 | FE crew of CTA `t < m` | thread 0 spins `ld.acquire.gpu router_done >= 78`, barrier, `topk_softmax_token_tiny` for token `t` (all 256 threads fetch the 4 partials per expert, warp 0 selects the top-8 + softmax), write `topk_idx / topk_weights`; barrier, thread 0 `atom.release.gpu.add topk_done += 1` |
 | 5 | dispatch warps of every CTA | lane 0 spins `ld.acquire.gpu topk_done >= num_tokens`, `__syncwarp`, then today's routing (push dispatch) unchanged, except that `topk_idx / topk_weights / x / x_sf` are read with `ld.global.cg` (`__ldcg`) instead of `ld.global.nc` (`__ldg`): they are produced inside this kernel by other SMs |
 
 Router unit `u` (0..95: expert group `u / 4`, K-part `u % 4`) runs on CTA `kNumSMs - 1 - (u % kNumSMs)`:
@@ -62,8 +62,9 @@ first task is published, which is causally after every rank's routing, hence aft
 which need every CTA's pushes, which wait for `topk_done`, which waits for `router_done == 78`).
 
 FE crew usage: 2 units x 58880 B (3 stages x 32 rows x 264 bf16 = 50688 B + 8 warps x 256 fp32
-partials = 8192 B) = 117760 B, + 128 B quant warp maxima + 2048 B top-k keys = 119936 B
-(static-asserted <= the stage region). No change to the kernel's smem layout or launch size.
+partials = 8192 B) = 117760 B, + 128 B quant warp maxima + 2048 B top-k keys + 16 B transaction
+mbarrier = 119952 B (static-asserted <= the stage region). No change to the kernel's smem layout
+or launch size. The crew itself lives in `fused_fe_crew` (`__noinline__`, sm90_fp4_mega_moe_h20_fused.cuh).
 
 ## Expected gain
 
