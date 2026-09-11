@@ -117,6 +117,36 @@ __device__ __forceinline__ void cp_async_16_hint(void* smem_dst, const void* gme
                  :: "r"(d), "l"(gmem_src), "l"(policy) : "memory");
 }
 
+// 1D bulk copies (TMA engine) with an mbarrier transaction count: the fused path
+// moves the router chunks with one 512 B bulk copy per row instead of 32 x 16 B
+// cp.async per row (the per-SM cp.async issue rate bounded the fused FE: 2 units
+// = 100 KB took 2.3 us to issue, the data landed 0.3 us after the last issue).
+__device__ __forceinline__ uint32_t smem_u32(const void* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+__device__ __forceinline__ void mbar_init(uint64_t* mbar, uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(smem_u32(mbar)), "r"(count) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+}
+__device__ __forceinline__ void mbar_expect_tx(uint64_t* mbar, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(smem_u32(mbar)), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint64_t* mbar, uint32_t phase) {
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "LAB_WAIT:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@p bra DONE;\n"
+        "bra LAB_WAIT;\n"
+        "DONE:\n"
+        "}\n" :: "r"(smem_u32(mbar)), "r"(phase) : "memory");
+}
+__device__ __forceinline__ void bulk_copy_g2s(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* mbar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                 :: "r"(smem_u32(smem_dst)), "l"(gmem_src), "r"(bytes), "r"(smem_u32(mbar)) : "memory");
+}
+
 // Per-unit smem accessors (`dyn_smem` = RouterCfg::kDynSmemBytes bytes, 128 B aligned).
 template <int kMTiles, bool kTiny>
 struct RouterSmem {
@@ -275,6 +305,34 @@ __device__ __forceinline__ void router_unit_issue_all(
     for (int chunk = 0; chunk < num_chunks; ++chunk)
         router_issue_chunk(smem, hidden, router_weight, m, h, unit_idx, chunk, tid, 0, 0ull);
 }
+// Bulk variant of `router_unit_issue_all`: one 512 B copy per (chunk, row), issued
+// by threads tid < num_chunks * (m + 16) (one copy each) on `mbar`; returns the
+// bytes this unit adds to the barrier's transaction count (caller: one
+// `mbar_expect_tx` with the total, then `mbar_wait`). Padding rows are zeroed here.
+template <int kMTiles, bool kTiny>
+__device__ __forceinline__ uint32_t router_unit_issue_all_bulk(
+        const __nv_bfloat16* __restrict__ hidden,
+        const __nv_bfloat16* __restrict__ router_weight,
+        int m, int h, int unit_idx, int tid, uint8_t* dyn_smem, uint64_t* mbar) {
+    using Cfg = RouterCfg<kMTiles, kTiny>;
+    RouterSmem<kMTiles, kTiny> smem {dyn_smem};
+    const int num_chunks = h / kChunkK / Cfg::kKSplitCTAs;
+    const int rows = m + kExpertsPerCTA;
+    const int expert_base = (unit_idx / Cfg::kKSplitCTAs) * kExpertsPerCTA;
+    const int k_part = unit_idx % Cfg::kKSplitCTAs;
+    router_zero_padding(smem, m, tid);
+    if (tid < num_chunks * rows) {
+        const int chunk = tid / rows, r = tid % rows;
+        const int k0 = (k_part * num_chunks + chunk) * kChunkK;
+        if (r < m)
+            bulk_copy_g2s(&smem.h(chunk)[r][0], hidden + static_cast<int64_t>(r) * h + k0, kChunkK * 2, mbar);
+        else
+            bulk_copy_g2s(&smem.w(chunk)[r - m][0],
+                          router_weight + static_cast<int64_t>(expert_base + r - m) * h + k0, kChunkK * 2, mbar);
+    }
+    return static_cast<uint32_t>(num_chunks * rows * kChunkK * 2);
+}
+
 template <int kMTiles, bool kTiny, typename Sync>
 __device__ __forceinline__ void router_unit_compute(
         float* __restrict__ logits, int m, int h, int e, int unit_idx, int tid, uint8_t* dyn_smem,
@@ -330,17 +388,26 @@ __device__ __forceinline__ void topk_softmax_token_tiny(
         float* __restrict__ topk_weights, unsigned long long* stamps, int t, int m, int e,
         int tid, uint32_t* key_s, const Sync& sync) {
     const int lane = tid & 31;
-    for (int ex = tid; ex < kPerLane * 32; ex += kThreads) {
-        float acc = 0.0f;
-        if (ex < e) {
-            float p[kKSplit];
+    // All partial loads of this thread's experts are issued before the first sum
+    // (one L2 round trip for the whole fetch); the per-expert sum order is the legacy one.
+    constexpr int kExPerThread = (kPerLane * 32 + kThreads - 1) / kThreads;
+    float p[kExPerThread][kKSplit];
+    #pragma unroll
+    for (int i = 0; i < kExPerThread; ++i) {
+        const int ex = tid + i * kThreads;
+        #pragma unroll
+        for (int ks = 0; ks < kKSplit; ++ks)
+            p[i][ks] = (ex < e) ? __ldcg(logits + (static_cast<int64_t>(ks) * m + t) * e + ex) : 0.0f;
+    }
+    #pragma unroll
+    for (int i = 0; i < kExPerThread; ++i) {
+        const int ex = tid + i * kThreads;
+        if (ex < kPerLane * 32) {
+            float acc = 0.0f;
             #pragma unroll
-            for (int ks = 0; ks < kKSplit; ++ks)
-                p[ks] = __ldcg(logits + (static_cast<int64_t>(ks) * m + t) * e + ex);
-            #pragma unroll
-            for (int ks = 0; ks < kKSplit; ++ks) acc += p[ks];      // same order as legacy
+            for (int ks = 0; ks < kKSplit; ++ks) acc += p[i][ks];      // same order as legacy
+            key_s[ex] = topk_key(ex < e ? round_bf16(acc) : -INFINITY, ex);
         }
-        key_s[ex] = topk_key(ex < e ? round_bf16(acc) : -INFINITY, ex);
     }
     sync();
     stamp(stamps, 4);
