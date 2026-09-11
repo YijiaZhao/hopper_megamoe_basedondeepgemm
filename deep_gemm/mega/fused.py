@@ -82,16 +82,26 @@ class FusedSymmBuffer:
         n,slice_fn=_C.get_symm_buffer_size_for_fused_mega_moe(group.size(),num_experts,max_tokens,topk,hidden,intermediate)
         from torch.distributed._symmetric_memory import empty as symm_empty, rendezvous
         self.buffer=symm_empty(n,dtype=torch.int8,device='cuda'); self.handle=rendezvous(self.buffer,group=group); self.buffer.zero_(); group.barrier(); torch.cuda.synchronize()
-        self.x,self.x_sf,self.topk_idx,self.topk_weights,self.l1_acts,self.l1_acts_sf,self.l2_acts,self.l2_acts_sf=slice_fn(self.buffer)
+        self.x,self.x_sf,self.topk_idx,self.topk_weights,self.l1_acts,self.l1_acts_sf,self.l2_acts,self.l2_acts_sf,self.combine_partials=slice_fn(self.buffer)
     def destroy(self): self.handle=None; self.buffer=None; self.group=None
 
 def get_fused_symm_buffer_for_mega_moe(group,num_experts,max_tokens,topk,hidden,intermediate):
     return FusedSymmBuffer(group,num_experts,max_tokens,topk,hidden,intermediate)
 
-def mxfp4_mega_moe_fused(y,l1,l2,b,cumulative_local_expert_recv_stats=None,activation_clamp=10.0,fast_math=True,phase_stamps=None):
-    w1,sf1,rs1=l1; w2,sf2,rs2=l2
-    _C.mxfp4_mega_moe_fused(y,(w1,sf1),(w2,sf2),cumulative_local_expert_recv_stats,rs1,rs2,b.buffer,b.handle.buffer_ptrs,b.group.rank(),b.num_max_tokens_per_rank,b.num_experts,b.num_topk,activation_clamp,fast_math,phase_stamps)
+def _frontend_args(b, frontend):
+    """``frontend=(hidden, router_weight)``: run the Fable frontend inside the fused kernel
+    (DG_FP4_FUSE_FE=1 must be set; the host refuses otherwise). Returns the three optional
+    tensors the C++ API takes (hidden, router weight, Fable frontend workspace)."""
+    if frontend is None:
+        return None, None, None
+    hidden, router_weight = frontend
+    from . import fable_frontend_workspace
+    return hidden, router_weight, fable_frontend_workspace(b, router_weight.size(0), hidden.device)
 
-def qoq_mega_moe_fused(y,l1,l2,b,cumulative_local_expert_recv_stats=None,activation_clamp=10.0,fast_math=True,phase_stamps=None):
+def mxfp4_mega_moe_fused(y,l1,l2,b,cumulative_local_expert_recv_stats=None,activation_clamp=10.0,fast_math=True,phase_stamps=None,frontend=None):
     w1,sf1,rs1=l1; w2,sf2,rs2=l2
-    _C.qoq_mega_moe_fused(y,(w1,sf1),(w2,sf2),cumulative_local_expert_recv_stats,rs1,rs2,b.buffer,b.handle.buffer_ptrs,b.group.rank(),b.num_max_tokens_per_rank,b.num_experts,b.num_topk,activation_clamp,fast_math,phase_stamps)
+    _C.mxfp4_mega_moe_fused(y,(w1,sf1),(w2,sf2),cumulative_local_expert_recv_stats,rs1,rs2,b.buffer,b.handle.buffer_ptrs,b.group.rank(),b.num_max_tokens_per_rank,b.num_experts,b.num_topk,activation_clamp,fast_math,phase_stamps,*_frontend_args(b,frontend))
+
+def qoq_mega_moe_fused(y,l1,l2,b,cumulative_local_expert_recv_stats=None,activation_clamp=10.0,fast_math=True,phase_stamps=None,frontend=None):
+    w1,sf1,rs1=l1; w2,sf2,rs2=l2
+    _C.qoq_mega_moe_fused(y,(w1,sf1),(w2,sf2),cumulative_local_expert_recv_stats,rs1,rs2,b.buffer,b.handle.buffer_ptrs,b.group.rank(),b.num_max_tokens_per_rank,b.num_experts,b.num_topk,activation_clamp,fast_math,phase_stamps,*_frontend_args(b,frontend))

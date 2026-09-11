@@ -14,6 +14,9 @@ replays a stamped FE+Mega graph (stamps taken inside the graph, i.e. after the
 previous replay's Mega streamed its weights through L2).
 Knobs echoed: DG_FE_TINYM_GRID (96 = legacy 24x4 split, auto = full-K SM-count grid),
 DG_FE_ROUTER_L2_PERSIST (router weights pinned in L2), DG_FE_PDL.
+DG_FP4_FUSE_FE=1 (fused backend): a fourth graph "FEinMega" (the fused kernel with the
+frontend fused in, no FE launch) is timed after FE+Mega; its span is the E2E span of the
+knob-1 path and compares directly with FE+Mega (knob 0).
 DG_BENCH_HOT_HIDDEN=1: re-touch the hidden rows after every L2 flush (in the real
 pipeline the attention output is written right before the FE and is L2-hot; the
 flush would otherwise put both the hidden rows and the router weights in HBM and
@@ -116,6 +119,7 @@ def main():
     mma_env = os.environ.get("DG_FE_TINYM_MMA", "wmma")
     kparts_env = os.environ.get("DG_FE_TINYM_KPARTS", "1")
     hot_hidden = int(os.environ.get("DG_BENCH_HOT_HIDDEN", "0"))
+    fuse_fe = int(os.environ.get("DG_FP4_FUSE_FE", "0")) != 0 and args.backend == "fused"
     buffer, launch_moe = prepare_backend(args, rank, local_rows, group)
     try:
         torch.manual_seed(20260805)
@@ -142,11 +146,18 @@ def main():
         def both_stamped():
             fe(1); mega()
 
+        def fe_in_mega():
+            launch_moe(y, frontend=(x, router_weight))
+
         both(); torch.cuda.synchronize(); dist.barrier(group=group)
         n_router = deep_gemm.fable_frontend_router_ctas(local_rows, EXPERTS, HIDDEN, 8, tinym)
         fullk = bool(tinym) and local_rows <= 16 and grid_env.strip().lower() != "96"
+        if fuse_fe:
+            fe_in_mega(); torch.cuda.synchronize(); dist.barrier(group=group)
         graphs = {}
         bodies = [("FE", fe), ("Mega", mega), ("FE+Mega", both)]
+        if fuse_fe:
+            bodies.append(("FEinMega", fe_in_mega))
         if stamps:
             bodies.append(("FE+Mega/st", both_stamped))
         for name, body in bodies:
@@ -160,7 +171,7 @@ def main():
         # Phase-sequential (all FE iterations, then all Mega, then all FE+Mega): the fused
         # MegaMoE's cross-rank flag protocol is captured per graph, so the two graphs that
         # contain it are never interleaved.
-        timed = ("FE", "Mega", "FE+Mega")
+        timed = ("FE", "Mega", "FE+Mega") + (("FEinMega",) if fuse_fe else ())
         times = {k: [] for k in timed}
         for name in timed:
             g = graphs[name]
@@ -180,6 +191,7 @@ def main():
                   f"(rows/rank={local_rows}) backend={args.backend} DG_FE_TINYM={tinym} "
                   f"DG_FE_TINYM_GRID={grid_env} (router CTAs={n_router}, full-K={int(fullk)}) DG_FE_TINYM_MMA={mma_env} DG_FE_TINYM_KPARTS={kparts_env} "
                   f"DG_FE_ROUTER_L2_PERSIST={l2_persist} DG_FE_PDL={pdl} DG_BENCH_HOT_HIDDEN={hot_hidden} "
+                  f"DG_FP4_FUSE_FE={int(fuse_fe)} "
                   f"iters={args.iters} GPU0 ==")
             for name in timed:
                 print(fmt_stats(name, times[name]))

@@ -28,7 +28,7 @@ static void validate_row_scale(const torch::Tensor& scale,
     DG_HOST_ASSERT(scale.is_contiguous() and scale.device() == device);
 }
 
-static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_fused_mega_moe(
         const int& num_ranks, const int& num_experts,
         const int& max_tokens, const int& topk,
@@ -68,7 +68,9 @@ get_symm_buffer_size_for_fused_mega_moe(
             t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a1.base)),{pool,hidden},torch::kFloat8_e4m3fn,b),
             t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a1sf.base)),{sf_pool,hidden/128},torch::kFloat32,b),
             t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a2.base)),{pool,intermediate},torch::kFloat8_e4m3fn,b),
-            t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a2sf.base)),{sf_pool,intermediate/64},torch::kFloat32,b));
+            t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(a2sf.base)),{sf_pool,intermediate/64},torch::kFloat32,b),
+            // per-(topk slot, local token) scattered L2 partials (combine input; diagnostics)
+            t(math::advance_ptr(b.data_ptr(),reinterpret_cast<int64_t>(combine.base)),{topk,max_tokens,hidden},torch::kBFloat16,b));
     };
     return {reinterpret_cast<int64_t>(combine.get_end_ptr()),slice};
 }
@@ -82,19 +84,23 @@ static void run_fused(
         const torch::Tensor& buffer, const std::vector<int64_t>& ptrs,
         const int& rank, const int& max_tokens, const int& experts, const int& topk,
         const std::optional<float>& clamp, const bool& fast_math,
-        const std::optional<torch::Tensor>& phase_stamps = std::nullopt) {
+        const std::optional<torch::Tensor>& phase_stamps = std::nullopt,
+        const std::optional<torch::Tensor>& fe_hidden = std::nullopt,
+        const std::optional<torch::Tensor>& fe_router_weight = std::nullopt,
+        const std::optional<torch::Tensor>& fe_workspace = std::nullopt) {
     const auto [w1,s1]=l1; const auto [w2,s2]=l2;
     const int nr=ptrs.size(), local=experts/nr, h=y.size(1);
     const int inter=s2.size(2)*128;
     validate_stats(stats,local,y.device()); validate_row_scale(l1_scale,local,inter*2,y.device()); validate_row_scale(l2_scale,local,h,y.device());
     const auto [bytes,slice]=get_symm_buffer_size_for_fused_mega_moe(nr,experts,max_tokens,topk,h,inter);
     DG_HOST_ASSERT(buffer.nbytes() >= static_cast<size_t>(bytes));
-    const auto [x,xsf,ti,tw,a1,a1sf,a2,a2sf]=slice(buffer);
-    sm90_fp4_h20_fused_mega_moe(y,a1,a1sf,a2,a2sf,w1,w2,stats,l1_scale,l2_scale,ptrs,rank,max_tokens,local,y.size(0),topk,h,inter,clamp.value_or(std::numeric_limits<float>::infinity()),fast_math,mode==1,phase_stamps,mode==2);
+    const auto [x,xsf,ti,tw,a1,a1sf,a2,a2sf,comb]=slice(buffer);
+    sm90_fp4_h20_fused_mega_moe(y,a1,a1sf,a2,a2sf,w1,w2,stats,l1_scale,l2_scale,ptrs,rank,max_tokens,local,y.size(0),topk,h,inter,clamp.value_or(std::numeric_limits<float>::infinity()),fast_math,mode==1,phase_stamps,mode==2,fe_hidden,fe_router_weight,fe_workspace);
 }
 
-static void mxfp4_mega_moe_fused(const torch::Tensor& y,const std::tuple<torch::Tensor,torch::Tensor>& l1,const std::tuple<torch::Tensor,torch::Tensor>& l2,const std::optional<torch::Tensor>& stats,const torch::Tensor& s1,const torch::Tensor& s2,const torch::Tensor& b,const std::vector<int64_t>& p,const int& r,const int& mt,const int& e,const int& k,const std::optional<float>& c,const bool& f,const std::optional<torch::Tensor>& ps){run_fused(1,y,l1,l2,stats,s1,s2,b,p,r,mt,e,k,c,f,ps);}
-static void qoq_mega_moe_fused(const torch::Tensor& y,const std::tuple<torch::Tensor,torch::Tensor>& l1,const std::tuple<torch::Tensor,torch::Tensor>& l2,const std::optional<torch::Tensor>& stats,const torch::Tensor& s1,const torch::Tensor& s2,const torch::Tensor& b,const std::vector<int64_t>& p,const int& r,const int& mt,const int& e,const int& k,const std::optional<float>& c,const bool& f,const std::optional<torch::Tensor>& ps){run_fused(2,y,l1,l2,stats,s1,s2,b,p,r,mt,e,k,c,f,ps);}
+// Trailing optionals: fused Fable frontend inputs (hidden, router weight, FE workspace), see the host.
+static void mxfp4_mega_moe_fused(const torch::Tensor& y,const std::tuple<torch::Tensor,torch::Tensor>& l1,const std::tuple<torch::Tensor,torch::Tensor>& l2,const std::optional<torch::Tensor>& stats,const torch::Tensor& s1,const torch::Tensor& s2,const torch::Tensor& b,const std::vector<int64_t>& p,const int& r,const int& mt,const int& e,const int& k,const std::optional<float>& c,const bool& f,const std::optional<torch::Tensor>& ps,const std::optional<torch::Tensor>& fh,const std::optional<torch::Tensor>& fw,const std::optional<torch::Tensor>& fws){run_fused(1,y,l1,l2,stats,s1,s2,b,p,r,mt,e,k,c,f,ps,fh,fw,fws);}
+static void qoq_mega_moe_fused(const torch::Tensor& y,const std::tuple<torch::Tensor,torch::Tensor>& l1,const std::tuple<torch::Tensor,torch::Tensor>& l2,const std::optional<torch::Tensor>& stats,const torch::Tensor& s1,const torch::Tensor& s2,const torch::Tensor& b,const std::vector<int64_t>& p,const int& r,const int& mt,const int& e,const int& k,const std::optional<float>& c,const bool& f,const std::optional<torch::Tensor>& ps,const std::optional<torch::Tensor>& fh,const std::optional<torch::Tensor>& fw,const std::optional<torch::Tensor>& fws){run_fused(2,y,l1,l2,stats,s1,s2,b,p,r,mt,e,k,c,f,ps,fh,fw,fws);}
 
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE

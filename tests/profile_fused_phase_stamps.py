@@ -25,11 +25,20 @@ import torch.distributed as dist
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import profile_four_api_h20 as P  # noqa: E402
+import deep_gemm  # noqa: E402
 
 INT64_MAX = (1 << 63) - 1
 MIN_SLOTS = (0, 3)
 REPORT = [
     (12, "init done"),
+    # fused Fable frontend (DG_FP4_FUSE_FE=1 + --fuse-fe): FE crew timeline
+    (49, "FE router loads issued (max)"),
+    (50, "FE quant done (top-k CTAs, max)"),
+    (51, "FE router loads landed (max)"),
+    (52, "FE router WMMA+store done (max)"),
+    (45, "FE router units done (max)"),
+    (54, "FE top-k saw all units (max)"),
+    (46, "FE top-k written (max)"),
     (8, "expert-offset atomics"),
     (9, "topk write"),
     (10, "grid sync"),
@@ -48,6 +57,8 @@ REPORT = [
 # SM0-only accumulators (per launch after reset): 13 = entry->after NVLink barrier#1,
 # 16 = time spent inside NVLink barrier#1 (includes cross-rank launch skew).
 ACCUM = [(13, "SM0: entry->after barrier1"), (16, "SM0: barrier1 wait incl. skew")]
+FE_DUR = [(58, "FE per-CTA: issue (max us)"), (59, "FE per-CTA: land (max us)"), (60, "FE per-CTA: WMMA+store (max us)"),
+          (61, "FE per-CTA: release (max us)"), (62, "FE top-k CTA: wait units (max us)"), (63, "FE top-k CTA: compute+write (max us)")]
 # K-loop stage probe (SM0 thread0, SM cycles @1830MHz): per-stage ns = cycles / count / 1.83
 # BM8 MXFP4 (kKBlocksPerStage == 2): one "stage" = two K128 blocks (12 stages per L1
 # task); 18 = both decodes of the stage, 19 = wait<1> + wait<0> drains.
@@ -62,9 +73,9 @@ SM_GHZ = 1.83
 PROBE_EXP = int(os.environ.get("PROBE_EXP", "0"))  # 1 skip decode, 2 skip wgmma, 3 both (timing only)
 PROBE_DUMP = int(os.environ.get("PROBE_DUMP", "0"))
 # 1: rank0 prints the per-CTA task timeline of the last measured launch (kernel task log,
-# slots 48 + sm * 16 + ..., enabled by the magic word in slot 47; see the body).
+# slots 64 + sm * 16 + ..., enabled by the magic word in slot 47; see the body).
 PROBE_TASKLOG = int(os.environ.get("PROBE_TASKLOG", "0"))
-TASKLOG_BASE, TASKLOG_PER_CTA, TASKLOG_MAX_SMS, TASKLOG_MAGIC = 48, 16, 160, 0x5441534B
+TASKLOG_BASE, TASKLOG_PER_CTA, TASKLOG_MAX_SMS, TASKLOG_MAGIC = 64, 16, 160, 0x5441534B
 
 
 def print_tasklog(s, t0):
@@ -134,6 +145,10 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--no-graph", action="store_true")
+    ap.add_argument("--fuse-fe", action="store_true",
+                    help="run the Fable frontend inside the kernel (needs DG_FP4_FUSE_FE=1); routing from the FE")
+    ap.add_argument("--fe-routing", action="store_true",
+                    help="knob-0 reference for --fuse-fe: the standalone FE runs eagerly before every replay (same routing / quant), the graph holds Mega only")
     ap.add_argument("--no-stamps", action="store_true",
                     help="launch without phase_stamps (wall-time only) to measure probe overhead")
     args = ap.parse_args()
@@ -152,7 +167,7 @@ def main():
     kernel = (deep_gemm_fused_kernel(args.quant))
     weights = prepare_weights(args, rank, local_experts)
 
-    stamps = torch.zeros(48 + TASKLOG_MAX_SMS * TASKLOG_PER_CTA, dtype=torch.int64, device="cuda")
+    stamps = torch.zeros(TASKLOG_BASE + TASKLOG_MAX_SMS * TASKLOG_PER_CTA, dtype=torch.int64, device="cuda")
     try:
         torch.manual_seed(17000 + rank * 1000003 + args.global_tokens)
         x = torch.randn(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
@@ -172,10 +187,20 @@ def main():
             buffer.topk_idx[:active_rows].copy_(idx)
             buffer.topk_weights[:active_rows].fill_(1.0 / P.TOPK)
         y = torch.empty(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
+        frontend = None
+        router_weight = None
+        if args.fuse_fe or args.fe_routing:
+            torch.manual_seed(20260805)
+            router_weight = (torch.randn(P.EXPERTS, P.HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
+        if args.fuse_fe:
+            frontend = (x, router_weight)
+        elif args.fe_routing:
+            deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant)
+            torch.cuda.synchronize()
 
         def launch():
             kernel(y, *weights, buffer, cumulative_local_expert_recv_stats=None,
-                   activation_clamp=10.0, phase_stamps=None if args.no_stamps else stamps)
+                   activation_clamp=10.0, phase_stamps=None if args.no_stamps else stamps, frontend=frontend)
 
         launch()
         torch.cuda.synchronize()
@@ -199,6 +224,8 @@ def main():
         for i in range(args.warmup + args.iters):
             reset(stamps)
             P.flush_l2_cache()
+            if args.fe_routing:
+                deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant)
             torch.cuda.synchronize()
             dist.barrier(group=group)
             start.record()
@@ -239,11 +266,17 @@ def main():
             print(f"{'slot':>4} {'phase':<32} {'median':>9} {'min':>9} {'max':>9} {'delta':>9}")
             prev = 0.0
             for slot, name in REPORT:
+                if slot in (49, 50, 51, 52, 45, 54, 46) and not args.fuse_fe:
+                    continue
                 print(f"{slot:>4} {name:<32} {med[slot]:>9.2f} {mn[slot]:>9.2f} {mx[slot]:>9.2f} {med[slot]-prev:>9.2f}")
                 prev = med[slot]
             for slot, name in ACCUM:
                 v = [r[slot] for r in rows]
                 print(f"{slot:>4} {name:<32} {statistics.median(v):>9.2f} {min(v):>9.2f} {max(v):>9.2f}")
+            if args.fuse_fe:
+                for slot, name in FE_DUR:
+                    v = [sr[slot] / 1000.0 for sr in raw_rows]
+                    print(f"{slot:>4} {name:<32} {statistics.median(v):>9.2f} {min(v):>9.2f} {max(v):>9.2f}")
             n_st = statistics.median(r[21] for r in rows)
             print(f"--- K-loop stage probe (SM0 thread0), {n_st:.0f} L1 stages/launch, ns per stage ---")
             for slot, name in STAGE:

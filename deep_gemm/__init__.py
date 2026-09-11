@@ -100,6 +100,7 @@ from .mega import (
     fable_frontend_stamps,
     fable_frontend_workspace_bytes,
     fable_router_weight_fragment_layout,
+    fable_frontend_workspace,
     mxfp4_mega_moe_split, qoq_mega_moe_split,
     FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe,
     transform_mxfp4_weights_for_mega_moe_fused, transform_qoq_weights_for_mega_moe_fused,
