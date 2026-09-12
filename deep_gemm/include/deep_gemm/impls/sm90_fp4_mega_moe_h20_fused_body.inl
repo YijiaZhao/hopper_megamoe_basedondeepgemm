@@ -289,12 +289,12 @@
     // is only zeroed by the cleanup of N+1, after N completed.
     constexpr bool kCombineDynamic = kFineCombine;
     // Batched combine signalling (host env DG_FP4_COMBINE_BATCH, swapAB L2 epilogue
-    // only): the warp that scattered a group of token rows over NVLink publishes
-    // their arrival counters itself right after its stores (__syncwarp, ONE
-    // fence.acq_rel.sys per warp, then one red.release.sys per row by one lane per
-    // row), so the per-task mailbox hop (CTA bar.sync -> st.release.gpu -> dispatch
-    // warp acquire -> fence.sys -> red) leaves the signal path. The consumer's
-    // acquire spin and target are unchanged; the mailbox still carries DONE.
+    // only): right after the CTA barrier that follows the NVLink scatter, epilogue
+    // warp 0 publishes the task's rows itself (one fence.acq_rel.sys + one
+    // red.release.sys per row, one lane per row), so the per-task mailbox hop
+    // (st.release.gpu -> dispatch warp acquire -> fence.sys -> red) leaves the
+    // signal path. The consumer's acquire spin and target are unchanged; the
+    // mailbox still carries DONE.
     constexpr bool kCombineBatch = kCombineBatchRequested && kFineCombine && kSwapABRequested;
     // Push dispatch (kPushDispatch; host env DG_FP4_PUSH_DISPATCH, see the host for
     // the default, gated by DG_FP4_PUSH_DISPATCH_MAX_M on the global token count,
@@ -2077,18 +2077,19 @@
                             *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                         }
                     }
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     if constexpr (kCombineBatch) {
-                        // Batched arrival publish (kCombineBatch): the rows this warp scattered
-                        // are tokens [16 w, 16 w + 2 kNumRowsPerWarp); after the warp barrier
-                        // (memory ordering among the lanes) lane t < 2 kNumRowsPerWarp owns
-                        // token 16 w + t: one sys-scope release fence (cumulative over the
-                        // lanes' stores) and one release-add on the destination counter.
-                        __syncwarp();
-                        if (is_epilogue_wg && lane_idx < 2u * kNumRowsPerWarp) {
-                            const uint32_t token = warp_idx_in_wg * 16u + lane_idx;
-                            if (token < valid_m) {
+                        // Batched arrival publish (kCombineBatch): after the CTA barrier (both
+                        // WGs' scatter stores of this 256-column block happen-before it) ONE
+                        // warp publishes every row of the task: lane r < valid_m owns row r,
+                        // one sys-scope release fence (cumulative over the CTA's stores via the
+                        // barrier) and one release-add on the row's destination counter. One
+                        // increment per (row, 256-column L2 block), exactly like the mailbox
+                        // path, so the consumer's target is unchanged.
+                        if (epilogue_warp_idx == 0) {
+                            for (uint32_t row = lane_idx; row < valid_m; row += 32) {
                                 const auto src_metadata = *workspace.get_token_src_metadata_ptr(
-                                    pool_block_idx * BLOCK_M + token);
+                                    pool_block_idx * BLOCK_M + row);
                                 asm volatile("fence.acq_rel.sys;" ::: "memory");
                                 ptx::red_add_rel_sys(
                                     sym_buffer.map(workspace.get_combine_arrival_count_ptr(src_metadata.token_idx),
@@ -2096,7 +2097,6 @@
                             }
                         }
                     }
-                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                     signal_combine_arrivals();
                 }
             };
