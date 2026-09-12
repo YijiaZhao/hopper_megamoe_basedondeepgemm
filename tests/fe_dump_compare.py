@@ -1,8 +1,9 @@
-"""FE output layout gate: run the Fable frontend alone under two env configurations and byte-compare every
-buffer the fused Mega consumes.
+"""FE output layout gate: run the Fable frontend alone under two configurations (two env settings and / or two
+builds of the extension, `--root-a` / `--root-b` = repository roots whose tests/fe_dump_compare.py runs the child)
+and byte-compare every buffer the fused Mega consumes.
 
-The FE knobs (DG_FE_CC_LEAN, DG_FE_CC_SELECT, DG_FE_TINYM_MMA, ...) are read once per process, so the tool
-forks one child process per configuration (`--dump`), then compares the two dump files buffer by buffer.
+Env knobs are read once per process, so the tool forks one child process per configuration (`--dump`), then
+compares the two dump files buffer by buffer.
 
 Per cell (seed x rows {1, 2} x quant {mxfp4, qoq}) and per configuration the child records, after pre-filling the
 buffers with a sentinel (x = 0x00, x_sf = 0, topk_idx = -7, topk_weights = -7.0, ticket / key area untouched):
@@ -32,8 +33,8 @@ uses (deep_gemm.utils.per_token_cast_to_fp8 / quantization_qoq_fused.per_token_c
 the two configurations is the wrong one.
 
 Usage (single GPU):
-  python3 tests/fe_dump_compare.py --env-a "DG_FE_CC_LEAN=0" --env-b "DG_FE_CC_LEAN=1" --seeds 64
-  python3 tests/fe_dump_compare.py --env-a "DG_FE_CC_LEAN=1" --env-b "DG_FE_CC_LEAN=1 DG_FE_CC_SELECT=pruned"
+  python3 tests/fe_dump_compare.py --root-a /path/to/reference/checkout --root-b . --seeds 64 --ref-torch
+  python3 tests/fe_dump_compare.py --env-a "DG_FE_ROUTER_L2_PERSIST=0" --env-b "DG_FE_ROUTER_L2_PERSIST=1"
   (DG_FE_SELECT_IN_MEGA 0 vs 1 is always covered: the sel1 buffers are compared with the sel0 ones inside each dump.)
 """
 import argparse
@@ -67,8 +68,6 @@ def _parse_env(spec):
 def dump(args):
     import types
     import deep_gemm  # noqa: E402  (after the env is set by the parent)
-    os.environ.setdefault("DG_FE_TINYM_GRID", "auto")
-    os.environ.setdefault("DG_FE_TINYM_MMA", "cc")
     torch.manual_seed(20260805)
     w = (torch.randn(EXPERTS, HIDDEN, device="cuda", dtype=torch.bfloat16) * args.scale).contiguous()
     buf = types.SimpleNamespace(
@@ -106,8 +105,8 @@ def dump(args):
                 cell["ticket_sel1"] = ws[:256].clone().cpu()
                 cell["hidden"] = x.cpu()
                 out[(seed, rows, quant)] = cell
-    env = {k: os.environ.get(k, "") for k in ("DG_FE_CC_LEAN", "DG_FE_CC_SELECT", "DG_FE_SELECT_IN_MEGA",
-                                                 "DG_FE_TINYM_MMA", "DG_FE_TINYM_GRID", "DG_FE_ROUTER_L2_PERSIST")}
+    env = {k: os.environ.get(k, "") for k in ("DG_FE_SELECT_IN_MEGA", "DG_FE_ROUTER_L2_PERSIST")}
+    env["build"] = os.path.abspath(ROOT)
     torch.save({"env": env, "out": out, "rows": args.rows, "quants": args.quants}, args.dump)
     print(f"FE_DUMP wrote {len(out)} cells to {args.dump} env={env}", flush=True)
 
@@ -330,8 +329,10 @@ def ref_check(d, side):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--env-a", default="DG_FE_CC_LEAN=0", help="space / comma separated K=V list for configuration A")
-    ap.add_argument("--env-b", default="DG_FE_CC_LEAN=1", help="space / comma separated K=V list for configuration B")
+    ap.add_argument("--env-a", default="", help="space / comma separated K=V list for configuration A")
+    ap.add_argument("--env-b", default="", help="space / comma separated K=V list for configuration B")
+    ap.add_argument("--root-a", default="", help="repository root whose build / tests/fe_dump_compare.py runs child A (default: this checkout)")
+    ap.add_argument("--root-b", default="", help="repository root whose build / tests/fe_dump_compare.py runs child B (default: this checkout)")
     ap.add_argument("--seeds", type=int, default=64)
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 2])
     ap.add_argument("--quants", nargs="+", default=["mxfp4", "qoq"])
@@ -346,15 +347,16 @@ def main():
     if args.dump:
         dump(args); return
     paths = []
-    for tag, spec in (("a", args.env_a), ("b", args.env_b)):
+    for tag, spec, root in (("a", args.env_a, args.root_a), ("b", args.env_b, args.root_b)):
         path = f"{args.out}_{tag}.pt"
         paths.append(path)
         if args.reuse and os.path.exists(path):
             continue
         env = dict(os.environ); env.update(_parse_env(spec))
-        cmd = [sys.executable, os.path.abspath(__file__), "--dump", path, "--seeds", str(args.seeds), "--scale", str(args.scale),
+        script = os.path.join(os.path.abspath(root), "tests", "fe_dump_compare.py") if root else os.path.abspath(__file__)
+        cmd = [sys.executable, script, "--dump", path, "--seeds", str(args.seeds), "--scale", str(args.scale),
                "--rows", *map(str, args.rows), "--quants", *args.quants]
-        print(f"FE_DUMP child {tag}: {spec}", flush=True)
+        print(f"FE_DUMP child {tag}: root={root or ROOT} env={spec!r}", flush=True)
         subprocess.run(cmd, env=env, check=True)
     ok = compare(args, *paths)
     sys.exit(0 if ok else 1)

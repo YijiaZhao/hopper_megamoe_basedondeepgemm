@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Standalone single-GPU driver for Nsight Compute profiling of the Fable frontend kernel
-(router_quant_topk_kernel in csrc/fable_frontend.cu). No torch.distributed, no MegaMoE.
+(router_cc_lean_kernel for rows <= 2, router_quant_topk_kernel otherwise; csrc/fable_frontend.cu).
+No torch.distributed, no MegaMoE.
 
 The kernel only sees rows_per_rank (the local M): with 8 ranks, global M = 2/4/8 map to
 1 row on a rank and M = 16 maps to 2 rows, so this profiles rows in {1, 2}.
-Setup mirrors tests/test_frontend_tinym.py (same buffer layout / weight scale).
 
-  ncu --kernel-name regex:router_quant_topk_kernel --launch-skip 5 --launch-count 1 --set full \
-      --clock-control none -o <rep> python3 tests/ncu_frontend_tinym.py --quant mxfp4 --rows 1 --tinym 1
+  ncu --kernel-name "regex:router_(quant_topk|cc_lean)_kernel" --launch-skip 5 --launch-count 1 --set full \
+      --clock-control none -o <rep> python3 tests/ncu_frontend_tinym.py --quant mxfp4 --rows 1
 """
 import argparse
 import os
@@ -33,10 +33,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quant", choices=("mxfp4", "qoq"), required=True)
     ap.add_argument("--rows", type=int, default=1, help="rows per rank seen by the kernel (1 or 2)")
-    ap.add_argument("--tinym", type=int, default=int(os.environ.get("DG_FE_TINYM", "1")))
-    ap.add_argument("--grid", default=os.environ.get("DG_FE_TINYM_GRID", "96"),
-                    help="DG_FE_TINYM_GRID: 96 = legacy split, auto = full-K SM-count grid, N = full-K N CTAs")
-    ap.add_argument("--mma", default=os.environ.get("DG_FE_TINYM_MMA", "swapab"), help="DG_FE_TINYM_MMA: wmma | fma")
     ap.add_argument("--warmup", type=int, default=5, help="eager launches before the profiled one")
     ap.add_argument("--l2-flush", type=int, default=1, help="flush L2 (256 MB memset) before each launch")
     args = ap.parse_args()
@@ -49,11 +45,10 @@ def main():
     for it in range(args.warmup + 1):  # the last launch is the one ncu profiles (--launch-skip warmup)
         if scratch is not None:
             scratch.zero_()
-        deep_gemm.fable_router_quant_topk_frontend(hidden, w, buf, quant=args.quant,
-                                                   tinym=args.tinym, stamps=0, grid=args.grid, mma=args.mma)
+        deep_gemm.fable_router_quant_topk_frontend(hidden, w, buf, quant=args.quant, stamps=0)
         torch.cuda.synchronize()
     m = args.rows
-    print(f"fe standalone: quant={args.quant} rows={m} tinym={args.tinym} grid={args.grid} mma={args.mma} launches={args.warmup + 1} "
+    print(f"fe standalone: quant={args.quant} rows={m} path={deep_gemm.fable_frontend_path(m, HIDDEN, EXPERTS, TOPK)} launches={args.warmup + 1} "
           f"device={torch.cuda.get_device_name()} topk_idx[0]={buf.topk_idx[0].tolist()}")
 
 

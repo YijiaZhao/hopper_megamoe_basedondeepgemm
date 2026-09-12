@@ -590,63 +590,23 @@ from .fused import FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe, transfor
 
 _FRONTEND_STAMPS_BYTES = 256 * 8 * 8
 _FRONTEND_CC_KEYS_OFF = 256 + 64 * 1024   # ticket area (256 B) + kCCKeysOff: compact [token][e] u32 keys of the cc router (fable_frontend.cu, ckeys = logits + kCCKeysOff, logits = workspace + 256)
+FE_PATH_WMMA, FE_PATH_SWAPAB, FE_PATH_CC = 0, 1, 2     # csrc/fable_frontend.h kFEPath*
 
 
 def fable_frontend_workspace_bytes(e: int) -> int:
     return 256 + 4 * 64 * e * 4 + _FRONTEND_STAMPS_BYTES
 
 
-def _fe_grid_from_env(grid):
-    """DG_FE_TINYM_GRID: unset -> None (follows the MMA: cc -> auto, else 96; see _fe_resolve_knobs);
-    '96' -> legacy 24x4 K-split tiny-M grid; 'auto' -> 0 = full-K scheme sized to the SM count;
-    N -> full-K scheme with N CTAs in total."""
-    if grid is None:
-        grid = os.environ.get("DG_FE_TINYM_GRID")
-        if grid is None:
-            return None
-    if isinstance(grid, str):
-        grid = 0 if grid.strip().lower() in ("auto", "", "0") else int(grid)
-    return int(grid)
-
-
-def _fe_mma_from_env(mma):
-    """DG_FE_TINYM_MMA: 'auto' (default) -> -1 = cc for m <= 2 rows, swapab (+ fragment) otherwise (_fe_resolve_knobs);
-    'wmma' -> 0, 'fma' -> 1 (full-K grid only), 'swapab' -> 2 (experts on the MMA M dimension,
-    mma.sync m16n8k16, A fragments straight from global; legacy 96 x 4 grid and full-K grid),
-    'cc' -> 4 / 'cc6' -> 5 (full-K grid, m <= 2: CUDA-core K-split router, 5 experts x 4 | 6 warps
-    per CTA, weights straight into registers)."""
-    if mma is None:
-        mma = os.environ.get("DG_FE_TINYM_MMA", "auto")
-    if isinstance(mma, str):
-        mma = {"auto": -1, "wmma": 0, "fma": 1, "swapab": 2, "cc": 4, "cc6": 5, "cc44": 6, "ccfp8": 7, "ccsel": 8,
-               "-1": -1, "0": 0, "1": 1, "2": 2, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8}[mma.strip().lower()]
-    return int(mma)
-
-
-def _fe_resolve_knobs(m, grid=None, mma=None, k_parts=None, l2_persist=None):
-    """Resolve (grid, mma, k_parts, l2_persist) for m rows. Default scheme (DG_FE_TINYM_MMA=auto):
-    m <= 2 rows -> the round-3 CUDA-core K-split router on the SM-count grid (cc: compact 384-key
-    array, relaxed ticket, router weights in the persisting L2 set-aside; kernel-end stamps 3.84 us,
-    customer-method nsys span 6.9-7.8 us at M=8 vs 7.4-8.1 swapab); rows > 2, an explicit 96 grid or
-    K-parts > 1 -> swapab (+ fragment layout) on the 96 grid, no L2 persistence. Explicit knobs / env
-    values pass through unchanged; an unset grid follows the MMA (cc -> auto, else 96) and an unset
-    DG_FE_ROUTER_L2_PERSIST defaults to 1 for the cc router, 0 otherwise."""
-    grid = _fe_grid_from_env(grid)
-    mma = _fe_mma_from_env(mma)
-    k_parts = _fe_kparts_from_env(k_parts)
-    if mma == -1:
-        mma = 4 if (m <= 2 and grid in (None, 0) and k_parts == 1) else 2
-    if grid is None:
-        grid = 0 if mma in (4, 5, 6, 7) else 96
-    if l2_persist is None:
-        l2_persist = os.environ.get("DG_FE_ROUTER_L2_PERSIST")
-        l2_persist = (1 if mma in (4, 5, 6, 7) else 0) if l2_persist is None else int(l2_persist)
-    return grid, mma, k_parts, int(l2_persist)
+def fable_frontend_path(m: int, h: int = 3072, e: int = 384, topk: int = 8) -> int:
+    """Launch shape the frontend uses for (m, h, e, topk) (csrc/fable_frontend.h `select_fe_path`): FE_PATH_CC
+    (m <= 2, h 3072, e 384, top-8: the CUDA-core K-split router, 77 + 1 CTAs), FE_PATH_SWAPAB (m <= 16, h 3072,
+    top-8: mma.sync m16n8k16 router on the 96 x 4 grid), else FE_PATH_WMMA."""
+    return _C.fable_frontend_path(m, h, e, topk)
 
 
 def _fe_wlayout_from_env(wlayout):
     """DG_FE_ROUTER_WLAYOUT: 'row' -> 0 = [e][h] router weights; 'fragment' (default) -> 1 =
-    one-time host permutation into m16n8k16 A-fragment order (swapab only; cached per weight
+    one-time host permutation into m16n8k16 A-fragment order (swapab path only; cached per weight
     tensor); 'pre' -> 2 = the caller already passes the permuted tensor."""
     if wlayout is None:
         wlayout = os.environ.get("DG_FE_ROUTER_WLAYOUT", "fragment")
@@ -689,53 +649,15 @@ def _fe_router_weight_for_layout(router_weight, wlayout):
     return hit[1]
 
 
-_fe_fp8_weight_cache = {}
-
-
-def fable_router_weight_fp8(router_weight: torch.Tensor) -> torch.Tensor:
-    """EXPERIMENT (DG_FE_TINYM_MMA=ccfp8): router weights [E, K] bf16 -> packed uint8 [E, K + 16]:
-    e4m3 row (scale = row amax / 448) followed by the fp32 row scale and 12 pad bytes (16 B row
-    alignment). Numeric effect vs bf16 is reported by tests/test_frontend_fe78.py --mma ccfp8."""
-    assert router_weight.dtype == torch.bfloat16 and router_weight.dim() == 2
-    e, k = router_weight.shape
-    w = router_weight.float()
-    scale = (w.abs().amax(dim=1) / 448.0).clamp_min(1e-30)
-    q = (w / scale[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
-    packed = torch.zeros(e, k + 16, dtype=torch.uint8, device=router_weight.device)
-    packed[:, :k] = q
-    packed[:, k:k + 4] = scale.view(torch.uint8).view(e, 4)
-    return packed.contiguous()
-
-
-def _fe_router_weight_fp8_cached(router_weight):
-    key = id(router_weight)
-    hit = _fe_fp8_weight_cache.get(key)
-    if hit is None or hit[0] != router_weight._version:
-        if hit is None:
-            weakref.finalize(router_weight, _fe_fp8_weight_cache.pop, key, None)
-        hit = _fe_fp8_weight_cache[key] = (router_weight._version, fable_router_weight_fp8(router_weight))
-    return hit[1]
-
-
-def _fe_kparts_from_env(k_parts):
-    """DG_FE_TINYM_KPARTS: 1 (default) | 2 | 4 K-parts per expert group (full-K grid only)."""
-    if k_parts is None:
-        k_parts = os.environ.get("DG_FE_TINYM_KPARTS", "1")
-    return int(k_parts)
-
-
-def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8, tinym=None, grid=None, k_parts=None, mma=None) -> int:
-    """Router CTA count the frontend launch uses for (m, h, e, topk) under the current knobs."""
-    if tinym is None:
-        tinym = int(os.environ.get("DG_FE_TINYM", "1"))
-    grid, mma, k_parts, _ = _fe_resolve_knobs(m, grid, mma, k_parts)
-    return _C.fable_frontend_router_ctas(m, h, e, topk, int(bool(tinym)), grid, k_parts)
+def fable_frontend_router_ctas(m: int, e: int, h: int = 3072, topk: int = 8) -> int:
+    """Router CTA count the frontend launch uses for (m, h, e, topk)."""
+    return _C.fable_frontend_router_ctas(m, h, e, topk)
 
 
 def fable_frontend_workspace(sym_buffer, e: int, device) -> torch.Tensor:
     """The Fable frontend workspace of ``sym_buffer`` (zero-initialised once, cached):
-    [0, 256) tickets / hand-off counters, then the fp32 K-split partial logits, then the
-    optional phase stamps. Shared by the standalone FE launch and the fused-FE kernel."""
+    [0, 256) tickets / hand-off counters, then the fp32 K-split partial logits (the cc router's
+    compact key array lives inside them at +64 KB), then the optional phase stamps."""
     cache = getattr(sym_buffer, "_fable_frontend_cache", None)
     if cache is None:
         cache = sym_buffer._fable_frontend_cache = {}
@@ -747,93 +669,62 @@ def fable_frontend_workspace(sym_buffer, e: int, device) -> torch.Tensor:
 
 
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
-                                     sym_buffer, quant: str = "mxfp4", tinym=None, stamps=None,
-                                     l2_persist=None, pdl=None, grid=None, mma=None, k_parts=None, wlayout=None,
-                                     select_in_mega=None):
-    """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend.
+                                     sym_buffer, quant: str = "mxfp4", stamps=None,
+                                     l2_persist=None, wlayout=None, select_in_mega=None):
+    """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend (one launch).
 
-    ``tinym`` (env ``DG_FE_TINYM``, default 1): for m <= 16 use the single-wave
-    3-stage configuration (bit-identical outputs, ~4x lower latency on 78-SM H20).
-    ``stamps`` (env ``DG_FE_STAMPS``, default 0): record per-CTA %globaltimer phase
-    stamps into the workspace; read them back with ``fable_frontend_stamps``.
-    ``l2_persist`` (env ``DG_FE_ROUTER_L2_PERSIST``, default 1 with the cc router, else 0): 1 = pin the router
-    weights in L2 with the persisting-L2 set-aside (access policy window launch
-    attribute), 2 = PTX ``L2::evict_last`` hint on the router weight loads.
-    ``pdl`` (env ``DG_FE_PDL``, default 0): programmatic-dependent-launch trigger for
-    the fused Mega that follows: 1 = at CTA start, 2 = after the CTA's last store.
-    ``grid`` (env ``DG_FE_TINYM_GRID``, default: follows ``mma`` -- ``auto`` for the cc router,
-    ``96`` otherwise): tiny-M CTA scheme. ``auto`` =
-    full-K router CTAs sized to the SM count (H20: 77 x 5 experts + 1 merger CTA = 78,
-    final logits per CTA, streaming top-8 merge, quant on the router CTAs' idle time);
-    ``96`` = legacy 24 expert groups x 4 K-parts + m quant/top-k CTAs; ``N`` = full-K
-    scheme with N CTAs in total. Full-K is deterministic but not bit-identical to 96
-    (different fp32 accumulation order before the bf16 logit rounding).
-    ``mma`` (env ``DG_FE_TINYM_MMA``, default ``auto`` = ``cc`` on the ``auto`` grid with L2-pinned
-    router weights for m <= 2 rows, ``swapab`` + fragment layout on the 96 grid otherwise): ``cc`` =
-    round-3 CUDA-core K-split router (5 experts x 4 warps per CTA, weights straight into registers,
-    compact 384-key array, relaxed ticket, last-arriving CTA does top-8 + softmax; kernel-end stamps
-    3.84 us, customer-method nsys span 6.9-7.8 us at M=8 vs 7.4-8.1 swapab); ``wmma`` = legacy cp.async ring / TMA row
-    pieces into smem + WMMA bf16 m16n16k16 fp32-accumulate; ``fma`` = CUDA-core fp32 FMA
-    straight from global memory (16 B ld.global.nc, warp butterfly + 8-warp smem sum);
-    ``swapab`` (legacy 96 x 4 grid AND full-K) = experts on the MMA M dimension, tokens on N
-    (mma.sync m16n8k16 bf16 -> fp32, rows pad to 8), weight A fragments loaded straight from
-    global into registers, activation rows staged once in smem.
-    ``wlayout`` (env ``DG_FE_ROUTER_WLAYOUT``, default ``fragment``; swapab on the legacy 96 tiny-M grid
-    only -- every other launch reads row-major weights and ignores this knob): ``fragment`` =
-    the router weights are permuted ONCE on the host (``fable_router_weight_fragment_layout``,
-    cached per weight tensor) into m16n8k16 A-fragment order so every warp load instruction is
-    one contiguous 512 B run (4 full lines instead of 8 half lines); identical numerics; ``pre`` =
-    the caller already passes the permuted tensor (no per-call work in this wrapper).
-    ``k_parts`` (env ``DG_FE_TINYM_KPARTS``, default 1; full-K grid only): 1 | 2 | 4 K-parts per
-    expert group; K-part CTAs exchange fp32 partials through the workspace (release/acquire
-    flag), the part-0 CTA sums in fixed order (part 0, 1, ..) and emits the keys.
+    The launch shape follows the problem shape (``fable_frontend_path``): the CUDA-core K-split
+    router for m <= 2 rows (h 3072, e 384, top-8), the swapab mma.sync router on the 96 x 4 grid
+    for m <= 16 (h 3072, top-8), the WMMA router otherwise.
+    ``stamps`` (env ``DG_FE_STAMPS``, default 0): record per-CTA %globaltimer phase stamps into
+    the workspace; read them back with ``fable_frontend_stamps``.
+    ``l2_persist`` (env ``DG_FE_ROUTER_L2_PERSIST``, default 1 on the cc path, else 0): 1 = pin the
+    router weights in L2 with the persisting-L2 set-aside (access policy window launch attribute).
+    ``wlayout`` (env ``DG_FE_ROUTER_WLAYOUT``, default ``fragment``; swapab path only -- the other
+    paths read row-major weights and ignore it): ``fragment`` = the router weights are permuted ONCE
+    on the host (``fable_router_weight_fragment_layout``, cached per weight tensor) into m16n8k16
+    A-fragment order so every warp load instruction is one contiguous 512 B run; identical numerics;
+    ``pre`` = the caller already passes the permuted tensor (no per-call work in this wrapper);
+    ``row`` = row-major.
+    ``select_in_mega`` (env ``DG_FE_SELECT_IN_MEGA``, default 0; cc path only): the frontend stops
+    after the router CTAs stored the 384 keys per token (no ticket / last-arriver select) and the
+    fused MegaMoE prologue selects the top-8 + softmax (``mxfp4|qoq_mega_moe_fused`` pick the key
+    array up from this buffer's cache). topk_idx / topk_weights are NOT valid after such a call.
     """
     assert quant in ("mxfp4", "qoq")
-    m = hidden.size(0)
+    m, h = hidden.shape
     e = router_weight.size(0)
-    if tinym is None:
-        tinym = int(os.environ.get("DG_FE_TINYM", "1"))
+    topk = sym_buffer.topk_idx.size(1)
+    path = fable_frontend_path(m, h, e, topk)
     if stamps is None:
         stamps = int(os.environ.get("DG_FE_STAMPS", "0"))
-    if pdl is None:
-        pdl = int(os.environ.get("DG_FE_PDL", "0"))
-    grid, mma, k_parts, l2_persist = _fe_resolve_knobs(m, grid, mma, k_parts, l2_persist)
+    if l2_persist is None:
+        l2_persist = os.environ.get("DG_FE_ROUTER_L2_PERSIST")
+        l2_persist = (1 if path == FE_PATH_CC else 0) if l2_persist is None else int(l2_persist)
     wlayout = _fe_wlayout_from_env(wlayout)
-    if mma == 2 and wlayout in (1, 2):
-        # The fragment layout is read ONLY by the swapab kernel of the legacy 96 tiny-M grid (m <= 16,
-        # top-8, h == 3072, 16-expert groups). Every other launch (tinym=0, m > 16, the full-K grid whose
-        # expert groups are not 16 wide, other shapes) reads row-major weights, so the permutation must
-        # not be applied there: it silently produced wrong top-8 sets (test_frontend_tinym vs tinym=0).
-        fragment_ok = bool(tinym) and m <= 16 and grid == 96 and hidden.size(1) == 3072 and sym_buffer.topk_idx.size(1) == 8
-        if fragment_ok:
-            if wlayout == 1:
-                router_weight = _fe_router_weight_for_layout(router_weight, 1)
-            mma = 3      # swapab + fragment weight layout (permuted here and cached, or 'pre' = permuted by the caller)
-        elif wlayout == 2:
-            raise ValueError("wlayout='pre' (fragment-layout router weight) needs the legacy 96 tiny-M grid: "
-                             f"tinym={tinym} m={m} grid={grid} h={hidden.size(1)} topk={sym_buffer.topk_idx.size(1)}")
-    elif mma == 7 and router_weight.dtype == torch.bfloat16:
-        router_weight = _fe_router_weight_fp8_cached(router_weight)     # ccfp8 experiment: e4m3 + row scale, cached
+    if path == FE_PATH_SWAPAB:
+        if wlayout == 1:
+            router_weight = _fe_router_weight_for_layout(router_weight, 1)
+        wlayout = 1 if wlayout in (1, 2) else 0
+    elif wlayout == 2:
+        raise ValueError(f"wlayout='pre' (fragment-layout router weight) needs the swapab path: m={m} h={h} e={e} topk={topk}")
+    else:
+        wlayout = 0
     if select_in_mega is None:
         select_in_mega = int(os.environ.get("DG_FE_SELECT_IN_MEGA", "0"))
-    # select_in_mega (env DG_FE_SELECT_IN_MEGA, default 0; cc router, m <= 2, e == 384 only): the
-    # frontend stops after the router CTAs stored the 384 keys per token (no ticket / last-arriver
-    # select); the fused MegaMoE prologue selects the top-8 + softmax (mxfp4|qoq_mega_moe_fused pick
-    # the key array up from this buffer's cache). topk_idx/topk_weights are NOT valid after this call.
-    if select_in_mega and mma == 4 and m <= 2 and e == 384 and tinym and str(grid).strip().lower() != "96":
-        mma = 8
+    select_in_mega = int(bool(select_in_mega) and path == FE_PATH_CC)
     workspace = fable_frontend_workspace(sym_buffer, e, hidden.device)
     cache = sym_buffer._fable_frontend_cache
     if cache.get("keys") is None or cache["keys"].data_ptr() != workspace[_FRONTEND_CC_KEYS_OFF:].data_ptr():
         cache["keys"] = workspace[_FRONTEND_CC_KEYS_OFF:_FRONTEND_CC_KEYS_OFF + 2 * 512 * 4].view(torch.int32)   # flat, token t at [t * e, (t + 1) * e)
-    cache["keys_active"] = cache["keys"] if mma == 8 else None
+    cache["keys_active"] = cache["keys"] if select_in_mega else None
     views = cache.get(m)
     if views is None:
         views = cache[m] = (sym_buffer.x[:m], sym_buffer.x_sf[:m],
                             sym_buffer.topk_idx[:m], sym_buffer.topk_weights[:m])
     _C.fable_router_quant_topk_frontend(
         hidden, router_weight, views[0], views[1], views[2], views[3], workspace,
-        0 if quant == "mxfp4" else 1, int(bool(tinym)), int(bool(stamps)), int(l2_persist), int(pdl), grid, mma, k_parts)
+        0 if quant == "mxfp4" else 1, int(bool(stamps)), int(l2_persist), wlayout, select_in_mega)
 
 
 def fable_frontend_keys(sym_buffer) -> torch.Tensor:
@@ -845,12 +736,13 @@ def fable_frontend_keys(sym_buffer) -> torch.Tensor:
 def fable_frontend_stamps(sym_buffer, e: int) -> torch.Tensor:
     """[num_ctas, 8] int64 ns %globaltimer stamps of the last DG_FE_STAMPS=1 launch.
 
-    Legacy grid (DG_FE_TINYM_GRID=96): router CTAs (first 96 for E=384, m <= 16): start /
-    chunk0 landed / mma done / ticket bumped; quant CTAs (next m): start / quant done /
-    ticket seen / top-k done / [tiny: partials loaded / rounds done].
-    Full-K grid (auto): router CTAs (``fable_frontend_router_ctas``): start / chunk0 landed /
-    mma done / keys written / quant done (CTAs t < m) / all chunks issued; merger CTA (last,
-    token 0's warp): start / first CTA seen / last CTA seen / merge done / top-k written.
+    cc path: router CTAs (``fable_frontend_router_ctas``): start / chunk0 landed / logits done /
+    keys written (+ ticket) / - / loads issued / %smid / prologue done; spare CTA: start / - / - / - /
+    - / quant done / %smid, and the last-arriving router CTA's select in its slots 1..4 (ticket won /
+    keys read / select done / top-k written).
+    swapab / WMMA grid: router CTAs (first 96 for E=384, m <= 16): start / chunk0 landed / mma done /
+    ticket bumped; quant CTAs (next m): start / quant done / ticket seen / top-k done /
+    [tiny: partials loaded / rounds done].
     """
     workspace = sym_buffer._fable_frontend_cache["workspace"]
     off = 256 + 4 * 64 * e * 4

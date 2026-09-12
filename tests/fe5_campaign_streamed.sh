@@ -1,11 +1,11 @@
 #!/bin/bash
 # Round-5 supplementary campaign, STREAMED replays (DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30: 30 back-to-back replays per case
-# without per-iteration host sync / barrier; the ranks self-align through the on-stream collectives): E2E, LEAN=1 only, normal and forced-balanced routing, both quants, M 2 4 8 16,
+# without per-iteration host sync / barrier; the ranks self-align through the on-stream collectives): E2E, normal and forced-balanced routing, both quants, M 2 4 8 16,
 # 3 interleaved passes + one Mega-only pass. Separate output root so it is never mixed with the plain customer method.
 # Usage (in four_api_build / fe5c_build, repo root): bash tests/fe5_campaign_streamed.sh [passes=3] [outroot=/raid/kimi/results/fe5/cap_streamed]
 cd "$(dirname "$0")/.."
 PASSES=${1:-3}; ROOT_OUT=${2:-/raid/kimi/results/fe5/cap_streamed}; mkdir -p "$ROOT_OUT"
-export DG_FE_SELECT_IN_MEGA=1 DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30 DG_FE_CC_LEAN=1
+export DG_FE_SELECT_IN_MEGA=1 DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30
 echo "CAMPAIGN_STREAMED_START $(date +%T) $(git log --oneline -1) passes=$PASSES"
 cap() {   # outdir scopes balanced
   local out=$1 scopes=$2

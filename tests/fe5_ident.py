@@ -1,11 +1,11 @@
-"""Round-5 bit-identity gate for the cc router knobs (DG_FE_CC_LEAN, DG_FE_CC_SELECT=pruned).
+"""Bit-identity gate for the cc router between two builds / env configurations.
 
-The knobs are read once per process (static), so the gate runs twice: `--save ref.pt` under the
-baseline env, then `--ref ref.pt` under the knob env. Per seed x rows {1, 2} x quant {mxfp4, qoq}
-it records (a) the knob-0 FE outputs topk_idx / topk_weights (ticket path: router + last-arriver
-select) and (b) the DG_FE_SELECT_IN_MEGA=1 compact key array (router only), and compares all of
-them bit-exactly against the reference file. Single GPU.
-Usage: python3 tests/fe5_ident.py --save /tmp/ref.pt ; DG_FE_CC_LEAN=1 python3 tests/fe5_ident.py --ref /tmp/ref.pt
+The gate runs twice: `--save ref.pt` under the reference build or env, then `--ref ref.pt` under the
+other one. Per seed x rows {1, 2} x quant {mxfp4, qoq} it records (a) the FE outputs topk_idx /
+topk_weights (ticket path: router + last-arriver select) and (b) the DG_FE_SELECT_IN_MEGA=1 compact
+key array (router only), plus x / x_sf, and compares all of them bit-exactly against the reference
+file. Single GPU.
+Usage: python3 tests/fe5_ident.py --save /tmp/ref.pt ; python3 tests/fe5_ident.py --ref /tmp/ref.pt
 """
 import argparse, os, sys, torch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,7 +21,6 @@ def main():
     ap.add_argument("--seeds", type=int, default=64)
     ap.add_argument("--scale", type=float, default=0.05, help="router weight std (0.05 = the bench default)")
     args = ap.parse_args()
-    os.environ.setdefault("DG_FE_TINYM_GRID", "auto"); os.environ.setdefault("DG_FE_TINYM_MMA", "cc")
     torch.manual_seed(20260805)
     w = (torch.randn(EXPERTS, HIDDEN, device="cuda", dtype=torch.bfloat16) * args.scale).contiguous()
     buf = make_buffer(64)
@@ -49,7 +48,7 @@ def main():
                           f"x_sf {tuple(buf.x_sf.shape)} {buf.x_sf.dtype} stride {buf.x_sf.stride()} | topk_idx {tuple(buf.topk_idx.shape)} "
                           f"{buf.topk_idx.dtype} | topk_weights {tuple(buf.topk_weights.shape)} {buf.topk_weights.dtype} | "
                           f"workspace {tuple(ws.shape)} {ws.dtype}, keys at byte {256 + 64 * 1024} (token t at +t*{EXPERTS}*4), ticket area [0,256)")
-    env = {k: os.environ.get(k, "") for k in ("DG_FE_CC_LEAN", "DG_FE_CC_SELECT", "DG_FE_SELECT_IN_MEGA", "DG_FE_TINYM_MMA")}
+    env = {k: os.environ.get(k, "") for k in ("DG_FE_SELECT_IN_MEGA", "DG_FE_ROUTER_L2_PERSIST")}; env["build"] = ROOT
     if args.save:
         torch.save({"env": env, "out": out}, args.save)
         print(f"FE5_IDENT saved {len(out)} cells to {args.save} env={env}")

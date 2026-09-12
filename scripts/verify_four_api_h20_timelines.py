@@ -48,7 +48,7 @@ def main():
 
         checks = {}
         if scope == "e2e":
-            # router_cc_lean_kernel = the round-5 cc entry point (DG_FE_CC_LEAN, default 1)
+            # router_cc_lean_kernel = the cc router entry point (rows <= 2 per rank), router_quant_topk_kernel = swapab / WMMA grid
             checks["fable_frontend"] = graph_present("router_quant_topk_kernel") or graph_present("router_cc_lean_kernel")
         if backend == "fused":
             checks["mega"] = graph_present(f"sm90_{quant}_mega_moe_h20_fused_impl")

@@ -1,11 +1,11 @@
 #!/bin/bash
 # Round-5 supplementary campaign WITH the host barrier before every graph replay (DG_PROFILE_HOST_BARRIER=1, removes
-# most of the inter-rank launch skew): E2E, LEAN=1 only, normal and forced-balanced routing, both quants, M 2 4 8 16,
+# most of the inter-rank launch skew): E2E, normal and forced-balanced routing, both quants, M 2 4 8 16,
 # 3 interleaved passes + one Mega-only pass. Separate output root so it is never mixed with the plain customer method.
 # Usage (in four_api_build / fe5c_build, repo root): bash tests/fe5_campaign_hb.sh [passes=3] [outroot=/raid/kimi/results/fe5/cap_hb]
 cd "$(dirname "$0")/.."
 PASSES=${1:-3}; ROOT_OUT=${2:-/raid/kimi/results/fe5/cap_hb}; mkdir -p "$ROOT_OUT"
-export DG_FE_SELECT_IN_MEGA=1 DG_PROFILE_HOST_BARRIER=1 DG_FE_CC_LEAN=1
+export DG_FE_SELECT_IN_MEGA=1 DG_PROFILE_HOST_BARRIER=1
 echo "CAMPAIGN_HB_START $(date +%T) $(git log --oneline -1) passes=$PASSES"
 cap() {   # outdir scopes balanced
   local out=$1 scopes=$2

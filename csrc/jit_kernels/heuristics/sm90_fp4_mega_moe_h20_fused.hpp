@@ -11,16 +11,6 @@ namespace deep_gemm {
 
 static constexpr int kSM90NVFP4BStoragePerKBlock = 80;
 
-// K128 blocks per pipeline stage of the BM8 MXFP4 RF swapAB tier (kernel
-// `kKBlocksPerStage`): env DG_FP4_KBLOCKS_PER_STAGE in {2, 4}. Shared by the
-// heuristic (stage depth) and the host (kernel template argument). Default 2:
-// 4 blocks x 2 stages measured slower on H20 (see the host comment next to
-// `k_blocks_per_stage`).
-static inline int get_sm90_fp4_h20_bm8_k_blocks_per_stage() {
-    const int v = get_env<int>("DG_FP4_KBLOCKS_PER_STAGE", 2);
-    return v == 4 ? 4 : 2;
-}
-
 struct SM90FP4H20FusedConfig {
     static constexpr int kBlockK = 128;
     static constexpr int kSwizzleActsMode = 128;
@@ -120,14 +110,12 @@ select_sm90_nvfp4_h200_fused(
         bool single_active_dispatch_warp;
     } tuning {};
 
-    // BM8 (MXFP4 RF swapAB) runs kKBlocksPerStage == 2 or 4 (host knob
-    // DG_FP4_KBLOCKS_PER_STAGE, see `get_sm90_fp4_h20_bm8_k_blocks_per_stage`):
-    // a stage carries 2 K128 blocks (2 KB A + 40 KB packed B + 2 SFA slots, 4
-    // stages = 173056 B) or 4 (4 KB + 80 KB + 4 slots, 2 stages = 173056 B); both
-    // keep 8 K-blocks in flight at the smem capacity. DG_FP4_BM8_STAGES overrides
-    // the depth (kernel static-asserts 2..4 for 2 blocks, exactly 2 for 4 blocks).
-    const int bm8_k_blocks = (input.rf_decode && !input.wide_tiles) ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 1;
-    const int bm8_stages = bm8_k_blocks == 4 ? 2 :
+    // BM8 (MXFP4 / QoQ RF swapAB) runs kKBlocksPerStage == 2: a stage carries 2 K128
+    // blocks (2 KB A + 40 KB packed B + 2 SFA slots, 4 stages = 173056 B); wide tasks
+    // carry one K128 block (1 KB A + 2 x 20 KB B) per stage. DG_FP4_BM8_STAGES overrides
+    // the depth (kernel static-asserts 2..4 for 2 blocks, 4..7 for 1 block).
+    const int bm8_k_blocks = (input.rf_decode && !input.wide_tiles) ? 2 : 1;
+    const int bm8_stages =
         std::clamp(get_env<int>("DG_FP4_BM8_STAGES", 4), bm8_k_blocks == 2 ? 2 : 4, bm8_k_blocks == 2 ? 4 : 7);
     if (input.num_tokens <= 1)
         tuning = {8, 256, 24, bm8_stages, SM90ArchSpec::smem_capacity,

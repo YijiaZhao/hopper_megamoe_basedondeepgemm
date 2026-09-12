@@ -3,12 +3,12 @@
 # template arguments the host JIT emits for the BM8 tier), with ptxas' register /
 # spill / smem report. Lets a task-shape change be checked and its register
 # footprint read while the GPUs are busy.
-#   [FUSE_FE=true] bash scripts/compile_check_fused_kernel.sh <quant mxfp4|qoq> <l1_tiles 1|2> <l2_tiles 1|2> \
-#        <k_blocks_per_stage 1|2|4> <stages> [outdir]
+#   bash scripts/compile_check_fused_kernel.sh <quant mxfp4|qoq> <l1_tiles 1|2> <l2_tiles 1|2> <stages> [outdir]
+#   (K128 blocks per stage follow the task shape: 2, or 1 with wide tiles.)
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-QUANT=${1:-mxfp4}; L1T=${2:-1}; L2T=${3:-1}; KB=${4:-2}; STAGES=${5:-4}
-OUT=${6:-/tmp/dg_compile_check/${QUANT}_bn$((256 * L1T))x$((256 * L2T))_kb${KB}_s${STAGES}${FUSE_FE:+_fefuse}}
+QUANT=${1:-mxfp4}; L1T=${2:-1}; L2T=${3:-1}; STAGES=${4:-4}
+OUT=${5:-/tmp/dg_compile_check/${QUANT}_bn$((256 * L1T))x$((256 * L2T))_s${STAGES}}
 mkdir -p "$OUT"
 CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 CUTLASS=${DG_CUTLASS_INCLUDE_PATH:-$ROOT/third-party/cutlass/include}
@@ -16,7 +16,6 @@ if [ "$QUANT" = qoq ]; then SYM=sm90_qoq_mega_moe_h20_fused_impl; MX=false; QQ=t
 else SYM=sm90_mxfp4_mega_moe_h20_fused_impl; MX=true; QQ=false; QIS2=false; QPF=false; fi
 cat > "$OUT/kernel.cu" <<CU
 #define DG_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT 1
-#define DG_FP4_TINYM_PREFETCH 2
 ${EXTRA_DEFINES:-}
 #define sm90_nvfp4_mega_moe_h200_fused_impl $SYM
 #include <deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh>
@@ -51,10 +50,6 @@ static void __instantiate_kernel() {
         /* kStreamKRequested */ false,
         /* kNvlFastEpilogueRequested */ false,
         /* kFineCombineRequested */ true,
-        /* kCombineDynamicRequested */ true,
-        /* kFuseL1L2Requested */ false,
-        /* kKBlocksPerStageRequested */ $KB,
-        /* kTinyMGemvRequested */ false,
         /* kPushDispatchRequested */ true,
         /* kPushMaxTokensPerRank */ 2,
         /* kLeanRouting */ true,
@@ -63,17 +58,10 @@ static void __instantiate_kernel() {
         /* kQoQInlineS2Frags */ 2,
         /* kQoQInlineS2Ilv */ false,
         /* kQoQInlineS2PrefetchPacked */ $QPF,
-        /* kQoQInlineS2RawU8 */ false,
         /* kRFPrefetchPacked */ false,
         /* kStridedPoolDebug */ false,
-        /* kL2PrefetchAllRequested */ false,
-        /* kL2PrefetchMaxMB */ 48,
-        /* kL2PrefetchKBlocks */ 0,
-        /* kSplitKL1All */ false,
-        /* kSplitKL2All */ false,
         /* kL1TaskTiles */ $L1T,
-        /* kL2TaskTiles */ $L2T,
-        /* kFuseFERequested */ ${FUSE_FE:-false}
+        /* kL2TaskTiles */ $L2T
     >);
 };
 CU

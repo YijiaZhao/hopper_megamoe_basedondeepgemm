@@ -3,11 +3,11 @@
 # SKEW_MAX (default 20 us, reconcile_nsys_devices.py): delete those reports, re-run the
 # capture with RESUME=1 (only the missing cases are captured, each behind the per-case idle
 # checks), re-reconcile; up to ROUNDS rounds. Then refresh the summaries.
-# Usage (inside four_api_build): bash scripts/recapture_skewed_points.sh OUTDIR KNOB_VALUE
+# Usage (inside four_api_build): bash scripts/recapture_skewed_points.sh OUTDIR
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
-OUT=$1; KNOB=$2
+OUT=$1
 SKEW_MAX=${SKEW_MAX:-20}; ROUNDS=${ROUNDS:-4}
 export PYTHONPATH="$ROOT"
 export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -34,7 +34,7 @@ for round in $(seq 1 "$ROUNDS"); do
   echo "round $round: re-capturing (skew > $SKEW_MAX us): $bad"
   for f in $bad; do rm -f "$OUT/$f"; done
   wait_idle || exit 1
-  OUT="$OUT" RESUME=1 DG_FP4_FUSE_L1L2=$KNOB timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.recapture$round.log" 2>&1
+  OUT="$OUT" RESUME=1 timeout 3600 bash scripts/capture_four_api_h20_timelines.sh > "$OUT.recapture$round.log" 2>&1
   echo "RECAPTURE_EXIT=$? $(date)"
 done
 python3 scripts/reconcile_nsys_devices.py --last 3 "$OUT"/*_fused_*.nsys-rep > "$OUT/reconcile_fused.txt" 2>&1

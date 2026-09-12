@@ -40,11 +40,6 @@ public:
         bool stream_k;
         bool nvl_fast_epilogue;
         bool fine_combine;
-        bool combine_dynamic;
-        bool fuse_l1l2;
-        int k_blocks_per_stage;
-        bool tinym;
-        int tinym_prefetch;
         bool push_dispatch;
         int push_max_tokens_per_rank;
         bool lean_routing;
@@ -53,17 +48,10 @@ public:
         int qoq_inline_s2_frags;
         bool qoq_inline_s2_ilv;
         bool qoq_inline_s2_prefetch_packed;
-        bool qoq_inline_s2_rawu8;
         bool rf_prefetch_packed;
         bool strided_pool_debug;
-        bool l2_prefetch_all;
-        int l2_prefetch_max_mb;
-        int l2_prefetch_k_blocks;
-        bool split_k_l1_all;
-        bool split_k_l2_all;
         int l1_task_tiles;
         int l2_task_tiles;
-        bool fuse_fe;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -82,9 +70,6 @@ public:
         const float* l1_global_scales;
         const float* l2_global_scales;
         unsigned long long* phase_stamps;
-        const void* fe_hidden;
-        const void* fe_router_weight;
-        void* fe_workspace;
         const uint32_t* fe_keys;
         LaunchArgs launch_args;
     };
@@ -95,15 +80,10 @@ public:
                           "sm90_nvfp4_mega_moe_h200_fused_impl");
         const std::string kernel_header = fmt::format(
             "#define DG_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT 1\n"
-            "#define DG_FP4_TINYM_PREFETCH {}\n"
-            "{}"
             "{}"
             "#define sm90_nvfp4_mega_moe_h200_fused_impl {}\n"
             "#include <deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh>",
-            args.tinym_prefetch,
             get_env<int>("DG_FP4_SPIN_TIMEOUT", 0) != 0 ? "#define DG_FUSED_SPIN_TIMEOUT 1\n" : "",
-            // DG_FE_CC_SELECT=pruned: the select-in-Mega prologue uses fable_cc::select_pruned (round 5 knob)
-            get_env<std::string>("DG_FE_CC_SELECT") == "pruned" ? "#define DG_FE_CC_SELECT_PRUNED 1\n" : "",
             kernel_symbol);
         const std::string policy_template_args = fmt::format(
             "/* kSwapABRequested */ {},\n"
@@ -123,10 +103,6 @@ public:
             "        /* kStreamKRequested */ {},\n"
             "        /* kNvlFastEpilogueRequested */ {},\n"
             "        /* kFineCombineRequested */ {},\n"
-            "        /* kCombineDynamicRequested */ {},\n"
-            "        /* kFuseL1L2Requested */ {},\n"
-            "        /* kKBlocksPerStageRequested */ {},\n"
-            "        /* kTinyMGemvRequested */ {},\n"
             "        /* kPushDispatchRequested */ {},\n"
             "        /* kPushMaxTokensPerRank */ {},\n"
             "        /* kLeanRouting */ {},\n"
@@ -135,17 +111,10 @@ public:
             "        /* kQoQInlineS2Frags */ {},\n"
             "        /* kQoQInlineS2Ilv */ {},\n"
             "        /* kQoQInlineS2PrefetchPacked */ {},\n"
-            "        /* kQoQInlineS2RawU8 */ {},\n"
             "        /* kRFPrefetchPacked */ {},\n"
             "        /* kStridedPoolDebug */ {},\n"
-            "        /* kL2PrefetchAllRequested */ {},\n"
-            "        /* kL2PrefetchMaxMB */ {},\n"
-            "        /* kL2PrefetchKBlocks */ {},\n"
-            "        /* kSplitKL1All */ {},\n"
-            "        /* kSplitKL2All */ {},\n"
             "        /* kL1TaskTiles */ {},\n"
-            "        /* kL2TaskTiles */ {},\n"
-            "        /* kFuseFERequested */ {}",
+            "        /* kL2TaskTiles */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -163,10 +132,6 @@ public:
             args.stream_k ? "true" : "false",
             args.nvl_fast_epilogue ? "true" : "false",
             args.fine_combine ? "true" : "false",
-            args.combine_dynamic ? "true" : "false",
-            args.fuse_l1l2 ? "true" : "false",
-            args.k_blocks_per_stage,
-            args.tinym ? "true" : "false",
             args.push_dispatch ? "true" : "false",
             args.push_max_tokens_per_rank,
             args.lean_routing ? "true" : "false",
@@ -175,17 +140,10 @@ public:
             args.qoq_inline_s2_frags,
             args.qoq_inline_s2_ilv ? "true" : "false",
             args.qoq_inline_s2_prefetch_packed ? "true" : "false",
-            args.qoq_inline_s2_rawu8 ? "true" : "false",
             args.rf_prefetch_packed ? "true" : "false",
             args.strided_pool_debug ? "true" : "false",
-            args.l2_prefetch_all ? "true" : "false",
-            args.l2_prefetch_max_mb,
-            args.l2_prefetch_k_blocks,
-            args.split_k_l1_all ? "true" : "false",
-            args.split_k_l2_all ? "true" : "false",
             args.l1_task_tiles,
-            args.l2_task_tiles,
-            args.fuse_fe ? "true" : "false");
+            args.l2_task_tiles);
         return fmt::format(R"(
 {}
 
@@ -240,9 +198,6 @@ static void __instantiate_kernel() {{
             args.l1_global_scales,
             args.l2_global_scales,
             args.phase_stamps,
-            args.fe_hidden,
-            args.fe_router_weight,
-            args.fe_workspace,
             args.fe_keys));
     }
 };
@@ -265,11 +220,7 @@ static void sm90_fp4_h20_fused_mega_moe(
     const bool& mxfp4 = false,
     const std::optional<torch::Tensor>& phase_stamps = std::nullopt,
     const bool& qoq = false,
-    // Fused Fable frontend (DG_FP4_FUSE_FE, see below): bf16 hidden [num_tokens, hidden],
-    // bf16 router weight [num_experts, hidden], the Fable frontend workspace tensor.
-    const std::optional<torch::Tensor>& fe_hidden = std::nullopt,
-    const std::optional<torch::Tensor>& fe_router_weight = std::nullopt,
-    const std::optional<torch::Tensor>& fe_workspace = std::nullopt,
+    // DG_FE_SELECT_IN_MEGA=1: the Fable cc frontend's compact [token][384] u32 key array
     const std::optional<torch::Tensor>& fe_keys = std::nullopt
 ) {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -435,38 +386,10 @@ static void sm90_fp4_h20_fused_mega_moe(
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
         dense_weight_tiles && split_k_l2_env != 0;
     const uint32_t split_k_l2_ways = split_k_l2_env >= 3 ? 3u : 2u;
-    // M=16 task-shape experiment (per-rank rows == 2 only, i.e. 16 global tokens on 8
-    // ranks): DG_FP4_SPLITK_L1_ALL=1 claims EVERY L1 task as two K halves (kernel
-    // `kSplitKL1All`, scheduler `kSplitL1All`): ~160 tasks / 78 SMs = 2.05 waves + a
-    // 4-task straggler wave today -> ~320 half tasks (4.1 waves) with the existing
-    // publisher/finisher protocol. DG_FP4_SPLITK_L2_ALL=1 does the same for the L2
-    // tasks (~180 -> ~360 halves; MXFP4 only, like kSplitKL2; implies the 2-way L2
-    // split for the launch). Both default 0: H20 .7 A/B (2026-09-10, official capture, GPU0
-    // last-3 median, median of 5 independent captures, M=16): Mega-only fused mxfp4 83.6 ->
-    // L1_ALL 87.3 / L2_ALL 90.2 / both 108.7 us, qoq 78.9 -> 86.2 / 80.8 / 85.1; E2E fused
-    // mxfp4 105.9 -> 112.4 / 126.1 / 134.4, qoq 93.1 -> 110.9 / 98.0 / 103.6. Host-barrier
-    // (skew-free) Mega-only, 2 captures: mxfp4 78.5-85.9 -> L1_ALL 92.4 (+1 skewed 315.8) /
-    // L2_ALL 89.7-92.4 / both 105.9-108.5; qoq 82.5-103.1 -> 83.4-85.2 / 83.5-86.8 / 86.0-88.0.
-    // A half task keeps ~4 us of fixed cost (pool wait, first stage fill, publish/acquire,
-    // epilogue), so 4.1 waves of halves lose to 2 waves + a split straggler wave; the
-    // all-split L2 additionally doubles the L2 tail. Numerics identical (T=2/8/8/16 both
-    // quants, mxfp4 128/512: same cos_min digits as knob off).
-    const bool m16_rows = num_tokens == 2 && num_ranks == 8;
     // QoQ inline s2 (kernel `kQoQInlineS2`, DG_FP4_QOQ_INLINE_S2 default 1) on every QoQ swapAB
     // launch. The 2026-09-11 T=32 / T=64 failures (rows 8.. of a BM16 / BM24 block with > 8 valid
-    // rows got token group 0's sums) were a `promote_task_rf` accumulator index (kernel, fixed);
-    // the interim host gate (num_tokens x num_ranks <= 8) is kept as a knob: DG_FP4_QIS2_MAX_GTOK
-    // bounds num_tokens x num_ranks (0 = no bound, default).
-    const int qis2_max_gtok = get_env<int>("DG_FP4_QIS2_MAX_GTOK", 0);
-    const bool qoq_inline_s2 = qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0 &&
-        (qis2_max_gtok <= 0 || num_tokens * num_ranks <= qis2_max_gtok);
-    // (Not with wide tasks: all-task splits measured +3.7..+7.3 us at M=16; wide L1 uses
-    // a 3-way TAIL split instead, see the kernel.)
-    const bool split_k_l1_all = split_k_l1 && m16_rows && !wide_tiles &&
-        get_env<int>("DG_FP4_SPLITK_L1_ALL", 0) != 0;
-    const bool split_k_l2_all = mxfp4 && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
-        !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
-        dense_weight_tiles && m16_rows && get_env<int>("DG_FP4_SPLITK_L2_ALL", 0) != 0;
+    // rows got token group 0's sums) were a `promote_task_rf` accumulator index (kernel, fixed).
+    const bool qoq_inline_s2 = qoq && get_env<int>("DG_FP4_QOQ_INLINE_S2", 1) != 0;
     // Stream-K (kernel `kStreamK`): for tiny M the (task, K128 block) units of the
     // L1 and of the L2 phase are split into 78 contiguous near-equal unit ranges (one
     // per SM, task-major) with an n-way cross-CTA fp32 reduction per tile through
@@ -522,19 +445,6 @@ static void sm90_fp4_h20_fused_mega_moe(
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
         dense_weight_tiles && get_env<int>("DG_FP4_STREAMK", 1) != 0 &&
         num_global_tokens_upper <= get_env<int>("DG_FP4_STREAMK_MAX_M", 8);
-    // Tiny-M CUDA-core GEMV (kernel `kTinyMGemv`, impls/sm90_fp4_mega_moe_h20_tinym_math.inl):
-    // for <= DG_FP4_TINYM_MAX_M (default 16) global tokens the L1/L2 math is a
-    // bandwidth-shaped weight-streaming GEMV on the CUDA cores (stream-K unit
-    // ranges, fp32 fixup through the split-K scratch); the TMA/WGMMA task pipeline,
-    // split-K tails and stream-K scheduler are off for that launch. DG_FP4_TINYM=1
-    // enables (default 0 until the path is validated and measured; see the tinym
-    // design note); DG_FP4_TINYM_PREFETCH (1..4, default 2) sets the units in flight.
-    const bool tinym = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
-        config.block_n == 256 && !half_tile_tasks && !l2_half_row_tasks &&
-        plan.use_interleaved_scheduler && dense_weight_tiles &&
-        get_env<int>("DG_FP4_TINYM", 0) != 0 &&
-        num_global_tokens_upper <= get_env<int>("DG_FP4_TINYM_MAX_M", 16);
-    const int tinym_prefetch = std::clamp(get_env<int>("DG_FP4_TINYM_PREFETCH", 2), 1, 4);
     // Push dispatch (kernel `kPushDispatch`): for <= DG_FP4_PUSH_DISPATCH_MAX_M
     // (default 16) global tokens the source rank pushes each routed row (3 KB token +
     // per-K128 SF + top-k weight + source metadata) into the destination rank's pool
@@ -585,15 +495,11 @@ static void sm90_fp4_h20_fused_mega_moe(
     // are issued by kNumRanks lanes at once: serially from one thread each
     // release.sys drained the SM's NVLink stores (~1.5 us) and put +8 us on the
     // kernel. H20 A/B (2026-09-09, phase-stamp probe under nsys, skew-free
-    // min-over-devices kernel duration, us, knob 1 vs 0, same session): with the
-    // default DG_FP4_L2_PREFETCH_ALL=1 mxfp4 M=2 42.7/43.5 vs 42.5/43.6, M=8
-    // 61.3/62.2 vs 62.0/62.3, M=16 80.1/79.4 vs 80.6/81.0, qoq M=8 60.4/60.8 vs
-    // 60.3/61.3 (neutral to -1.6: the B loader's prefetch loop exits on the SM e
-    // high-word publish, so the direct DONE poll is not on its path); with
-    // DG_FP4_L2_PREFETCH_ALL=0 mxfp4 M=2 40.3 vs 41.2, M=8 53.3 vs 54.4, M=16 75.3
-    // vs 76.4, qoq M=8 53.0 vs 54.1 (-1 us: rank-0 push issued -> data complete
-    // 2.9 vs 3.7 us, first math 8.2 vs 9.6). Numerics unchanged (mxfp4/qoq
-    // T=2/8/8/16 x2, mxfp4 128/512, 200-iter graph-replay stress).
+    // min-over-devices kernel duration, us, knob 1 vs 0, same session): mxfp4 M=2
+    // 40.3 vs 41.2, M=8 53.3 vs 54.4, M=16 75.3 vs 76.4, qoq M=8 53.0 vs 54.1 (-1 us:
+    // rank-0 push issued -> data complete 2.9 vs 3.7 us, first math 8.2 vs 9.6).
+    // Numerics unchanged (mxfp4/qoq T=2/8/8/16 x2, mxfp4 128/512, 200-iter
+    // graph-replay stress).
     const bool push_done_flags = push_dispatch &&
         get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 &&
         get_env<int>("DG_FP4_PUSH_DONE_FLAGS", 1) != 0;
@@ -622,73 +528,6 @@ static void sm90_fp4_h20_fused_mega_moe(
     // barrier path (numerics identical: T=2/8/16/128/512 + QoQ, 200-iter graph
     // replay stress clean).
     const bool fine_combine = get_env<int>("DG_FP4_FINE_COMBINE", 1) != 0;
-    // Dynamic combine token claim (kernel `kCombineDynamic`, fine combine only): the
-    // combine warps take local tokens from a per-launch ticket (one atom.add per
-    // claim) instead of the static token -> (SM, warp) map. With <= 16 local tokens
-    // the static map put every token on SM0's warps, which are the last CTA to leave
-    // its math tasks (M8 MXFP4: SM0 math until ~48-49 us vs ~46.6 us elsewhere), so
-    // the first warps grid-wide that become free now spin on the arrival counters.
-    // DG_FP4_COMBINE_DYNAMIC=0 restores the static map.
-    const bool combine_dynamic = fine_combine && get_env<int>("DG_FP4_COMBINE_DYNAMIC", 1) != 0;
-    // Two-layer fusion for tiny M (kernel `kFuseL1L2`, docs/fuse_l1l2_design.md): every
-    // L1 task keeps its SwiGLU output in SMEM and runs the W2 K-slice (12 output
-    // N-blocks x its K128 block, 6 extra pipeline stages) itself; the 10 L1 tasks of a
-    // pool block red.add their fp32 partials into the (otherwise unused) L2 split-K
-    // scratch and the 10th arriver per (pool block, N-block) runs the L2 epilogue. No
-    // L2 tasks exist, so the L2 quantisation tail and the L1->L2 dependency waits
-    // disappear (the straggler L1 tasks carry their W2 slice, see the design note).
-    // DG_FP4_FUSE_L1L2=1 enables (default 0), for <= DG_FP4_FUSE_L1L2_MAX_M (default 16)
-    // global tokens; BM8 RF swapAB (MXFP4 / QoQ), 2 K-blocks per stage, dense tiles,
-    // interleaved scheduler; exclusive with half-tile / L2 half-row / split-K L2 /
-    // stream-K / tiny-M (forced off below).
-    // H20 2026-09-10 (tip b323af2, numerics verified T=2/8/16 + QoQ, 200-iter stress OK):
-    // a LOSS at every M. Skew-free min-over-devices, 2 passes, 0 -> 1 (us): MXFP4 M2
-    // 41.1/41.4 -> 51.6/52.3, M8 55.2/55.4 -> 105.0/106.9, M16 77.5/78.7 -> 146.8/139.6;
-    // QoQ M8 54.1/54.7 -> 101.6/103.8, M16 75.5/75.7 -> 151.1/144.8. The fused L1 task
-    // takes 36 us (p50) instead of 19.4 + a 7.7 us L2 task: the 12 W2 tiles cost ~13 us
-    // (red.add + per-stage tickets, no cross-stage overlap) and the finisher epilogues
-    // ~1.5-2 us each land on the last arriver of the pool block (the split-K tail half
-    // runs 45 us). Customer method (official capture, GPU0 last-3 median, 2 passes,
-    // skew <= 20 us, Mega-only Fused, 0 -> 1): MXFP4 M2 43.1/54.9 -> 56.6/56.9, M8
-    // 62.3/62.9 -> 108.7/108.1, M16 78.0/83.8 -> 150.9/152.2; QoQ M2 44.1/43.1 -> 58.2/53.2,
-    // M8 72.2/60.4 -> 109.2/107.6, M16 81.4/81.3 -> 149.4/145.2. See
-    // docs/fuse_l1l2_design.md "Result". Kept as a documented negative-result knob.
-    const bool fuse_l1l2 = (mxfp4 || qoq) && plan.swap_ab && config.block_m == 8 && !wide_tiles &&
-        config.block_n == 256 && !half_tile_tasks && !l2_half_row_tasks && !tinym &&
-        plan.use_interleaved_scheduler && dense_weight_tiles &&
-        get_sm90_fp4_h20_bm8_k_blocks_per_stage() == 2 &&
-        get_env<int>("DG_FP4_FUSE_L1L2", 0) != 0 &&
-        num_global_tokens_upper <= get_env<int>("DG_FP4_FUSE_L1L2_MAX_M", 16);
-    // Fused Fable frontend (kernel `kFuseFE`, docs/fe_into_mega_design.md): with
-    // DG_FP4_FUSE_FE=1 and the frontend tensors passed by the caller, the kernel computes
-    // router logits / top-k / softmax / activation quantisation for its own rows at
-    // kernel start (math warps, hand-off through the frontend workspace) and the FE
-    // launch is skipped. Tiny M only (<= DG_FP4_FUSE_FE_MAX_M global tokens, default
-    // 16, and <= num_sms local rows); MXFP4 (fp8 e4m3 + per-K128 SF) and QoQ (int8 +
-    // per-row scale) exactly like the standalone FE. Default 0: H20 2026-09-11 A/B
-    // (CUDA-event E2E, FE+Mega graph vs fused-only graph, GPU0 median, n=100) is a loss
-    // at every M -- MXFP4 M2 +4.8, M8 +4.8, M16 +4.8; QoQ M2 +5.0, M8 +6.4, M16 +4.9 us
-    // (best variant: bulk-copy loads, __noinline__ crew). The in-kernel crew reaches the
-    // top-k only ~11-15 us after kernel entry (load issue 2-5 us, top-k 2.5-5.5 us on 8
-    // warps vs 96 dedicated FE CTAs) while the standalone FE + gap costs the graph ~9-10 us
-    // and overlaps the Mega prologue; inlined, the crew also degraded the RF K-loop codegen
-    // (+3.6 us L1 phase). Outputs are bit-identical to FE + Mega (see the design note).
-    const bool fuse_fe_requested = fe_hidden.has_value() && get_env<int>("DG_FP4_FUSE_FE", 0) != 0;
-    const bool fuse_fe = fuse_fe_requested && (mxfp4 || qoq) && plan.use_interleaved_scheduler &&
-        !tinym && num_global_tokens_upper <= get_env<int>("DG_FP4_FUSE_FE_MAX_M", 16) && num_tokens <= num_sms;
-    DG_HOST_ASSERT(!fuse_fe_requested || fuse_fe);   // caller asked for the fused FE: refuse silently falling back
-    if (fuse_fe) {
-        DG_HOST_ASSERT(fe_router_weight.has_value() && fe_workspace.has_value());
-        DG_HOST_ASSERT(fe_hidden->scalar_type() == torch::kBFloat16 && fe_hidden->is_contiguous() &&
-                       fe_hidden->dim() == 2 && fe_hidden->size(0) == num_tokens && fe_hidden->size(1) == hidden);
-        DG_HOST_ASSERT(fe_router_weight->scalar_type() == torch::kBFloat16 && fe_router_weight->is_contiguous() &&
-                       fe_router_weight->dim() == 2 && fe_router_weight->size(0) == num_experts &&
-                       fe_router_weight->size(1) == hidden);
-        DG_HOST_ASSERT(num_topk == 8 && num_experts % 16 == 0 && num_experts <= 512 && hidden % 1024 == 0);
-        DG_HOST_ASSERT(fe_workspace->nbytes() >= static_cast<size_t>(256 + 4 * 64 * num_experts * 4));
-        DG_HOST_ASSERT(fe_hidden->device() == y.device() && fe_router_weight->device() == y.device() &&
-                       fe_workspace->device() == y.device());
-    }
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n * l1_task_tiles;
     constexpr int kL1ScaleGranK = 128;
     // L2 activation scale granularity (kernel kL2ActsSFGranK): per 64 on the BM128/BN128
@@ -769,31 +608,12 @@ static void sm90_fp4_h20_fused_mega_moe(
         // NVFP4 keeps the row-major fused layout + 2D TMA.
         .dense_weight_tiles = dense_weight_tiles,
         .half_tile_tasks = half_tile_tasks,
-        .split_k_l1 = split_k_l1 && !tinym,
+        .split_k_l1 = split_k_l1,
         .l2_half_row_tasks = l2_half_row_tasks,
-        .split_k_l2_ways = ((split_k_l2 || split_k_l2_all) && !tinym && !fuse_l1l2) ?
-            (split_k_l2_all ? 2u : split_k_l2_ways) : 0u,
-        .stream_k = stream_k && !tinym && !fuse_l1l2,
+        .split_k_l2_ways = split_k_l2 ? split_k_l2_ways : 0u,
+        .stream_k = stream_k,
         .nvl_fast_epilogue = nvl_fast_epilogue,
         .fine_combine = fine_combine,
-        .combine_dynamic = combine_dynamic,
-        .fuse_l1l2 = fuse_l1l2,
-        // K128 blocks per pipeline stage on the BM8 RF swapAB tiers (MXFP4 and QoQ,
-        // kernel `kKBlocksPerStage`; other tiers ignore it). DG_FP4_KBLOCKS_PER_STAGE in
-        // {2, 4}: 2 blocks x 4 stages (default) or 4 blocks x 2 stages (same 173 KB
-        // of stages, the L2 K loop (10 blocks) ends with a 2-block partial stage).
-        // H20 A/B (2026-09-09, phase stamps, kernel end us, 4 vs 2 blocks, same
-        // session): M=2 53.5-54.4 vs 46.9; M=8 73.9-75.0 vs 64.9; M=16 101-115 vs
-        // 88.3. The per-K128 stage cost barely moves (slot 22: 2655/4 = 664 ns vs
-        // 1386/2 = 693 ns at M=8; the exposed drain per block doubles, 330 vs 132 ns)
-        // while the task head must land an 80 KB first stage and only ONE stage can
-        // be in flight while the other is consumed (vs 3 x 40 KB), so the L1 and L2
-        // phases lose 5-6 us / 2-5 us. Default 2 (the 4-block kernel also carries
-        // 16 B of ptxas spill at 168 regs; the 2-block one has none).
-        .k_blocks_per_stage = wide_tiles ? 1 :
-            ((mxfp4 || qoq) ? get_sm90_fp4_h20_bm8_k_blocks_per_stage() : 2),
-        .tinym = tinym,
-        .tinym_prefetch = tinym_prefetch,
         .push_dispatch = push_dispatch,
         .push_max_tokens_per_rank = push_max_tokens_per_rank,
         // Lean routing (kernel `kLeanRouting`, DG_FP4_LEAN_ROUTING, default 1): the
@@ -826,16 +646,6 @@ static void sm90_fp4_h20_fused_mega_moe(
         // (2 passes, skew-corrected kernel end, us): M16 64.6/61.5 vs 67.7/67.4 off,
         // M8 42.1/40.5 vs 40.9/41.2 (L1 phase M16 41.7/42.2 vs 44.0/44.1).
         .qoq_inline_s2_prefetch_packed = qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) != 0,
-        // DG_FP4_QIS2_RAWU8 (default 0): raw-u8 decode (nibble extraction only), RS wgmma
-        // s32.u8.s8 into per-K128-block int32 sets and an exact int32 deferred affine
-        // (s2 * acc_blk - z * s2 * colsum(B)) per block; bit-identical sums (cos_min
-        // identical to 10 digits). Folding a retired set while the other block's group
-        // is in flight trips ptxas C7514 (every wgmma serialised), so the fold sits
-        // after a stage-end wait<0>: the drain + ~230 ns fold on the critical path cost
-        // more than the ~2 ALU ops per A word it saves (H20 stage 1415-1434 ns vs
-        // 1136-1244, skew-corrected end M8 44.3-45.0 vs 40.5-42.1 us, M16 65.0-65.6 vs
-        // 61.5-64.6 with prefetch). Kept as an experiment knob.
-        .qoq_inline_s2_rawu8 = qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0,
         // DG_FP4_RF_PREFETCH_PACKED (default 0): same packed-word prefetch for the generic
         // 2-K-block RF loop (MXFP4 LUT decode / QoQ per-block promote): the k+1 barrier
         // check and the next block-0 packed LDS move ahead of the wait<1> that frees
@@ -846,38 +656,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         // ns) — so off. The L1 loop is loader/HBM-bound at these token counts.
         .rf_prefetch_packed = get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0,
         .strided_pool_debug = strided_pool_debug,
-        // Communication-window L2 weight prefetch (kernel `kL2PrefetchAll`, needs push
-        // dispatch + dense tiles): DG_FP4_L2_PREFETCH_ALL=1 (gated on <= 16 global
-        // tokens) lets the idle B loader warps warm L2 with every active local expert's
-        // W1 (then W2) dense tiles as soon as the remote tickets reveal the expert,
-        // i.e. during the ~10 us routing -> first-math window; DG_FP4_L2_PREFETCH_MAX_MB
-        // (default 48, H20 L2 = 60 MB) caps the rank-wide bytes, DG_FP4_L2_PREFETCH_KBLOCKS
-        // the leading K blocks per W1 task. Default 0: H20 A/B (2026-09-09, probe under
-        // nsys, skew-free min-over-devices kernel us, knob 1 vs 0, 2-5 samples each;
-        // node shared with another job on GPUs 0-2, all cells paired in-session):
-        // mxfp4 M2 42.2-43.4 vs 39.6-41.4, M8 60.5-62.5 vs 53.8-54.1, M16 80.1-82.7 vs
-        // 75.1-76.2; qoq M8 60.1-63.0 vs 53.2-53.7, M16 78.7-81.0 vs 74.2-75.3. 24 MB cap
-        // or 12 K blocks: still +1-4 us (mxfp4 M8 56.1-58.1, M16 76.7-79.5; qoq M8
-        // 57.2-58.1, M16 78.8-79.6). Mechanism (rank-0 stamps): the weights DO land
-        // (46.9 MB issued by ~9-15 us; exposed k+1 wait 430-470 -> 270-380 ns at M8, 260
-        // -> 210-230 at M16) but the per-stage head-to-head time (1.15-1.33 us, decode +
-        // wgmma issue) hardly moves, so the L1 phase gains only ~1-1.5 us (M8 28.6-29.3 ->
-        // 27.6-28.4 mxfp4, 27.4-27.9 -> 25.2-26.4 qoq), while the flood delays the first
-        // math task by 3-9 us (M8 first math 9-11 -> 16-20 us; 13-15 with the 24 MB cap):
-        // barrier-#1 flags, the count finalise and the first stage fills queue behind
-        // the prefetch in L2/HBM. The tiny-M L1 loop is issue-bound, not HBM-bound.
-        .l2_prefetch_all = push_dispatch && dense_weight_tiles &&
-            get_env<int>("DG_FP4_L2_PREFETCH_ALL", 0) != 0 &&
-            num_global_tokens_upper <= get_env<int>("DG_FP4_L2_PREFETCH_MAX_M", 16),
-        .l2_prefetch_max_mb = std::clamp(get_env<int>("DG_FP4_L2_PREFETCH_MAX_MB", 48), 1, 4096),
-        // DG_FP4_L2_PREFETCH_KBLOCKS (default 0 = whole K): leading K128 blocks of each
-        // W1 task to prefetch, to keep the flood within the window's HBM capacity.
-        .l2_prefetch_k_blocks = std::clamp(get_env<int>("DG_FP4_L2_PREFETCH_KBLOCKS", 0), 0, 24),
-        .split_k_l1_all = split_k_l1_all && !tinym && !stream_k,
-        .split_k_l2_all = split_k_l2_all && !tinym && !stream_k && !fuse_l1l2,
         .l1_task_tiles = l1_task_tiles,
         .l2_task_tiles = l2_task_tiles,
-        .fuse_fe = fuse_fe,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -896,17 +676,9 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l2_global_scales = l2_global_scales_ptr,
         .phase_stamps = phase_stamps.has_value() ?
             reinterpret_cast<unsigned long long*>(phase_stamps->data_ptr()) : nullptr,
-        .fe_hidden = fuse_fe ? fe_hidden->data_ptr() : nullptr,
-        .fe_router_weight = fuse_fe ? fe_router_weight->data_ptr() : nullptr,
-        .fe_workspace = fuse_fe ? fe_workspace->data_ptr() : nullptr,
         // DG_FE_SELECT_IN_MEGA=1: Fable cc frontend compact key array ([token][384] u32)
         .fe_keys = fe_keys.has_value() ? reinterpret_cast<const uint32_t*>(fe_keys->data_ptr()) : nullptr,
-        // DG_FE_PDL=1: programmatic dependent launch on the Fable frontend (the
-        // kernel executes griddepcontrol.wait before touching frontend outputs).
-        .launch_args = LaunchArgs(
-            num_sms,
-            KernelConfig::kNumThreads,
-            config.smem_size, 1, true, get_env<int>("DG_FE_PDL", 0) != 0)
+        .launch_args = LaunchArgs(num_sms, KernelConfig::kNumThreads, config.smem_size)
     };
 
     const auto code = SM90FP4H20FusedRuntime::generate(args);
@@ -918,7 +690,7 @@ static void sm90_fp4_h20_fused_mega_moe(
             "_h200_fused_interleaved" :
             (plan.use_mode2_row_decoder ?
                 "_h200_fused_mode2_row" :
-                "_h200_fused_lut_window")) + (tinym ? "_tinym" : "") + (push_dispatch ? "_push" : "") +
+                "_h200_fused_lut_window")) + (push_dispatch ? "_push" : "") +
         (push_done_flags ? "_pdf" : "") +
         (strided_pool_debug ? "_stridedbg" : "") +
         (get_env<int>("DG_FP4_LEAN_ROUTING", 1) != 0 ? "_lean" : "") +
@@ -927,10 +699,8 @@ static void sm90_fp4_h20_fused_mega_moe(
             fmt::format("f{}", std::clamp(get_env<int>("DG_FP4_QIS2_FRAGS", 2), 2, 4)) : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
-        ((qoq && get_env<int>("DG_FP4_QIS2_RAWU8", 0) != 0) ? "_rawu8" : "") +
         (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "") +
-        (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "") +
-        (fuse_fe ? "_fefuse" : "");
+        (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }
