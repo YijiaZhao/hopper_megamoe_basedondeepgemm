@@ -257,139 +257,261 @@ including the real inter-kernel gap.  `Target span` in E2E is measured from
 Fable frontend start through MegaMoE completion.  It is not a sum of unrelated
 kernel statistics and is not aggregated across GPUs.
 
-## Performance results (2026-09-10, locked clock)
+## Performance results (2026-09-12, round 5, locked clock) -- single source of truth
 
-Method: `10.6.131.7`, eight H20 GPUs locked at **1830 MHz**,
-`scripts/capture_four_api_h20_timelines.sh`, GPU 0 median of the final three
-complete spans (see the runnable commands below).  Values are microseconds.  Mega-only Fused is
-the customer comparison column (targets M2 < 53, M8 < 61, M16 < 85: all met).
+Machine and method: `10.6.131.8`, eight H20-3e locked at **1830 MHz** (`nvidia-smi -lgc 1830,1830`, the capture
+script verifies), container `fe5c_build` (same image as `four_api_build`), branch `perf/phase-stamps-probe` kernels
+`eba23b1` (build `fee8931`, 06:54 UTC), one session 06:54-08:39 UTC, `scripts/capture_four_api_h20_timelines.sh`
+(nsys, `--cuda-graph-trace=node`), **GPU 0, median of the last 3 graph replays**, then the median over passes.
+Values are microseconds; M = global tokens over the 8 ranks (M2/M4/M8 = 1 row per rank, M16 = 2 rows), both quants,
+fused backend (`mxfp4|qoq_mega_moe_fused`), pipeline knobs `DG_FE_SELECT_IN_MEGA=1 DG_FE_CC_LEAN=1` (library defaults
+except SELECT_IN_MEGA, which the profiling drivers default to 1). Older tables (2026-09-04 / 09-10 captures on
+10.6.131.7) are superseded by this section; the per-change history stays in the knob table below and in `docs/`.
 
-| Precision | M | FE Fused | E2E Fused (FE + Mega) | Mega-only Fused |
+### a. Correctness verification
+
+Everything below is on the same kernels the tables were captured with (`DG_FE_CC_LEAN=1` and `=0`). Details, logs and
+per-cell tables: `docs/fe5_correctness.md`, `docs/fe_cc_round5.md` section 4.
+
+* **FE output layout, byte gate** (`tests/fe_dump_compare.py`): the FE runs alone under two env configurations (one
+  child process each, the knobs are process-static) for 64 seeds x rows {1, 2} x {mxfp4, qoq} = 256 cells and every
+  buffer the fused Mega consumes is byte-compared after a sentinel pre-fill: `x` [rows 0..3 incl. padding, 3072] bytes
+  (mxfp4 e4m3 per K128 group; qoq int8 whole row in the same e4m3 tensor), `x_sf` [4, 24] fp32 (mxfp4 amax/448 per
+  K128; qoq amax/127 replicated), `topk_idx` [4, 8] int64, `topk_weights` [4, 8] fp32, the 256 B ticket area, the
+  select-in-Mega launch's `x` / `x_sf`, the 4 KB compact key array at workspace byte 65792 (token t at + t * 1536) and
+  the ticket area after it. Result `DG_FE_CC_LEAN=0` vs `=1`: `FE_DUMP_COMPARE cells=256 failing_cells=0`, all 9 buffers
+  identical in all 256 cells, padding rows included; `--ref-torch`: mxfp4 x / x_sf byte-identical to the torch
+  per-token cast in every cell. (`tests/fe5_ident.py`, the same comparison over topk / keys / ticket / x / x_sf, also
+  PASS 256/256 for LEAN, pruned select and both together.)
+* **End-to-end vs a pure-torch real-MoE reference** (`tests/test_four_api_correctness.py --frontend fe --reference
+  torch-moe`, 8 ranks): the reference computes the bf16 router GEMM in fp32 -> bf16-rounded logits -> top-8 (value
+  desc, index asc) -> fp32 softmax over the 8 logits -> torch per-token quantisation of x -> dequantised expert GEMMs
+  (both layers, exact-quantised weights, SwiGLU, clamp) -> weighted combine, with the FE's REAL routing of random
+  hidden rows; none of our FE / Mega kernels is in the reference. FE vs torch router: top-8 index sets equal on every
+  token (8/8 .. 256/256 per launch; 292 800 / 292 800 tokens in the sweep), softmax weights within 1 fp32 ulp
+  (6e-8 .. 2.4e-7), mxfp4 x identical, qoq x differs by <= 1 quantisation step on ~0.5 elements per 1000 (see the
+  note below). y vs reference (single seed, .8, T = 1 / 2 / 8 / 16 / 32 rows per rank, both LEAN settings identical to
+  the last printed digit): mxfp4 cos_min 0.99999 / 0.99999 / 0.99992 / 0.99992 / 0.99992, qoq 0.99993 x3 / 0.99992 x2,
+  norm ratio 0.9998-1.00004; per-(token, slot) `--slot-check` clean on 8/8 ranks (T=32, and the balanced
+  `--tokens 32 --hot-rows 12 --slot-check`).
+* **Forced-balanced routing verified the same way**: `DG_FE_FORCE_BALANCED=1` in the correctness test applies the same
+  override the profiler uses (FE runs, then the routing is replaced by the Mega-only assignment `expert = s * 48 +
+  (g + 7 s) % 48`, weight 1/8 each, unrouted inactive rows) and the torch reference routes with it: all cells PASS
+  (sweep rows "balanced" in `docs/fe5_correctness.md` 4.2, cos_min mxfp4 >= 0.99996, qoq >= 0.99992).
+* **ComputeLab 50-seed sweep** (job 4252043, 8 x H20-3e): 14 shapes x 3 configurations (LEAN 0/1 x SELECT_IN_MEGA
+  0/1) = 42 launches, 50 seeds each, 292 800 evaluated tokens, 0 failures, 0 top-8 disagreements, 0 SELECT_IN_MEGA
+  prologue/python-decode differences; worst cos_min mxfp4 0.99993, qoq 0.99992 (M = 2 .. 256).
+* **Known benign difference**: the FE's QoQ int8 quantisation rounds `v * (1/scale)` where the torch cast rounds
+  `x / scale`; on exact .5 ties this is 1 int8 step on a handful of elements per row (223 bytes of 8 x 3072 per launch
+  at M8), x_sf identical, same for LEAN 0 and 1, within the reference tolerance. mxfp4 has no such difference.
+* Gates that must stay green (all PASS on this tip): `tests/test_select_in_mega.py` (8 ranks, 50 seeds, M 2 / 16,
+  both quants: 0 topk mismatches, y bit-identical between select-in-FE and select-in-Mega), `tests/test_frontend_fe78.py
+  --mma cc --seeds 40 --rows 1 2` (cc / lean vs the legacy WMMA router: 0 top-8 set mismatches, 0 x mismatches).
+
+Commands (8 GPUs unless noted; inside the container, repo root):
+```bash
+python3 tests/fe_dump_compare.py --env-a DG_FE_CC_LEAN=0 --env-b DG_FE_CC_LEAN=1 --seeds 64 --ref-torch      # 1 GPU
+python3 tests/fe5_ident.py --save /tmp/ref.pt ; DG_FE_CC_LEAN=1 python3 tests/fe5_ident.py --ref /tmp/ref.pt  # 1 GPU
+torchrun --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
+    --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --frontend fe --reference torch-moe --tokens 1   # T = 1 2 8 16 32
+DG_FE_FORCE_BALANCED=1 torchrun --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
+    --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --frontend fe --reference torch-moe --tokens 1 --seeds 50
+LEANS="0 1" OUT=/raid/kimi/results/fe5c bash tests/fe5c_sweep.sh ; python3 scripts/summarize_fe5c_sweep.py /raid/kimi/results/fe5c
+bash tests/fe5_gates.sh                                                                                    # the gate set above
+```
+
+### b. E2E (FE + MegaMoE in one CUDA graph), normal routing (the FE's real top-8)
+
+**Streamed method** (`DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30`, `tests/fe5_campaign_streamed.sh`): the 30 replays of
+a case are enqueued back-to-back on the stream (no per-iteration `torch.cuda.synchronize()` / `dist.barrier()`), so
+the ranks lock to each other through the on-stream reduce-scatter / all-gather instead of re-skewing at every host
+round trip; GPU-0 median of the last 3 replays, median over 3 passes. `skew` = inter-rank spread of the Mega kernel
+start (max - min over the 8 devices, median over passes of the per-pass max of the last 3 replays).
+
+| Precision | M | FE (lean) | Mega (in graph) | E2E (FE start -> Mega end) | Mega-start skew |
+|---|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | 2.6 | 60.9 | **63.8** | 2.1 |
+| MXFP4 | 4 | 2.8 | 60.1 | **63.2** | 1.7 |
+| MXFP4 | 8 | 2.6 | 65.2 | **68.1** | 2.4 |
+| MXFP4 | 16 | 2.8 | 78.2 | **81.3** | 1.4 |
+| QOQ | 2 | 2.6 | 60.4 | **63.5** | 50.0 |
+| QOQ | 4 | 2.7 | 60.2 | **63.2** | 6.7 |
+| QOQ | 8 | 2.7 | 63.4 | **66.3** | 1.5 |
+| QOQ | 16 | 3.0 | 76.6 | **80.0** | 1.6 |
+
+**Plain customer method** (per-iteration host sync + barrier, `tests/fe5_campaign.sh`, 8 replays per case, GPU-0
+median of the last 3, median over 5 passes; base = `DG_FE_CC_LEAN=0`, lean = `1`):
+
+| Precision | M | FE base | FE lean | Mega base | Mega lean | E2E base | E2E lean | skew base / lean |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | 3.8 | 2.5 | 69.2 | 66.2 | 73.7 | 69.0 | 12.9 / 19.3 |
+| MXFP4 | 4 | 4.1 | 2.5 | 69.5 | 90.2 | 73.4 | 93.0 | 13.8 / 50.8 |
+| MXFP4 | 8 | 4.0 | 2.5 | 72.2 | 76.4 | 76.3 | 79.3 | 14.9 / 20.7 |
+| MXFP4 | 16 | 4.0 | 2.8 | 89.4 | 92.2 | 93.5 | 95.4 | 20.9 / 13.7 |
+| QOQ | 2 | 4.2 | 2.7 | 66.0 | 66.3 | 70.5 | 69.3 | 14.7 / 11.9 |
+| QOQ | 4 | 4.3 | 2.7 | 72.0 | 69.2 | 76.6 | 72.2 | 23.3 / 17.6 |
+| QOQ | 8 | 4.1 | 2.7 | 68.6 | 71.9 | 73.1 | 74.8 | 17.0 / 15.3 |
+| QOQ | 16 | 4.4 | 2.8 | 91.4 | 95.3 | 95.7 | 98.5 | 14.3 / 17.5 |
+
+Why the two methods differ: the fused Mega kernels of the 8 ranks END within ~1 us of each other (the first in-kernel
+NVLink barrier aligns them), so a rank's Mega span is `common end - its own start` = kernel work + that rank's head
+start over the slowest rank. With a host sync + barrier between replays the ranks re-skew by 10-60 us at every launch
+(the `skew` column), and GPU 0 -- usually among the first to launch -- absorbs it inside its Mega span; the E2E /
+Mega columns of the plain method therefore measure launch skew as much as kernel work, and their base-vs-lean
+differences (+-5..20 us, in both directions) are that skew's noise. Streamed, the skew collapses to 1-2.5 us in 12
+of 16 cells (M2 and qoq M4 stay looser: with one active token per TP half the collectives carry little data) and the
+Mega column converges to the kernel work. Per-rank decomposition of one plain replay (`scripts/decompose_e2e_skew.py`,
+balanced MXFP4 M2, base, pass 1, replay -3; times relative to the earliest FE start):
+
+| device | FE start | FE end | FE span | gap -> Mega | memcpy node | Mega start | Mega end | Mega span |
+|---|---:|---:|---:|---:|---|---:|---:|---:|
+| GPU0 | 0.0 | 4.0 | 4.0 | 1.3 | 4.1-5.2 | 5.3 | 60.8 | 55.5 |
+| GPU1 | 5.4 | 9.4 | 4.1 | 1.4 | 9.5-10.7 | 10.8 | 60.7 | 50.0 |
+| GPU2 | 4.1 | 8.7 | 4.6 | 1.2 | 8.7-9.8 | 9.8 | 60.6 | 50.7 |
+| GPU3 | 11.7 | 16.1 | 4.4 | 1.2 | 16.2-17.2 | 17.3 | 60.5 | 43.2 |
+| GPU4 | 14.7 | 19.0 | 4.3 | 1.3 | 19.0-20.3 | 20.3 | 61.7 | 41.4 |
+| GPU5 | 11.9 | 16.3 | 4.5 | 1.4 | 16.4-17.6 | 17.7 | 60.7 | 43.0 |
+| GPU6 | 5.0 | 9.1 | 4.2 | 1.2 | 9.2-10.2 | 10.3 | 60.7 | 50.4 |
+| GPU7 | 6.5 | 10.8 | 4.3 | 1.3 | 10.9-12.1 | 12.2 | 60.4 | 48.3 |
+| skew (max - min) | 14.7 | 15.0 | | | | 15.0 | 1.3 | |
+
+GPU 0's Mega span 55.5 = the latest rank's 41.4 (the kernel work, = the Mega-only column) + 14.1 head start; the FE
+is 4.0-4.6 us on every rank; the FE end -> Mega start gap is 0.3 us with normal routing and 1.2-1.5 us in balanced
+mode (the 1.1-1.2 us memcpy override node); there are no other nodes in the graph. The same replay streamed:
+FE 2.7-2.8, gap 1.2-1.4, Mega-start skew 0.9 / 2.8 / 6.5 us, GPU 0 Mega span 40.2 / 41.9 / 40.6 vs streamed
+Mega-only 38.2-38.5. Full per-rank tables for M2 (both quants, normal / balanced, plain / streamed):
+`~/Downloads/h20_fused_official/fe5/decomp/`.
+
+### c. E2E with forced-balanced routing (`DG_PROFILE_FORCE_BALANCED=1`)
+
+The FE runs exactly as in (b); one graph memcpy node (`cudaMemcpyAsync`, no kernel, 1.1-1.2 us between the FE and
+Mega kernels, inside the E2E span, outside both kernel spans) then overwrites its routing with the Mega-only scope's
+balanced assignment: active row t of rank r (global token g = r * rows + t) -> expert `s * 48 + (g + 7 s) % 48` for
+slot s = 0..7, one route to every EP rank, **uniform weights 1/8**; inactive owner-layout rows (M < 8) unrouted. With
+`DG_FE_SELECT_IN_MEGA=1` the compact key array is overwritten (chosen experts logit 1.0, others 0.0 -> the Mega prologue
+selects them in slot order, softmax of eight equal logits = exactly 0.125; all-zero keys = unrouted row), otherwise
+`topk_idx` / `topk_weights` directly. Same layout as (b):
+
+Streamed (3 passes):
+
+| Precision | M | FE (lean) | Mega (in graph) | E2E | Mega-start skew |
+|---|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | 2.7 | 40.7 | **44.7** | 15.8 |
+| MXFP4 | 4 | 2.7 | 50.1 | **54.0** | 2.1 |
+| MXFP4 | 8 | 2.7 | 58.3 | **62.3** | 1.8 |
+| MXFP4 | 16 | 2.8 | 76.8 | **80.8** | 1.1 |
+| QOQ | 2 | 2.8 | 42.0 | **46.1** | 15.4 |
+| QOQ | 4 | 2.8 | 50.2 | **54.4** | 2.0 |
+| QOQ | 8 | 2.8 | 56.5 | **60.6** | 1.4 |
+| QOQ | 16 | 3.0 | 76.0 | **80.5** | 1.5 |
+
+Plain customer method (5 passes):
+
+| Precision | M | FE base | FE lean | Mega base | Mega lean | E2E base | E2E lean | skew base / lean |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | 4.1 | 2.6 | 49.4 | 60.0 | 54.8 | 64.2 | 43.9 / 62.1 |
+| MXFP4 | 4 | 4.1 | 2.5 | 50.8 | 63.5 | 56.0 | 67.4 | 13.4 / 20.1 |
+| MXFP4 | 8 | 4.1 | 2.5 | 76.8 | 64.1 | 82.2 | 68.0 | 24.2 / 16.8 |
+| MXFP4 | 16 | 4.3 | 2.9 | 84.7 | 82.6 | 90.3 | 86.9 | 27.2 / 24.8 |
+| QOQ | 2 | 4.3 | 2.8 | 47.3 | 43.9 | 52.7 | 48.2 | 14.5 / 14.7 |
+| QOQ | 4 | 4.3 | 2.8 | 58.2 | 53.1 | 64.1 | 57.2 | 12.8 / 18.6 |
+| QOQ | 8 | 4.3 | 2.8 | 66.6 | 56.0 | 72.5 | 60.1 | 20.2 / 23.0 |
+| QOQ | 16 | 4.3 | 3.0 | 91.2 | 81.4 | 96.6 | 85.8 | 21.1 / 12.6 |
+
+Streamed and balanced, E2E = FE + 1.3 us (memcpy node + launch gap) + Mega, and Mega = Mega-only + 1-3 us of
+residual skew (e.g. MXFP4 M2: 44.7 = 2.7 + 1.3 + 40.7 with Mega-only 38.3). The difference between (b) and (c) in the
+Mega column (60-65 vs 41-58 us at M2-M8) is the real cost of the FE's actual, unbalanced top-8 routing against the
+uniform assignment -- not skew.
+
+### d. Mega-only, balanced routing (the customer comparison column)
+
+Mega-only scope (no FE; balanced assignment, uniform 1/8 weights, as in the 2026-09-04 delivery), fused backend.
+Targets: M2 < 53, M8 < 61, M16 < 85 us.
+
+| Precision | M | plain customer method (5 passes) | streamed (1 pass) | target | status |
+|---|---:|---:|---:|---:|---|
+| MXFP4 | 2 | 45.0 | 38.3 | < 53 | met |
+| MXFP4 | 4 | 54.3 | 46.9 | – | |
+| MXFP4 | 8 | 60.5 | 56.8 | < 61 | met (plain 60.5) |
+| MXFP4 | 16 | 78.7 | 74.4 | < 85 | met |
+| QOQ | 2 | 48.7 | 37.4 | < 53 | met |
+| QOQ | 4 | 50.8 | 46.4 | – | |
+| QOQ | 8 | 56.6 | 53.3 | < 61 | met |
+| QOQ | 16 | 78.5 | 73.0 | < 85 | met |
+
+The Mega-only scope has the same launch-skew exposure as (b): its plain-method Mega-start skews were 7-36 us per
+replay (one 1530 us outlier in qoq M2 pass 1), which is why its plain numbers sit 4-11 us above the streamed ones.
+
+### e. FE kernel (`router_quant_topk_kernel` -> `router_cc_lean_kernel`)
+
+`DG_FE_CC_LEAN=1` (default since round 5; `0` = the previous generic kernel) compiles the CUDA-core cc router
+(77 CTAs x 5 experts x 4 K-part warps, weights straight into registers, 384 compact keys per token, spare CTA
+quantises) as its own entry point: 2.7 K SASS instructions instead of the 11.9 K-instruction generic instantiation
+whose router role sat 73 KB into the kernel behind a far branch and was fetched cold from DRAM after every L2 flush /
+Mega weight stream (NCU top stall `no_instruction` 6.9 -> 1.7 warps per issue cycle, warp instructions -44 %, SM
+elapsed cycles -26 %, registers 96 -> 64; `~/Downloads/h20_fused_official/ncu/ncu_fe5/KEY_TABLE.md`). The hot path is
+the first code of the kernel, the quant CTA and the knob-0 last-arriver select are `__noinline__` cold paths, weights
+are issued before activations, activations are converted to fp32 once in the weight-latency shadow (1-instruction
+bf16 -> fp32), row 1 runs only when m == 2, and the spare CTA quantises both rows concurrently (320 threads and a named
+barrier per row; the sequential QoQ row quant had been the kernel's critical path at 2 rows). Numerics unchanged
+(same fma chain / butterfly / K-part order, one bf16 rounding) -> bit-identical outputs (section a).
+
+FE kernel span, plain customer method, 5-pass medians (every cell 5/5 passes; base and lean pass distributions never
+overlap; standalone single-GPU nsys spans 2.94/2.91 -> 2.50/2.50 rows 1, 3.17/3.46 -> 2.88/2.91 rows 2 in
+`docs/fe_cc_round5.md`):
+
+| Precision | M | normal base -> lean | balanced base -> lean | streamed lean (normal / balanced) |
 |---|---:|---:|---:|---:|
-| MXFP4 | 2 | 4.1 (7.8 swapab, 8.3 wmma, 13.9 legacy) | 68.4–119.4 | **42.9** |
-| MXFP4 | 4  | 8.3 (13.8 legacy) | 81.5–88.3   | **~49** |
-| MXFP4 | 8 | 4.2 (7.6 swapab, 8.3 wmma, 13.9 legacy) | 83.6–95.9 | **56.4–59.1** |
-| MXFP4 | 16 | 4.1 (8.0 swapab, 8.7 wmma, 14.0 legacy) | 95.8–113.5 | **74.0–82.6** |
-| QOQ | 2 | 4.0 (7.6 swapab, 8.7 wmma, 14.5 legacy) | 66.9–116.2 | **44.1** |
-| QOQ   | 4  | 8.5 (14.6 legacy) | 84.9–87.1   | **48.0** |
-| QOQ | 8 | 4.1 (7.7 swapab, 8.6 wmma, 14.8 legacy) | 77.5–169.3 | **54.9–59.3** |
-| QOQ | 16 | 3.9 (7.9 swapab, 8.7 wmma, 14.9 legacy) | 90.6–97.2 | **74.0–77.4** |
+| MXFP4 | 2 | 3.8 -> 2.5 | 4.1 -> 2.6 | 2.6 / 2.7 |
+| MXFP4 | 4 | 4.1 -> 2.5 | 4.1 -> 2.5 | 2.8 / 2.7 |
+| MXFP4 | 8 | 4.0 -> 2.5 | 4.1 -> 2.5 | 2.6 / 2.7 |
+| MXFP4 | 16 | 4.0 -> 2.8 | 4.3 -> 2.9 | 2.8 / 2.8 |
+| QOQ | 2 | 4.2 -> 2.7 | 4.3 -> 2.8 | 2.6 / 2.8 |
+| QOQ | 4 | 4.3 -> 2.7 | 4.3 -> 2.8 | 2.7 / 2.8 |
+| QOQ | 8 | 4.1 -> 2.7 | 4.3 -> 2.8 | 2.7 / 2.8 |
+| QOQ | 16 | 4.4 -> 2.8 | 4.3 -> 3.0 | 3.0 / 3.0 |
 
-Round 5 (below): with the lean cc entry point (`DG_FE_CC_LEAN=1`, default) the FE Fused column is 2.5-3.0 us at
-M2/4/8/16 in both quants (5-pass medians, 10.6.131.8), from 3.8-4.4 for the same build with the knob off.
-FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16). Library default
-`DG_FE_TINYM_MMA=auto`: rows <= 2 per rank (every customer point: M2/M8 = 1 row, M16 = 2 rows) run
-the round-3 CUDA-core K-split router (`cc`, SM-count grid, compact 384-key array, kernel-end
-stamps 3.84 us); rows > 2 run the swapped-operand MMA router + fragment weight layout (`swapab`,
-96 grid). In the PIPELINE (FE immediately followed by the fused Mega: `tests/profile_four_api_h20.py`
-E2E scope, `tests/bench_frontend_tinym.py` FE+Mega) the FE additionally runs with
-`DG_FE_SELECT_IN_MEGA=1`: the router CTAs end after storing their 384 keys per token and the fused
-Mega prologue does the top-8 + softmax. Customer method (nsys `router_quant_topk_kernel` span, GPU 0,
-1830 MHz, medians of 3 captures, `/raid/kimi/results/merge/cap_land`): FE 4.1 / 4.2 / 4.1 us MXFP4 and
-4.0 / 4.1 / 3.9 us QOQ at M2 / M8 / M16, against 7.4-8.0 us for the swapab default captured the same
-day (`cap_swapab`), i.e. -3.6..-3.9 us per FE launch; round-4 in-graph CUDA-event timing of the FE
-alone gives 3.1-3.3 us (6.4 us without select-in-Mega; 3.6-3.8 us standalone back-to-back) and
-FE+Mega gains ~2-3 us in every M x quant cell (E2E medians here: MXFP4 85.4 / 84.9 / 98.5, QOQ
-94.1 / 85.1 / 93.5 us, within the host-skew spread of the swapab captures 85.1 / 85.5 / 96.4 and
-76.2 / 108.5 / 98.6)
-(`tests/test_select_in_mega.py`: 8 ranks, 50 seeds, 0 top-8 mismatches, y bit-identical). The
-library default of `select_in_mega` stays 0 so standalone FE calls still produce
-`topk_idx`/`topk_weights`. M2/M8/M16 FE values above are those medians (the value in parentheses: swapab default, same-day
-captures); the wmma
-value in parentheses is the previous default (96 x 4 WMMA, nsys span 8.3-8.7 us), the legacy value
-the pre-tiny-M kernel. Round-4 finding: `DG_FE_ROUTER_L2_PERSIST=1` does not keep the router weights
-resident across the Mega weight stream (no in-graph gain; the stamps-only win was a cold/warm-L2
-artefact). E2E ranges span captures with different host launch skew.
+Negative (kept as a knob, default off): `DG_FE_CC_SELECT=pruned`, a two-level threshold top-8 (lane maxes ranked by
+an all-gather, bound = 8th lane max, fast path when no lane holds two keys >= bound, else <= 3 candidates per lane +
+8 redux rounds; bit-identical): knob-0 FE span 4.48 -> 4.51 us (rows 1), 4.64 -> 4.99 (rows 2); the single-warp
+select is issue-bound and, in the pipeline (SELECT_IN_MEGA=1), off the critical path anyway. Earlier FE negatives
+(78 full-K wmma / FMA, 78 x 2 K-parts, tc16, ccfp8, PDL, L2 persist alone, radix select, FE-into-Mega fusion) are in
+the negatives list below and in `docs/fe_cc_round4.md`.
 
-QoQ correctness note (2026-09-11): `tests/test_four_api_correctness.py --frontend fe --tokens 32`
-(real routing, 256 global tokens) failed for `qoq_mega_moe_fused` only (cos_min 0.0007, mxfp4 fine),
-and so did the default balanced routing at qoq T=32 / T=64 (cos_min < 0). Root cause (fixed on this
-branch): `promote_task_rf` of the QoQ inline-s2 RF loop (`kInlineS2`, `DG_FP4_QOQ_INLINE_S2`) read
-accumulator `acc[..][j]` instead of `acc[..][i * 4 + j]`, so every token group `i > 0` of the RS
-wgmma N dimension (tokens 8.. of a BM16 / BM24 block with > 8 valid rows, i.e. the T=32 / T=64 tiers;
-BM8 tiers have a single group and were bit-exact) was promoted with token group 0's int32 sums under
-its own activation scale. Localised with `--slot-check --hot-rows 12` at T=32: tokens 8..11 of the
-hot expert matched the reference rows 0..3 (cos 0.9999) instead of their own. The interim host
-gate (inline s2 only when `num_tokens x num_ranks <= 8`) is lifted; `DG_FP4_QIS2_MAX_GTOK` (default
-0 = no bound) keeps it as a knob. Gates after the fix (8-rank, this branch): qoq T=2/8/8/16/32/64
-cos_min 0.99993/0.99993/0.99993/0.99993/0.99993/0.99993 (T=128 is not a QoQ tier: host assert
-`!qoq || plan.swap_ab`), `--frontend fe --tokens 32` qoq 0.99992 with a clean SLOT_CHECK, mxfp4
-T=8/128/512 0.99997/0.99995/0.99990 (unchanged), 200-replay FE+Mega graph at M=16 qoq clean.
-QoQ M16 with inline s2 back on (probe, rank 0): L1 phase 47.6 -> 43.3 us, L1 stage head-to-head
-1424 -> 1265 ns; customer method (mega fused qoq M16, GPU0 median of last 3 spans): 77.2 us with the
-gate vs 74.9 / 75.3 / 79.3 us over three captures with it lifted.
+### f. Reproduce
 
-M2/M4 values are medians over five independent captures (branch tip with
-`DG_FP4_STREAMK` default on); M8/M16 are the range over the r4/r5 captures
-(`docs/` and `delivery/four_api_fable_timeline_last3_r4_20260909.md`,
-`..._r5_20260909.md`).  Ranges reflect host launch skew between the eight
-ranks, not kernel variance: the kernel duration on the latest-starting rank
-agrees to within 1.5 us across captures.  Adding `dist.barrier()` before each
-graph replay in the profiling driver (`DG_PROFILE_HOST_BARRIER=1`) removes
-most of that skew (e.g. MXFP4 M8 110.8 -> 57.6 in one A/B).
+Requirements: 8 idle H20 (the capture script waits for <= 64 MiB used per GPU and no compute process), SM clock
+locked at 1830 MHz (`nvidia-smi -lgc 1830,1830`; `LOCK_SM_CLOCK_MHZ=1830 CLOCK_LOCK_MODE=verify` in the script),
+the extension built from this branch (`bash tests/build_ccrouter.sh` or `develop.sh`; the fused Mega JIT-compiles on
+first use), `DG_FE_SELECT_IN_MEGA=1` in the pipeline (the profiling driver's default). Inside the container, repo root:
+```bash
+# (b)+(c)+(d) plain customer method: 5 passes x {base, lean} x {normal, balanced} E2E + Mega-only, interleaved
+bash tests/fe5_campaign.sh 5 /raid/kimi/results/fe5/cap            # ~65 min
+# (b)+(c)+(d) streamed: 3 passes, lean, normal + balanced E2E, then one Mega-only pass
+bash tests/fe5_campaign_streamed.sh 3 /raid/kimi/results/fe5/cap_streamed   # ~16 min
+# tables (median over passes of each capture's GPU-0 median-of-last-3; skew columns; skew-filtered medians)
+python3 tests/fe5_summarize_campaign.py /raid/kimi/results/fe5/cap 20
+python3 tests/fe5_summarize_campaign.py /raid/kimi/results/fe5/cap_streamed 20
+# one capture set by hand (what the campaign scripts call; env selects build / routing / method)
+DG_FE_CC_LEAN=1 DG_PROFILE_FORCE_BALANCED=0 DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30 DG_FE_SELECT_IN_MEGA=1 \
+  OUT=/raid/kimi/results/x SCOPES=e2e BACKENDS=fused QUANTS="mxfp4 qoq" TOKENS_LIST="2 4 8 16" FORCE=1 \
+  bash scripts/capture_four_api_h20_timelines.sh
+SCOPES=e2e BACKENDS=fused python3 scripts/summarize_four_api_h20_last3.py /raid/kimi/results/x   # GPU-0 last-3 medians + skew
+python3 scripts/decompose_e2e_skew.py /raid/kimi/results/x/e2e_fused_mxfp4_M2.nsys-rep \
+  --mega-only /raid/kimi/results/x_mega/mega_fused_mxfp4_M2.nsys-rep     # per-rank FE / gap / memcpy / Mega + skew
+# FE standalone A/B + identity + NCU (single GPU)
+FE5_GPU=7 bash tests/fe5_chain.sh /raid/kimi/results/fe5 ; NCU_FE_GPU=7 bash tests/ncu_fe5.sh   # ncu needs docker exec --privileged
+```
+Knobs used by these tables: `DG_FE_CC_LEAN` (default 1; 0 = generic cc44 kernel), `DG_FE_SELECT_IN_MEGA` (library
+default 0, pipeline drivers 1), `DG_PROFILE_STREAMED` (0 = customer method; 1 = back-to-back replays) with
+`DG_PROFILE_ITERS` (8; 30 in the streamed tables), `DG_PROFILE_FORCE_BALANCED` (profiler: FE + memcpy override of the
+routing), `DG_FE_FORCE_BALANCED` (correctness test: the same override, reference follows it), `DG_PROFILE_HOST_BARRIER`
+(1 = `dist.barrier()` before each replay in the plain method; a 3-pass lean-only run with it is in
+`docs/fe_cc_round5.md` 3d for reference, not part of the tables above), `DG_FE_CC_SELECT` (`insert` | `pruned` | `redux`).
+Raw artefacts of this section: `~/Downloads/h20_fused_official/fe5/` (per-capture `TIMELINE_LAST3.*`, campaign logs,
+gate log, decompositions, NCU reports).
 
-### Round 5 (2026-09-12): FE lean entry point, customer method on 10.6.131.8 (8 x H20-3e, 1830 MHz, one build, one session)
-
-`DG_FE_CC_LEAN=1` (now the default, docs/fe_cc_round5.md) compiles the cc router as its own 2.7 K-instruction kernel
-(`router_cc_lean_kernel`) instead of the 11.9 K-instruction generic instantiation whose router role sat 73 KB into the
-kernel and was fetched cold after every Mega weight stream (NCU top stall `no_instruction` 6.9 -> 1.7 warps per issue
-cycle, instructions -44 %). Bit-identical x / x_sf / keys / topk (tests/fe5_ident.py, 256 cells byte-compared; 8-rank
-gates in docs/fe_cc_round5.md section 4). `tests/fe5_campaign.sh`: 5 interleaved passes of base (`DG_FE_CC_LEAN=0`) and
-lean, each with the FE's real routing ("normal") and with the FE output overridden by the Mega-only scope's balanced
-assignment through one graph memcpy node (`DG_PROFILE_FORCE_BALANCED=1`, "balanced"); values = median over passes of
-each capture's GPU-0 median-of-last-3 span (us); `skew` = inter-rank spread of the Mega kernel start (median over passes
-of the per-pass max of the last 3 replays).
-
-| Precision | M | routing | FE base | FE lean | E2E Mega base | E2E Mega lean | E2E base | E2E lean | Mega-only | skew base / lean |
-|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| MXFP4 | 2 | normal | 3.8 | **2.5** | 69.2 | 66.2 | 73.7 | 69.0 | 45.0 | 12.9 / 19.3 |
-| MXFP4 | 2 | balanced | 4.1 | **2.6** | 49.4 | 60.0 | 54.8 | 64.2 | 45.0 | 43.9 / 62.1 |
-| MXFP4 | 4 | normal | 4.1 | **2.5** | 69.5 | 90.2 | 73.4 | 93.0 | 54.3 | 13.8 / 50.8 |
-| MXFP4 | 4 | balanced | 4.1 | **2.5** | 50.8 | 63.5 | 56.0 | 67.4 | 54.3 | 13.4 / 20.1 |
-| MXFP4 | 8 | normal | 4.0 | **2.5** | 72.2 | 76.4 | 76.3 | 79.3 | 60.5 | 14.9 / 20.7 |
-| MXFP4 | 8 | balanced | 4.1 | **2.5** | 76.8 | 64.1 | 82.2 | 68.0 | 60.5 | 24.2 / 16.8 |
-| MXFP4 | 16 | normal | 4.0 | **2.8** | 89.4 | 92.2 | 93.5 | 95.4 | 78.7 | 20.9 / 13.7 |
-| MXFP4 | 16 | balanced | 4.3 | **2.9** | 84.7 | 82.6 | 90.3 | 86.9 | 78.7 | 27.2 / 24.8 |
-| QOQ | 2 | normal | 4.2 | **2.7** | 66.0 | 66.3 | 70.5 | 69.3 | 48.7 | 14.7 / 11.9 |
-| QOQ | 2 | balanced | 4.3 | **2.8** | 47.3 | 43.9 | 52.7 | 48.2 | 48.7 | 14.5 / 14.7 |
-| QOQ | 4 | normal | 4.3 | **2.7** | 72.0 | 69.2 | 76.6 | 72.2 | 50.8 | 23.3 / 17.6 |
-| QOQ | 4 | balanced | 4.3 | **2.8** | 58.2 | 53.1 | 64.1 | 57.2 | 50.8 | 12.8 / 18.6 |
-| QOQ | 8 | normal | 4.1 | **2.7** | 68.6 | 71.9 | 73.1 | 74.8 | 56.6 | 17.0 / 15.3 |
-| QOQ | 8 | balanced | 4.3 | **2.8** | 66.6 | 56.0 | 72.5 | 60.1 | 56.6 | 20.2 / 23.0 |
-| QOQ | 16 | normal | 4.4 | **2.8** | 91.4 | 95.3 | 95.7 | 98.5 | 78.5 | 14.3 / 17.5 |
-| QOQ | 16 | balanced | 4.3 | **3.0** | 91.2 | 81.4 | 96.6 | 85.8 | 78.5 | 21.1 / 12.6 |
-
-FE: -1.3 .. -1.6 us in all 32 cells, 5/5 passes each, base and lean pass distributions do not overlap (per-pass
-values in docs/fe_cc_round5.md). E2E and E2E-Mega columns of the plain customer method are dominated by the
-inter-rank launch skew (12-62 us), not by kernel work: the fused Mega kernels of the 8 ranks END within ~1 us of each
-other (first in-kernel NVLink barrier), so GPU 0's Mega span = common end - GPU 0's own start, i.e. kernel work
-(the latest rank's span, ~40 us at M2, = the Mega-only column) plus GPU 0's head start over the slowest rank
-(10-35 us per replay). Per-rank decomposition of a balanced MXFP4 M2 replay (`scripts/decompose_e2e_skew.py`):
-FE 4.0-4.6 us on every rank, FE end -> Mega start 1.2-1.5 us (1.1-1.2 us of it the forced-balanced memcpy node;
-0.3 us with normal routing), Mega ends within 1.3 us across ranks, GPU 0 Mega span 55.5 = latest rank's 41.4 +
-14.1 head start. Base-vs-lean differences in the E2E columns (+-5..20 us) are that skew's noise.
-
-Streamed replays (separate method, do not mix with the table above: `DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30`, the
-30 replays of a case enqueued back-to-back without per-iteration host sync / barrier, LEAN only, 3 passes + 1 Mega-only
-pass, GPU-0 median of the last 3 replays then median over passes, us):
-
-| Precision | M | routing | FE | E2E Mega | E2E | Mega-only (streamed) | Mega-start skew |
-|---|---:|---|---:|---:|---:|---:|---:|
-| MXFP4 | 2 | normal / balanced | 2.6 / 2.7 | 60.9 / 40.7 | 63.8 / 44.7 | 38.3 | 2.1 / 15.8 |
-| MXFP4 | 4 | normal / balanced | 2.8 / 2.7 | 60.1 / 50.1 | 63.2 / 54.0 | 46.9 | 1.7 / 2.1 |
-| MXFP4 | 8 | normal / balanced | 2.6 / 2.7 | 65.2 / 58.3 | 68.1 / 62.3 | 56.8 | 2.4 / 1.8 |
-| MXFP4 | 16 | normal / balanced | 2.8 / 2.8 | 78.2 / 76.8 | 81.3 / 80.8 | 74.4 | 1.4 / 1.1 |
-| QOQ | 2 | normal / balanced | 2.6 / 2.8 | 60.4 / 42.0 | 63.5 / 46.1 | 37.4 | 50.0 / 15.4 |
-| QOQ | 4 | normal / balanced | 2.7 / 2.8 | 60.2 / 50.2 | 63.2 / 54.4 | 46.4 | 6.7 / 2.0 |
-| QOQ | 8 | normal / balanced | 2.7 / 2.8 | 63.4 / 56.5 | 66.3 / 60.6 | 53.3 | 1.5 / 1.4 |
-| QOQ | 16 | normal / balanced | 3.0 / 3.0 | 76.6 / 76.0 | 80.0 / 80.5 | 73.0 | 1.6 / 1.5 |
-
-Streamed, the ranks lock to 1-2.5 us of Mega-start skew in 12 of 16 cells (M2 and qoq M4 normal stay looser: one
-token per TP half gives the collectives little to pin on), the balanced E2E reads FE + 1.3 us memcpy node + Mega
-(Mega-only + 1-3 us), and the normal-routing Mega (60-65 us at M2-8) versus balanced (40-58) is the real cost of the
-FE's actual unbalanced top-8 routing, not skew.
-
-### How the table is produced (runnable as-is)
+### Legacy full-matrix capture (split + fused, 2026-09-10 flow; commands still valid)
 
 ```bash
 # On 10.6.131.7, inside the four_api_build container, repo at /raid/kimi/dg_dev
@@ -446,6 +568,9 @@ has an env override documented in `csrc/jit_kernels/impls/sm90_fp4_mega_moe_h20_
 | QoQ inline s2 gated to launches with <= 8 possible rows per local expert (`num_tokens x num_ranks <= 8`) | `DG_FP4_QOQ_INLINE_S2` (default 1, now host-gated) | fix: with > 8 rows on one expert (two BM8 pool blocks) the inline-s2 L1 path returns wrong partials for the second block's rows; found by `--frontend fe` T=32 (qoq cos_min 0.0007), reproduced with default routing T=64/128 (cos_min < 0), `DG_FP4_QOQ_INLINE_S2=0` passes; no perf change at M <= 8 (1 row/rank), M16 loses the inline promote |
 | FE cc lean entry point (round 5, docs/fe_cc_round5.md): `router_cc_lean_kernel`, the cc44 router compiled as its own kernel (2.7 K SASS instructions vs 11.9 K for the generic instantiation whose router role sat 73 KB into the kernel), weights issued before activations, activations converted once in the weight-latency shadow, 1-instruction bf16 -> fp32, row 1 only when m == 2, spare CTA quantises the two rows concurrently; bit-identical outputs | `DG_FE_CC_LEAN` (default 1; 0 = generic kernel) | ON: standalone nsys span (pipeline config) mxfp4/qoq rows 1 2.94/2.91 -> 2.50/2.50 us, rows 2 3.17/3.46 -> 2.88/2.91; NCU no_instruction stall 6.9 -> 1.7 warps/issue-cycle, instructions -44 %, elapsed cycles -26 %; customer method: see the perf section |
 | FE two-level threshold top-8 select (round 5): lane maxes ranked by an all-gather, bound = 8th lane max, fast path when no lane holds two keys >= bound, else <= 3 candidates per lane + 8 redux rounds | `DG_FE_CC_SELECT=pruned` (default `insert`) | kept OFF: knob-0 FE span 4.48 -> 4.51 us rows 1, 4.64 -> 4.99 rows 2 (the single-warp select is issue-bound; the fast path covers ~45 % of random tokens); in the pipeline the select is off the critical path anyway; bit-identical |
+| Profiling: streamed replays (no per-iteration host sync / barrier inside the MEASURE loop), replay count | `DG_PROFILE_STREAMED` (default 0 = customer method), `DG_PROFILE_ITERS` (default 8) | measurement only: inter-rank Mega-start skew 12-62 us -> 1-2.5 us (section b) |
+| Profiling: forced-balanced routing in the E2E scope (FE runs, one graph memcpy overrides its routing with the Mega-only assignment, uniform 1/8 weights) | `DG_PROFILE_FORCE_BALANCED` (default 0) | measurement only (section c); `DG_FE_FORCE_BALANCED` = the same override in `tests/test_four_api_correctness.py` |
+| Profiling: host barrier before each replay (plain method) | `DG_PROFILE_HOST_BARRIER` (default 0) | measurement only; docs/fe_cc_round5.md 3d |
 | FE select-in-Mega: the cc router stops after its 384 keys per token, the fused Mega prologue selects top-8 + softmax (`deep_gemm/impls/fable_cc_select.cuh`) | `DG_FE_SELECT_IN_MEGA` (library default 0; pipeline drivers default 1 for the fused backend) | ON in the pipeline: FE ~3.1-3.3 us in-graph (6.4 without), FE+Mega -1.1..-4.2 us in all 6 cells; 8-rank 50 seeds 0 mismatches, y bit-identical; round-4 fixes: key-array view offset, `ld.global.cg` for prologue-written topk |
 
 Measured and kept off (documented negative results): 4 K-blocks per stage,

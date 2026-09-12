@@ -1,4 +1,4 @@
-# Fable cc router, round 5 (2026-09-12, H20-3e 10.6.131.7, branch perf/phase-stamps-probe)
+# Fable cc router, round 5 (2026-09-12, H20-3e 10.6.131.7 standalone / NCU, 10.6.131.8 gates + customer-method campaigns, branch perf/phase-stamps-probe)
 
 Starting point: round 4 (docs/fe_cc_round4.md). Pipeline configuration `DG_FE_TINYM_GRID=auto DG_FE_TINYM_MMA=cc
 DG_FE_SELECT_IN_MEGA=1`: the FE kernel is the 77 router CTAs (5 experts x 4 K-part warps, weights straight into
@@ -211,7 +211,23 @@ balanced cells read FE + 1.3 us memcpy node + ~0.1 + Mega (Mega-only + 1-3 us of
 2.7 + 1.3 + 40.7; and the normal-routing cells show the real cost of the FE's actual routing versus the balanced
 assignment: the Mega kernel is 60-65 us at M2-8 with real (unbalanced) top-8 routing against 40-58 balanced.
 
-HB_PLACEHOLDER
+### 3d. Reference only: plain method WITH `DG_PROFILE_HOST_BARRIER=1` (`dist.barrier()` before every replay; `tests/fe5_campaign_hb.sh`, lean only, 3 passes + 1 Mega-only pass, 08:21-08:39 UTC)
+
+| Precision | M | routing | FE lean | E2E Mega lean | E2E lean | Mega-only (host barrier) | Mega-start skew lean (us) |
+|---|---:|---|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | normal / balanced | 2.5 / 2.6 | 67.4 / 48.8 | 70.1 / 52.7 | 67.8 | 13.5 / 12.7 |
+| MXFP4 | 4 | normal / balanced | 2.5 / 2.6 | 75.7 / 55.2 | 78.5 / 59.1 | 78.5 | 15.4 / 19.3 |
+| MXFP4 | 8 | normal / balanced | 2.5 / 2.5 | 71.9 / 63.4 | 74.7 / 67.3 | 86.2 | 153.4 / 12.2 |
+| MXFP4 | 16 | normal / balanced | 2.9 / 2.9 | 87.0 / 90.2 | 90.1 / 94.5 | 104.6 | 14.0 / 18.1 |
+| QOQ | 2 | normal / balanced | 2.7 / 2.8 | 63.4 / 49.9 | 66.3 / 54.4 | 38.9 | 35.2 / 16.9 |
+| QOQ | 4 | normal / balanced | 2.7 / 2.8 | 72.7 / 54.2 | 75.7 / 58.4 | 49.3 | 20.0 / 18.0 |
+| QOQ | 8 | normal / balanced | 2.7 / 2.8 | 67.7 / 66.6 | 70.7 / 70.9 | 59.3 | 44.5 / 23.9 |
+| QOQ | 16 | normal / balanced | 2.9 / 3.0 | 90.0 / 85.3 | 93.2 / 89.7 | 76.6 | 15.4 / 13.3 |
+
+The host barrier does not remove the skew (12-45 us, one 153 us outlier; the Mega-only mxfp4 pass was badly skewed
+at 68-105 us) -- after the barrier every rank still launches its replay from Python independently -- so this set is
+kept only as the record that the streamed method (3c), not the barrier, is what locks the ranks.
+
 
 
 
