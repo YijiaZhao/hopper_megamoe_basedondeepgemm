@@ -180,7 +180,7 @@ Same test and build (perf/fe5-correctness 80d9ac9 on the 92fb07b kernels), `--se
 router / expert weights, new hidden rows per seed and rank): 14 cells x 3 configurations = 42 launches, 4200 seed-rows.
 Worst case over the 50 seeds per column. Logs node-local `/tmp/kimiz_fe5c_out/sweep50/` (copied to
 `~/fe5c/sweep50_logs.tgz` on the ComputeLab home). No ROUTER_REF_DISAGREE anywhere: FE top-8 == torch top-8 on all
- evaluated tokens; SELECT_IN_MEGA: 0 tokens differ in every applicable launch.
+ 292800 evaluated tokens; SELECT_IN_MEGA: 0 tokens differ in every applicable launch.
 
 | shape | routing | quant | lean | DG_FE_SELECT_IN_MEGA (effective) | seeds | top-8 agree (tokens) | w max diff | qoq x bytes diff (rows, max dq) | cos_min | cos_mean (min) | max abs dy | mean abs dy (max) | norm ratio (worst) | slot check | status |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
