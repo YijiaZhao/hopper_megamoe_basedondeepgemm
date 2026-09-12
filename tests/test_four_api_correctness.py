@@ -190,6 +190,35 @@ def _run(api, args, rank, group):
             buffer.x_sf[:m].copy_(xs)
             buffer.topk_idx[:m].copy_(topk_idx)
             buffer.topk_weights[:m].copy_(topk_weights)
+        if use_fe and args.router_ref == "torch":
+            # Pure-torch router reference, independent of the FE kernel: bf16 router GEMM (fp32 accumulate) ->
+            # bf16-rounded logits -> top-8 (value desc, index asc on ties) -> fp32 softmax over the 8 selected
+            # bf16 logits; activations quantised by the torch per-token casts. The FE outputs are compared to it
+            # (per-token top-8 index-set agreement, weight max |diff| on agreeing tokens, x / x_sf byte diffs)
+            # and the MoE reference below routes / dequantises with the TORCH values, so y is checked against a
+            # reference that contains none of our FE or Mega kernels.
+            logits_ref = (x_bf.float() @ router_weight.float().T).to(torch.bfloat16).float()
+            order = torch.sort(logits_ref, dim=-1, descending=True, stable=True).indices
+            ref_idx = order[:, :args.topk].contiguous()
+            ref_w = torch.softmax(torch.gather(logits_ref, 1, ref_idx), dim=-1).contiguous()
+            if is_qoq:
+                xq_ref, xs_ref = per_token_cast_to_int8(x_bf, gran_k=128)
+            else:
+                xq_ref, xs_ref = per_token_cast_to_fp8(x_bf, use_ue8m0=False, gran_k=128)
+            fe_sorted, ref_sorted = torch.sort(topk_idx, dim=1), torch.sort(ref_idx, dim=1)
+            agree = (fe_sorted.values == ref_sorted.values).all(dim=1)
+            w_fe = torch.gather(topk_weights, 1, fe_sorted.indices)
+            w_ref = torch.gather(ref_w, 1, ref_sorted.indices)
+            w_diff = torch.where(agree[:, None], (w_fe - w_ref).abs(), torch.zeros_like(w_fe)).max()
+            stats = torch.tensor([float(agree.sum()), float(m), float((xq.view(torch.uint8) != xq_ref.view(torch.uint8)).sum()),
+                                  float((xs.float() != xs_ref.float()).sum())], device="cuda")
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=group)
+            dist.all_reduce(w_diff, op=dist.ReduceOp.MAX, group=group)
+            if rank == 0:
+                print(f"ROUTER_REF api={api} tokens={m} top8_set_agree={int(stats[0])}/{int(stats[1])} "
+                      f"weight_max_abs_diff(agreeing)={w_diff.item():.3g} x_bytes_diff={int(stats[2])} x_sf_diff={int(stats[3])} "
+                      f"(FE vs torch bf16-GEMM/top-8/softmax/per-token cast reference; reference y uses the torch routing)", flush=True)
+            topk_idx, topk_weights, xq, xs = ref_idx, ref_w, xq_ref, xs_ref
         x_ref_local = x_reference(xq, xs)
         y = torch.zeros(args.tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
         if is_fused:
@@ -332,6 +361,8 @@ def main():
                         help="route every slot of the first N global tokens to local expert 0 (N > 8: a second BM8 pool block)")
     parser.add_argument("--slot-check", action="store_true",
                         help="fused APIs: per-(token, slot) partial check (SLOT_CHECK) also without --frontend, with best-match row")
+    parser.add_argument("--router-ref", choices=("fe", "torch"), default="fe",
+                        help="--frontend fe: reference routing / activation quantisation from the FE outputs (fe) or from a pure-torch router + per-token cast (torch)")
     parser.add_argument("--frontend", choices=("none", "fe", "fused"), default="none",
                         help="fused APIs: route/quantise with the Fable frontend (fe), and also run the fused-FE kernel and require bit-identical outputs (fused)")
     args = parser.parse_args()
