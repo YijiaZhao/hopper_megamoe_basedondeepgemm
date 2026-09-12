@@ -384,18 +384,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           // task's `pool_block_idx` is expert * stride + m_block instead of the
           // dense prefix-sum block index. Task indices / counts stay dense.
           // 0 == packed (pull) layout.
-          uint32_t kPushBlocksPerExpert = 0,
-          // Fused L1+L2 (kernel `kFuseL1L2`): no L2 tasks exist (every L1 task runs its
-          // W2 K-slice itself), so all L1 waves are claimed as warm-up waves and the
-          // L2 claim only terminates the producer.
-          bool kNoL2Tasks = false,
-          // All-task K splits (kernel `kSplitKL1All` / `kSplitKL2All`, M=16 experiment):
-          // every L1 (resp. L2) task of a launch that fits the scratch is claimed as
-          // kNumL1KSplits (resp. kNumL2KSplits) adjacent K-range indices, not only the
-          // tasks of the last partial wave. Same protocol, same fit rule on the pool
-          // block count; the tail rule is bypassed.
-          bool kSplitL1All = false,
-          bool kSplitL2All = false>
+          uint32_t kPushBlocksPerExpert = 0>
 struct InterleavedMegaMoEScheduler {
     DG_STATIC_ASSERT(!kStreamK || (kNumL1BlockKs % kStreamKKBlocksPerUnit == 0 &&
                                    kNumL2BlockKs % kStreamKKBlocksPerUnit == 0),
@@ -547,27 +536,21 @@ struct InterleavedMegaMoEScheduler {
         const uint32_t num_l1_tail_tasks = num_l1_full_tasks % kNumSMs;
         // Split only when the tail's splits fit one wave (otherwise they would
         // form another full wave and merely add per-task fixed cost).
-        const bool split_all_l1 = kSplitL1All && !streamk_active && kNumL1KSplits > 1 &&
-            num_total_m_blocks <= kMaxSplitKPoolBlocks;
-        const bool split_tail = !split_all_l1 && !streamk_active && kNumL1KSplits > 1 &&
+        const bool split_tail = !streamk_active && kNumL1KSplits > 1 &&
             num_total_m_blocks <= kMaxSplitKPoolBlocks &&
             num_l1_tail_tasks > 0 && num_l1_tail_tasks * kNumL1KSplits <= kNumSMs;
-        num_l1_k_splits = (split_tail || split_all_l1) ? kNumL1KSplits : 1u;
-        num_l1_split_base = split_all_l1 ? 0u :
-            (split_tail ? num_l1_full_tasks - num_l1_tail_tasks : num_l1_full_tasks);
+        num_l1_k_splits = split_tail ? kNumL1KSplits : 1u;
+        num_l1_split_base = split_tail ? num_l1_full_tasks - num_l1_tail_tasks : num_l1_full_tasks;
         num_total_l1_task_indices =
             num_l1_split_base + (num_l1_full_tasks - num_l1_split_base) * num_l1_k_splits;
         const uint32_t num_total_l1_waves =
             math::ceil_div(num_total_l1_task_indices, kNumSMs);
-        // All-split L1: every M block owns kNumL1BlockNs * splits L1 indices, so the
-        // warm-up wave count is derived from that effective per-M-block L1 index count.
         uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
-            num_total_m_blocks, kNumSMs,
-            split_all_l1 ? kNumL1BlockNs * kNumL1KSplits : kNumL1BlockNs, kNumL2BlockNs);
+            num_total_m_blocks, kNumSMs, kNumL1BlockNs, kNumL2BlockNs);
         // Split-K tail: claim the (short) halves in the L1 warm-up rather than
         // behind an L2 task on the alternating schedule (M=16: 156 + 8 indices
         // on 78 SMs -> 3 warm-up waves claim them all).
-        if (split_tail || split_all_l1)
+        if (split_tail)
             min_l1_warmup_waves += kNumSplitKExtraWarmupWaves;
         num_l1_warmup_waves =
             cute::min(min_l1_warmup_waves, num_total_l1_waves);
@@ -586,22 +569,13 @@ struct InterleavedMegaMoEScheduler {
         const uint32_t num_l2_first_batch = num_l1_last_wave == 0 ? 0u : kNumSMs - num_l1_last_wave;
         const uint32_t num_l2_tail_tasks = num_l2_full_tasks <= num_l2_first_batch ?
             num_l2_full_tasks : (num_l2_full_tasks - num_l2_first_batch) % kNumSMs;
-        const bool split_all_l2 = kSplitL2All && !streamk_active && kNumL2KSplits > 1 &&
-            num_total_m_blocks <= kMaxSplitKPoolBlocks;
-        const bool split_l2_tail = !split_all_l2 && !streamk_active && kNumL2KSplits > 1 &&
+        const bool split_l2_tail = !streamk_active && kNumL2KSplits > 1 &&
             num_total_m_blocks <= kMaxSplitKPoolBlocks &&
             num_l2_tail_tasks > 0 && num_l2_tail_tasks * kNumL2KSplits <= kNumSMs;
-        num_l2_k_splits = (split_l2_tail || split_all_l2) ? kNumL2KSplits : 1u;
-        num_l2_split_base = split_all_l2 ? 0u :
-            (split_l2_tail ? num_l2_full_tasks - num_l2_tail_tasks : num_l2_full_tasks);
+        num_l2_k_splits = split_l2_tail ? kNumL2KSplits : 1u;
+        num_l2_split_base = split_l2_tail ? num_l2_full_tasks - num_l2_tail_tasks : num_l2_full_tasks;
         num_total_l2_task_indices =
             num_l2_split_base + (num_l2_full_tasks - num_l2_split_base) * num_l2_k_splits;
-        if constexpr (kNoL2Tasks) {
-            num_l2_k_splits = 1u;
-            num_l2_split_base = 0u;
-            num_total_l2_task_indices = 0u;
-            num_l1_warmup_waves = num_total_l1_waves;
-        }
     }
 
     // Number of L1 task indices covering the first `num_full_tasks` L1 tasks

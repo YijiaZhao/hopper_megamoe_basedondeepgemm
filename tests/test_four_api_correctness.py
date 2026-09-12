@@ -7,10 +7,6 @@ checks that the explicit APIs do not depend on process-global DG_W4A8_INT.
 --frontend fe: the Fable frontend (router + top-k + softmax + quant, tiny-M path) produces
   x / x_sf / topk_idx / topk_weights from a bf16 hidden and a shared router weight; the
   reference uses those outputs (real, unbalanced routing). Fused APIs only.
---frontend fused: same, then the fused kernel is run again with the frontend fused in
-  (DG_FP4_FUSE_FE=1, `frontend=(hidden, router_weight)`) into cleared buffer views; the
-  frontend outputs and y must be bit-identical to the FE + Mega pass, and y is checked
-  against the exact-quantised reference as usual.
 """
 import argparse
 import os
@@ -288,35 +284,6 @@ def _run(api, args, rank, group):
                 print(f"ROUTING api={api} tokens/rank={m} global_tokens={args.global_tokens or m * world} frontend={args.frontend} "
                       f"select_in_mega={int(sel_in_mega)} force_balanced={int(args.force_balanced)} reference={args.reference} "
                       f"DG_FE_CC_LEAN={os.environ.get('DG_FE_CC_LEAN', '<default 1>')}", flush=True)
-            if args.frontend == "fused":
-                # Fused-FE pass into cleared views: frontend outputs and y must be bit-identical.
-                os.environ["DG_FP4_FUSE_FE"] = "1"
-                buffer.x[:m].zero_(); buffer.x_sf[:m].zero_()
-                buffer.topk_idx[:m].fill_(-1); buffer.topk_weights[:m].zero_()
-                torch.cuda.synchronize()
-                dist.barrier(group=group)
-                y_fused = torch.zeros_like(y)
-                kernel(y_fused, *weights, buffer, activation_clamp=args.activation_clamp,
-                       frontend=(x_bf, router_weight))
-                torch.cuda.synchronize()
-                dist.barrier(group=group)
-                eq = {
-                    "x": bool(torch.equal(buffer.x[:m].view(torch.uint8), xq.view(torch.uint8))),
-                    "x_sf": bool(torch.equal(buffer.x_sf[:m], xs)),
-                    "topk_idx": bool(torch.equal(buffer.topk_idx[:m], topk_idx)),
-                    "topk_weights": bool(torch.equal(buffer.topk_weights[:m], topk_weights)),
-                    "y": bool(torch.equal(y_fused, y)),
-                }
-                all_eq = torch.tensor([int(all(eq.values()))], device="cuda", dtype=torch.int32)
-                dist.all_reduce(all_eq, op=dist.ReduceOp.MIN, group=group)
-                y_diff = (y_fused.float() - y.float()).abs().max()
-                dist.all_reduce(y_diff, op=dist.ReduceOp.MAX, group=group)
-                if rank == 0:
-                    print(f"FUSED_FE_EQUALITY api={api} tokens={m} " +
-                          " ".join(f"{k}={int(v)}" for k, v in eq.items()) +
-                          f" all_ranks={int(all_eq.item())} y_max_abs_diff={y_diff.item():.6g}", flush=True)
-                assert bool(all_eq.item()), (api, eq)
-                y = y_fused
             if use_fe and args.router_ref == "torch":
                 # Pure-torch router reference, independent of the FE kernel: bf16 router GEMM (fp32 accumulate) ->
                 # bf16-rounded logits -> top-8 (value desc, index asc on ties) -> fp32 softmax over the 8 selected
@@ -490,8 +457,8 @@ def main():
     parser.add_argument("--force-balanced", action="store_true", default=os.environ.get("DG_FE_FORCE_BALANCED", os.environ.get("DG_PROFILE_FORCE_BALANCED", "0")) == "1",
                         help="(env DG_FE_FORCE_BALANCED=1) --frontend fe: run the FE, then override its routing with the balanced "
                              "assignment (one route per EP rank, weight 1/8) in the buffers the Mega reads; the reference uses the same routing")
-    parser.add_argument("--frontend", choices=("none", "fe", "fused"), default="none",
-                        help="fused APIs: route/quantise with the Fable frontend (fe), and also run the fused-FE kernel and require bit-identical outputs (fused)")
+    parser.add_argument("--frontend", choices=("none", "fe"), default="none",
+                        help="fused APIs: route/quantise with the Fable frontend (fe)")
     args = parser.parse_args()
     if args.reference == "torch-moe":
         args.router_ref = "torch"

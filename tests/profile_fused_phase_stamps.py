@@ -31,14 +31,6 @@ INT64_MAX = (1 << 63) - 1
 MIN_SLOTS = (0, 3)
 REPORT = [
     (12, "init done"),
-    # fused Fable frontend (DG_FP4_FUSE_FE=1 + --fuse-fe): FE crew timeline
-    (49, "FE router loads issued (max)"),
-    (50, "FE quant done (top-k CTAs, max)"),
-    (51, "FE router loads landed (max)"),
-    (52, "FE router WMMA+store done (max)"),
-    (45, "FE router units done (max)"),
-    (54, "FE top-k saw all units (max)"),
-    (46, "FE top-k written (max)"),
     (8, "expert-offset atomics"),
     (9, "topk write"),
     (10, "grid sync"),
@@ -57,8 +49,6 @@ REPORT = [
 # SM0-only accumulators (per launch after reset): 13 = entry->after NVLink barrier#1,
 # 16 = time spent inside NVLink barrier#1 (includes cross-rank launch skew).
 ACCUM = [(13, "SM0: entry->after barrier1"), (16, "SM0: barrier1 wait incl. skew")]
-FE_DUR = [(58, "FE per-CTA: issue (max us)"), (59, "FE per-CTA: land (max us)"), (60, "FE per-CTA: WMMA+store (max us)"),
-          (61, "FE per-CTA: release (max us)"), (62, "FE top-k CTA: wait units (max us)"), (63, "FE top-k CTA: compute+write (max us)")]
 # K-loop stage probe (SM0 thread0, SM cycles @1830MHz): per-stage ns = cycles / count / 1.83
 # BM8 MXFP4 (kKBlocksPerStage == 2): one "stage" = two K128 blocks (12 stages per L1
 # task); 18 = both decodes of the stage, 19 = wait<1> + wait<0> drains.
@@ -100,7 +90,7 @@ def print_tasklog(s, t0):
         return
     def pct(v, q):
         if not v:
-            return float("nan")  # e.g. no L2 tasks under DG_FP4_FUSE_L1L2
+            return float("nan")
         v = sorted(v); return v[min(len(v) - 1, int(q * len(v)))]
     first = [c[1][0]['start'] for c in ctas]
     l1_end = [max(t['end'] for t in c[1] if not t['l2']) for c in ctas if any(not t['l2'] for t in c[1])]
@@ -118,7 +108,7 @@ def print_tasklog(s, t0):
           f"L2 start p0/p50/p90/p100 {pct(l2_start,0):.1f}/{pct(l2_start,.5):.1f}/{pct(l2_start,.9):.1f}/{pct(l2_start,1):.1f} | "
           f"L2 end p50/p100 {pct(l2_end,.5):.1f}/{pct(l2_end,1):.1f}")
     if l1_dur:
-        print(f"TASKLOG: full L1 task dur (incl. the W2 slice under DG_FP4_FUSE_L1L2) p50/p100 {pct(l1_dur,.5):.2f}/{pct(l1_dur,1):.2f}  "
+        print(f"TASKLOG: full L1 task dur p50/p100 {pct(l1_dur,.5):.2f}/{pct(l1_dur,1):.2f}  "
               f"full L2 task dur p50/p100 {pct(l2_dur,.5):.2f}/{pct(l2_dur,1):.2f}  "
               f"idle per CTA (gaps + wait for kernel-wide last L2 end) p50/p100 {pct(idle,.5):.1f}/{pct(idle,1):.1f} "
               f"sum {sum(idle):.0f} us")
@@ -145,10 +135,8 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--no-graph", action="store_true")
-    ap.add_argument("--fuse-fe", action="store_true",
-                    help="run the Fable frontend inside the kernel (needs DG_FP4_FUSE_FE=1); routing from the FE")
     ap.add_argument("--fe-routing", action="store_true",
-                    help="knob-0 reference for --fuse-fe: the standalone FE runs eagerly before every replay (same routing / quant), the graph holds Mega only")
+                    help="the standalone FE runs eagerly before every replay (real routing / quant), the graph holds Mega only")
     ap.add_argument("--no-stamps", action="store_true",
                     help="launch without phase_stamps (wall-time only) to measure probe overhead")
     args = ap.parse_args()
@@ -187,20 +175,16 @@ def main():
             buffer.topk_idx[:active_rows].copy_(idx)
             buffer.topk_weights[:active_rows].fill_(1.0 / P.TOPK)
         y = torch.empty(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
-        frontend = None
         router_weight = None
-        if args.fuse_fe or args.fe_routing:
+        if args.fe_routing:
             torch.manual_seed(20260805)
             router_weight = (torch.randn(P.EXPERTS, P.HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
-        if args.fuse_fe:
-            frontend = (x, router_weight)
-        elif args.fe_routing:
             deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant)
             torch.cuda.synchronize()
 
         def launch():
             kernel(y, *weights, buffer, cumulative_local_expert_recv_stats=None,
-                   activation_clamp=10.0, phase_stamps=None if args.no_stamps else stamps, frontend=frontend)
+                   activation_clamp=10.0, phase_stamps=None if args.no_stamps else stamps)
 
         launch()
         torch.cuda.synchronize()
@@ -266,37 +250,16 @@ def main():
             print(f"{'slot':>4} {'phase':<32} {'median':>9} {'min':>9} {'max':>9} {'delta':>9}")
             prev = 0.0
             for slot, name in REPORT:
-                if slot in (49, 50, 51, 52, 45, 54, 46) and not args.fuse_fe:
-                    continue
                 print(f"{slot:>4} {name:<32} {med[slot]:>9.2f} {mn[slot]:>9.2f} {mx[slot]:>9.2f} {med[slot]-prev:>9.2f}")
                 prev = med[slot]
             for slot, name in ACCUM:
                 v = [r[slot] for r in rows]
                 print(f"{slot:>4} {name:<32} {statistics.median(v):>9.2f} {min(v):>9.2f} {max(v):>9.2f}")
-            if args.fuse_fe:
-                for slot, name in FE_DUR:
-                    v = [sr[slot] / 1000.0 for sr in raw_rows]
-                    print(f"{slot:>4} {name:<32} {statistics.median(v):>9.2f} {min(v):>9.2f} {max(v):>9.2f}")
             n_st = statistics.median(r[21] for r in rows)
             print(f"--- K-loop stage probe (SM0 thread0), {n_st:.0f} L1 stages/launch, ns per stage ---")
             for slot, name in STAGE:
                 v = [r[slot] for r in rows]
                 print(f"{slot:>4} {name:<32} {statistics.median(v):>9.1f} {min(v):>9.1f} {max(v):>9.1f}")
-            # 38/39 = comm-window L2 weight prefetch (kL2PrefetchAll): max-over-CTAs issue-done
-            # time (us from entry) and rank-wide bytes issued
-            if any(sr[38] > 0 for sr in raw_rows):
-                pf_t = statistics.median((sr[38] - sr[0]) / 1000.0 for sr in raw_rows if sr[38] > 0)
-                pf_mb = statistics.median(sr[39] / 1048576.0 for sr in raw_rows)
-                print(f"--- L2 weight prefetch (slots 38/39): issue done at {pf_t:.2f} us, {pf_mb:.1f} MB issued ---")
-            # 41..44 = fused L1+L2 (kFuseL1L2): 41 finisher epilogues (all SMs), 42 their SM0 cycles,
-            # 43 W2 slices on SM0, 44 their cycles (first W2 stage wait -> last ticket handled)
-            if any(sr[43] > 0 for sr in raw_rows):
-                fin_n = statistics.median(sr[41] for sr in raw_rows)
-                w2_n = statistics.median(sr[43] for sr in raw_rows)
-                w2_us = statistics.median(sr[44] / max(sr[43], 1) / SM_GHZ / 1000.0 for sr in raw_rows)
-                fin_us = statistics.median(sr[42] / SM_GHZ / 1000.0 for sr in raw_rows)
-                print(f"--- fused L1+L2 (slots 41-44): {fin_n:.0f} finisher epilogues rank-wide; SM0: "
-                      f"{w2_n:.0f} W2 slices of {w2_us:.2f} us (incl. its finisher epilogues, {fin_us:.2f} us total) ---")
             def _task_us(sl, cnt):
                 return [ (sr[sl] / max(sr[cnt], 1) / SM_GHZ / 1000.0) for sr in raw_rows ]
             l1t = _task_us(25, 27); l2t = _task_us(26, 28)
