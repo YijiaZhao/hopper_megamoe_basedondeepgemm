@@ -134,11 +134,14 @@ __device__ __forceinline__ void topk_tiny_cta(
 // quant_role_range: the quantisation of one token by threads tid = 0..nthreads-1 (a multiple of
 // 32) of the CTA; bar_id 0 = __syncthreads (whole CTA), else a named barrier over nthreads (a
 // thread subset, e.g. the merger CTA's idle warps while its warps 0..7 poll the keys).
+// smem_slot: which 32-entry slice of the warp-max scratch this thread group uses (two groups quantising two
+// rows concurrently in one CTA, lean cc kernel, use slots 0 and 1 with their own named barriers).
 template <int kMode>
 __device__ __forceinline__ void quant_role_range(
         const __nv_bfloat16* __restrict__ hidden, uint8_t* __restrict__ x_bytes,
-        float* __restrict__ x_sf, int token, int h, int tid, int nthreads, int bar_id) {
-    __shared__ float smem_warp_max[32];
+        float* __restrict__ x_sf, int token, int h, int tid, int nthreads, int bar_id, int smem_slot = 0) {
+    __shared__ float smem_warp_max_all[2][32];
+    float* smem_warp_max = smem_warp_max_all[smem_slot];
     const int warp = tid >> 5, lane = tid & 31;
     auto sync = [&]() {
         if (bar_id == 0) __syncthreads();
@@ -1242,10 +1245,18 @@ __global__ void __launch_bounds__(cc_block(kCC), (kFma || kCC > 0) ? 1 : (kFullK
 // c ascending; xor butterfly 16..1; K-part partials summed ks = 0..3; one bf16 rounding).
 __device__ __forceinline__ float bf16lo_f32(uint32_t w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float bf16hi_f32(uint32_t w) { return __uint_as_float(w & 0xFFFF0000u); }
+// Spare CTA: m == 1 -> the whole CTA quantises the row; m == 2 -> the two rows concurrently, 320 threads (10 warps)
+// each with their own named barrier (1, 2) and warp-max scratch slot. The generic kernel quantises the rows one after
+// the other, and for QoQ (row-wide amax -> barrier -> quantise) the second row made the spare CTA the kernel's
+// critical path (rows 2 qoq FE span 3.46 us vs 2.88 mxfp4, standalone nsys). Same numerics: the row amax is order
+// independent, per-element rounding unchanged, mxfp4 K128 groups still map to aligned half-warps.
 template <int kMode>
 __device__ __noinline__ void lean_quant_cta(const __nv_bfloat16* __restrict__ hidden, uint8_t* __restrict__ x_bytes,
                                             float* __restrict__ x_sf, int m, int h) {
-    for (int t = 0; t < m; ++t) quant_cta<kMode, cc_block(44)>(hidden, x_bytes, x_sf, t, h);
+    if (m == 1) { quant_cta<kMode, cc_block(44)>(hidden, x_bytes, x_sf, 0, h); return; }
+    constexpr int kHalf = cc_block(44) / 2;                              // 320
+    const int r = threadIdx.x / kHalf, tid = threadIdx.x % kHalf;
+    if (r < m) quant_role_range<kMode>(hidden, x_bytes, x_sf, r, h, tid, kHalf, 1 + r, r);
 }
 __device__ __noinline__ void lean_last_arriver(uint32_t* __restrict__ ckeys, int64_t* __restrict__ topk_idx,
                                                float* __restrict__ topk_weights, unsigned long long* mstamps,
