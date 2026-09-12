@@ -4,6 +4,7 @@
 # spill / smem report. Lets a task-shape change be checked and its register
 # footprint read while the GPUs are busy.
 #   bash scripts/compile_check_fused_kernel.sh <quant mxfp4|qoq> <l1_tiles 1|2> <l2_tiles 1|2> <stages> [outdir]
+#   HOT_SPLIT=1|2 sets kHotSplitLevel (DG_FP4_HOT_SPLIT); STREAMK=true compiles the stream-K paths in.
 #   (K128 blocks per stage follow the task shape: 2, or 1 with wide tiles.)
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -47,7 +48,7 @@ static void __instantiate_kernel() {
         /* kSplitKL1Requested */ true,
         /* kL2HalfRowTasksRequested */ false,
         /* kSplitKL2Requested */ 0,
-        /* kStreamKRequested */ false,
+        /* kStreamKRequested */ ${STREAMK:-false},
         /* kNvlFastEpilogueRequested */ false,
         /* kFineCombineRequested */ true,
         /* kPushDispatchRequested */ true,
@@ -61,7 +62,8 @@ static void __instantiate_kernel() {
         /* kRFPrefetchPacked */ false,
         /* kStridedPoolDebug */ false,
         /* kL1TaskTiles */ $L1T,
-        /* kL2TaskTiles */ $L2T
+        /* kL2TaskTiles */ $L2T,
+        /* kHotSplitLevel */ ${HOT_SPLIT:-0}
     >);
 };
 CU
