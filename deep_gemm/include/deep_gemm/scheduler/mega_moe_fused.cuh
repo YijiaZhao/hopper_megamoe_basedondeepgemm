@@ -384,26 +384,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           // task's `pool_block_idx` is expert * stride + m_block instead of the
           // dense prefix-sum block index. Task indices / counts stay dense.
           // 0 == packed (pull) layout.
-          uint32_t kPushBlocksPerExpert = 0,
-          // Hot-rank tail split (kernel kHotSplitLevel, host env DG_FP4_HOT_SPLIT; only
-          // with kStreamK compiled in, on launches where stream-K is inactive, i.e. >=
-          // kNumSMs L1 tasks: the rank that real routing loads with >= 8 active local
-          // experts at M <= 8). Level >= 1: the L1 tail tasks are claimed as n
-          // stage-aligned K ranges each, n = the largest of {4, 3, 2} with tail * n <=
-          // kNumSMs (instead of the fixed 2-way publisher/finisher split, which is
-          // skipped entirely when 2 * tail > kNumSMs). Level >= 2: the L2 tail tasks
-          // likewise, n in {5, 3, 2}. The ranges are published as stream-K segments
-          // with VIRTUAL worker indices (tail task j, split s) -> j * n + s < kNumSMs
-          // (unique partial slots, the phases have separate slot spaces), so the
-          // kernel's role-free stream-K reduction applies: every contributor stores
-          // its fp32 partial, the last arriver on the tile's ticket sums them in split
-          // order (deterministic) and runs the epilogue; no contributor waits on any
-          // other, so the deadlock argument of the wave scheduler is unchanged.
-          uint32_t kHotSplitLevel = 0>
+          uint32_t kPushBlocksPerExpert = 0>
 struct InterleavedMegaMoEScheduler {
-    static constexpr bool kHotSplit = kStreamK && kHotSplitLevel >= 1;
-    static constexpr bool kHotSplitL2 = kStreamK && kHotSplitLevel >= 2;
-    DG_STATIC_ASSERT(!kHotSplit || kNumSMs <= 160u, "Hot split: virtual worker indices must fit the stream-K slots");
     DG_STATIC_ASSERT(!kStreamK || (kNumL1BlockKs % kStreamKKBlocksPerUnit == 0 &&
                                    kNumL2BlockKs % kStreamKKBlocksPerUnit == 0),
                      "Stream-K units (stages) must tile both K extents");
@@ -463,9 +445,6 @@ struct InterleavedMegaMoEScheduler {
     // ceil(U1 / units-per-worker) tickets, which never wait on L2 progress, so an
     // L2 segment's L1-readiness waits are deadlock-free by induction.
     bool streamk_active = false;
-    // Hot-rank tail split active for this launch (kHotSplit, wave scheduler): the L1
-    // (L2) tail indices are stream-K segments with virtual workers, n = num_l{1,2}_k_splits.
-    bool hot_split_l1 = false, hot_split_l2 = false;
     uint32_t sk_state = 0;  // 0 claim L1 range, 1 in L1 range, 2 claim L2 range, 3 in L2 range, 4 done
     uint32_t sk_worker_idx = 0;
     uint32_t sk_unit = 0, sk_unit_end = 0;
@@ -505,32 +484,6 @@ struct InterleavedMegaMoEScheduler {
                 num_blocks += math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
         }
         return __reduce_add_sync(0xffffffff, num_blocks);
-    }
-
-    // Hot-rank tail split factor: the largest candidate n (descending) with
-    // num_tail_tasks * n <= kNumSMs, 1 if none (or no tail).
-    template <uint32_t kNumCandidates>
-    static CUTLASS_DEVICE uint32_t pick_hot_split(const uint32_t& num_tail_tasks,
-                                                  const uint32_t (&candidates)[kNumCandidates]) {
-        if (num_tail_tasks == 0)
-            return 1u;
-        #pragma unroll
-        for (uint32_t i = 0; i < kNumCandidates; ++ i) {
-            if (num_tail_tasks * candidates[i] <= kNumSMs)
-                return candidates[i];
-        }
-        return 1u;
-    }
-
-    // Stage-aligned K-block range of split `s` of `n` over `num_k_blocks` K-blocks
-    // (kStreamKKBlocksPerUnit blocks per stage): the remainder stages go to the last
-    // splits, so the finisher-most range is never the shortest.
-    static CUTLASS_DEVICE void get_hot_split_k_range(const uint32_t& num_k_blocks,
-                                                     const uint32_t& s, const uint32_t& n,
-                                                     uint32_t& k_block_begin, uint32_t& k_block_end) {
-        const uint32_t num_stages = num_k_blocks / kStreamKKBlocksPerUnit;
-        k_block_begin = (s * num_stages / n) * kStreamKKBlocksPerUnit;
-        k_block_end = ((s + 1u) * num_stages / n) * kStreamKKBlocksPerUnit;
     }
 
     // `push_done_ptr` (kPushDoneFlags): wait for the push DONE count to reach
@@ -583,21 +536,10 @@ struct InterleavedMegaMoEScheduler {
         const uint32_t num_l1_tail_tasks = num_l1_full_tasks % kNumSMs;
         // Split only when the tail's splits fit one wave (otherwise they would
         // form another full wave and merely add per-task fixed cost).
-        bool split_tail = !streamk_active && kNumL1KSplits > 1 &&
+        const bool split_tail = !streamk_active && kNumL1KSplits > 1 &&
             num_total_m_blocks <= kMaxSplitKPoolBlocks &&
             num_l1_tail_tasks > 0 && num_l1_tail_tasks * kNumL1KSplits <= kNumSMs;
         num_l1_k_splits = split_tail ? kNumL1KSplits : 1u;
-        if constexpr (kHotSplit) {
-            // Hot-rank tail split: n-way stream-K segments (see the template parameter)
-            constexpr uint32_t kL1Candidates[3] = {4u, 3u, 2u};
-            const uint32_t n = (!streamk_active && num_total_m_blocks <= kMaxSplitKPoolBlocks) ?
-                pick_hot_split(num_l1_tail_tasks, kL1Candidates) : 1u;
-            hot_split_l1 = n > 1u;
-            if (hot_split_l1) {
-                split_tail = true;
-                num_l1_k_splits = n;
-            }
-        }
         num_l1_split_base = split_tail ? num_l1_full_tasks - num_l1_tail_tasks : num_l1_full_tasks;
         num_total_l1_task_indices =
             num_l1_split_base + (num_l1_full_tasks - num_l1_split_base) * num_l1_k_splits;
@@ -627,20 +569,10 @@ struct InterleavedMegaMoEScheduler {
         const uint32_t num_l2_first_batch = num_l1_last_wave == 0 ? 0u : kNumSMs - num_l1_last_wave;
         const uint32_t num_l2_tail_tasks = num_l2_full_tasks <= num_l2_first_batch ?
             num_l2_full_tasks : (num_l2_full_tasks - num_l2_first_batch) % kNumSMs;
-        bool split_l2_tail = !streamk_active && kNumL2KSplits > 1 &&
+        const bool split_l2_tail = !streamk_active && kNumL2KSplits > 1 &&
             num_total_m_blocks <= kMaxSplitKPoolBlocks &&
             num_l2_tail_tasks > 0 && num_l2_tail_tasks * kNumL2KSplits <= kNumSMs;
         num_l2_k_splits = split_l2_tail ? kNumL2KSplits : 1u;
-        if constexpr (kHotSplitL2) {
-            constexpr uint32_t kL2Candidates[3] = {5u, 3u, 2u};
-            const uint32_t n = (!streamk_active && num_total_m_blocks <= kMaxSplitKPoolBlocks) ?
-                pick_hot_split(num_l2_tail_tasks, kL2Candidates) : 1u;
-            hot_split_l2 = n > 1u;
-            if (hot_split_l2) {
-                split_l2_tail = true;
-                num_l2_k_splits = n;
-            }
-        }
         num_l2_split_base = split_l2_tail ? num_l2_full_tasks - num_l2_tail_tasks : num_l2_full_tasks;
         num_total_l2_task_indices =
             num_l2_split_base + (num_l2_full_tasks - num_l2_split_base) * num_l2_k_splits;
@@ -805,16 +737,6 @@ struct InterleavedMegaMoEScheduler {
                 auto task_info = create_task(
                     BlockPhase::Linear1, num_l1_split_base + tail_idx / num_l1_k_splits,
                     kNumL1BlockNs, L1_SHAPE_N, L1_SHAPE_K);
-                if constexpr (kHotSplit) {
-                    if (hot_split_l1) {
-                        // Stream-K segment with virtual worker (tail task j, split s) -> j * n + s
-                        const uint32_t j = tail_idx / num_l1_k_splits, s_idx = tail_idx % num_l1_k_splits;
-                        uint32_t k_block_begin, k_block_end;
-                        get_hot_split_k_range(kNumL1BlockKs, s_idx, num_l1_k_splits, k_block_begin, k_block_end);
-                        task_info.set_streamk(k_block_begin, k_block_end, j * num_l1_k_splits, s_idx, num_l1_k_splits);
-                        return task_info;
-                    }
-                }
                 task_info.set_k_split(tail_idx % num_l1_k_splits, num_l1_k_splits);
                 return task_info;
             }
@@ -835,19 +757,8 @@ struct InterleavedMegaMoEScheduler {
             auto task_info = create_task(
                 BlockPhase::Linear2, l2_full_task_idx,
                 kNumL2BlockNs, L2_SHAPE_N, L2_SHAPE_K);
-            if (is_l2_split) {
-                bool as_segment = false;
-                if constexpr (kHotSplitL2)
-                    as_segment = hot_split_l2;
-                if (as_segment) {
-                    const uint32_t j = l2_tail_idx / num_l2_k_splits, s_idx = l2_tail_idx % num_l2_k_splits;
-                    uint32_t k_block_begin, k_block_end;
-                    get_hot_split_k_range(kNumL2BlockKs, s_idx, num_l2_k_splits, k_block_begin, k_block_end);
-                    task_info.set_streamk(k_block_begin, k_block_end, j * num_l2_k_splits, s_idx, num_l2_k_splits);
-                } else {
-                    task_info.set_k_split(l2_tail_idx % num_l2_k_splits, num_l2_k_splits);
-                }
-            }
+            if (is_l2_split)
+                task_info.set_k_split(l2_tail_idx % num_l2_k_splits, num_l2_k_splits);
             // Dependency gate on the DENSE block index (task_info.pool_block_idx is
             // the strided pool index under push dispatch).
             const uint32_t dense_pool_block_idx = l2_full_task_idx / kNumL2BlockNs;

@@ -523,13 +523,7 @@ template <
     // DG_FP4_BN512_MIN_M / DG_FP4_BN512_MAX_M on the global token count): packed
     // 256-row weight tiles per L1 / L2 task (1 or 2). See `kWideTiles` in the body.
     uint32_t kL1TaskTiles = 1,
-    uint32_t kL2TaskTiles = 1,
-    // Hot-rank tail split (host env DG_FP4_HOT_SPLIT, default 0): on wave-scheduled
-    // launches with stream-K compiled in (M <= 8), the L1 tail tasks (1) and the L2
-    // tail tasks (2) are claimed as n stage-aligned K ranges with n chosen per launch
-    // so that tail * n <= SMs, reduced through the role-free stream-K protocol; see
-    // `kHotSplit` in the scheduler.
-    uint32_t kHotSplitLevel = 0
+    uint32_t kL2TaskTiles = 1
 >
 CUTLASS_GLOBAL __launch_bounds__(384, 1) void
 sm90_nvfp4_mega_moe_h200_fused_impl(

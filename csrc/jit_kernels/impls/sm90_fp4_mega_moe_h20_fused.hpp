@@ -52,7 +52,6 @@ public:
         bool strided_pool_debug;
         int l1_task_tiles;
         int l2_task_tiles;
-        int hot_split_level;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -115,8 +114,7 @@ public:
             "        /* kRFPrefetchPacked */ {},\n"
             "        /* kStridedPoolDebug */ {},\n"
             "        /* kL1TaskTiles */ {},\n"
-            "        /* kL2TaskTiles */ {},\n"
-            "        /* kHotSplitLevel */ {}",
+            "        /* kL2TaskTiles */ {}",
             args.swap_ab ? "true" : "false",
             args.single_active_dispatch_warp ? "true" : "false",
             args.use_mode2_row_decoder ? "true" : "false",
@@ -145,8 +143,7 @@ public:
             args.rf_prefetch_packed ? "true" : "false",
             args.strided_pool_debug ? "true" : "false",
             args.l1_task_tiles,
-            args.l2_task_tiles,
-            args.hot_split_level);
+            args.l2_task_tiles);
         return fmt::format(R"(
 {}
 
@@ -448,20 +445,6 @@ static void sm90_fp4_h20_fused_mega_moe(
         !half_tile_tasks && !l2_half_row_tasks && plan.use_interleaved_scheduler &&
         dense_weight_tiles && get_env<int>("DG_FP4_STREAMK", 1) != 0 &&
         num_global_tokens_upper <= get_env<int>("DG_FP4_STREAMK_MAX_M", 8);
-    // Hot-rank tail split (kernel `kHotSplitLevel` -> scheduler `kHotSplit`; host env
-    // DG_FP4_HOT_SPLIT, default 0). Real (unbalanced) routing puts >= 8 active local
-    // experts on one rank at M <= 8 (the E2E harness's inactive ranks route their zero
-    // rows to experts 0..7 of rank 0: 48 of the 64 routed pairs at M=2), so that rank
-    // runs the wave scheduler (>= 80 L1 tasks) and its kernel end is the E2E critical
-    // path. On such launches the last partial L1 wave (level >= 1) and the last L2
-    // claim batch (level >= 2) are claimed as n stage-aligned K ranges per task, n
-    // chosen per launch as the largest allowed value with tail * n <= SMs (L1: 4, 3,
-    // 2; L2: 5, 3, 2), and reduced through the role-free stream-K protocol (per-tile
-    // arrival ticket, the last arriver sums the partials in split order and runs the
-    // epilogue), replacing the fixed 2-way publisher/finisher tail split. Needs the
-    // stream-K consumer paths compiled in (`stream_k` above), so M = 16 launches are
-    // untouched.
-    const int hot_split_level = stream_k ? std::clamp(get_env<int>("DG_FP4_HOT_SPLIT", 0), 0, 2) : 0;
     // Push dispatch (kernel `kPushDispatch`): for <= DG_FP4_PUSH_DISPATCH_MAX_M
     // (default 16) global tokens the source rank pushes each routed row (3 KB token +
     // per-K128 SF + top-k weight + source metadata) into the destination rank's pool
@@ -675,7 +658,6 @@ static void sm90_fp4_h20_fused_mega_moe(
         .strided_pool_debug = strided_pool_debug,
         .l1_task_tiles = l1_task_tiles,
         .l2_task_tiles = l2_task_tiles,
-        .hot_split_level = hot_split_level,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -718,8 +700,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
         (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "") +
-        (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "") +
-        (hot_split_level != 0 ? fmt::format("_hot{}", hot_split_level) : "");
+        (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }
