@@ -104,6 +104,14 @@ size_t router_quant_topk_frontend_workspace_bytes(int e);
 //   qoq 78.5/79.5/97.7 -> 75.5/76.3/95.7 (-1..-4 us, the knob-0 baseline itself moves 2-3 us run to run); gate
 //   8 ranks x 50 seeds x M 2|16 x both quants: topk_idx/topk_weights bit-identical, y max|dy| 0. Knob default 0
 //   (a standalone FE launch with it on writes no topk_idx); set DG_FE_SELECT_IN_MEGA=1 in the FE+Mega pipeline.
+// ROUND 5 (2026-09-12, docs/fe_cc_round5.md): DG_FE_CC_LEAN (default 1) = router_cc_lean_kernel, the cc44 router as its
+// own entry point (2.7 K SASS instructions; the generic instantiation is 11.9 K with the router role 73 KB into the kernel,
+// fetched cold after every L2 flush / Mega weight stream: NCU no_instruction 6.9 -> 1.7 warps per issue cycle, instructions
+// -44 %, elapsed cycles -26 %), weights issued before activations, fp32 activations converted once in the weight-latency
+// shadow, row 1 only when m == 2, spare CTA quantises both rows concurrently (the sequential QoQ row quant was the rows-2
+// critical path). Standalone nsys span (pipeline config) rows 1 2.94 -> 2.50 us, rows 2 3.17/3.46 -> 2.88/2.91;
+// bit-identical x / x_sf / keys / topk (tests/fe5_ident.py, 256 cells). DG_FE_CC_SELECT=pruned (two-level threshold
+// select, fable_cc::select_pruned) is neutral-to-negative on the knob-0 span and off by default.
 // Router CTA count the launch will use (bench / stamp attribution helper).
 // `k_parts` (DG_FE_TINYM_KPARTS, full-K grid only): 1 | 2 | 4 K-parts per expert
 // group (grid=97,k_parts=4 = the legacy 24 x 16 x 4 layout inside the full-K
