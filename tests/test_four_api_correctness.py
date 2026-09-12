@@ -277,8 +277,9 @@ def _run(api, args, rank, group):
             if sel_in_mega:
                 # the Mega prologue wrote the selected top-8 into the buffer: this IS the routing the kernel used
                 topk_idx, topk_weights = buffer.topk_idx[:m].clone(), buffer.topk_weights[:m].clone()
-                if not args.force_balanced and active:
-                    n_bad = int((torch.sort(topk_idx, 1).values != torch.sort(fe_idx, 1).values).any(1).sum())
+                if not args.force_balanced:
+                    # (collective on every rank; an inactive rank contributes 0)
+                    n_bad = int((torch.sort(topk_idx, 1).values != torch.sort(fe_idx, 1).values).any(1).sum()) if active else 0
                     n_bad = torch.tensor([n_bad], device="cuda"); dist.all_reduce(n_bad, group=group)
                     if rank == 0:
                         print(f"SELECT_IN_MEGA api={api} tokens={m}: Mega-prologue top-8 vs python decode of the FE key array: "
