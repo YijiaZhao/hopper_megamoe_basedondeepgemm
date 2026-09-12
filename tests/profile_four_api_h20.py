@@ -55,7 +55,14 @@ INTERMEDIATE = 1280
 EXPERTS = 384
 TOPK = 8
 WARMUP = 2
-ITERS = 8
+# DG_PROFILE_ITERS (default 8 = the customer method) measured replays per case.
+ITERS = int(os.environ.get("DG_PROFILE_ITERS", "8"))
+# DG_PROFILE_STREAMED=1: inside the MEASURE loop no per-iteration torch.cuda.synchronize() / dist.barrier() (and no
+# pre-replay barrier): the L2 flush, work.copy_, reduce-scatter, graph replay and all-gather of all ITERS iterations
+# are enqueued back-to-back on the stream, so the 8 ranks self-align through the GPU-side collectives; one
+# synchronize + barrier before the loop and one after. NVTX iter ranges are kept. Default 0 = the customer method
+# (byte-identical behaviour).
+STREAMED = os.environ.get("DG_PROFILE_STREAMED", "0") == "1"
 
 
 def make_tp_group(rank):
@@ -224,9 +231,10 @@ def run_e2e(args, rank, tp_group, group):
 
         def replay(input_id, annotate):
             flush_l2_cache()
-            torch.cuda.synchronize()
+            if not STREAMED:
+                torch.cuda.synchronize()
             work.copy_(partials[input_id])
-            if HOST_BARRIER:
+            if HOST_BARRIER and not STREAMED:
                 torch.cuda.synchronize()
                 dist.barrier(group=group)
             if annotate:
@@ -251,12 +259,14 @@ def run_e2e(args, rank, tp_group, group):
         nvtx.range_push(
             f"rank{rank}/MEASURE_{ITERS}/e2e/{args.backend}/{args.quant}/M{args.global_tokens}")
         for i in range(ITERS):
-            dist.barrier(group=group)
+            if not STREAMED:
+                dist.barrier(group=group)
             nvtx.range_push(f"rank{rank}/iter_{i:02d}")
             replay(i + WARMUP, True)
             nvtx.range_pop()
-            torch.cuda.synchronize()
-            dist.barrier(group=group)
+            if not STREAMED:
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
         nvtx.range_pop()
         torch.cuda.synchronize()
         dist.barrier(group=group)
@@ -312,8 +322,9 @@ def run_mega(args, rank, group):
 
         def replay(annotate):
             flush_l2_cache()
-            torch.cuda.synchronize()
-            if HOST_BARRIER:
+            if not STREAMED:
+                torch.cuda.synchronize()
+            if HOST_BARRIER and not STREAMED:
                 dist.barrier(group=group)
             if annotate:
                 nvtx.range_push(
@@ -329,12 +340,15 @@ def run_mega(args, rank, group):
         nvtx.range_push(
             f"rank{rank}/MEASURE_{ITERS}/mega/{args.backend}/{args.quant}/M{args.global_tokens}")
         for i in range(ITERS):
-            dist.barrier(group=group)
+            if not STREAMED:
+                dist.barrier(group=group)
             nvtx.range_push(f"rank{rank}/iter_{i:02d}")
             replay(True)
             nvtx.range_pop()
-            torch.cuda.synchronize()
+            if not STREAMED:
+                torch.cuda.synchronize()
         nvtx.range_pop()
+        torch.cuda.synchronize()
         dist.barrier(group=group)
     finally:
         buffer.destroy()
