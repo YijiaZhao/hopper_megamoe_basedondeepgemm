@@ -311,15 +311,21 @@ def ref_check(d, side):
         else:
             xq, xs = per_token_cast_to_fp8(x, use_ue8m0=False, gran_k=128)
         for name, sfname in (("x", "x_sf"), ("x_sel1", "x_sf_sel1")):
-            nx = int((c[name][:rows].cuda() != xq.view(torch.uint8)).sum())
+            fe_b, ref_b = c[name][:rows].cuda(), xq.view(torch.uint8)
+            nx = int((fe_b != ref_b).sum())
             nsf = int((c[sfname][:rows].cuda() != xs.float()).sum())
+            if quant == "qoq":
+                dq = (fe_b.view(torch.int8).int() - ref_b.view(torch.int8).int()).abs()
+            else:
+                ia, ib = fe_b.int(), ref_b.int()      # e4m3 as sign-magnitude integers: 1 = one ulp
+                dq = (torch.where(ia >= 128, -(ia - 128), ia) - torch.where(ib >= 128, -(ib - 128), ib)).abs()
             if nx or nsf:
                 k = (rows, quant, name)
-                bad.setdefault(k, [0, 0, 0]); bad[k][0] += 1; bad[k][1] += nx; bad[k][2] += nsf
+                bad.setdefault(k, [0, 0, 0, 0]); bad[k][0] += 1; bad[k][1] += nx; bad[k][2] += nsf; bad[k][3] = max(bad[k][3], int(dq.max()))
     if not bad:
         print(f"  REF_TORCH {side}: x / x_sf byte-identical to the torch per-token casts in every cell (rows < rows)")
-    for (rows, quant, name), (nc, nx, nsf) in sorted(bad.items()):
-        print(f"  REF_TORCH {side}: rows={rows} quant={quant} {name}: {nc} cells differ from the torch cast (x bytes {nx}, x_sf words {nsf})")
+    for (rows, quant, name), (nc, nx, nsf, mdq) in sorted(bad.items()):
+        print(f"  REF_TORCH {side}: rows={rows} quant={quant} {name}: {nc} cells differ from the torch cast (x bytes {nx}, max |dq| {mdq} ulp, x_sf words {nsf})")
 
 
 def main():
