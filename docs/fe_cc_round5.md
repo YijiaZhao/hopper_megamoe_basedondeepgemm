@@ -174,7 +174,45 @@ kernels). The Mega-only capture has the same effect: its last-3 Mega-start skews
 and 7.7 / 1530 / 36.2 us (qoq) with Mega-end skews of ~1 us, i.e. GPU 0 was not the earliest rank there, so the
 Mega-only column (39.5-46) is closer to the kernel work than the E2E Mega column.
 
-STREAMED_PLACEHOLDER
+### 3c. Streamed replays ("streamed 30 iters, last-3 median"; `DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30`, `tests/fe5_campaign_streamed.sh`, lean only, 3 passes + 1 Mega-only pass, 08:05-08:21 UTC, same build / box / session)
+
+Same capture and reduction as 3a (nsys, GPU 0, median of the last 3 replays, then median over passes), but inside the
+MEASURE loop the 30 replays of a case are enqueued back-to-back (no per-iteration `torch.cuda.synchronize()` /
+`dist.barrier()`, no pre-replay barrier; one synchronize + barrier before and after the loop), so the ranks lock to
+each other through the on-stream collectives instead of re-skewing at every host round trip. Do not mix with 3a.
+
+| Precision | M | routing | FE lean | E2E Mega lean | E2E lean | Mega-only (streamed) | Mega-start skew lean (us) |
+|---|---:|---|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | normal | 2.6 | 60.9 | **63.8** | 38.3 | 2.1 |
+| MXFP4 | 2 | balanced | 2.7 | 40.7 | **44.7** | 38.3 | 15.8 |
+| MXFP4 | 4 | normal | 2.8 | 60.1 | **63.2** | 46.9 | 1.7 |
+| MXFP4 | 4 | balanced | 2.7 | 50.1 | **54.0** | 46.9 | 2.1 |
+| MXFP4 | 8 | normal | 2.6 | 65.2 | **68.1** | 56.8 | 2.4 |
+| MXFP4 | 8 | balanced | 2.7 | 58.3 | **62.3** | 56.8 | 1.8 |
+| MXFP4 | 16 | normal | 2.8 | 78.2 | **81.3** | 74.4 | 1.4 |
+| MXFP4 | 16 | balanced | 2.8 | 76.8 | **80.8** | 74.4 | 1.1 |
+| QOQ | 2 | normal | 2.6 | 60.4 | **63.5** | 37.4 | 50.0 |
+| QOQ | 2 | balanced | 2.8 | 42.0 | **46.1** | 37.4 | 15.4 |
+| QOQ | 4 | normal | 2.7 | 60.2 | **63.2** | 46.4 | 6.7 |
+| QOQ | 4 | balanced | 2.8 | 50.2 | **54.4** | 46.4 | 2.0 |
+| QOQ | 8 | normal | 2.7 | 63.4 | **66.3** | 53.3 | 1.5 |
+| QOQ | 8 | balanced | 2.8 | 56.5 | **60.6** | 53.3 | 1.4 |
+| QOQ | 16 | normal | 3.0 | 76.6 | **80.0** | 73.0 | 1.6 |
+| QOQ | 16 | balanced | 3.0 | 76.0 | **80.5** | 73.0 | 1.5 |
+
+Did the ranks lock? Plain method (3a): Mega-start skew 12-62 us per cell. Streamed: 1.1-2.4 us in 12 of 16 cells
+(median over passes of the per-pass max of the last 3 replays); the exceptions are the M2 cells (mxfp4 balanced 15.8,
+qoq balanced 15.4, qoq normal 50.0: with one active token per TP half the reduce-scatter / all-gather carry almost no
+data and do not pin the ranks as tightly; per-replay decomposition of streamed qoq M2 normal pass 1: skews 22.5 / 1.2
+/ 50.0) and qoq M4 normal (6.7). Streamed balanced MXFP4 M2, pass 1, last 3 replays (`decompose_e2e_skew.py`): FE
+2.7-2.8 us, FE end -> Mega start 1.2-1.4 (memcpy node 1.2), Mega-start skew 0.9 / 2.8 / 6.5 us, GPU 0 Mega span 40.2 /
+41.9 / 40.6 vs the streamed Mega-only 38.5 / 38.3 / 38.2 with 1.8-2.6 us skew. With the skew removed the E2E
+balanced cells read FE + 1.3 us memcpy node + ~0.1 + Mega (Mega-only + 1-3 us of residual skew), e.g. MXFP4 M2 44.7 =
+2.7 + 1.3 + 40.7; and the normal-routing cells show the real cost of the FE's actual routing versus the balanced
+assignment: the Mega kernel is 60-65 us at M2-8 with real (unbalanced) top-8 routing against 40-58 balanced.
+
+HB_PLACEHOLDER
+
 
 
 ## 4. Gates

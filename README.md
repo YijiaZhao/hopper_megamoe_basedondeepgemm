@@ -367,7 +367,27 @@ other (first in-kernel NVLink barrier), so GPU 0's Mega span = common end - GPU 
 (10-35 us per replay). Per-rank decomposition of a balanced MXFP4 M2 replay (`scripts/decompose_e2e_skew.py`):
 FE 4.0-4.6 us on every rank, FE end -> Mega start 1.2-1.5 us (1.1-1.2 us of it the forced-balanced memcpy node;
 0.3 us with normal routing), Mega ends within 1.3 us across ranks, GPU 0 Mega span 55.5 = latest rank's 41.4 +
-14.1 head start. Base-vs-lean differences in the E2E columns (+-5..20 us) are that skew's noise. STREAMED_README_PLACEHOLDER
+14.1 head start. Base-vs-lean differences in the E2E columns (+-5..20 us) are that skew's noise.
+
+Streamed replays (separate method, do not mix with the table above: `DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30`, the
+30 replays of a case enqueued back-to-back without per-iteration host sync / barrier, LEAN only, 3 passes + 1 Mega-only
+pass, GPU-0 median of the last 3 replays then median over passes, us):
+
+| Precision | M | routing | FE | E2E Mega | E2E | Mega-only (streamed) | Mega-start skew |
+|---|---:|---|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | normal / balanced | 2.6 / 2.7 | 60.9 / 40.7 | 63.8 / 44.7 | 38.3 | 2.1 / 15.8 |
+| MXFP4 | 4 | normal / balanced | 2.8 / 2.7 | 60.1 / 50.1 | 63.2 / 54.0 | 46.9 | 1.7 / 2.1 |
+| MXFP4 | 8 | normal / balanced | 2.6 / 2.7 | 65.2 / 58.3 | 68.1 / 62.3 | 56.8 | 2.4 / 1.8 |
+| MXFP4 | 16 | normal / balanced | 2.8 / 2.8 | 78.2 / 76.8 | 81.3 / 80.8 | 74.4 | 1.4 / 1.1 |
+| QOQ | 2 | normal / balanced | 2.6 / 2.8 | 60.4 / 42.0 | 63.5 / 46.1 | 37.4 | 50.0 / 15.4 |
+| QOQ | 4 | normal / balanced | 2.7 / 2.8 | 60.2 / 50.2 | 63.2 / 54.4 | 46.4 | 6.7 / 2.0 |
+| QOQ | 8 | normal / balanced | 2.7 / 2.8 | 63.4 / 56.5 | 66.3 / 60.6 | 53.3 | 1.5 / 1.4 |
+| QOQ | 16 | normal / balanced | 3.0 / 3.0 | 76.6 / 76.0 | 80.0 / 80.5 | 73.0 | 1.6 / 1.5 |
+
+Streamed, the ranks lock to 1-2.5 us of Mega-start skew in 12 of 16 cells (M2 and qoq M4 normal stay looser: one
+token per TP half gives the collectives little to pin on), the balanced E2E reads FE + 1.3 us memcpy node + Mega
+(Mega-only + 1-3 us), and the normal-routing Mega (60-65 us at M2-8) versus balanced (40-58) is the real cost of the
+FE's actual unbalanced top-8 routing, not skew.
 
 ### How the table is produced (runnable as-is)
 
