@@ -31,14 +31,24 @@ def main():
             torch.manual_seed(17000 + seed * 7919 + rows)
             x = torch.randn(rows, HIDDEN, device="cuda", dtype=torch.bfloat16)
             for quant in ("mxfp4", "qoq"):
+                ws = deep_gemm.fable_frontend_workspace(buf, EXPERTS, x.device)
+                # the buffers exactly as the Mega consumes them, incl. the padding rows up to 4: x / x_sf (quantised
+                # activations + block scales), topk_idx / topk_weights, the 256 B ticket area and the 4 KB compact key area
                 deep_gemm.fable_router_quant_topk_frontend(x, w, buf, quant=quant, select_in_mega=0)
                 torch.cuda.synchronize()
-                idx = buf.topk_idx[:rows].clone(); wts = buf.topk_weights[:rows].clone()
-                xq = buf.x[:rows].clone(); xsf = buf.x_sf[:rows].clone()
+                idx = buf.topk_idx[:4].clone(); wts = buf.topk_weights[:4].clone()
+                xq = buf.x[:4].clone(); xsf = buf.x_sf[:4].clone()
+                ticket0 = ws[:256].clone()
                 deep_gemm.fable_router_quant_topk_frontend(x, w, buf, quant=quant, select_in_mega=1)
                 torch.cuda.synchronize()
-                keys = deep_gemm.fable_frontend_keys(buf).clone()[: rows * EXPERTS]
-                out[(seed, rows, quant)] = (idx.cpu(), wts.cpu(), keys.cpu(), xq.cpu(), xsf.cpu())
+                keys = ws[256 + 64 * 1024: 256 + 64 * 1024 + 4096].clone()
+                ticket1 = ws[:256].clone()
+                out[(seed, rows, quant)] = (idx.cpu(), wts.cpu(), torch.cat([keys, ticket0, ticket1]).cpu(), xq.cpu(), xsf.cpu())
+                if seed == 0:
+                    print(f"FE5_LAYOUT rows={rows} quant={quant}: x {tuple(buf.x.shape)} {buf.x.dtype} stride {buf.x.stride()} | "
+                          f"x_sf {tuple(buf.x_sf.shape)} {buf.x_sf.dtype} stride {buf.x_sf.stride()} | topk_idx {tuple(buf.topk_idx.shape)} "
+                          f"{buf.topk_idx.dtype} | topk_weights {tuple(buf.topk_weights.shape)} {buf.topk_weights.dtype} | "
+                          f"workspace {tuple(ws.shape)} {ws.dtype}, keys at byte {256 + 64 * 1024} (token t at +t*{EXPERTS}*4), ticket area [0,256)")
     env = {k: os.environ.get(k, "") for k in ("DG_FE_CC_LEAN", "DG_FE_CC_SELECT", "DG_FE_SELECT_IN_MEGA", "DG_FE_TINYM_MMA")}
     if args.save:
         torch.save({"env": env, "out": out}, args.save)
@@ -57,7 +67,7 @@ def main():
                 bad_x += 1
                 d = detail.setdefault((k[1], k[2]), [0, 0, 0]); d[0] += 1; d[1] += nx; d[2] += nsf
         status = "PASS" if bad_idx == bad_w == bad_keys == bad_x == 0 else "FAIL"
-        print(f"FE5_IDENT {status} cells={len(out)} mismatching cells: topk_idx={bad_idx} topk_weights={bad_w} keys={bad_keys} x/x_sf={bad_x} "
+        print(f"FE5_IDENT {status} cells={len(out)} mismatching cells: topk_idx={bad_idx} topk_weights={bad_w} keys+ticket_area={bad_keys} x/x_sf={bad_x} "
               f"env={env} ref_env={ref['env']}")
         for (rows, quant), (cells, nx, nsf) in sorted(detail.items()):
             print(f"  x/x_sf mismatch rows={rows} quant={quant}: cells={cells} x_bytes_diff={nx} x_sf_words_diff={nsf} "
