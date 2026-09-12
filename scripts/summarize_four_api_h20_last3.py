@@ -41,6 +41,9 @@ def main():
             target_median_us=statistics.median(
                 call["target_span_us"] for call in final_three
             ),
+            mega_start_skew_median_us=median_or_none([call.get("mega_start_skew_us") for call in final_three]),
+            mega_start_skew_max_us=max([call.get("mega_start_skew_us") or 0.0 for call in final_three]) or None,
+            gpu0_start_after_earliest_median_us=median_or_none([call.get("mega_start_after_earliest_us") for call in final_three]),
             report=metadata["report"],
         ))
 

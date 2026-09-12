@@ -1,6 +1,6 @@
 #!/bin/bash
-# Round-5 supplementary campaign WITH the host barrier before every graph replay (DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30, removes
-# most of the inter-rank launch skew): E2E, LEAN=1 only, normal and forced-balanced routing, both quants, M 2 4 8 16,
+# Round-5 supplementary campaign, STREAMED replays (DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30: 30 back-to-back replays per case
+# without per-iteration host sync / barrier; the ranks self-align through the on-stream collectives): E2E, LEAN=1 only, normal and forced-balanced routing, both quants, M 2 4 8 16,
 # 3 interleaved passes + one Mega-only pass. Separate output root so it is never mixed with the plain customer method.
 # Usage (in four_api_build / fe5c_build, repo root): bash tests/fe5_campaign_streamed.sh [passes=3] [outroot=/raid/kimi/results/fe5/cap_streamed]
 cd "$(dirname "$0")/.."
