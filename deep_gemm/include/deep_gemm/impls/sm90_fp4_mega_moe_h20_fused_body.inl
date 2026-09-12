@@ -745,7 +745,7 @@
         }
         cutlass::arch::fence_barrier_init();
     }
-    // PDL (host: DG_FE_PDL -> LaunchArgs::force_pdl): launched with programmatic
+    // PDL (library-wide DG_PDL -> LaunchArgs::enable_pdl): launched with programmatic
     // stream serialization this grid may start while the Fable frontend is still
     // running. Everything above touches only SMEM, m-barriers, TMA descriptors and
     // the constant LUT; from here on we read frontend outputs (topk_idx, x, x_sf),

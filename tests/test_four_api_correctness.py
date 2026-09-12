@@ -282,8 +282,7 @@ def _run(api, args, rank, group):
                               f"{int(n_bad)} tokens differ", flush=True)
             if rank == 0:
                 print(f"ROUTING api={api} tokens/rank={m} global_tokens={args.global_tokens or m * world} frontend={args.frontend} "
-                      f"select_in_mega={int(sel_in_mega)} force_balanced={int(args.force_balanced)} reference={args.reference} "
-                      f"DG_FE_CC_LEAN={os.environ.get('DG_FE_CC_LEAN', '<default 1>')}", flush=True)
+                      f"select_in_mega={int(sel_in_mega)} force_balanced={int(args.force_balanced)} reference={args.reference}", flush=True)
             if use_fe and args.router_ref == "torch":
                 # Pure-torch router reference, independent of the FE kernel: bf16 router GEMM (fp32 accumulate) ->
                 # bf16-rounded logits -> top-8 (value desc, index asc on ties) -> fp32 softmax over the 8 selected

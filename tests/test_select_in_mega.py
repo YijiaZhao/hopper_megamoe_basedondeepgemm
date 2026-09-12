@@ -3,7 +3,7 @@
 (2) FE with the select in the Mega prologue (knob 1) + Mega -> the topk_idx / topk_weights the Mega
 wrote into the buffer must be bit-identical to (1), and y must match (cos_min, max |dy|).
 
-  DG_FE_TINYM_GRID=auto DG_FE_TINYM_MMA=cc /usr/local/bin/torchrun --standalone --nproc_per_node=8 \\
+  /usr/local/bin/torchrun --standalone --nproc_per_node=8 \\
       tests/test_select_in_mega.py --quant mxfp4 --global-tokens 8 --seeds 50
 """
 import argparse, os, sys, types

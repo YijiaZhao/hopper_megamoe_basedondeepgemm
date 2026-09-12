@@ -8,7 +8,7 @@ import argparse, os, re, sys
 
 RE_RESULT = re.compile(r"RESULT api=(\S+?)(?: seed=\d+)? finite=(\d) max_abs=(\S+) mean_abs=(\S+) cos_min=(\S+) cos_mean=(\S+) norm_ratio=(\S+)")
 RE_ROUTER = re.compile(r"ROUTER_REF api=(\S+?)(?: seed=\d+)? tokens=(\d+) top8_set_agree=(\d+)/(\d+) weight_max_abs_diff\(agreeing\)=(\S+)(?: weight_max_abs_diff\(all\)=(\S+))? x_bytes_diff=(\d+)(?: x_rows_with_diff=(\d+) x_max_\|dq\|=(\S+))? x_sf_diff=(\d+)")
-RE_ROUTING = re.compile(r"ROUTING api=(\S+) tokens/rank=(\d+) global_tokens=(\d+) frontend=(\S+) select_in_mega=(\d) force_balanced=(\d) reference=(\S+) DG_FE_CC_LEAN=(\S+)")
+RE_ROUTING = re.compile(r"ROUTING api=(\S+) tokens/rank=(\d+) global_tokens=(\d+) frontend=(\S+) select_in_mega=(\d) force_balanced=(\d) reference=(\S+)(?: DG_FE_CC_LEAN=(\S+))?")
 RE_SELMEGA = re.compile(r"SELECT_IN_MEGA api=(\S+) tokens=\d+: .*?: (\d+) tokens differ")
 RE_SLOT = re.compile(r"SLOT_CHECK api=(\S+)")
 
@@ -18,7 +18,7 @@ def parse(path):
     txt = open(path, errors="replace").read()
     for m in RE_ROUTING.finditer(txt):
         r = rows.setdefault(m.group(1), {})
-        r.update(tokens=int(m.group(2)), M=int(m.group(3)), sel=int(m.group(5)), fb=int(m.group(6)), lean=m.group(8))
+        r.update(tokens=int(m.group(2)), M=int(m.group(3)), sel=int(m.group(5)), fb=int(m.group(6)), lean=m.group(8) or "-")
     for m in RE_ROUTER.finditer(txt):     # aggregate over the seeds of one launch
         r = rows.setdefault(m.group(1), {})
         r["agree_n"] = r.get("agree_n", 0) + int(m.group(3)); r["agree_d"] = r.get("agree_d", 0) + int(m.group(4))

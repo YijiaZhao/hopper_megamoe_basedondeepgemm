@@ -14,10 +14,6 @@ export PATH="$CUDA_HOME/bin:/usr/local/bin:/usr/bin:/bin"
 export DG_CUTLASS_INCLUDE_PATH="$ROOT/third-party/cutlass/include"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONUNBUFFERED=1
-# The tiny-M GEMV path (DG_FP4_TINYM, default ON for <= 16 global tokens) takes over
-# the math warps and disables stream-K on the host; this runner measures the
-# stream-K scheduler against the wave scheduler, so it is forced OFF here.
-export DG_FP4_TINYM=0
 TR=/usr/local/bin/torchrun
 LOG=corr_sk.log
 

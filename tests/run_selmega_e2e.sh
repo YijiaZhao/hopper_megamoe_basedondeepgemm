@@ -5,7 +5,7 @@
 # Usage (in four_api_build, repo root): bash tests/run_selmega_e2e.sh [iters=100] [knobs="0 1"] [quants="mxfp4 qoq"] [Ms="2 8 16"]
 cd "$(dirname "$0")/.."
 N=${1:-100}; KNOBS=${2:-"0 1"}; QS=${3:-"mxfp4 qoq"}; MS=${4:-"2 8 16"}
-export DG_FE_TINYM_GRID=auto DG_FE_TINYM_MMA=cc DG_FE_STAMPS=1
+export DG_FE_STAMPS=1
 echo "E2E_START $(date +%T)"
 for k in $KNOBS; do for q in $QS; do for m in $MS; do
   echo "### knob=$k quant=$q M=$m"
