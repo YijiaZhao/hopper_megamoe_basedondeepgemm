@@ -51,7 +51,8 @@ def main():
             ridx, rwts, rkeys, rxq, rxsf = ref["out"][k]
             bad_idx += int((idx != ridx).any()); bad_w += int((wts.view(torch.int32) != rwts.view(torch.int32)).any())
             bad_keys += int((keys != rkeys).any())
-            nx = int((xq != rxq).sum()); nsf = int((xsf.view(torch.int32) != rxsf.view(torch.int32)).sum())
+            # byte compare: the QoQ x is int8 stored in a float8_e4m3fn tensor, whose 0x7F / 0xFF bytes are NaN (NaN != NaN)
+            nx = int((xq.view(torch.uint8) != rxq.view(torch.uint8)).sum()); nsf = int((xsf.view(torch.int32) != rxsf.view(torch.int32)).sum())
             if nx or nsf:
                 bad_x += 1
                 d = detail.setdefault((k[1], k[2]), [0, 0, 0]); d[0] += 1; d[1] += nx; d[2] += nsf
