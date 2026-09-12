@@ -2303,6 +2303,23 @@
                             }
                         }
                     };
+                    // One accumulator set only (kSwPipeActive: the other set's group may be in
+                    // flight, and a register named by a non-wgmma instruction while its wgmma
+                    // is pending would serialise the pipe, ptxas C7514).
+                    const auto fence_acc_set = [&](swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum]) {
+                        #pragma unroll
+                        for (uint32_t g = 0; g < kSFGroups; ++ g) {
+                            #pragma unroll
+                            for (uint32_t h = 0; h < kUnitHalves; ++ h) {
+                                #pragma unroll
+                                for (uint32_t c = 0; c < kAccChains; ++ c) {
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(acc[g][h][c][i]);
+                                }
+                            }
+                        }
+                    };
                     const auto fence_frag = [&](uint32_t (&f)[kUnitHalves][4][4]) {
                         #pragma unroll
                         for (uint32_t h = 0; h < kUnitHalves; ++ h) {
@@ -2451,9 +2468,13 @@
                     // descriptor addresses the kb-th 1 KB swizzled A tile of the stage.
                     const auto issue_stage_rf = [&](const uint32_t& stage, const uint32_t& unit,
                                                     uint32_t (&f)[kUnitHalves][4][4],
-                                                    swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum]) {
+                                                    swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum],
+                                                    const bool& fence_all_accum) {
                         const uint32_t kb = unit / kHalfPairs;
-                        fence_accum();
+                        if (fence_all_accum)
+                            fence_accum();
+                        else
+                            fence_acc_set(acc);
                         fence_frag(f);
                         ptx::warpgroup_arrive();
                         #pragma unroll
@@ -2665,7 +2686,7 @@
                             kstage_t_prev = kt_head;
                         }
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, ksplit_kb, fcur, swap_accum[0]);
+                            issue_stage_rf(cur_stage, ksplit_kb, fcur, swap_accum[0], true);
                         unsigned long long kt_b = clock64();
                         if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
                             const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
@@ -2918,7 +2939,7 @@
                             kstage_add(22, kt_head - kstage_t_prev);
                         kstage_t_prev = kt_head;
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 0, frag[b0], swap_accum[0]);
+                            issue_stage_rf(cur_stage, 0, frag[b0], swap_accum[0], true);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
                         fence_accum();
@@ -2932,7 +2953,7 @@
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 1, frag[b1], swap_accum[0]);
+                            issue_stage_rf(cur_stage, 1, frag[b1], swap_accum[0], true);
                         kt_a = clock64();
                         kstage_add(31, kt_a - kt_b);
                         if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
@@ -3039,7 +3060,7 @@
                             kstage_add(22, kt_head - kstage_t_prev);
                         kstage_t_prev = kt_head;
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
+                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0], true);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
                         if constexpr (kQIS2Prefetch)
@@ -3063,7 +3084,7 @@
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1u % kNumAccKBlocks]);
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1u % kNumAccKBlocks], true);
                         kt_a = clock64();
                         kstage_add(31, kt_a - kt_b);
                         const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
@@ -3169,7 +3190,7 @@
                             if constexpr (kUseInterleavedScheduler)
                                 interleaved_scheduler.release_task_info(lane_idx);
                             decode_stage_rf(stage_idx, 0, frag[0]);
-                            issue_stage_rf(stage_idx, 0, frag[0], swap_accum[0]);
+                            issue_stage_rf(stage_idx, 0, frag[0], swap_accum[0], false);
                         }
                         // Unit 1 of the current stage: decode, issue, retire unit 0, promote it.
                         const auto unit1_and_promote0 = [&](const uint32_t& cur_stage, const uint32_t& k_block_idx) {
@@ -3183,11 +3204,11 @@
                             decode_stage_rf(cur_stage, 1, frag[1]);
                             unsigned long long kt_b = clock64();
                             kstage_add(18, kt_b - kt_head);
-                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1]);
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1], false);
                             unsigned long long kt_a = clock64();
                             kstage_add(31, kt_a - kt_b);
-                            fence_accum();
                             ptx::warpgroup_wait<1>();
+                            fence_acc_set(swap_accum[0]);   // pins the promote's reads after the wait
                             fence_frag(frag[0]);
                             kt_b = clock64();
                             kstage_add(19, kt_b - kt_a);
@@ -3214,13 +3235,13 @@
                             decode_stage_rf(next_stage, 0, frag[0]);
                             kt_b = clock64();
                             kstage_add(18, kt_b - kt_a);
-                            issue_stage_rf(next_stage, 0, frag[0], swap_accum[0]);
+                            issue_stage_rf(next_stage, 0, frag[0], swap_accum[0], false);
                             kt_a = clock64();
                             kstage_add(31, kt_a - kt_b);
                             // Retire the current stage's unit-1 group: acc 1 is promoted while the
                             // next stage's unit 0 runs, then the stage's smem can be recycled.
-                            fence_accum();
                             ptx::warpgroup_wait<1>();
+                            fence_acc_set(swap_accum[1]);
                             fence_frag(frag[1]);
                             kt_b = clock64();
                             kstage_add(19, kt_b - kt_a);
@@ -3234,8 +3255,8 @@
                             const uint32_t cur_stage = stage_idx;
                             unit1_and_promote0(cur_stage, k_block_idx);
                             const unsigned long long kt_b = clock64();
-                            fence_accum();
                             ptx::warpgroup_wait<0>();
+                            fence_accum();
                             fence_frag(frag[1]);
                             const unsigned long long kt_a = clock64();
                             kstage_add(19, kt_a - kt_b);
@@ -3275,7 +3296,7 @@
                             kstage_t_prev = kt_head;
                         }
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
+                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0], true);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
                         if (!exp_skip(1u))
@@ -3283,7 +3304,7 @@
                         unsigned long long kt_a = clock64();
                         kstage_add(18, kt_a - kt_b);
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1]);
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1], true);
                         kt_b = clock64();
                         kstage_add(31, kt_b - kt_a);
                         kt_a = kt_b;
