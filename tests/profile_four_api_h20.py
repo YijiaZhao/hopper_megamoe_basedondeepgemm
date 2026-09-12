@@ -55,7 +55,14 @@ INTERMEDIATE = 1280
 EXPERTS = 384
 TOPK = 8
 WARMUP = 2
-ITERS = 8
+# DG_PROFILE_ITERS (default 8 = the customer method) measured replays per case.
+ITERS = int(os.environ.get("DG_PROFILE_ITERS", "8"))
+# DG_PROFILE_STREAMED=1: inside the MEASURE loop no per-iteration torch.cuda.synchronize() / dist.barrier() (and no
+# pre-replay barrier): the L2 flush, work.copy_, reduce-scatter, graph replay and all-gather of all ITERS iterations
+# are enqueued back-to-back on the stream, so the 8 ranks self-align through the GPU-side collectives; one
+# synchronize + barrier before the loop and one after. NVTX iter ranges are kept. Default 0 = the customer method
+# (byte-identical behaviour).
+STREAMED = os.environ.get("DG_PROFILE_STREAMED", "0") == "1"
 
 
 def make_tp_group(rank):
@@ -117,6 +124,45 @@ def prepare_backend(args, rank, local_rows, group):
 # library default stays 0 so standalone FE calls keep producing topk). Only the fused backend can
 # consume the keys; the split backend always gets the full FE.
 SELECT_IN_MEGA = os.environ.get("DG_FE_SELECT_IN_MEGA", "1") != "0"
+# DG_PROFILE_FORCE_BALANCED=1 (E2E scope): the frontend runs as usual, then ONE graph memcpy node (cudaMemcpyAsync,
+# no kernel) overrides its routing output with the Mega-only scope's balanced assignment (local_tokens() active rows,
+# idx = slot * 48 + (global_token + slot * 7) % 48, weight 1/8; inactive rows unrouted) before the Mega: with
+# DG_FE_SELECT_IN_MEGA=1 the compact key array is overwritten (chosen experts logit 1.0, others 0.0 -> the Mega
+# prologue selects them in slot order with softmax weight 0.125; inactive rows get all-zero keys, which the
+# prologue maps to topk_idx -1), otherwise topk_idx / topk_weights are overwritten directly. The memcpy sits
+# between the FE and Mega kernels: it is inside the E2E span, outside both kernel spans.
+FORCE_BALANCED = os.environ.get("DG_PROFILE_FORCE_BALANCED", "0") == "1"
+
+
+def topk_key_bits(value: float, expert: int) -> int:
+    """fable cc router key of a bf16 logit (orderable bf16 << 16 | 0xFFFF - expert), as a u32."""
+    b = torch.tensor(value, dtype=torch.bfloat16).view(torch.int16).item() & 0xFFFF
+    o = (~b & 0xFFFF) if (b & 0x8000) else (b | 0x8000)
+    return (o << 16) | (0xFFFF - expert)
+
+
+def forced_balanced_routing(global_tokens, rank, local_rows):
+    """(topk_idx [local_rows, 8] int64, topk_weights [local_rows, 8] f32, keys [local_rows * EXPERTS] int32)."""
+    active_rows = local_tokens(global_tokens, rank)
+    local_experts = EXPERTS // WORLD
+    idx = torch.full((local_rows, TOPK), -1, dtype=torch.int64)
+    wts = torch.zeros(local_rows, TOPK, dtype=torch.float32)
+    keys = torch.zeros(local_rows, EXPERTS, dtype=torch.int64)
+    if active_rows:
+        token = torch.arange(active_rows, dtype=torch.int64)[:, None]
+        slot = torch.arange(TOPK, dtype=torch.int64)[None, :]
+        global_token = rank * local_rows + token
+        chosen = slot * local_experts + ((global_token + slot * 7) % local_experts)
+        idx[:active_rows] = chosen
+        wts[:active_rows] = 1.0 / TOPK
+        base = torch.tensor([topk_key_bits(0.0, ex) for ex in range(EXPERTS)], dtype=torch.int64)
+        keys[:active_rows] = base
+        for t in range(active_rows):
+            for ex in chosen[t].tolist():
+                keys[t, ex] = topk_key_bits(1.0, ex)
+    keys = (keys & 0xFFFFFFFF).to(torch.int64)
+    keys = torch.where(keys >= 2**31, keys - 2**32, keys).to(torch.int32).reshape(-1)
+    return idx.cuda(), wts.cuda(), keys.cuda()
 
 
 def launch_frontend(quant, x, router_weight, logits, buffer, rows, select_in_mega=False):
@@ -153,12 +199,20 @@ def run_e2e(args, rank, tp_group, group):
         y = torch.empty_like(x)
         output = torch.empty(padded_rows, HIDDEN, device="cuda", dtype=torch.bfloat16)
 
+        sel_in_mega = SELECT_IN_MEGA and args.backend == "fused"
+        forced = forced_balanced_routing(args.global_tokens, rank, local_rows) if FORCE_BALANCED else None
+
         def graph_body():
             if FUSE_FE and args.backend == "fused":
                 launch_moe(y, frontend=(x, router_weight))
             else:
-                launch_frontend(args.quant, x, router_weight, logits, buffer, local_rows,
-                                select_in_mega=SELECT_IN_MEGA and args.backend == "fused")
+                launch_frontend(args.quant, x, router_weight, logits, buffer, local_rows, select_in_mega=sel_in_mega)
+                if forced is not None:       # contiguous same-dtype D2D copy_ = cudaMemcpyAsync (a graph memcpy node)
+                    if sel_in_mega:
+                        deep_gemm.fable_frontend_keys(buffer)[: local_rows * EXPERTS].copy_(forced[2], non_blocking=True)
+                    else:
+                        buffer.topk_idx[:local_rows].copy_(forced[0], non_blocking=True)
+                        buffer.topk_weights[:local_rows].copy_(forced[1], non_blocking=True)
                 launch_moe(y)
 
         work.copy_(partials[0])
@@ -177,9 +231,10 @@ def run_e2e(args, rank, tp_group, group):
 
         def replay(input_id, annotate):
             flush_l2_cache()
-            torch.cuda.synchronize()
+            if not STREAMED:
+                torch.cuda.synchronize()
             work.copy_(partials[input_id])
-            if HOST_BARRIER:
+            if HOST_BARRIER and not STREAMED:
                 torch.cuda.synchronize()
                 dist.barrier(group=group)
             if annotate:
@@ -204,12 +259,14 @@ def run_e2e(args, rank, tp_group, group):
         nvtx.range_push(
             f"rank{rank}/MEASURE_{ITERS}/e2e/{args.backend}/{args.quant}/M{args.global_tokens}")
         for i in range(ITERS):
-            dist.barrier(group=group)
+            if not STREAMED:
+                dist.barrier(group=group)
             nvtx.range_push(f"rank{rank}/iter_{i:02d}")
             replay(i + WARMUP, True)
             nvtx.range_pop()
-            torch.cuda.synchronize()
-            dist.barrier(group=group)
+            if not STREAMED:
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
         nvtx.range_pop()
         torch.cuda.synchronize()
         dist.barrier(group=group)
@@ -265,8 +322,9 @@ def run_mega(args, rank, group):
 
         def replay(annotate):
             flush_l2_cache()
-            torch.cuda.synchronize()
-            if HOST_BARRIER:
+            if not STREAMED:
+                torch.cuda.synchronize()
+            if HOST_BARRIER and not STREAMED:
                 dist.barrier(group=group)
             if annotate:
                 nvtx.range_push(
@@ -282,12 +340,15 @@ def run_mega(args, rank, group):
         nvtx.range_push(
             f"rank{rank}/MEASURE_{ITERS}/mega/{args.backend}/{args.quant}/M{args.global_tokens}")
         for i in range(ITERS):
-            dist.barrier(group=group)
+            if not STREAMED:
+                dist.barrier(group=group)
             nvtx.range_push(f"rank{rank}/iter_{i:02d}")
             replay(True)
             nvtx.range_pop()
-            torch.cuda.synchronize()
+            if not STREAMED:
+                torch.cuda.synchronize()
         nvtx.range_pop()
+        torch.cuda.synchronize()
         dist.barrier(group=group)
     finally:
         buffer.destroy()

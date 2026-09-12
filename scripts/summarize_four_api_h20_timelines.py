@@ -55,7 +55,8 @@ def export_events(report):
 
 
 def build_calls(events, scope, backend, quant):
-    frontend_calls = [event for event in events if event[0] == "router_quant_topk_kernel"]
+    # router_cc_lean_kernel: the round-5 dedicated cc entry point (DG_FE_CC_LEAN), same role as router_quant_topk_kernel
+    frontend_calls = [event for event in events if event[0] in ("router_quant_topk_kernel", "router_cc_lean_kernel")]
 
     if backend == "fused":
         target = f"sm90_{quant}_mega_moe_h20_fused_impl"
@@ -158,6 +159,17 @@ def extract_final_three(report, device_id=0):
         raise RuntimeError(
             f"{report}: only {len(final_three)} target calls on device {device_id}"
         )
+    # Inter-rank launch skew of the same replays: max - min over all devices of the Mega kernel start (fused
+    # backend) for the last 3 replays; the fused kernel's first NVLink barrier makes every rank's span absorb
+    # (latest start - own start), so this is the part of the GPU-0 Mega / E2E span that is not kernel work.
+    if backend == "fused":
+        target = f"sm90_{quant}_mega_moe_h20_fused_impl"
+        starts = {dev: [e[1] for e in ev if target in e[0]][-3:] for dev, ev in per_device.items()}
+        if all(len(v) == 3 for v in starts.values()):
+            for i, call in enumerate(final_three):
+                col = [v[i] for v in starts.values()]
+                call["mega_start_skew_us"] = (max(col) - min(col)) / 1e3
+                call["mega_start_after_earliest_us"] = (starts[device_id][i] - min(col)) / 1e3
     metadata = dict(
         scope=scope,
         backend=backend,

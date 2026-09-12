@@ -97,10 +97,13 @@ public:
             "#define DG_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT 1\n"
             "#define DG_FP4_TINYM_PREFETCH {}\n"
             "{}"
+            "{}"
             "#define sm90_nvfp4_mega_moe_h200_fused_impl {}\n"
             "#include <deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh>",
             args.tinym_prefetch,
             get_env<int>("DG_FP4_SPIN_TIMEOUT", 0) != 0 ? "#define DG_FUSED_SPIN_TIMEOUT 1\n" : "",
+            // DG_FE_CC_SELECT=pruned: the select-in-Mega prologue uses fable_cc::select_pruned (round 5 knob)
+            get_env<std::string>("DG_FE_CC_SELECT") == "pruned" ? "#define DG_FE_CC_SELECT_PRUNED 1\n" : "",
             kernel_symbol);
         const std::string policy_template_args = fmt::format(
             "/* kSwapABRequested */ {},\n"
