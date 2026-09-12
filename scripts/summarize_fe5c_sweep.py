@@ -46,7 +46,8 @@ def parse(path):
         blk = re.search(r"SLOT_CHECK api=" + re.escape(api) + r"\n((?:  rank\d.*\n?)+)", txt)
         if blk:
             lines = blk.group(1).strip().splitlines()
-            bad = [l for l in lines if "all slots cos>=0.999" not in l]
+            # "rankN: [local active experts=.., with >1 rows=..]" alone = every slot cos >= 0.999; anything after the ] = a bad slot
+            bad = [l for l in lines if l.split("]", 1)[-1].strip() not in ("", "all slots cos>=0.999")]
             rows[api]["slot"] = f"{len(lines) - len(bad)}/{len(lines)} ranks clean"
     failed = "Traceback" in txt or "AssertionError" in txt or "Error" in txt and "RESULT" not in txt
     return rows, failed
