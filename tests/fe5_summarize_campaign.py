@@ -7,7 +7,7 @@ root = pathlib.Path(sys.argv[1])
 SKEW_LIMIT = float(sys.argv[2]) if len(sys.argv) > 2 else 20.0
 cells = {}   # (cfg, mode, quant, M) -> {"fe": [...], "mega": [...], "e2e": [...]}
 mega_only = {}
-for d in sorted(root.glob("*_p*")):
+for d in sorted(p for p in root.glob("*_p*") if p.is_dir()):
     js = d / "TIMELINE_LAST3.json"
     if not js.exists():
         print(f"missing {js}", file=sys.stderr); continue

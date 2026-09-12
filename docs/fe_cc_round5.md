@@ -105,7 +105,77 @@ active rows, idx = slot * 48 + (global_token + slot * 7) % 48, weight 1/8; inact
 prologue maps to topk_idx -1). The memcpy sits between the FE and Mega kernels: inside the E2E span, outside both
 kernel spans.
 
-RESULTS_PLACEHOLDER
+### 3a. Plain customer method (build ff7c4ca/14fdb23 python, kernel eba23b1; 10.6.131.8, 8 x H20-3e at 1830 MHz, 5 passes, 2026-09-12 06:58-08:02 UTC)
+
+Values: median over the 5 passes of each capture's GPU-0 median-of-last-3 span (us). FE = the router kernel span,
+E2E Mega = the fused Mega kernel span inside the FE + Mega graph, E2E = FE start -> Mega end on GPU 0, Mega-only = the
+Mega-only scope (no FE, balanced assignment; identical for both FE builds). `skew` = inter-rank spread (max - min over
+the 8 devices) of the Mega kernel start, median over passes of the per-pass maximum of the last 3 replays.
+
+| Precision | M | routing | FE base | FE lean | E2E Mega base | E2E Mega lean | E2E base | E2E lean | Mega-only | skew base / lean (us) |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | normal | 3.8 | 2.5 | 69.2 | 66.2 | **73.7** | **69.0** | 45.0 | 12.9 / 19.3 |
+| MXFP4 | 2 | balanced | 4.1 | 2.6 | 49.4 | 60.0 | **54.8** | **64.2** | 45.0 | 43.9 / 62.1 |
+| MXFP4 | 4 | normal | 4.1 | 2.5 | 69.5 | 90.2 | **73.4** | **93.0** | 54.3 | 13.8 / 50.8 |
+| MXFP4 | 4 | balanced | 4.1 | 2.5 | 50.8 | 63.5 | **56.0** | **67.4** | 54.3 | 13.4 / 20.1 |
+| MXFP4 | 8 | normal | 4.0 | 2.5 | 72.2 | 76.4 | **76.3** | **79.3** | 60.5 | 14.9 / 20.7 |
+| MXFP4 | 8 | balanced | 4.1 | 2.5 | 76.8 | 64.1 | **82.2** | **68.0** | 60.5 | 24.2 / 16.8 |
+| MXFP4 | 16 | normal | 4.0 | 2.8 | 89.4 | 92.2 | **93.5** | **95.4** | 78.7 | 20.9 / 13.7 |
+| MXFP4 | 16 | balanced | 4.3 | 2.9 | 84.7 | 82.6 | **90.3** | **86.9** | 78.7 | 27.2 / 24.8 |
+| QOQ | 2 | normal | 4.2 | 2.7 | 66.0 | 66.3 | **70.5** | **69.3** | 48.7 | 14.7 / 11.9 |
+| QOQ | 2 | balanced | 4.3 | 2.8 | 47.3 | 43.9 | **52.7** | **48.2** | 48.7 | 14.5 / 14.7 |
+| QOQ | 4 | normal | 4.3 | 2.7 | 72.0 | 69.2 | **76.6** | **72.2** | 50.8 | 23.3 / 17.6 |
+| QOQ | 4 | balanced | 4.3 | 2.8 | 58.2 | 53.1 | **64.1** | **57.2** | 50.8 | 12.8 / 18.6 |
+| QOQ | 8 | normal | 4.1 | 2.7 | 68.6 | 71.9 | **73.1** | **74.8** | 56.6 | 17.0 / 15.3 |
+| QOQ | 8 | balanced | 4.3 | 2.8 | 66.6 | 56.0 | **72.5** | **60.1** | 56.6 | 20.2 / 23.0 |
+| QOQ | 16 | normal | 4.4 | 2.8 | 91.4 | 95.3 | **95.7** | **98.5** | 78.5 | 14.3 / 17.5 |
+| QOQ | 16 | balanced | 4.3 | 3.0 | 91.2 | 81.4 | **96.6** | **85.8** | 78.5 | 21.1 / 12.6 |
+
+FE per pass (us), base -> lean, every cell 5/5 passes: normal mxfp4 M2 3.8/4.1/3.8/3.8/3.9 -> 2.4/2.5/2.6/2.5/2.5,
+M4 4.2/4.7/4.1/3.8/4.0 -> 2.5 x4/2.6, M8 3.8/4.2/4.4/3.9/4.0 -> 2.5/2.6/2.5/2.4/2.5, M16 4.3/4.0/4.1/3.9/3.9 ->
+2.9/2.8/2.8/2.8/2.7; qoq M2 4.2/4.1/4.4/4.4/4.1 -> 2.7/2.7/2.8/2.7/2.7, M4 4.4/4.2/4.2/4.4/4.3 -> 2.7/2.7/2.6/2.7/2.6,
+M8 4.1/4.1/4.2/4.1/4.1 -> 2.7 x4/2.6, M16 4.4/4.2/4.6/4.3/4.4 -> 2.8/2.8/2.9/2.9/2.8; balanced within 0.1 of normal.
+FE verdict: -1.3 .. -1.6 us in every one of the 32 cells (3.8-4.4 -> 2.5-3.0), no overlap between the base and lean
+pass distributions; the in-pipeline gain is larger than the standalone -0.3..-0.55 because in the pipeline the
+kernel's code is fetched cold after the Mega weight stream (the no_instruction stall the lean entry removes).
+
+E2E / E2E Mega columns: the plain customer method's E2E spans are dominated by inter-rank launch skew (skew column:
+12-62 us per cell), not by kernel work, so base-vs-lean differences of +-5..20 us in those two columns are noise of
+that skew (see 3b) -- the Mega-only column and the per-rank decomposition below are the kernel-work references.
+Passes with skew <= 20 us leave 0-5 of 5 passes per cell (`tests/fe5_summarize_campaign.py <dir> 20` prints the
+filtered medians), too few to be a table; the streamed campaign (3c) is the skew-free measurement.
+
+### 3b. Where do the E2E microseconds go? Per-rank decomposition (`scripts/decompose_e2e_skew.py`, base pass 1, balanced M2, last 3 replays; times relative to the earliest FE start of the replay)
+
+MXFP4 M2 balanced, replay -3 (GPU 0 = the earliest rank):
+
+| device | FE start | FE end | FE span | gap FE end -> Mega start | memcpy node | Mega start | Mega end | Mega span | FE start -> Mega end |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| GPU0 | 0.0 | 4.0 | 4.0 | 1.3 | 4.1-5.2 | 5.3 | 60.8 | 55.5 | 60.8 |
+| GPU1 | 5.4 | 9.4 | 4.1 | 1.4 | 9.5-10.7 | 10.8 | 60.7 | 50.0 | 55.4 |
+| GPU2 | 4.1 | 8.7 | 4.6 | 1.2 | 8.7-9.8 | 9.8 | 60.6 | 50.7 | 56.5 |
+| GPU3 | 11.7 | 16.1 | 4.4 | 1.2 | 16.2-17.2 | 17.3 | 60.5 | 43.2 | 48.8 |
+| GPU4 | 14.7 | 19.0 | 4.3 | 1.3 | 19.0-20.3 | 20.3 | 61.7 | 41.4 | 47.1 |
+| GPU5 | 11.9 | 16.3 | 4.5 | 1.4 | 16.4-17.6 | 17.7 | 60.7 | 43.0 | 48.9 |
+| GPU6 | 5.0 | 9.1 | 4.2 | 1.2 | 9.2-10.2 | 10.3 | 60.7 | 50.4 | 55.7 |
+| GPU7 | 6.5 | 10.8 | 4.3 | 1.3 | 10.9-12.1 | 12.2 | 60.4 | 48.3 | 53.9 |
+| skew (max - min) | 14.7 | 15.0 | | | | 15.0 | 1.3 | | |
+
+Every rank's FE is 4.0-4.6 us; the FE end -> Mega start gap is 1.2-1.5 us, of which the forced-balanced memcpy node
+is 1.1-1.2 us (normal routing: gap 0.3 us, no node); the Mega kernels END within 1.3 us of each other on all 8 ranks
+(the first in-kernel NVLink barrier aligns them), so each rank's Mega span = common end - its own start: GPU 0
+started 15.0 us before the latest rank (GPU4) and its Mega span is 55.5 = 41.4 (the latest rank's span, i.e. the
+kernel work, matching the Mega-only column) + 14.1. The other replays: skew 11.4 -> GPU0 Mega span 50.0 (latest rank
+39.1); skew 38.4 -> GPU0 72.3 (latest rank 38.2). QOQ M2 balanced: skews 15.5 / 25.1 / 11.8, GPU0 Mega spans 47.3 /
+58.8 / 40.2, latest-rank spans 37.7 / 37.3 / 37.2. So the "extra ~10 us" of the E2E balanced cells over Mega-only is
+(a) the inter-rank Mega-start skew absorbed by GPU 0 inside the kernel (10-35 us, varies per replay), (b) the 1.2 us
+memcpy override node + 0.1 us, (c) the FE itself (4.0 base / 2.5 lean); nothing else is in the E2E span (no extra
+kernels). The Mega-only capture has the same effect: its last-3 Mega-start skews were 7.2 / 20.7 / 7.2 us (mxfp4)
+and 7.7 / 1530 / 36.2 us (qoq) with Mega-end skews of ~1 us, i.e. GPU 0 was not the earliest rank there, so the
+Mega-only column (39.5-46) is closer to the kernel work than the E2E Mega column.
+
+STREAMED_PLACEHOLDER
+
 
 ## 4. Gates
 
@@ -121,7 +191,19 @@ RESULTS_PLACEHOLDER
   the same "failure" appeared baseline vs baseline; the gate now compares bytes.)
 * `tests/test_frontend_fe78.py --mma cc --seeds 40 --rows 1 2` (cc/lean vs the legacy 96 x 4 WMMA path): PASS,
   240 row-evaluations, 0 top-8 index-set mismatches, 0 weight diffs > 1e-6, 0 x / x_sf mismatches.
-* 8-rank gates (`tests/fe5_gates.sh`): GATES_PLACEHOLDER
+* 8-rank gates (`tests/fe5_gates.sh`): all PASS (10.6.131.8, build fee8931, `/raid/kimi/results/fe5/gates.log`):
+  * `tests/test_select_in_mega.py` (DG_FE_CC_LEAN default 1), 50 seeds, 8 ranks: mxfp4 M2 / M16, qoq M2 / M16: 0 topk_idx
+    and 0 topk_weights mismatches (400 / 800 rows per cell), y max |dy| 0, cos_min 0.9999998.
+  * `tests/test_four_api_correctness.py --frontend fe --router-ref torch`, fused mxfp4 + qoq, T = 1 / 2 / 8 / 16 / 32
+    tokens per rank (M = 8 .. 256), DG_FE_CC_LEAN=1 and =0: the FE's top-8 index sets agree with the pure-torch router
+    reference (bf16 GEMM -> bf16 logits -> top-8 -> fp32 softmax) on 8/8, 16/16, 64/64, 128/128, 256/256 tokens,
+    weight max |diff| 6e-8 .. 1.2e-7, mxfp4 x bytes identical to the torch per-token cast (0 differing bytes), qoq x
+    4 / 4 / 37 / 89 / 155 differing int8 bytes of 8T x 3072 (the FE's `__float2int_rn` vs the torch cast on exact
+    .5 ties; identical for LEAN 0 and 1, pre-existing); y vs the torch-routed dequantised reference: mxfp4 cos_min
+    0.99999 / 0.99999 / 0.99992 / 0.99992 / 0.99992, qoq 0.99993 / 0.99993 / 0.99993 / 0.99992 / 0.99992, norm ratio
+    0.9998-1.00004; every metric identical to the last digit between LEAN=1 and LEAN=0. T=32 also with --slot-check
+    (clean), and the balanced `--tokens 32 --hot-rows 12 --slot-check` (mxfp4 0.99996, qoq 0.99993). T = 1 and 2 are
+    the cells that run the cc / lean router (rows <= 2 per rank); T >= 8 run the swapab router.
 
 ## 5. What remains
 
