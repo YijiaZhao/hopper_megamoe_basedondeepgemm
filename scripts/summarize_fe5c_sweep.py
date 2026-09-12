@@ -6,8 +6,8 @@ Usage: python3 scripts/summarize_fe5c_sweep.py /raid/kimi/results/fe5c/*.log [--
 """
 import argparse, os, re, sys
 
-RE_RESULT = re.compile(r"RESULT api=(\S+) finite=(\d) max_abs=(\S+) mean_abs=(\S+) cos_min=(\S+) cos_mean=(\S+) norm_ratio=(\S+)")
-RE_ROUTER = re.compile(r"ROUTER_REF api=(\S+) tokens=(\d+) top8_set_agree=(\d+)/(\d+) weight_max_abs_diff\(agreeing\)=(\S+)(?: weight_max_abs_diff\(all\)=(\S+))? x_bytes_diff=(\d+)(?: x_rows_with_diff=(\d+) x_max_\|dq\|=(\S+))? x_sf_diff=(\d+)")
+RE_RESULT = re.compile(r"RESULT api=(\S+?)(?: seed=\d+)? finite=(\d) max_abs=(\S+) mean_abs=(\S+) cos_min=(\S+) cos_mean=(\S+) norm_ratio=(\S+)")
+RE_ROUTER = re.compile(r"ROUTER_REF api=(\S+?)(?: seed=\d+)? tokens=(\d+) top8_set_agree=(\d+)/(\d+) weight_max_abs_diff\(agreeing\)=(\S+)(?: weight_max_abs_diff\(all\)=(\S+))? x_bytes_diff=(\d+)(?: x_rows_with_diff=(\d+) x_max_\|dq\|=(\S+))? x_sf_diff=(\d+)")
 RE_ROUTING = re.compile(r"ROUTING api=(\S+) tokens/rank=(\d+) global_tokens=(\d+) frontend=(\S+) select_in_mega=(\d) force_balanced=(\d) reference=(\S+) DG_FE_CC_LEAN=(\S+)")
 RE_SELMEGA = re.compile(r"SELECT_IN_MEGA api=(\S+) tokens=\d+: .*?: (\d+) tokens differ")
 RE_SLOT = re.compile(r"SLOT_CHECK api=(\S+)")
@@ -19,16 +19,28 @@ def parse(path):
     for m in RE_ROUTING.finditer(txt):
         r = rows.setdefault(m.group(1), {})
         r.update(tokens=int(m.group(2)), M=int(m.group(3)), sel=int(m.group(5)), fb=int(m.group(6)), lean=m.group(8))
-    for m in RE_ROUTER.finditer(txt):
+    for m in RE_ROUTER.finditer(txt):     # aggregate over the seeds of one launch
         r = rows.setdefault(m.group(1), {})
-        r.update(agree=f"{m.group(3)}/{m.group(4)}", wdiff=m.group(5), wdiff_all=m.group(6) or "", xdiff=int(m.group(7)),
-                 xrows=m.group(8) or "", xdq=m.group(9) or "", sfdiff=int(m.group(10)))
+        r["agree_n"] = r.get("agree_n", 0) + int(m.group(3)); r["agree_d"] = r.get("agree_d", 0) + int(m.group(4))
+        r["agree"] = f"{r['agree_n']}/{r['agree_d']}"
+        r["wdiff"] = f"{max(float(r.get('wdiff', 0)), float(m.group(5))):.3g}"
+        r["wdiff_all"] = f"{max(float(r.get('wdiff_all', 0) or 0), float(m.group(6) or 0)):.3g}" if m.group(6) else ""
+        r["xdiff"] = r.get("xdiff", 0) + int(m.group(7))
+        r["xrows"] = str(int(r.get("xrows", 0) or 0) + int(m.group(8) or 0)) if m.group(8) else ""
+        r["xdq"] = str(max(int(float(r.get("xdq", 0) or 0)), int(float(m.group(9) or 0)))) if m.group(9) else ""
+        r["sfdiff"] = r.get("sfdiff", 0) + int(m.group(10))
     for m in RE_SELMEGA.finditer(txt):
         rows.setdefault(m.group(1), {})["selmega_bad"] = int(m.group(2))
-    for m in RE_RESULT.finditer(txt):
+    for m in RE_RESULT.finditer(txt):     # aggregate over the seeds of one launch: worst case per column
         r = rows.setdefault(m.group(1), {})
-        r.update(finite=int(m.group(2)), max_abs=float(m.group(3)), mean_abs=float(m.group(4)), cos_min=float(m.group(5)),
-                 cos_mean=float(m.group(6)), norm_ratio=float(m.group(7)))
+        r["n_seeds"] = r.get("n_seeds", 0) + 1
+        r["finite"] = min(r.get("finite", 1), int(m.group(2)))
+        r["max_abs"] = max(r.get("max_abs", 0.0), float(m.group(3)))
+        r["mean_abs"] = max(r.get("mean_abs", 0.0), float(m.group(4)))
+        r["cos_min"] = min(r.get("cos_min", 1.0), float(m.group(5)))
+        r["cos_mean"] = min(r.get("cos_mean", 1.0), float(m.group(6)))
+        nr = float(m.group(7)); r["norm_lo"] = min(r.get("norm_lo", 9.0), nr); r["norm_hi"] = max(r.get("norm_hi", 0.0), nr)
+        r["norm_ratio"] = nr if abs(nr - 1) >= abs(r.get("norm_ratio", 1.0) - 1) else r["norm_ratio"]
     # slot check: count "all slots cos>=0.999" vs bad
     for api in rows:
         blk = re.search(r"SLOT_CHECK api=" + re.escape(api) + r"\n((?:  rank\d.*\n?)+)", txt)
@@ -45,23 +57,23 @@ def main():
     ap.add_argument("logs", nargs="+")
     ap.add_argument("--md", default="")
     args = ap.parse_args()
-    hdr = ("| cell | api | M (tok/rank) | lean | select_in_mega | routing | top-8 agree | w max diff (agree / all) | x bytes diff (rows, max dq) | x_sf diff "
-           "| cos_min | cos_mean | max abs dy | mean abs dy | norm ratio | slot check | status |")
+    hdr = ("| cell | api | M (tok/rank) | seeds | lean | select_in_mega | routing | top-8 agree | w max diff (agree / all) | x bytes diff (rows, max dq) | x_sf diff "
+           "| cos_min | cos_mean (min) | max abs dy | mean abs dy (max) | norm ratio (worst) | slot check | status |")
     out = [hdr, "|" + "---|" * (hdr.count("|") - 1)]
     n_fail = 0
     for path in sorted(args.logs):
         rows, failed = parse(path)
         tag = os.path.basename(path)[:-4]
         if not rows:
-            out.append(f"| {tag} | - | | | | | | | | | | | | | | | **NO RESULT** {'(error)' if failed else ''} |"); n_fail += 1; continue
+            out.append(f"| {tag} | - | | | | | | | | | | | | | | | | **NO RESULT** {'(error)' if failed else ''} |"); n_fail += 1; continue
         for api, r in rows.items():
             has = "cos_min" in r
-            ok = has and r.get("finite", 0) == 1 and r["cos_min"] >= 0.99 and 0.97 <= r["norm_ratio"] <= 1.03 and not failed
+            ok = has and r.get("finite", 0) == 1 and r["cos_min"] >= 0.99 and 0.97 <= r["norm_lo"] and r["norm_hi"] <= 1.03 and not failed
             status = "PASS" if ok else ("**FAIL**" if has else "**NO RESULT**")
             n_fail += int(not ok)
             routing = "balanced (forced)" if r.get("fb") == 1 else ("synthetic balanced" if "agree" not in r else "normal (FE top-8)")
-            out.append("| {tag} | {api} | {M} ({tok}) | {lean} | {sel} | {routing} | {agree} | {w} | {x} | {sf} | {cmin} | {cmean} | {mx} | {mean} | {nr} | {slot} | {st} |".format(
-                tag=tag, api=api.replace("_mega_moe_fused", ""), M=r.get("M", ""), tok=r.get("tokens", ""), lean=r.get("lean", ""), sel=r.get("sel", ""),
+            out.append("| {tag} | {api} | {M} ({tok}) | {ns} | {lean} | {sel} | {routing} | {agree} | {w} | {x} | {sf} | {cmin} | {cmean} | {mx} | {mean} | {nr} | {slot} | {st} |".format(
+                tag=tag, api=api.replace("_mega_moe_fused", ""), M=r.get("M", ""), tok=r.get("tokens", ""), ns=r.get("n_seeds", ""), lean=r.get("lean", ""), sel=r.get("sel", ""),
                 routing=routing, agree=r.get("agree", "-"), w=(f"{r['wdiff']} / {r['wdiff_all']}" if "wdiff" in r else "-"),
                 x=(f"{r['xdiff']} ({r['xrows']} rows, {r['xdq']})" if "xdiff" in r else "-"), sf=r.get("sfdiff", "-"),
                 cmin=(f"{r['cos_min']:.8f}" if has else "-"), cmean=(f"{r['cos_mean']:.8f}" if has else "-"),
