@@ -55,7 +55,8 @@ def export_events(report):
 
 
 def build_calls(events, scope, backend, quant):
-    frontend_calls = [event for event in events if event[0] == "router_quant_topk_kernel"]
+    # router_cc_lean_kernel: the round-5 dedicated cc entry point (DG_FE_CC_LEAN), same role as router_quant_topk_kernel
+    frontend_calls = [event for event in events if event[0] in ("router_quant_topk_kernel", "router_cc_lean_kernel")]
 
     if backend == "fused":
         target = f"sm90_{quant}_mega_moe_h20_fused_impl"

@@ -1491,8 +1491,9 @@ void launch(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, flo
         if (kCC > 0 && pruned_sel && (w_hint & kKeysCompactBit)) w_hint |= kSelectPrunedBit;
     }
     if constexpr (kCC == 44 && !kW8) {
-        // round 5: DG_FE_CC_LEAN=1 -> dedicated cc44 entry point (hot path first, cold paths out of line, leaner FMA body)
-        static const bool lean = getenv("DG_FE_CC_LEAN") ? atoi(getenv("DG_FE_CC_LEAN")) != 0 : false;
+        // round 5: DG_FE_CC_LEAN (default 1) -> dedicated cc44 entry point (hot path first, cold paths out of line, leaner
+        // FMA body); 0 = the generic router_quant_topk_kernel<..., 44> instantiation
+        static const bool lean = getenv("DG_FE_CC_LEAN") ? atoi(getenv("DG_FE_CC_LEAN")) != 0 : true;
         if (lean && (w_hint & kKeysCompactBit) && (w_hint & kTicketMergeBit)) {
             static bool lean_attr = false;
             if (!lean_attr) {

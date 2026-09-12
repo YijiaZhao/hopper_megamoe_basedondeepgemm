@@ -885,11 +885,22 @@
     // because the frontend kernel finished before this grid (or before griddepcontrol.wait).
     if (fe_keys != nullptr and warp_idx >= 4 and warp_idx - 4 < num_tokens and warp_idx - 4 < 8) {
         const uint32_t t = warp_idx - 4;
-        // DG_FE_CC_SELECT=pruned (host: -DDG_FE_CC_SELECT_PRUNED=1 in the JIT header): two-level threshold select
-        fable_cc::select_topk8_compact384(fe_keys + t * kNumExperts, static_cast<int>(lane_idx), static_cast<int>(t),
-                                          input_topk_idx_buffer.get_base_ptr<int64_t>(),
-                                          input_topk_weights_buffer.get_base_ptr<float>(),
-                                          DG_FE_CC_SELECT_PRUNED != 0);
+        const uint32_t* keys_t = fe_keys + t * kNumExperts;
+        if (__ldcg(keys_t) == 0u) {
+            // Zero first key = unrouted token (the FE never produces a 0 key: its low 16 bits are 0xFFFF - expert).
+            // Written by the profiling driver's forced-balanced routing (DG_PROFILE_FORCE_BALANCED, the Mega-only
+            // scope's inactive rows): topk_idx -1 / weights 0, which the dispatch already treats as "no expert".
+            if (lane_idx < kNumTopk) {
+                input_topk_idx_buffer.get_base_ptr<int64_t>()[t * kNumTopk + lane_idx] = -1;
+                input_topk_weights_buffer.get_base_ptr<float>()[t * kNumTopk + lane_idx] = 0.0f;
+            }
+        } else {
+            // DG_FE_CC_SELECT=pruned (host: -DDG_FE_CC_SELECT_PRUNED=1 in the JIT header): two-level threshold select
+            fable_cc::select_topk8_compact384(keys_t, static_cast<int>(lane_idx), static_cast<int>(t),
+                                              input_topk_idx_buffer.get_base_ptr<int64_t>(),
+                                              input_topk_weights_buffer.get_base_ptr<float>(),
+                                              DG_FE_CC_SELECT_PRUNED != 0);
+        }
         if (thread_idx == 4 * 32) stamp_max(16);       // slot 16: max FE-select-in-Mega done
     }
     // topk_idx / topk_weights loads: read-only (__ldg, ld.global.nc) when the frontend produced
