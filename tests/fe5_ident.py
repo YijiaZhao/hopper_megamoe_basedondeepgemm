@@ -46,13 +46,21 @@ def main():
     if args.ref:
         ref = torch.load(args.ref)
         bad_idx = bad_w = bad_keys = bad_x = 0
+        detail = {}
         for k, (idx, wts, keys, xq, xsf) in out.items():
             ridx, rwts, rkeys, rxq, rxsf = ref["out"][k]
             bad_idx += int((idx != ridx).any()); bad_w += int((wts.view(torch.int32) != rwts.view(torch.int32)).any())
-            bad_keys += int((keys != rkeys).any()); bad_x += int((xq != rxq).any() or (xsf.view(torch.int32) != rxsf.view(torch.int32)).any())
+            bad_keys += int((keys != rkeys).any())
+            nx = int((xq != rxq).sum()); nsf = int((xsf.view(torch.int32) != rxsf.view(torch.int32)).sum())
+            if nx or nsf:
+                bad_x += 1
+                d = detail.setdefault((k[1], k[2]), [0, 0, 0]); d[0] += 1; d[1] += nx; d[2] += nsf
         status = "PASS" if bad_idx == bad_w == bad_keys == bad_x == 0 else "FAIL"
         print(f"FE5_IDENT {status} cells={len(out)} mismatching cells: topk_idx={bad_idx} topk_weights={bad_w} keys={bad_keys} x/x_sf={bad_x} "
               f"env={env} ref_env={ref['env']}")
+        for (rows, quant), (cells, nx, nsf) in sorted(detail.items()):
+            print(f"  x/x_sf mismatch rows={rows} quant={quant}: cells={cells} x_bytes_diff={nx} x_sf_words_diff={nsf} "
+                  f"(x {tuple(out[(0, rows, quant)][3].shape)} {out[(0, rows, quant)][3].dtype}, x_sf {tuple(out[(0, rows, quant)][4].shape)} {out[(0, rows, quant)][4].dtype})")
 
 
 if __name__ == "__main__":
