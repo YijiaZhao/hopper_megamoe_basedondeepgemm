@@ -275,6 +275,8 @@ the customer comparison column (targets M2 < 53, M8 < 61, M16 < 85: all met).
 | QOQ | 8 | 4.1 (7.7 swapab, 8.6 wmma, 14.8 legacy) | 77.5–169.3 | **54.9–59.3** |
 | QOQ | 16 | 3.9 (7.9 swapab, 8.7 wmma, 14.9 legacy) | 90.6–97.2 | **74.0–77.4** |
 
+Round 5 (below): with the lean cc entry point (`DG_FE_CC_LEAN=1`, default) the FE Fused column is 2.5-3.0 us at
+M2/4/8/16 in both quants (5-pass medians, 10.6.131.8), from 3.8-4.4 for the same build with the knob off.
 FE Fused is the tiny-M Fable frontend (`DG_FE_TINYM=1`, default for m <= 16). Library default
 `DG_FE_TINYM_MMA=auto`: rows <= 2 per rank (every customer point: M2/M8 = 1 row, M16 = 2 rows) run
 the round-3 CUDA-core K-split router (`cc`, SM-count grid, compact 384-key array, kernel-end
@@ -325,6 +327,47 @@ ranks, not kernel variance: the kernel duration on the latest-starting rank
 agrees to within 1.5 us across captures.  Adding `dist.barrier()` before each
 graph replay in the profiling driver (`DG_PROFILE_HOST_BARRIER=1`) removes
 most of that skew (e.g. MXFP4 M8 110.8 -> 57.6 in one A/B).
+
+### Round 5 (2026-09-12): FE lean entry point, customer method on 10.6.131.8 (8 x H20-3e, 1830 MHz, one build, one session)
+
+`DG_FE_CC_LEAN=1` (now the default, docs/fe_cc_round5.md) compiles the cc router as its own 2.7 K-instruction kernel
+(`router_cc_lean_kernel`) instead of the 11.9 K-instruction generic instantiation whose router role sat 73 KB into the
+kernel and was fetched cold after every Mega weight stream (NCU top stall `no_instruction` 6.9 -> 1.7 warps per issue
+cycle, instructions -44 %). Bit-identical x / x_sf / keys / topk (tests/fe5_ident.py, 256 cells byte-compared; 8-rank
+gates in docs/fe_cc_round5.md section 4). `tests/fe5_campaign.sh`: 5 interleaved passes of base (`DG_FE_CC_LEAN=0`) and
+lean, each with the FE's real routing ("normal") and with the FE output overridden by the Mega-only scope's balanced
+assignment through one graph memcpy node (`DG_PROFILE_FORCE_BALANCED=1`, "balanced"); values = median over passes of
+each capture's GPU-0 median-of-last-3 span (us); `skew` = inter-rank spread of the Mega kernel start (median over passes
+of the per-pass max of the last 3 replays).
+
+| Precision | M | routing | FE base | FE lean | E2E Mega base | E2E Mega lean | E2E base | E2E lean | Mega-only | skew base / lean |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| MXFP4 | 2 | normal | 3.8 | **2.5** | 69.2 | 66.2 | 73.7 | 69.0 | 45.0 | 12.9 / 19.3 |
+| MXFP4 | 2 | balanced | 4.1 | **2.6** | 49.4 | 60.0 | 54.8 | 64.2 | 45.0 | 43.9 / 62.1 |
+| MXFP4 | 4 | normal | 4.1 | **2.5** | 69.5 | 90.2 | 73.4 | 93.0 | 54.3 | 13.8 / 50.8 |
+| MXFP4 | 4 | balanced | 4.1 | **2.5** | 50.8 | 63.5 | 56.0 | 67.4 | 54.3 | 13.4 / 20.1 |
+| MXFP4 | 8 | normal | 4.0 | **2.5** | 72.2 | 76.4 | 76.3 | 79.3 | 60.5 | 14.9 / 20.7 |
+| MXFP4 | 8 | balanced | 4.1 | **2.5** | 76.8 | 64.1 | 82.2 | 68.0 | 60.5 | 24.2 / 16.8 |
+| MXFP4 | 16 | normal | 4.0 | **2.8** | 89.4 | 92.2 | 93.5 | 95.4 | 78.7 | 20.9 / 13.7 |
+| MXFP4 | 16 | balanced | 4.3 | **2.9** | 84.7 | 82.6 | 90.3 | 86.9 | 78.7 | 27.2 / 24.8 |
+| QOQ | 2 | normal | 4.2 | **2.7** | 66.0 | 66.3 | 70.5 | 69.3 | 48.7 | 14.7 / 11.9 |
+| QOQ | 2 | balanced | 4.3 | **2.8** | 47.3 | 43.9 | 52.7 | 48.2 | 48.7 | 14.5 / 14.7 |
+| QOQ | 4 | normal | 4.3 | **2.7** | 72.0 | 69.2 | 76.6 | 72.2 | 50.8 | 23.3 / 17.6 |
+| QOQ | 4 | balanced | 4.3 | **2.8** | 58.2 | 53.1 | 64.1 | 57.2 | 50.8 | 12.8 / 18.6 |
+| QOQ | 8 | normal | 4.1 | **2.7** | 68.6 | 71.9 | 73.1 | 74.8 | 56.6 | 17.0 / 15.3 |
+| QOQ | 8 | balanced | 4.3 | **2.8** | 66.6 | 56.0 | 72.5 | 60.1 | 56.6 | 20.2 / 23.0 |
+| QOQ | 16 | normal | 4.4 | **2.8** | 91.4 | 95.3 | 95.7 | 98.5 | 78.5 | 14.3 / 17.5 |
+| QOQ | 16 | balanced | 4.3 | **3.0** | 91.2 | 81.4 | 96.6 | 85.8 | 78.5 | 21.1 / 12.6 |
+
+FE: -1.3 .. -1.6 us in all 32 cells, 5/5 passes each, base and lean pass distributions do not overlap (per-pass
+values in docs/fe_cc_round5.md). E2E and E2E-Mega columns of the plain customer method are dominated by the
+inter-rank launch skew (12-62 us), not by kernel work: the fused Mega kernels of the 8 ranks END within ~1 us of each
+other (first in-kernel NVLink barrier), so GPU 0's Mega span = common end - GPU 0's own start, i.e. kernel work
+(the latest rank's span, ~40 us at M2, = the Mega-only column) plus GPU 0's head start over the slowest rank
+(10-35 us per replay). Per-rank decomposition of a balanced MXFP4 M2 replay (`scripts/decompose_e2e_skew.py`):
+FE 4.0-4.6 us on every rank, FE end -> Mega start 1.2-1.5 us (1.1-1.2 us of it the forced-balanced memcpy node;
+0.3 us with normal routing), Mega ends within 1.3 us across ranks, GPU 0 Mega span 55.5 = latest rank's 41.4 +
+14.1 head start. Base-vs-lean differences in the E2E columns (+-5..20 us) are that skew's noise. STREAMED_README_PLACEHOLDER
 
 ### How the table is produced (runnable as-is)
 
