@@ -49,9 +49,6 @@ public:
         bool qoq_inline_s2_ilv;
         bool qoq_inline_s2_prefetch_packed;
         bool rf_prefetch_packed;
-        bool sw_pipe;
-        bool sw_pipe_wide;
-        bool combine_batch;
         bool strided_pool_debug;
         int l1_task_tiles;
         int l2_task_tiles;
@@ -115,9 +112,6 @@ public:
             "        /* kQoQInlineS2Ilv */ {},\n"
             "        /* kQoQInlineS2PrefetchPacked */ {},\n"
             "        /* kRFPrefetchPacked */ {},\n"
-            "        /* kSwPipe */ {},\n"
-            "        /* kSwPipeWide */ {},\n"
-            "        /* kCombineBatchRequested */ {},\n"
             "        /* kStridedPoolDebug */ {},\n"
             "        /* kL1TaskTiles */ {},\n"
             "        /* kL2TaskTiles */ {}",
@@ -147,9 +141,6 @@ public:
             args.qoq_inline_s2_ilv ? "true" : "false",
             args.qoq_inline_s2_prefetch_packed ? "true" : "false",
             args.rf_prefetch_packed ? "true" : "false",
-            args.sw_pipe ? "true" : "false",
-            args.sw_pipe_wide ? "true" : "false",
-            args.combine_batch ? "true" : "false",
             args.strided_pool_debug ? "true" : "false",
             args.l1_task_tiles,
             args.l2_task_tiles);
@@ -537,9 +528,6 @@ static void sm90_fp4_h20_fused_mega_moe(
     // barrier path (numerics identical: T=2/8/16/128/512 + QoQ, 200-iter graph
     // replay stress clean).
     const bool fine_combine = get_env<int>("DG_FP4_FINE_COMBINE", 1) != 0;
-    const bool sw_pipe = get_env<int>("DG_FP4_SWPIPE", 0) != 0;
-    const bool sw_pipe_wide = get_env<int>("DG_FP4_SWPIPE_BN512", 0) != 0;
-    const bool combine_batch = fine_combine && get_env<int>("DG_FP4_COMBINE_BATCH", 0) != 0;
     const int task_block_n = half_tile_tasks ? config.block_n / 2 : config.block_n * l1_task_tiles;
     constexpr int kL1ScaleGranK = 128;
     // L2 activation scale granularity (kernel kL2ActsSFGranK): per 64 on the BM128/BN128
@@ -667,16 +655,6 @@ static void sm90_fp4_h20_fused_mega_moe(
         // 63.7/64.3 (the hoisted k+1 barrier check exposes the wait: slot 17 654 vs 444
         // ns) — so off. The L1 loop is loader/HBM-bound at these token counts.
         .rf_prefetch_packed = get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0,
-        // DG_FP4_SWPIPE (default 0): software-pipelined generic 2-unit RF loop (MXFP4 L1 +
-        // L2, QoQ L2): a unit's promote runs after the wait<1> that retires its group
-        // while the other unit's group is in flight; no per-stage tensor-pipe drain.
-        // DG_FP4_SWPIPE_BN512 (default 0): the same loop on the wide (BN512, M = 16) units.
-        .sw_pipe = sw_pipe,
-        .sw_pipe_wide = sw_pipe_wide,
-        // DG_FP4_COMBINE_BATCH (default 0): the L2 scatter warp publishes its rows'
-        // combine arrival counters itself (one fence.acq_rel.sys per warp) instead of the
-        // per-task mailbox hop through the dispatch warp.
-        .combine_batch = combine_batch,
         .strided_pool_debug = strided_pool_debug,
         .l1_task_tiles = l1_task_tiles,
         .l2_task_tiles = l2_task_tiles,
@@ -722,7 +700,6 @@ static void sm90_fp4_h20_fused_mega_moe(
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
         (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "") +
-        (sw_pipe ? "_swp" : "") + (sw_pipe_wide ? "_swpw" : "") + (combine_batch ? "_cbat" : "") +
         (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "");
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);

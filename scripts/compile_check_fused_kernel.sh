@@ -5,8 +5,6 @@
 # footprint read while the GPUs are busy.
 #   bash scripts/compile_check_fused_kernel.sh <quant mxfp4|qoq> <l1_tiles 1|2> <l2_tiles 1|2> <stages> [outdir]
 #   (K128 blocks per stage follow the task shape: 2, or 1 with wide tiles.)
-#   Env SWPIPE / SWPIPE_WIDE / COMBINE_BATCH = true|false override the DG_FP4_SWPIPE /
-#   DG_FP4_SWPIPE_BN512 / DG_FP4_COMBINE_BATCH template arguments (default false).
 set -uo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 QUANT=${1:-mxfp4}; L1T=${2:-1}; L2T=${3:-1}; STAGES=${4:-4}
@@ -61,9 +59,6 @@ static void __instantiate_kernel() {
         /* kQoQInlineS2Ilv */ false,
         /* kQoQInlineS2PrefetchPacked */ $QPF,
         /* kRFPrefetchPacked */ false,
-        /* kSwPipe */ ${SWPIPE:-false},
-        /* kSwPipeWide */ ${SWPIPE_WIDE:-false},
-        /* kCombineBatchRequested */ ${COMBINE_BATCH:-false},
         /* kStridedPoolDebug */ false,
         /* kL1TaskTiles */ $L1T,
         /* kL2TaskTiles */ $L2T

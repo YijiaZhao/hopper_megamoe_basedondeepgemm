@@ -515,17 +515,6 @@ template <
     // Generic 2-K-block RF loop (host env DG_FP4_RF_PREFETCH_PACKED): k+1 barrier check
     // and next block-0 packed LDS before the wait<1> that frees frag[0].
     bool kRFPrefetchPacked = false,
-    // Generic 2-unit RF loop, software-pipelined variant (host env DG_FP4_SWPIPE, and
-    // DG_FP4_SWPIPE_BN512 for the wide-task kernels): the per-unit promote runs after a
-    // wait_group<1> while the other unit's wgmma group is in flight, so the tensor pipe
-    // is never drained inside a task; see `kSwPipeActive` in the body.
-    bool kSwPipe = false,
-    bool kSwPipeWide = false,
-    // Fine combine, batched signalling (host env DG_FP4_COMBINE_BATCH): the L2 scatter
-    // warp publishes its rows' arrival counters itself (one sys-scope fence per warp)
-    // instead of posting the task to the CTA mailbox for the dispatch warp; see
-    // `kCombineBatch` in the body.
-    bool kCombineBatchRequested = false,
     // Debug (host env DG_FP4_POOL_STRIDE_DEBUG, pull dispatch only): address the
     // token pool with the push-dispatch fixed per-expert stride while keeping the
     // pull protocol; see `kStridedPool` in the body.

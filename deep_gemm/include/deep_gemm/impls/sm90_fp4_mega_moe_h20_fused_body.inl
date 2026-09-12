@@ -288,14 +288,6 @@
     // stream), so no late claimer of N-1 can observe the reset; launch N's own word
     // is only zeroed by the cleanup of N+1, after N completed.
     constexpr bool kCombineDynamic = kFineCombine;
-    // Batched combine signalling (host env DG_FP4_COMBINE_BATCH, swapAB L2 epilogue
-    // only): right after the CTA barrier that follows the NVLink scatter, epilogue
-    // warp 0 publishes the task's rows itself (one fence.acq_rel.sys + one
-    // red.release.sys per row, one lane per row), so the per-task mailbox hop
-    // (st.release.gpu -> dispatch warp acquire -> fence.sys -> red) leaves the
-    // signal path. The consumer's acquire spin and target are unchanged; the
-    // mailbox still carries DONE.
-    constexpr bool kCombineBatch = kCombineBatchRequested && kFineCombine && kSwapABRequested;
     // Push dispatch (kPushDispatch; host env DG_FP4_PUSH_DISPATCH, see the host for
     // the default, gated by DG_FP4_PUSH_DISPATCH_MAX_M on the global token count,
     // default 16). Pull model
@@ -1930,7 +1922,7 @@
             // release, and the dispatch consumer's acquire + sys-scope release make
             // them visible to the remote combine warp (cumulativity).
             const auto signal_combine_arrivals = [&]() {
-                if constexpr (kFineCombine && !kCombineBatch) {
+                if constexpr (kFineCombine) {
                     if (epilogue_thread_idx == 0 && valid_m > 0) {
                         auto* mailbox = workspace.get_combine_mailbox_ptr(sm_idx);
                         DG_SPIN_WHILE(combine_mailbox_seq - ptx::ld_volatile(mailbox + 1) >= fused_layout::kSM90FineCombineRingSize, 1611);
@@ -2078,25 +2070,6 @@
                         }
                     }
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                    if constexpr (kCombineBatch) {
-                        // Batched arrival publish (kCombineBatch): after the CTA barrier (both
-                        // WGs' scatter stores of this 256-column block happen-before it) ONE
-                        // warp publishes every row of the task: lane r < valid_m owns row r,
-                        // one sys-scope release fence (cumulative over the CTA's stores via the
-                        // barrier) and one release-add on the row's destination counter. One
-                        // increment per (row, 256-column L2 block), exactly like the mailbox
-                        // path, so the consumer's target is unchanged.
-                        if (epilogue_warp_idx == 0) {
-                            for (uint32_t row = lane_idx; row < valid_m; row += 32) {
-                                const auto src_metadata = *workspace.get_token_src_metadata_ptr(
-                                    pool_block_idx * BLOCK_M + row);
-                                asm volatile("fence.acq_rel.sys;" ::: "memory");
-                                ptx::red_add_rel_sys(
-                                    sym_buffer.map(workspace.get_combine_arrival_count_ptr(src_metadata.token_idx),
-                                                   src_metadata.rank_idx), 1);
-                            }
-                        }
-                    }
                     signal_combine_arrivals();
                 }
             };
@@ -2244,12 +2217,6 @@
                     constexpr bool kQIS2Plain = kInlineS2 && kUnitsPerStage == 2 &&
                                                 (kWideUnits || (!kQoQInlineS2Ilv && kQoQInlineS2Frags == 2));
                     constexpr bool kQIS2Prefetch = kQIS2Plain && kQoQInlineS2PrefetchPacked;
-                    // Software-pipelined generic 2-unit loop (kSwPipe / kSwPipeWide, host env
-                    // DG_FP4_SWPIPE / DG_FP4_SWPIPE_BN512): replaces the per-unit-promote loop
-                    // (MXFP4 L1 + L2, QoQ L2; the QoQ inline-s2 L1 loop is already lag-1) on
-                    // the BN256 units, and on the wide (BN512) units only with the second knob.
-                    constexpr bool kSwPipeActive = (kWideUnits ? kSwPipeWide : kSwPipe) &&
-                                                   kUnitsPerStage == 2 && !kInlineS2 && !kHalfTileTasks;
                     using SwapRS = typename std::conditional_t<kQoQ,
                         mma::sm90::INT8MMARSSelector<(N_SWAP == 24 ? 32 : N_SWAP)>,
                         mma::sm90::FP8MMARSSelector<N_SWAP>>::type;
@@ -2299,23 +2266,6 @@
                                         for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                             ptx::warpgroup_fence_operand(swap_accum[kb][g][h][c][i]);
                                     }
-                                }
-                            }
-                        }
-                    };
-                    // One accumulator set only (kSwPipeActive: the other set's group may be in
-                    // flight, and a register named by a non-wgmma instruction while its wgmma
-                    // is pending would serialise the pipe, ptxas C7514).
-                    const auto fence_acc_set = [&](swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum]) {
-                        #pragma unroll
-                        for (uint32_t g = 0; g < kSFGroups; ++ g) {
-                            #pragma unroll
-                            for (uint32_t h = 0; h < kUnitHalves; ++ h) {
-                                #pragma unroll
-                                for (uint32_t c = 0; c < kAccChains; ++ c) {
-                                    #pragma unroll
-                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
-                                        ptx::warpgroup_fence_operand(acc[g][h][c][i]);
                                 }
                             }
                         }
@@ -2468,13 +2418,9 @@
                     // descriptor addresses the kb-th 1 KB swizzled A tile of the stage.
                     const auto issue_stage_rf = [&](const uint32_t& stage, const uint32_t& unit,
                                                     uint32_t (&f)[kUnitHalves][4][4],
-                                                    swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum],
-                                                    const bool& fence_all_accum) {
+                                                    swap_accum_t (&acc)[kSFGroups][kUnitHalves][kAccChains][kSwapAccum]) {
                         const uint32_t kb = unit / kHalfPairs;
-                        if (fence_all_accum)
-                            fence_accum();
-                        else
-                            fence_acc_set(acc);
+                        fence_accum();
                         fence_frag(f);
                         ptx::warpgroup_arrive();
                         #pragma unroll
@@ -2543,30 +2489,7 @@
                                         return static_cast<float>(v);
                                     }
                                 };
-                                if constexpr (kSwPipeActive) {
-                                    // Pipelined loop: this promote runs while the other unit's wgmma
-                                    // group is in flight, so it must stay branch-free (a compiler-
-                                    // inserted wait in a divergent path serialises every wgmma,
-                                    // ptxas C7518): unconditional SF loads, per-token select of the
-                                    // contribution (0 for padded tokens). Both operands are selected
-                                    // (0 * 0), not the product, so the FFMA contraction of the plain
-                                    // loop's `(scale * s2) * acc` is preserved: identical bits for
-                                    // valid tokens; padded tokens get + 0 (the plain loop skips them).
-                                    const float raw_0 = ptx::ld_shared(sfa + token_0);
-                                    const float raw_1 = ptx::ld_shared(sfa + token_1);
-                                    const bool live_0 = token_0 < valid_m;
-                                    const bool live_1 = token_1 < valid_m;
-                                    const float scale_0 = live_0 ? raw_0 : 0.0f;
-                                    const float scale_1 = live_1 ? raw_1 : 0.0f;
-                                    const float a00 = live_0 ? acc_sum(i * 4 + 0) : 0.0f;
-                                    const float a02 = live_0 ? acc_sum(i * 4 + 2) : 0.0f;
-                                    const float a11 = live_1 ? acc_sum(i * 4 + 1) : 0.0f;
-                                    const float a13 = live_1 ? acc_sum(i * 4 + 3) : 0.0f;
-                                    final_accum[accum_offset + 0] += (scale_0 * s2_r0) * a00;
-                                    final_accum[accum_offset + 2] += (scale_0 * s2_r1) * a02;
-                                    final_accum[accum_offset + 1] += (scale_1 * s2_r0) * a11;
-                                    final_accum[accum_offset + 3] += (scale_1 * s2_r1) * a13;
-                                } else if constexpr (kQoQ) {
+                                if constexpr (kQoQ) {
                                     // Branch-free: the token guards compiled to one BSSY/BRA/BSYNC
                                     // block per token pair, each with an exposed LDS -> FMUL -> FFMA
                                     // chain (SASS of the 09-09 build; slot-30 probe 525 ns/stage vs
@@ -2686,7 +2609,7 @@
                             kstage_t_prev = kt_head;
                         }
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, ksplit_kb, fcur, swap_accum[0], true);
+                            issue_stage_rf(cur_stage, ksplit_kb, fcur, swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
                             const uint32_t next_stage = cur_stage == kNumStages - 1 ? 0 : cur_stage + 1;
@@ -2939,7 +2862,7 @@
                             kstage_add(22, kt_head - kstage_t_prev);
                         kstage_t_prev = kt_head;
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 0, frag[b0], swap_accum[0], true);
+                            issue_stage_rf(cur_stage, 0, frag[b0], swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
                         fence_accum();
@@ -2953,7 +2876,7 @@
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 1, frag[b1], swap_accum[0], true);
+                            issue_stage_rf(cur_stage, 1, frag[b1], swap_accum[0]);
                         kt_a = clock64();
                         kstage_add(31, kt_a - kt_b);
                         if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
@@ -3060,7 +2983,7 @@
                             kstage_add(22, kt_head - kstage_t_prev);
                         kstage_t_prev = kt_head;
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0], true);
+                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
                         if constexpr (kQIS2Prefetch)
@@ -3084,7 +3007,7 @@
                         kt_b = clock64();
                         kstage_add(18, kt_b - kt_a);
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1u % kNumAccKBlocks], true);
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1u % kNumAccKBlocks]);
                         kt_a = clock64();
                         kstage_add(31, kt_a - kt_b);
                         const bool has_next = k_block_idx + kKBlocksPerStage < num_k_blocks;
@@ -3156,153 +3079,6 @@
                     // finds a path from an in-flight wgmma to the next task's accumulator
                     // zeroing / first decode and serialises every wgmma (C7518).
                     ptx::warpgroup_wait<0>();
-                    } else if constexpr (kUnitsPerStage == 2 && kSwPipeActive) {
-                    // Software-pipelined generic 2-unit loop (kSwPipeActive). Same commit
-                    // groups G(s,0) [frag 0 -> acc 0] / G(s,1) [frag 1 -> acc 1], fragment
-                    // buffers, accumulator sets and per-unit promote as the plain loop below
-                    // (numerics identical), but a unit is promoted right after the wait<1>
-                    // that retires its group, while the OTHER unit's group is in flight, and
-                    // the tensor pipe is drained once per TWO stages instead of once per
-                    // stage. ptxas keeps wgmma asynchronous only when a non-wgmma read of an
-                    // accumulator follows a wait_group that retires its group in STRAIGHT-LINE
-                    // code; at a loop header with a group still pending it assumes every
-                    // accumulator in flight and serialises every wgmma of the kernel (C7514,
-                    // reproduced 2026-09-12 with a 2-set toy loop). So the body covers two
-                    // stages and ends with wait<0>, and a single remaining stage runs in a
-                    // drained tail; on every edge into the header nothing is pending.
-                    //   prologue: wait stage s full; decode unit 0 -> frag 0
-                    //   body (stages s, s+1):
-                    //     issue G(s,0); decode unit 1 -> frag 1; issue G(s,1);
-                    //     wait<1> -> G(s,0) retired: promote acc 0 (overlaps G(s,1));
-                    //     wait s+1 full; decode its unit 0 -> frag 0; issue G(s+1,0);
-                    //     wait<1> -> G(s,1) retired: promote acc 1 (overlaps G(s+1,0)); release s;
-                    //     decode s+1 unit 1 -> frag 1; issue G(s+1,1);
-                    //     wait<1> -> G(s+1,0) retired: promote acc 0 (overlaps G(s+1,1));
-                    //     [s+2 exists: wait s+2 full; decode its unit 0 -> frag 0 (overlaps G(s+1,1))]
-                    //     wait<0>; promote acc 1; release s+1
-                    //   tail (one stage left): issue G(s,0); decode unit 1; issue G(s,1);
-                    //     wait<1>; promote acc 0; wait<0>; promote acc 1; release s
-                    // Probe slots as the plain loop: 17 = exposed k+1 full wait, 18 = both
-                    // decodes, 19 = exposed wait<1>s / wait<0>, 31 = both issues, 30 = both
-                    // promotes, 21 = stage count, 22 = head-to-head.
-                    // Stage head: probe bookkeeping + issue unit 0 (frag[0] already decoded).
-                    const auto sw_issue0 = [&](const uint32_t& stage, const uint32_t& k_block_idx) {
-                        const unsigned long long kt_head = clock64();
-                        if constexpr (!kBlockIsL2) {
-                            kstage_add(21, 1ull);
-                            if (k_block_idx > 0)
-                                kstage_add(22, kt_head - kstage_t_prev);
-                            kstage_t_prev = kt_head;
-                        }
-                        issue_stage_rf(stage, 0, frag[0], swap_accum[0], false);
-                        kstage_add(31, clock64() - kt_head);
-                    };
-                    // Unit 1: decode, issue; retire unit 0's group; promote acc 0.
-                    const auto sw_unit1_promote0 = [&](const uint32_t& stage) {
-                        const unsigned long long kt_head = clock64();
-                        decode_stage_rf(stage, 1, frag[1]);
-                        unsigned long long kt_b = clock64();
-                        kstage_add(18, kt_b - kt_head);
-                        issue_stage_rf(stage, 1, frag[1], swap_accum[1], false);
-                        unsigned long long kt_a = clock64();
-                        kstage_add(31, kt_a - kt_b);
-                        ptx::warpgroup_wait<1>();
-                        fence_acc_set(swap_accum[0]);   // pins the promote's reads after the wait
-                        fence_frag(frag[0]);
-                        kt_b = clock64();
-                        kstage_add(19, kt_b - kt_a);
-                        promote_stage_rf(stage, 0, swap_accum[0]);
-                        kstage_add(30, clock64() - kt_b);
-                    };
-                    // Next stage's unit 0 decode into the (retired) frag[0].
-                    const auto sw_wait_decode_next0 = [&](const uint32_t& next_stage) {
-                        const uint32_t next_phase = phase ^ (next_stage == 0);
-                        const unsigned long long kt_b = clock64();
-                        if ((kexp & 4u) == 0u) {
-                            if (!barrier_ready(full_barriers[next_stage], next_phase)) {
-                                if constexpr (!kBlockIsL2)
-                                    kstage_add(23, 1ull);
-                                full_barriers[next_stage]->wait(next_phase);
-                            }
-                        }
-                        const unsigned long long kt_a = clock64();
-                        if constexpr (!kBlockIsL2)
-                            kstage_add(17, kt_a - kt_b);
-                        decode_stage_rf(next_stage, 0, frag[0]);
-                        kstage_add(18, clock64() - kt_a);
-                    };
-                    // Drain, promote acc 1, release the stage.
-                    const auto sw_drain_promote1 = [&](const uint32_t& stage) {
-                        const unsigned long long kt_b = clock64();
-                        ptx::warpgroup_wait<0>();
-                        fence_accum();
-                        fence_frag(frag[1]);
-                        const unsigned long long kt_a = clock64();
-                        kstage_add(19, kt_a - kt_b);
-                        promote_stage_rf(stage, 1, swap_accum[1]);
-                        kstage_add(30, clock64() - kt_a);
-                        arrive_empty_barrier(stage);
-                    };
-                    if (num_k_blocks > 0) {
-                        const unsigned long long kt_head = clock64();
-                        full_barriers[stage_idx]->wait(phase);
-                        if constexpr (!kBlockIsL2)
-                            { const unsigned long long kt_fw = clock64() - kt_head; kstage_add(17, kt_fw); kstage_add(36, kt_fw); kstage_add(37, 1ull); }  // 36/37: first-stage wait / count
-                        if constexpr (kUseInterleavedScheduler)
-                            interleaved_scheduler.release_task_info(lane_idx);
-                        decode_stage_rf(stage_idx, 0, frag[0]);
-                    }
-                    uint32_t k_block_idx = 0;
-                    for (; k_block_idx + 2u * kKBlocksPerStage <= num_k_blocks;) {
-                        // ---- stage s ----
-                        const uint32_t s0 = stage_idx;
-                        sw_issue0(s0, k_block_idx);
-                        sw_unit1_promote0(s0);
-                        const uint32_t s1 = s0 == kNumStages - 1 ? 0 : s0 + 1;
-                        sw_wait_decode_next0(s1);
-                        {
-                            const unsigned long long kt_b = clock64();
-                            issue_stage_rf(s1, 0, frag[0], swap_accum[0], false);
-                            const unsigned long long kt_a = clock64();
-                            kstage_add(31, kt_a - kt_b);
-                            // Retire G(s,1): acc 1 promoted while G(s+1,0) runs, stage s recycled.
-                            ptx::warpgroup_wait<1>();
-                            fence_acc_set(swap_accum[1]);
-                            fence_frag(frag[1]);
-                            const unsigned long long kt_c = clock64();
-                            kstage_add(19, kt_c - kt_a);
-                            promote_stage_rf(s0, 1, swap_accum[1]);
-                            kstage_add(30, clock64() - kt_c);
-                            arrive_empty_barrier(s0);
-                        }
-                        advance_pipeline(k_block_idx);
-                        // ---- stage s+1 (unit 0 already issued) ----
-                        if constexpr (!kBlockIsL2) {
-                            const unsigned long long kt_head = clock64();
-                            kstage_add(21, 1ull);
-                            kstage_add(22, kt_head - kstage_t_prev);
-                            kstage_t_prev = kt_head;
-                        }
-                        sw_unit1_promote0(s1);
-                        if (k_block_idx + kKBlocksPerStage < num_k_blocks) {
-                            // Look ahead: the next stage's unit 0 is decoded while G(s+1,1) runs
-                            // (frag[0]'s last reader G(s+1,0) retired above); it is issued by the
-                            // next body / the tail after the drain.
-                            const uint32_t s2 = s1 == kNumStages - 1 ? 0 : s1 + 1;
-                            sw_wait_decode_next0(s2);
-                        }
-                        sw_drain_promote1(s1);
-                        advance_pipeline(k_block_idx);
-                    }
-                    if (k_block_idx < num_k_blocks) {
-                        // One stage left (odd stage count): drained tail.
-                        const uint32_t s0 = stage_idx;
-                        sw_issue0(s0, k_block_idx);
-                        sw_unit1_promote0(s0);
-                        sw_drain_promote1(s0);
-                        advance_pipeline(k_block_idx);
-                    }
-                    ptx::warpgroup_wait<0>();  // explicit drain on the loop exit path (ptxas C7518, see above)
                     } else if constexpr (kUnitsPerStage == 2) {
                     // Two K128 blocks per stage, one commit group each, frag buffers at
                     // K-block granularity (frag[0] always holds block 0, frag[1] block 1):
@@ -3332,7 +3108,7 @@
                             kstage_t_prev = kt_head;
                         }
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0], true);
+                            issue_stage_rf(cur_stage, 0, frag[0], swap_accum[0]);
                         unsigned long long kt_b = clock64();
                         kstage_add(31, kt_b - kt_head);
                         if (!exp_skip(1u))
@@ -3340,7 +3116,7 @@
                         unsigned long long kt_a = clock64();
                         kstage_add(18, kt_a - kt_b);
                         if (!exp_skip(2u))
-                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1], true);
+                            issue_stage_rf(cur_stage, 1, frag[1], swap_accum[1]);
                         kt_b = clock64();
                         kstage_add(31, kt_b - kt_a);
                         kt_a = kt_b;
