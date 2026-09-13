@@ -609,6 +609,19 @@ __global__ void __launch_bounds__(kCCBlock, 1) router_cc_lean_kernel(
             for (int j = 0; j < 4; ++j) { xf[1][c][2 * j] = bf16lo_f32(xw[j]); xf[1][c][2 * j + 1] = bf16hi_f32(xw[j]); }
         }
     }
+    if (zero_row_unrouted) {
+        // row-is-zero flag (in the weight-latency shadow, xv's last use): OR of the row's bf16 bits, sign masked;
+        // the 4 K-part warps of a slot hold the whole row
+        uint32_t nz0 = 0u, nz1 = 0u;
+        #pragma unroll
+        for (int c = 0; c < kChunks; ++c) {
+            nz0 |= xv[0][c].x | xv[0][c].y | xv[0][c].z | xv[0][c].w;
+            nz1 |= xv[1][c].x | xv[1][c].y | xv[1][c].z | xv[1][c].w;
+        }
+        nz0 = __reduce_or_sync(0xffffffffu, nz0 & 0x7FFF7FFFu);
+        nz1 = __reduce_or_sync(0xffffffffu, nz1 & 0x7FFF7FFFu);
+        if (lane == 0) { nz_s[slot][0][ks] = nz0; nz_s[slot][1][ks] = nz1; }
+    }
     float acc0 = 0.0f, acc1 = 0.0f;
     #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
@@ -635,18 +648,6 @@ __global__ void __launch_bounds__(kCCBlock, 1) router_cc_lean_kernel(
     if (two) {
         acc1 = warp_sum(acc1);
         if (lane == 0) part_s[slot][1][ks] = acc1;
-    }
-    if (zero_row_unrouted) {
-        // row-is-zero flag: OR of the row's bf16 bits (the 4 K-part warps of a slot hold the whole row), sign masked
-        uint32_t nz0 = 0u, nz1 = 0u;
-        #pragma unroll
-        for (int c = 0; c < kChunks; ++c) {
-            nz0 |= xv[0][c].x | xv[0][c].y | xv[0][c].z | xv[0][c].w;
-            nz1 |= xv[1][c].x | xv[1][c].y | xv[1][c].z | xv[1][c].w;
-        }
-        nz0 = __reduce_or_sync(0xffffffffu, nz0 & 0x7FFF7FFFu);
-        nz1 = __reduce_or_sync(0xffffffffu, nz1 & 0x7FFF7FFFu);
-        if (lane == 0) { nz_s[slot][0][ks] = nz0; nz_s[slot][1][ks] = nz1; }
     }
     __syncthreads();
     stamp(stamps, 2);
