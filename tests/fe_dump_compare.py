@@ -180,11 +180,15 @@ def _bytes(name, raw):
 def classify(name, quant, rows, raw_a, raw_b, zero_rows=0):
     """Return (mismatch_count, first_flat_index, class, detail) for one buffer of one cell."""
     ba, bb = _bytes(name, raw_a).flatten(), _bytes(name, raw_b).flatten()
+    shape = _shape_of(name, quant)
+    if name == "keys":
+        # the dump holds the whole [2][512] u32 key area; only the two [384] token rows are written
+        ba, bb = ba[:shape[0] * shape[1]], bb[:shape[0] * shape[1]]
+        raw_a, raw_b = ba, bb
     diff_bytes = ba != bb
     n_bytes = int(diff_bytes.sum())
     if n_bytes == 0:
         return 0, -1, "identical", ""
-    shape = _shape_of(name, quant)
     # element-wise (not byte-wise) mismatch mask in the buffer's natural element type
     na, nb = _numeric(name, quant, raw_a).reshape(shape), _numeric(name, quant, raw_b).reshape(shape)
     if name in ("ticket", "ticket_sel1", "keys"):

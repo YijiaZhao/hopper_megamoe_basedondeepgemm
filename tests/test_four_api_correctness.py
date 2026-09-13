@@ -12,7 +12,11 @@ checks that the explicit APIs do not depend on process-global DG_W4A8_INT.
   per seed, FE knob zero_row_unrouted 0 then 1 (DG_FE_ZERO_ROW_UNROUTED; effective on the cc path,
   <= 2 rows per rank): the kernel output of every zero row must be exactly 0 with both, the FE must
   leave zero rows unrouted with the knob on (cc path), and x / x_sf / the routing / y of the other
-  rows must be bit-identical between the two runs (ZERO_ROWS line; assertion).
+  rows must be bit-identical between the two runs (ZERO_ROWS line; assertion). The two runs are
+  different launches (knob 0 routes 8 extra rows to experts 0..7 of rank 0), so the fused kernel's
+  last-partial-wave split-K tail (DG_FP4_SPLITK_L1, default 1) may land on other L1 tasks and sum
+  their fp32 K halves in the other order: --zero-rows-y-ulp 1 tolerates 1 bf16 ulp on the other
+  rows in that configuration; with DG_FP4_SPLITK_L1=0 (or no tail) the default 0 = bit-identical.
 """
 import argparse
 import os
@@ -334,19 +338,25 @@ def _run(api, args, rank, group):
                 fe_routed_bad = fe_unrouted if not fe_unroutes_zero else 0     # knob off / non-cc path: zero rows stay routed
                 x_diff = int((xq.view(torch.uint8) != off["x"].view(torch.uint8)).sum() + (xs != off["x_sf"]).sum())
                 route_diff = int((fe_idx[nz] != off["idx"][nz]).sum() + (fe_w[nz] != off["w"][nz]).sum())
-                y_diff_elems = int((y[nz].view(torch.int16) != off["y"][nz].view(torch.int16)).sum())
+                y_on_i, y_off_i = y[nz].view(torch.int16).int(), off["y"][nz].view(torch.int16).int()
+                y_diff_elems = int((y_on_i != y_off_i).sum())
+                # bf16 ulps between the two runs (sign-magnitude integer distance of the bf16 encodings)
+                y_ulp = (torch.where(y_on_i < 0, -(y_on_i & 0x7FFF), y_on_i) - torch.where(y_off_i < 0, -(y_off_i & 0x7FFF), y_off_i)).abs()
+                y_ulp_max = y_ulp.max() if nz.any() else torch.zeros((), device="cuda", dtype=torch.int32)
                 y_diff_max = (y[nz].float() - off["y"][nz].float()).abs().max() if nz.any() else torch.zeros((), device="cuda")
                 st = torch.tensor([int(zero_mask.sum()), fe_unrouted, y_zero_bad, fe_unrouted_bad, fe_routed_bad, x_diff, route_diff,
-                                   y_diff_elems, int(nz.sum()) * args.hidden], device="cuda", dtype=torch.int64)
-                dist.all_reduce(st, group=group)
+                                   y_diff_elems, int(nz.sum()) * args.hidden, int(y_ulp_max)], device="cuda", dtype=torch.int64)
+                dist.all_reduce(st[:9], group=group)
+                dist.all_reduce(st[9:], op=dist.ReduceOp.MAX, group=group)
                 dist.all_reduce(y_diff_max, op=dist.ReduceOp.MAX, group=group)
                 st = st.tolist()
-                ok_zero = st[2] == 0 and st[3] == 0 and st[4] == 0 and st[5] == 0 and st[6] == 0 and st[7] == 0
+                y_ok = st[7] == 0 or st[9] <= args.zero_rows_y_ulp
+                ok_zero = st[2] == 0 and st[3] == 0 and st[4] == 0 and st[5] == 0 and st[6] == 0 and y_ok
                 if rank == 0:
                     print(f"ZERO_ROWS api={api} seed={seed} zero_rows={st[0]} fe_unrouted={st[1]} y_zero_nonzero_elems={st[2]} "
                           f"fe_unrouted_missing={st[3]} fe_unexpected_unrouted={st[4]} | knob0 vs knob1 on the other rows: "
-                          f"x/x_sf diffs={st[5]} routing diffs={st[6]} y diff elems={st[7]}/{st[8]} max|dy|={y_diff_max.item():.3g} "
-                          f"-> {'PASS' if ok_zero else 'FAIL'}", flush=True)
+                          f"x/x_sf diffs={st[5]} routing diffs={st[6]} y diff elems={st[7]}/{st[8]} max ulp={st[9]} max|dy|={y_diff_max.item():.3g} "
+                          f"(allowed ulp {args.zero_rows_y_ulp}) -> {'PASS' if ok_zero else 'FAIL'}", flush=True)
                 if not ok_zero:
                     failures.append((seed, {"zero_rows": st}))
             if use_fe and args.router_ref == "torch":
@@ -540,6 +550,9 @@ def main():
     parser.add_argument("--zero-ranks", default="all", help="comma-separated ranks that carry the --zero-rows rows (default all)")
     parser.add_argument("--zero-row-unrouted", type=int, default=None,
                         help="FE knob for the checked run (default: env DG_FE_ZERO_ROW_UNROUTED, 1)")
+    parser.add_argument("--zero-rows-y-ulp", type=int, default=0,
+                        help="ZERO_ROWS gate: bf16 ulps tolerated on the other rows between the knob-0 and knob-1 runs (0 = bit-identical; "
+                             "1 when the fused kernel's split-K tail DG_FP4_SPLITK_L1=1 may move between the two task sets)")
     args = parser.parse_args()
     if args.reference == "torch-moe":
         args.router_ref = "torch"
