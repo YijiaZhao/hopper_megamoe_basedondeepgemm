@@ -138,6 +138,15 @@ Details and per-cell tables: [`docs/fe5_correctness.md`](docs/fe5_correctness.md
 * **50-seed sweep** (14 shapes x {SELECT_IN_MEGA 0, 1} x {normal, balanced}, 292 800 evaluated
   tokens): 0 failures, 0 top-8 disagreements, 0 Mega-prologue vs python-decode differences;
   worst `cos_min` MXFP4 0.99975 (M = 128 / 256), QoQ 0.99990.
+* **Zero-row gate** (`tests/test_four_api_correctness.py --zero-rows K [--zero-ranks ...]`, 8 ranks, both
+  fused APIs, `DG_FE_SELECT_IN_MEGA` 0 and 1): all-zero hidden rows (the E2E padding rows: T = 1 with
+  zero rows on the ranks that own no token at M2 / M4, T = 2 with one zero and one real row per rank,
+  T = 8 swapab path) -- the frontend leaves every zero row unrouted on the cc path, the kernel output of
+  every zero row is exactly 0, and x / x_sf / the routing / y of the other rows are bit-identical between
+  the pipeline with `DG_FE_ZERO_ROW_UNROUTED` 0 and 1 (5 seeds per cell; T = 2 with the split-K tail
+  `DG_FP4_SPLITK_L1=1`: <= 2 bf16 ulps on 2 of 24 576 elements in one QoQ seed, bit-identical with the
+  tail off). `tests/fe_dump_compare.py --zero-rows 1` knob 0 vs 1, 64 seeds: differences only in the
+  routing outputs (`topk_idx`, `topk_weights`, keys) of the zero rows, `x` / `x_sf` identical.
 * **Select-in-Mega gate** (`tests/test_select_in_mega.py`, 8 ranks, 50 seeds, M 2 / 16, both
   quants): 0 topk mismatches, y bit-identical between select-in-frontend and select-in-Mega.
 * **Frontend output layout gate** (`tests/fe_dump_compare.py`): the frontend runs alone for
@@ -162,12 +171,18 @@ DG_FE_FORCE_BALANCED=1 torchrun --standalone --nproc_per_node=8 tests/test_four_
     --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --frontend fe --reference torch-moe --tokens 1 --seeds 50
 torchrun --standalone --nproc_per_node=8 tests/test_four_api_correctness.py \
     --apis mxfp4_mega_moe_fused qoq_mega_moe_fused --tokens 32 --hot-rows 12 --slot-check
+# zero-row gate: M2-like owner layout (zero rows on ranks 1,2,3,5,6,7), mixed rows, swapab path
+torchrun --standalone --nproc_per_node=8 tests/test_four_api_correctness.py --apis mxfp4_mega_moe_fused qoq_mega_moe_fused \
+    --frontend fe --reference torch-moe --tokens 1 --zero-rows 1 --zero-ranks 1,2,3,5,6,7 --seeds 5
+torchrun --standalone --nproc_per_node=8 tests/test_four_api_correctness.py --apis mxfp4_mega_moe_fused qoq_mega_moe_fused \
+    --frontend fe --reference torch-moe --tokens 2 --zero-rows 1 --seeds 5 --zero-rows-y-ulp 2
+python3 tests/fe_dump_compare.py --env-a DG_FE_ZERO_ROW_UNROUTED=0 --env-b DG_FE_ZERO_ROW_UNROUTED=1 --zero-rows 1 --seeds 64  # 1 GPU
 bash tests/fe5_gates.sh                                     # the gate set above, T = 1 2 8 16 32 + slot checks
 OUT=/raid/kimi/results/fe5c bash tests/fe5c_sweep.sh ; python3 scripts/summarize_fe5c_sweep.py /raid/kimi/results/fe5c/*.log
 python3 tests/fe_dump_compare.py --root-a <reference checkout> --root-b . --seeds 64 --ref-torch   # 1 GPU
 ```
 
-## Performance results (2026-09-12)
+## Performance results (2026-09-13)
 
 Microseconds; M = global tokens over the 8 ranks (M2 / M4 / M8 = 1 row per rank, M16 = 2 rows);
 fused backend (`mxfp4_mega_moe_fused` / `qoq_mega_moe_fused`); GPU 0, median of the last 3
@@ -175,13 +190,13 @@ replays, median over 3 passes.
 
 | | Precision | M2 | M4 | M8 | M16 |
 |---|---|---:|---:|---:|---:|
-| E2E, normal routing | MXFP4 | 63.8 | 63.2 | 68.1 | 81.3 |
-| E2E, normal routing | QoQ | 63.5 | 63.2 | 66.3 | 80.0 |
+| E2E, normal routing | MXFP4 | 53.4 | 60.3 | 68.8 | 81.2 |
+| E2E, normal routing | QoQ | 52.1 | 58.7 | 66.7 | 80.0 |
 | E2E, forced-balanced | MXFP4 | 44.7 | 54.0 | 62.3 | 80.8 |
 | E2E, forced-balanced | QoQ | 46.1 | 54.4 | 60.6 | 80.5 |
 | Mega-only, balanced | MXFP4 | 38.3 | 46.9 | 56.8 | 74.4 |
 | Mega-only, balanced | QoQ | 37.4 | 46.4 | 53.3 | 73.0 |
-| FE kernel | both | 2.6–2.8 | 2.6–2.8 | 2.6–2.8 | 2.8–3.0 |
+| FE kernel | both | 2.7–2.8 | 2.7–2.8 | 2.7–2.8 | 3.0–3.1 |
 
 Rows: **E2E** = frontend kernel + fused MegaMoE kernel in one CUDA graph, span from the frontend
 start to the MegaMoE end; **normal routing** = the frontend's real top-8 of random hidden rows;
@@ -196,8 +211,11 @@ reduce-scatter and the TP4 all-gather sit between the replays, outside the graph
 
 **Measurement method:** host `10.6.131.8`, eight H20-3e with the SM clock locked at 1830 MHz
 (`nvidia-smi -lgc 1830,1830`, verified by the capture script), container `fe5c_build` (the
-pinned image above), kernels of `perf/phase-stamps-probe` `eba23b1` (build `fee8931`; the default
-code paths of this tree), one session 2026-09-12 08:05-08:21 UTC.
+pinned image above). E2E normal-routing and FE rows: kernels of `perf/zero-row-unrouted` `0a4b21e`
+(frontend build `6122017`; the default code paths of this tree), session 2026-09-13 03:45-04:12 UTC,
+5 interleaved passes; forced-balanced and Mega-only rows: `perf/phase-stamps-probe` `eba23b1`
+(build `fee8931`), session 2026-09-12 08:05-08:21 UTC -- the fused MegaMoE kernel is unchanged
+between the two builds and those rows do not depend on the frontend's routing of padding rows.
 `scripts/capture_four_api_h20_timelines.sh` runs `tests/profile_four_api_h20.py` under Nsight
 Systems (`--trace=cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none`) with
 `DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30`: after 2 warm-up replays, the 30 measured replays of a
@@ -206,7 +224,7 @@ all-gather; no per-iteration `torch.cuda.synchronize()` / `dist.barrier()`), so 
 through the on-stream collectives. `scripts/summarize_four_api_h20_last3.py` reads the report of
 GPU 0, takes the last 3 replays, measures each span (E2E: frontend kernel start -> MegaMoE kernel
 end; Mega-only: kernel start -> end; FE: frontend kernel start -> end) and reports their median;
-`tests/fe5_summarize_campaign.py` takes the median over the 3 passes (Mega-only: 1 pass). Env of
+`tests/fe5_summarize_campaign.py` takes the median over the passes (Mega-only: 1 pass). Env of
 the runs: `DG_FE_SELECT_IN_MEGA=1 DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30`, plus
 `DG_PROFILE_FORCE_BALANCED=1` for the forced-balanced rows; every other knob at its library default.
 
