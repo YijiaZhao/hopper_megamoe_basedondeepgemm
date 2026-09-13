@@ -670,7 +670,7 @@ def fable_frontend_workspace(sym_buffer, e: int, device) -> torch.Tensor:
 
 def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.Tensor,
                                      sym_buffer, quant: str = "mxfp4", stamps=None,
-                                     l2_persist=None, wlayout=None, select_in_mega=None):
+                                     l2_persist=None, wlayout=None, select_in_mega=None, zero_row_unrouted=None):
     """Fable dynamic-M fused Router + Quant + TopK8 + Softmax frontend (one launch).
 
     The launch shape follows the problem shape (``fable_frontend_path``): the CUDA-core K-split
@@ -690,6 +690,10 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     after the router CTAs stored the 384 keys per token (no ticket / last-arriver select) and the
     fused MegaMoE prologue selects the top-8 + softmax (``mxfp4|qoq_mega_moe_fused`` pick the key
     array up from this buffer's cache). topk_idx / topk_weights are NOT valid after such a call.
+    ``zero_row_unrouted`` (env ``DG_FE_ZERO_ROW_UNROUTED``, default 1; cc path only): an all-zero hidden
+    row (the E2E harness's padding rows on the ranks that own no token) is left unrouted -- topk_idx -1 /
+    weight 0, or all-zero keys under ``select_in_mega`` -- instead of tie-broken onto experts 0..7 (all on
+    rank 0, weight 1/8). Exact: x = 0 gives y = 0 either way; non-zero rows are bit-identical.
     """
     assert quant in ("mxfp4", "qoq")
     m, h = hidden.shape
@@ -713,6 +717,9 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
     if select_in_mega is None:
         select_in_mega = int(os.environ.get("DG_FE_SELECT_IN_MEGA", "0"))
     select_in_mega = int(bool(select_in_mega) and path == FE_PATH_CC)
+    if zero_row_unrouted is None:
+        zero_row_unrouted = int(os.environ.get("DG_FE_ZERO_ROW_UNROUTED", "1"))
+    zero_row_unrouted = int(bool(zero_row_unrouted) and path == FE_PATH_CC)
     workspace = fable_frontend_workspace(sym_buffer, e, hidden.device)
     cache = sym_buffer._fable_frontend_cache
     if cache.get("keys") is None or cache["keys"].data_ptr() != workspace[_FRONTEND_CC_KEYS_OFF:].data_ptr():
@@ -724,7 +731,7 @@ def fable_router_quant_topk_frontend(hidden: torch.Tensor, router_weight: torch.
                             sym_buffer.topk_idx[:m], sym_buffer.topk_weights[:m])
     _C.fable_router_quant_topk_frontend(
         hidden, router_weight, views[0], views[1], views[2], views[3], workspace,
-        0 if quant == "mxfp4" else 1, int(bool(stamps)), int(l2_persist), wlayout, select_in_mega)
+        0 if quant == "mxfp4" else 1, int(bool(stamps)), int(l2_persist), wlayout, select_in_mega, zero_row_unrouted)
 
 
 def fable_frontend_keys(sym_buffer) -> torch.Tensor:

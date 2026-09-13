@@ -764,9 +764,11 @@
         const uint32_t t = warp_idx - 4;
         const uint32_t* keys_t = fe_keys + t * kNumExperts;
         if (__ldcg(keys_t) == 0u) {
-            // Zero first key = unrouted token (the FE never produces a 0 key: its low 16 bits are 0xFFFF - expert).
+            // Zero first key = unrouted token (a real logit key is never 0: its low 16 bits are 0xFFFF - expert).
             // Written by the profiling driver's forced-balanced routing (DG_PROFILE_FORCE_BALANCED, the Mega-only
-            // scope's inactive rows): topk_idx -1 / weights 0, which the dispatch already treats as "no expert".
+            // scope's inactive rows) and by the Fable cc frontend for an all-zero hidden row (DG_FE_ZERO_ROW_UNROUTED,
+            // the E2E harness's padding rows; x = 0 -> y = 0 exactly): topk_idx -1 / weights 0, which the dispatch
+            // treats as "no expert" and the combine as an all-zero output row (empty slot mask -> zeros stored).
             if (lane_idx < kNumTopk) {
                 input_topk_idx_buffer.get_base_ptr<int64_t>()[t * kNumTopk + lane_idx] = -1;
                 input_topk_weights_buffer.get_base_ptr<float>()[t * kNumTopk + lane_idx] = 0.0f;

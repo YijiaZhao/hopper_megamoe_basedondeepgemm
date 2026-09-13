@@ -457,8 +457,9 @@ __global__ void __launch_bounds__(kThreads, kTiny ? 3 : 1) router_quant_topk_ker
 // ticket; the LAST router CTA reads the 384 keys per token (3 x 16 B per lane, re-reading
 // slots still 0), per-lane sorted top-8 + one 8-round redux merge, softmax, writes top-k.
 // select_in_mega: no ticket / no select -- the router CTAs end after their keys and the
-// fused MegaMoE prologue selects (deep_gemm/impls/fable_cc_select.cuh). The spare CTA
-// (blockIdx == num_router_ctas) quantises the m rows (both concurrently when m == 2).
+// fused MegaMoE prologue selects (deep_gemm/impls/fable_cc_select.cuh). zero_row_unrouted:
+// an all-zero hidden row gets unrouted keys instead of logits (see kCCZeroRowKey below). The
+// spare CTA (blockIdx == num_router_ctas) quantises the m rows (both concurrently when m == 2).
 // The hot path is the first code of the kernel; the cold paths (quant CTA, last-arriver
 // select) are __noinline__ (2.7 K SASS instructions: after a 256 MB L2 flush or the Mega
 // weight stream every CTA fetches its code cold from DRAM).
@@ -468,9 +469,22 @@ constexpr int kCCE = 384;
 constexpr int kCCSlots = 5, kCCKS = 4;                              // 5 experts x 4 K-part warps
 constexpr int kCCBlock = kCCSlots * kCCKS * 32;                     // 640 threads
 constexpr size_t kCCKeysOff = 64 * 1024;                            // workspace offset (after the 256 B ticket area) of the compact keys ([2][512] u32 max)
+// All-zero hidden row (zero_row_unrouted, DG_FE_ZERO_ROW_UNROUTED): x = 0 -> every expert output is 0 -> y = 0
+// exactly, so the row is UNROUTED instead of tie-broken onto experts 0..7 (all on rank 0, weight 1/8). The
+// router CTAs OR-reduce the row they already hold in registers (sign bit masked: -0.0 counts as zero) and
+// write, for such a row, every one of its 384 keys as
+//   select_in_mega:  0u              -- the fused Mega prologue's "unrouted token" encoding (topk_idx -1 / weight 0)
+//   FE select:       kCCZeroRowKey   -- non-zero (the last-arriver spin treats 0 as "not yet visible"); its low
+//                                       16 bits = 0xFFFF - expert would mean expert 0xFFFE, which no real key has
+// and the last arriver writes topk_idx -1 / topk_weights 0 for it. Non-zero rows: unchanged bits.
+constexpr uint32_t kCCZeroRowKey = 1u;
 
 // Compact-key last-arriver select: token t's e (= 384) keys are contiguous -> 3 x 16 B per lane,
 // insertion 12 x 8 + merge8, softmax, top-k write, keys zeroed for the next launch.
+
+// Compact-key last-arriver select: token t's e (= 384) keys are contiguous -> 3 x 16 B per lane,
+// insertion 12 x 8 + merge8, softmax, top-k write, keys zeroed for the next launch. A row whose
+// keys are kCCZeroRowKey (all-zero hidden row, see above) is written unrouted (-1 / 0).
 template <int kTopK>
 __device__ __forceinline__ void last_arriver_topk_compact(
         uint32_t* __restrict__ ckeys, int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
@@ -495,13 +509,22 @@ __device__ __forceinline__ void last_arriver_topk_compact(
             }
         if (!__any_sync(0xffffffffu, zero)) break;
     }
-    uint32_t run = 0u;
-    uint32_t loc[kTopK];
-    fable_cc::insert_keys<kTopK, kVec>(q, loc);
-    merge8<kTopK>(run, loc, lane);
-    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
-    topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
-    if (mstamps != nullptr && t == 0 && lane == 0) mstamps[4] = globaltimer_ns();
+    // all-zero hidden row (every key of the row == kCCZeroRowKey, key 0 suffices): unrouted
+    if (__shfl_sync(0xffffffffu, q[0].x, 0) == kCCZeroRowKey) {
+        if (lane < kTopK) {
+            topk_idx[static_cast<int64_t>(t) * kTopK + lane] = -1;
+            topk_weights[static_cast<int64_t>(t) * kTopK + lane] = 0.0f;
+        }
+        if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = mstamps[4] = globaltimer_ns();
+    } else {
+        uint32_t run = 0u;
+        uint32_t loc[kTopK];
+        fable_cc::insert_keys<kTopK, kVec>(q, loc);
+        merge8<kTopK>(run, loc, lane);
+        if (mstamps != nullptr && t == 0 && lane == 0) mstamps[3] = globaltimer_ns();
+        topk_finish<kTopK>(run, lane, t, topk_idx, topk_weights);
+        if (mstamps != nullptr && t == 0 && lane == 0) mstamps[4] = globaltimer_ns();
+    }
     #pragma unroll
     for (int i = 0; i < kVec; ++i) *reinterpret_cast<uint4*>(base + 4 * (lane + 32 * i)) = make_uint4(0u, 0u, 0u, 0u);
 }
@@ -535,10 +558,11 @@ __global__ void __launch_bounds__(kCCBlock, 1) router_cc_lean_kernel(
         int64_t* __restrict__ topk_idx, float* __restrict__ topk_weights,
         int* __restrict__ ticket, float* __restrict__ logits,
         unsigned long long* stamps,
-        int m, int h, int e, int num_router_ctas, int epc, int select_in_mega) {
+        int m, int h, int e, int num_router_ctas, int epc, int select_in_mega, int zero_row_unrouted) {
     constexpr int kSlots = kCCSlots, kKS = kCCKS;
     constexpr int kKPart = kCCH / kKS, kChunks = kKPart / 8 / 32;         // 768 elements = 3 x 16 B chunks per lane
     __shared__ float part_s[kSlots][kCCMaxM][kKS];
+    __shared__ uint32_t nz_s[kSlots][kCCMaxM][kKS];                       // per-warp OR of the row's bf16 bits (sign masked)
     __shared__ int s_last;
     stamp(stamps, 0);
     stamp_smid(stamps);
@@ -612,15 +636,34 @@ __global__ void __launch_bounds__(kCCBlock, 1) router_cc_lean_kernel(
         acc1 = warp_sum(acc1);
         if (lane == 0) part_s[slot][1][ks] = acc1;
     }
+    if (zero_row_unrouted) {
+        // row-is-zero flag: OR of the row's bf16 bits (the 4 K-part warps of a slot hold the whole row), sign masked
+        uint32_t nz0 = 0u, nz1 = 0u;
+        #pragma unroll
+        for (int c = 0; c < kChunks; ++c) {
+            nz0 |= xv[0][c].x | xv[0][c].y | xv[0][c].z | xv[0][c].w;
+            nz1 |= xv[1][c].x | xv[1][c].y | xv[1][c].z | xv[1][c].w;
+        }
+        nz0 = __reduce_or_sync(0xffffffffu, nz0 & 0x7FFF7FFFu);
+        nz1 = __reduce_or_sync(0xffffffffu, nz1 & 0x7FFF7FFFu);
+        if (lane == 0) { nz_s[slot][0][ks] = nz0; nz_s[slot][1][ks] = nz1; }
+    }
     __syncthreads();
     stamp(stamps, 2);
     if (static_cast<int>(threadIdx.x) < kSlots * kCCMaxM) {
         const int r = threadIdx.x / kSlots, c = threadIdx.x % kSlots;
         if (r < m && c < n_exp) {
             float v = 0.0f;
+            uint32_t nz = 1u;
             #pragma unroll
             for (int k = 0; k < kKS; ++k) v += part_s[c][r][k];
-            ckeys[static_cast<int64_t>(r) * e + expert_base + c] = topk_key(round_bf16(v), expert_base + c);
+            if (zero_row_unrouted) {
+                nz = 0u;
+                #pragma unroll
+                for (int k = 0; k < kKS; ++k) nz |= nz_s[c][r][k];
+            }
+            ckeys[static_cast<int64_t>(r) * e + expert_base + c] = nz != 0u ? topk_key(round_bf16(v), expert_base + c)
+                                                                            : (select_in_mega ? 0u : kCCZeroRowKey);
         }
     }
     if (select_in_mega) {                     // kernel completion publishes the keys; the Mega prologue selects
@@ -728,7 +771,7 @@ void launch_legacy(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t*
 template <int kMode>
 void launch_cc(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
                int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-               int m, int h, int e, int l2_persist, int select_in_mega, cudaStream_t stream) {
+               int m, int h, int e, int l2_persist, int select_in_mega, int zero_row_unrouted, cudaStream_t stream) {
     int epc = 0, router_ctas = 0;
     cc_plan(e, epc, router_ctas);
     const int num_ctas = router_ctas + 1;
@@ -746,16 +789,16 @@ void launch_cc(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, 
     make_launch_config(cfg, attrs, num_ctas, kCCBlock, smem_bytes, stream, w,
                        static_cast<size_t>(e) * h * sizeof(__nv_bfloat16), l2_persist);
     cudaLaunchKernelEx(&cfg, router_cc_lean_kernel<kMode>,
-                       hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, router_ctas, epc, select_in_mega);
+                       hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, router_ctas, epc, select_in_mega, zero_row_unrouted);
 }
 
 template <int kMode>
 void launch_mode(const __nv_bfloat16* hidden, const __nv_bfloat16* w, uint8_t* x, float* sf,
                  int64_t* idx, float* wts, int* ticket, float* logits, unsigned long long* stamps,
-                 int m, int h, int e, int topk, int l2_persist, int wlayout, int select_in_mega, cudaStream_t stream) {
+                 int m, int h, int e, int topk, int l2_persist, int wlayout, int select_in_mega, int zero_row_unrouted, cudaStream_t stream) {
     switch (select_fe_path(m, h, e, topk)) {
         case kFEPathCC:
-            launch_cc<kMode>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, l2_persist, select_in_mega, stream);
+            launch_cc<kMode>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, l2_persist, select_in_mega, zero_row_unrouted, stream);
             return;
         case kFEPathSwapAB:   // legacy 96 x 4 grid, h / 256 / 4 == 3 blocks per warp (h == 3072)
             launch_legacy<1, kMode, true, 3>(hidden, w, x, sf, idx, wts, ticket, logits, stamps, m, h, e, topk, l2_persist, wlayout, stream);
@@ -795,7 +838,7 @@ void launch_router_quant_topk_frontend(
         const void* hidden, const void* router_weight,
         void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
         void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-        int stamps_on, int l2_persist, int wlayout, int select_in_mega, cudaStream_t stream) {
+        int stamps_on, int l2_persist, int wlayout, int select_in_mega, int zero_row_unrouted, cudaStream_t stream) {
     int* ticket = static_cast<int*>(workspace);
     float* logits = reinterpret_cast<float*>(static_cast<char*>(workspace) + kFrontendStampsOffsetBase);
     unsigned long long* stamps = nullptr;
@@ -807,9 +850,9 @@ void launch_router_quant_topk_frontend(
     if (mode == 0)
         launch_mode<0>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, l2_persist, wlayout, select_in_mega, stream);
+                       ticket, logits, stamps, m, h, e, topk, l2_persist, wlayout, select_in_mega, zero_row_unrouted, stream);
     else
         launch_mode<1>(hp, wp, static_cast<uint8_t*>(x_bytes), static_cast<float*>(x_sf),
                        static_cast<int64_t*>(topk_idx), static_cast<float*>(topk_weights),
-                       ticket, logits, stamps, m, h, e, topk, l2_persist, wlayout, select_in_mega, stream);
+                       ticket, logits, stamps, m, h, e, topk, l2_persist, wlayout, select_in_mega, zero_row_unrouted, stream);
 }

@@ -189,8 +189,10 @@ start to the MegaMoE end; **normal routing** = the frontend's real top-8 of rand
 the balanced assignment (`expert = s * 48 + (g + 7 s) % 48`, weight 1/8; `DG_PROFILE_FORCE_BALANCED=1`);
 **Mega-only** = the fused MegaMoE kernel alone with the same balanced assignment; **FE kernel** =
 the frontend kernel span (`router_cc_lean_kernel`, `DG_FE_SELECT_IN_MEGA=1`: the kernel ends after
-the keys, the MegaMoE prologue selects). The 256 MiB L2 flush, the TP4 reduce-scatter and the TP4
-all-gather sit between the replays, outside the graph.
+the keys, the MegaMoE prologue selects). At M2 / M4 only the ranks that own a token carry a real row
+(ranks 0, 4 / 0, 1, 4, 5); the other ranks' row is all-zero padding, which the frontend leaves
+unrouted (`DG_FE_ZERO_ROW_UNROUTED=1`, exact: x = 0 gives y = 0). The 256 MiB L2 flush, the TP4
+reduce-scatter and the TP4 all-gather sit between the replays, outside the graph.
 
 **Measurement method:** host `10.6.131.8`, eight H20-3e with the SM clock locked at 1830 MHz
 (`nvidia-smi -lgc 1830,1830`, verified by the capture script), container `fe5c_build` (the
@@ -230,6 +232,7 @@ Env knobs of this tree (all read once per process; the table above uses the defa
 | `DG_FE_ROUTER_WLAYOUT` | `fragment` | swapab path: router weights permuted once into m16n8k16 A-fragment order (`fable_router_weight_fragment_layout`); `row`, `pre` (caller permuted) |
 | `DG_FE_STAMPS` | 0 | per-CTA `%globaltimer` phase stamps of the frontend kernel (`fable_frontend_stamps`) |
 | `DG_FE_FORCE_BALANCED` | 0 | `tests/test_four_api_correctness.py`: the forced-balanced override, reference follows it |
+| `DG_FE_ZERO_ROW_UNROUTED` | 1 | cc frontend: an all-zero hidden row (a padding row of a rank that owns no token) is left unrouted (all-zero keys / `topk_idx` -1, weight 0) instead of tie-broken onto experts 0..7 on rank 0; exact (x = 0 gives y = 0 either way), non-zero rows bit-identical |
 | `DG_FP4_FINE_COMBINE` | 1 | per-token arrival counters replace the combine NVLink barrier (combine warps claim tokens from a per-launch ticket) |
 | `DG_FP4_PUSH_DISPATCH`, `DG_FP4_PUSH_DISPATCH_MAX_M` | 1, 16 | source rank pushes routed rows + tickets into the destination pool during routing (<= MAX_M global tokens) |
 | `DG_FP4_LEAN_ROUTING` | 1 | publish non-zero experts only; no cross-rank count broadcast under push |

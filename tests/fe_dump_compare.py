@@ -27,6 +27,9 @@ decoded), and a classification:
   whole-row missing   the differing elements cover whole rows, one side still holds the sentinel there
   rounding            numeric values differ by <= 1 ulp (fp8 / int8: |q_a - q_b| <= 1; fp32: rel <= 2^-20)
   layout shift        one side's data equals the other side shifted by a whole number of rows / K128 groups
+  zero-row routing    (--zero-rows K: the first K of the `rows` hidden rows are all-zero) topk_idx / topk_weights /
+                      keys differ on zero rows only -- the DG_FE_ZERO_ROW_UNROUTED contract (unrouted vs experts 0..7);
+                      does not fail the gate
   other               none of the above
 Optionally (--ref-torch) each dump's x / x_sf is also compared against the torch per-token casts the Mega reference
 uses (deep_gemm.utils.per_token_cast_to_fp8 / quantization_qoq_fused.per_token_cast_to_int8), which tells which of
@@ -35,6 +38,7 @@ the two configurations is the wrong one.
 Usage (single GPU):
   python3 tests/fe_dump_compare.py --root-a /path/to/reference/checkout --root-b . --seeds 64 --ref-torch
   python3 tests/fe_dump_compare.py --env-a "DG_FE_ROUTER_L2_PERSIST=0" --env-b "DG_FE_ROUTER_L2_PERSIST=1"
+  python3 tests/fe_dump_compare.py --env-a "DG_FE_ZERO_ROW_UNROUTED=0" --env-b "DG_FE_ZERO_ROW_UNROUTED=1" --zero-rows 1
   (DG_FE_SELECT_IN_MEGA 0 vs 1 is always covered: the sel1 buffers are compared with the sel0 ones inside each dump.)
 """
 import argparse
@@ -86,6 +90,7 @@ def dump(args):
         for rows in args.rows:
             torch.manual_seed(17000 + seed * 7919 + rows)
             x = torch.randn(rows, HIDDEN, device="cuda", dtype=torch.bfloat16)
+            x[:min(args.zero_rows, rows)] = 0            # --zero-rows: all-zero hidden rows (the E2E padding rows)
             for quant in args.quants:
                 cell = {}
                 prefill()
@@ -105,9 +110,9 @@ def dump(args):
                 cell["ticket_sel1"] = ws[:256].clone().cpu()
                 cell["hidden"] = x.cpu()
                 out[(seed, rows, quant)] = cell
-    env = {k: os.environ.get(k, "") for k in ("DG_FE_SELECT_IN_MEGA", "DG_FE_ROUTER_L2_PERSIST")}
+    env = {k: os.environ.get(k, "") for k in ("DG_FE_SELECT_IN_MEGA", "DG_FE_ROUTER_L2_PERSIST", "DG_FE_ZERO_ROW_UNROUTED")}
     env["build"] = os.path.abspath(ROOT)
-    torch.save({"env": env, "out": out, "rows": args.rows, "quants": args.quants}, args.dump)
+    torch.save({"env": env, "out": out, "rows": args.rows, "quants": args.quants, "zero_rows": args.zero_rows}, args.dump)
     print(f"FE_DUMP wrote {len(out)} cells to {args.dump} env={env}", flush=True)
 
 
@@ -172,7 +177,7 @@ def _bytes(name, raw):
     return raw if raw.dtype == torch.uint8 else raw.contiguous().view(torch.uint8)
 
 
-def classify(name, quant, rows, raw_a, raw_b):
+def classify(name, quant, rows, raw_a, raw_b, zero_rows=0):
     """Return (mismatch_count, first_flat_index, class, detail) for one buffer of one cell."""
     ba, bb = _bytes(name, raw_a).flatten(), _bytes(name, raw_b).flatten()
     diff_bytes = ba != bb
@@ -196,6 +201,9 @@ def classify(name, quant, rows, raw_a, raw_b):
     rows_hit = sorted(set(elem_diff.nonzero()[:, 0].tolist()))
     in_padding = all(rr >= rows for rr in rows_hit) if name not in ("ticket", "ticket_sel1", "keys") else False
     detail = f"rows_hit={rows_hit}{' (padding only)' if in_padding else ''}"
+    # 0. routing outputs of all-zero hidden rows only (DG_FE_ZERO_ROW_UNROUTED 0 vs 1)
+    if zero_rows > 0 and name in ("topk_idx", "topk_weights", "keys") and all(rr < min(zero_rows, rows) for rr in rows_hit):
+        return n, first, "zero-row routing", f"{detail} (zero rows only)"
     # 1. sentinel / uninitialised on one side
     if name not in ("ticket", "ticket_sel1", "keys"):
         sa, sb = _sentinel_mask(name, raw_a.reshape(shape)), _sentinel_mask(name, raw_b.reshape(shape))
@@ -243,6 +251,8 @@ def compare(args, dump_a, dump_b):
     print(f"FE_DUMP_COMPARE A env={a['env']}\n                B env={b['env']}")
     cells = sorted(a["out"].keys())
     assert cells == sorted(b["out"].keys()), "dump cell sets differ"
+    zero_rows = a.get("zero_rows", 0)
+    assert zero_rows == b.get("zero_rows", 0), "dumps taken with different --zero-rows"
     totals = {}     # buffer -> [mismatching cells, mismatching elements, classes, padding-only cells]
     failing = 0
     axes = {}       # (buffer) -> {axis -> set of values hit}
@@ -251,14 +261,14 @@ def compare(args, dump_a, dump_b):
         ca, cb = a["out"][cell], b["out"][cell]
         cell_fail = False
         for name in BUFFERS:
-            n, first, cls, detail = classify(name, quant, rows, ca[name], cb[name])
+            n, first, cls, detail = classify(name, quant, rows, ca[name], cb[name], zero_rows)
             t = totals.setdefault(name, [0, 0, {}, 0])
             if n:
                 padding_only = "(padding only)" in detail
                 t[0] += 1; t[1] += n; t[2][cls] = t[2].get(cls, 0) + 1; t[3] += int(padding_only)
                 ax = axes.setdefault(name, {"seed": set(), "rows": set(), "quant": set()})
                 ax["seed"].add(seed); ax["rows"].add(rows); ax["quant"].add(quant)
-                if not padding_only or args.strict_padding:
+                if (not padding_only or args.strict_padding) and cls != "zero-row routing":
                     cell_fail = True
                 if t[0] <= args.max_print:
                     va, vb = _decode(name, quant, ca[name], cb[name], first)
@@ -337,6 +347,7 @@ def main():
     ap.add_argument("--rows", type=int, nargs="+", default=[1, 2])
     ap.add_argument("--quants", nargs="+", default=["mxfp4", "qoq"])
     ap.add_argument("--scale", type=float, default=0.05, help="router weight std")
+    ap.add_argument("--zero-rows", type=int, default=0, help="the first K hidden rows of every cell are all-zero (E2E padding rows)")
     ap.add_argument("--out", default="/tmp/fe_dump", help="dump file prefix")
     ap.add_argument("--max-print", type=int, default=3, help="per buffer: first N mismatching cells printed")
     ap.add_argument("--strict-padding", action="store_true", help="padding rows (>= rows) also fail the gate")
@@ -355,7 +366,7 @@ def main():
         env = dict(os.environ); env.update(_parse_env(spec))
         script = os.path.join(os.path.abspath(root), "tests", "fe_dump_compare.py") if root else os.path.abspath(__file__)
         cmd = [sys.executable, script, "--dump", path, "--seeds", str(args.seeds), "--scale", str(args.scale),
-               "--rows", *map(str, args.rows), "--quants", *args.quants]
+               "--zero-rows", str(args.zero_rows), "--rows", *map(str, args.rows), "--quants", *args.quants]
         print(f"FE_DUMP child {tag}: root={root or ROOT} env={spec!r}", flush=True)
         subprocess.run(cmd, env=env, check=True)
     ok = compare(args, *paths)
