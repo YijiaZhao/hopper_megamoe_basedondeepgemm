@@ -7,6 +7,17 @@ checks that the explicit APIs do not depend on process-global DG_W4A8_INT.
 --frontend fe: the Fable frontend (router + top-k + softmax + quant, tiny-M path) produces
   x / x_sf / topk_idx / topk_weights from a bf16 hidden and a shared router weight; the
   reference uses those outputs (real, unbalanced routing). Fused APIs only.
+--zero-rows K [--zero-ranks r,r,...]: the first K hidden rows of every listed rank (default: all
+  ranks) are all-zero (the E2E harness's padding rows). With --frontend fe the pipeline runs twice
+  per seed, FE knob zero_row_unrouted 0 then 1 (DG_FE_ZERO_ROW_UNROUTED; effective on the cc path,
+  <= 2 rows per rank): the kernel output of every zero row must be exactly 0 with both, the FE must
+  leave zero rows unrouted with the knob on (cc path), and x / x_sf / the routing / y of the other
+  rows must be bit-identical between the two runs (ZERO_ROWS line; assertion). The two runs are
+  different launches (knob 0 routes 8 extra rows to experts 0..7 of rank 0), so the fused kernel's
+  last-partial-wave split-K tail (DG_FP4_SPLITK_L1, default 1) may land on other L1 tasks and sum
+  their fp32 K halves in the other order (measured: <= 2 bf16 ulps on 2 of 24576 elements in one
+  QoQ seed): --zero-rows-y-ulp 2 tolerates that in the default configuration; with
+  DG_FP4_SPLITK_L1=0 (no tail) the default 0 = bit-identical.
 """
 import argparse
 import os
@@ -19,6 +30,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import deep_gemm
+from deep_gemm.mega import FE_PATH_CC
 from deep_gemm.quantization_mxfp4 import (
     dequantize_mxfp4_to_fp32 as dequantize_mxfp4_split,
     dequantize_qoq_int4,
@@ -102,7 +114,12 @@ def _topk_from_keys(keys_i32, m, e, topk):
     o = top >> 16
     bits = torch.where((o & 0x8000) != 0, o & 0x7FFF, (~o) & 0xFFFF)
     logits = bits.to(torch.int16).view(torch.bfloat16).float()
-    return expert.contiguous(), torch.softmax(logits, dim=1).contiguous()
+    weights = torch.softmax(logits, dim=1)
+    # all-zero keys = unrouted token (the Mega prologue writes topk_idx -1 / weight 0 for it)
+    unrouted = (k[:, :1] == 0)
+    expert = torch.where(unrouted, torch.full_like(expert, -1), expert)
+    weights = torch.where(unrouted, torch.zeros_like(weights), weights)
+    return expert.contiguous(), weights.contiguous()
 
 
 def _balanced_routing(rank, m, local_experts, topk, experts, active=True):
@@ -137,6 +154,16 @@ def _run(api, args, rank, group):
     # DG_FE_SELECT_IN_MEGA=1 (the E2E pipeline configuration): the FE stops after the 384 compact keys per token and
     # the fused Mega prologue selects the top-8 (cc router, <= 2 rows per rank only; more rows = full FE as usual).
     sel_in_mega = use_fe and os.environ.get("DG_FE_SELECT_IN_MEGA", "0") == "1" and args.tokens <= 2 and args.experts == 384
+    # --zero-rows: rows of THIS rank that are all-zero; the FE leaves them unrouted on the cc path when the knob is on
+    zero_ranks = list(range(world)) if args.zero_ranks == "all" else [int(r) for r in args.zero_ranks.split(",")]
+    zero_mask = torch.zeros(args.tokens, dtype=torch.bool, device="cuda")
+    if args.zero_rows > 0 and rank in zero_ranks:
+        assert args.zero_rows <= args.tokens
+        zero_mask[:args.zero_rows] = True
+    fe_path_cc = use_fe and deep_gemm.fable_frontend_path(args.tokens, args.hidden, args.experts, args.topk) == FE_PATH_CC
+    zr_knob = int(os.environ.get("DG_FE_ZERO_ROW_UNROUTED", "1")) if args.zero_row_unrouted is None else args.zero_row_unrouted
+    fe_unroutes_zero = bool(zr_knob) and fe_path_cc
+    zero_ab = use_fe and args.zero_rows > 0            # knob 0 then knob 1 in one process, per seed
 
     torch.manual_seed(20260805)
     router_weight = (torch.randn(args.experts, args.hidden, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
@@ -224,12 +251,31 @@ def _run(api, args, rank, group):
             topk_idx, topk_weights = syn_idx, syn_w
             torch.manual_seed(seed + rank * 1000003)
             x_bf = torch.randn(args.tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
+            x_bf[zero_mask] = 0
             xq, xs = x_quant(x_bf)
             fe_idx = fe_w = None            # the FE's own top-8 (before any override), for the ROUTER_REF report
+            y = torch.zeros(args.tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
+            if zero_ab:
+                # knob OFF pipeline first (FE routes the zero rows onto experts 0..7 with weight 1/8): FE outputs + y
+                deep_gemm.fable_router_quant_topk_frontend(
+                    x_bf, router_weight, buffer, quant="qoq" if is_qoq else "mxfp4", select_in_mega=int(sel_in_mega),
+                    zero_row_unrouted=0)
+                torch.cuda.synchronize()
+                off = {"x": buffer.x[:m].clone(), "x_sf": buffer.x_sf[:m].clone()}
+                if sel_in_mega:
+                    off["idx"], off["w"] = _topk_from_keys(deep_gemm.fable_frontend_keys(buffer)[:m * args.experts], m, args.experts, args.topk)
+                else:
+                    off["idx"], off["w"] = buffer.topk_idx[:m].clone(), buffer.topk_weights[:m].clone()
+                kernel(y, *weights, buffer, activation_clamp=args.activation_clamp)
+                torch.cuda.synchronize()
+                dist.barrier(group=group)
+                off["y"] = y.clone()
+                y.zero_()
             if use_fe:
                 # Standalone Fable frontend -> buffer views; these define the reference routing unless overridden.
                 deep_gemm.fable_router_quant_topk_frontend(
-                    x_bf, router_weight, buffer, quant="qoq" if is_qoq else "mxfp4", select_in_mega=int(sel_in_mega))
+                    x_bf, router_weight, buffer, quant="qoq" if is_qoq else "mxfp4", select_in_mega=int(sel_in_mega),
+                    zero_row_unrouted=zr_knob)
                 torch.cuda.synchronize()
                 xq, xs = buffer.x[:m].clone(), buffer.x_sf[:m].clone()
                 if sel_in_mega:
@@ -261,7 +307,6 @@ def _run(api, args, rank, group):
                 buffer.x_sf[:m].copy_(xs)
                 buffer.topk_idx[:m].copy_(topk_idx)
                 buffer.topk_weights[:m].copy_(topk_weights)
-            y = torch.zeros(args.tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
             if is_fused:
                 kernel(y, *weights, buffer, activation_clamp=args.activation_clamp)
             else:
@@ -282,7 +327,39 @@ def _run(api, args, rank, group):
                               f"{int(n_bad)} tokens differ", flush=True)
             if rank == 0:
                 print(f"ROUTING api={api} tokens/rank={m} global_tokens={args.global_tokens or m * world} frontend={args.frontend} "
-                      f"select_in_mega={int(sel_in_mega)} force_balanced={int(args.force_balanced)} reference={args.reference}", flush=True)
+                      f"select_in_mega={int(sel_in_mega)} force_balanced={int(args.force_balanced)} reference={args.reference} "
+                      f"zero_rows={args.zero_rows} zero_row_unrouted={zr_knob} (effective={int(fe_unroutes_zero)})", flush=True)
+            if zero_ab:
+                # Zero-row gate (collective). Zero rows: y == 0 exactly with both knob settings; knob on (cc path): the FE
+                # left them unrouted. Other rows: x / x_sf / routing / y bit-identical between the knob-0 and knob-1 runs.
+                nz = ~zero_mask
+                y_zero_bad = int((y[zero_mask].view(torch.int16) != 0).sum() + (off["y"][zero_mask].view(torch.int16) != 0).sum())
+                fe_unrouted = int((fe_idx[zero_mask] < 0).all(dim=1).sum()) if zero_mask.any() else 0
+                fe_unrouted_bad = int(zero_mask.sum()) - fe_unrouted if fe_unroutes_zero else 0
+                fe_routed_bad = fe_unrouted if not fe_unroutes_zero else 0     # knob off / non-cc path: zero rows stay routed
+                x_diff = int((xq.view(torch.uint8) != off["x"].view(torch.uint8)).sum() + (xs != off["x_sf"]).sum())
+                route_diff = int((fe_idx[nz] != off["idx"][nz]).sum() + (fe_w[nz] != off["w"][nz]).sum())
+                y_on_i, y_off_i = y[nz].view(torch.int16).int(), off["y"][nz].view(torch.int16).int()
+                y_diff_elems = int((y_on_i != y_off_i).sum())
+                # bf16 ulps between the two runs (sign-magnitude integer distance of the bf16 encodings)
+                y_ulp = (torch.where(y_on_i < 0, -(y_on_i & 0x7FFF), y_on_i) - torch.where(y_off_i < 0, -(y_off_i & 0x7FFF), y_off_i)).abs()
+                y_ulp_max = y_ulp.max() if nz.any() else torch.zeros((), device="cuda", dtype=torch.int32)
+                y_diff_max = (y[nz].float() - off["y"][nz].float()).abs().max() if nz.any() else torch.zeros((), device="cuda")
+                st = torch.tensor([int(zero_mask.sum()), fe_unrouted, y_zero_bad, fe_unrouted_bad, fe_routed_bad, x_diff, route_diff,
+                                   y_diff_elems, int(nz.sum()) * args.hidden, int(y_ulp_max)], device="cuda", dtype=torch.int64)
+                dist.all_reduce(st[:9], group=group)
+                dist.all_reduce(st[9:], op=dist.ReduceOp.MAX, group=group)
+                dist.all_reduce(y_diff_max, op=dist.ReduceOp.MAX, group=group)
+                st = st.tolist()
+                y_ok = st[7] == 0 or st[9] <= args.zero_rows_y_ulp
+                ok_zero = st[2] == 0 and st[3] == 0 and st[4] == 0 and st[5] == 0 and st[6] == 0 and y_ok
+                if rank == 0:
+                    print(f"ZERO_ROWS api={api} seed={seed} zero_rows={st[0]} fe_unrouted={st[1]} y_zero_nonzero_elems={st[2]} "
+                          f"fe_unrouted_missing={st[3]} fe_unexpected_unrouted={st[4]} | knob0 vs knob1 on the other rows: "
+                          f"x/x_sf diffs={st[5]} routing diffs={st[6]} y diff elems={st[7]}/{st[8]} max ulp={st[9]} max|dy|={y_diff_max.item():.3g} "
+                          f"(allowed ulp {args.zero_rows_y_ulp}) -> {'PASS' if ok_zero else 'FAIL'}", flush=True)
+                if not ok_zero:
+                    failures.append((seed, {"zero_rows": st}))
             if use_fe and args.router_ref == "torch":
                 # Pure-torch router reference, independent of the FE kernel: bf16 router GEMM (fp32 accumulate) ->
                 # bf16-rounded logits -> top-8 (value desc, index asc on ties) -> fp32 softmax over the 8 selected
@@ -295,6 +372,10 @@ def _run(api, args, rank, group):
                 order = torch.sort(logits_ref, dim=-1, descending=True, stable=True).indices
                 ref_idx = order[:, :args.topk].contiguous()
                 ref_w = torch.softmax(torch.gather(logits_ref, 1, ref_idx), dim=-1).contiguous()
+                if fe_unroutes_zero:
+                    # the reference follows the FE contract: an all-zero row is unrouted (y = 0 either way, exact)
+                    ref_idx[zero_mask] = -1
+                    ref_w[zero_mask] = 0.0
                 if is_qoq:
                     xq_ref, xs_ref = per_token_cast_to_int8(x_bf, gran_k=128)
                 else:
@@ -303,7 +384,7 @@ def _run(api, args, rank, group):
                 agree = (fe_sorted.values == ref_sorted.values).all(dim=1)
                 # per-token weight max |diff| over the union of both expert sets (a missing expert counts as weight 0)
                 dense_fe = torch.zeros(m, args.experts, device="cuda").scatter_(1, fe_idx.clamp_min(0), fe_w)
-                dense_ref = torch.zeros(m, args.experts, device="cuda").scatter_(1, ref_idx, ref_w)
+                dense_ref = torch.zeros(m, args.experts, device="cuda").scatter_(1, ref_idx.clamp_min(0), ref_w)
                 w_diff_tok = (dense_fe - dense_ref).abs().amax(dim=1)
                 w_diff_agree = torch.where(agree, w_diff_tok, torch.zeros_like(w_diff_tok)).max()
                 w_diff_all = w_diff_tok.max()
@@ -402,6 +483,12 @@ def _run(api, args, rank, group):
                 assert torch.isfinite(y).all(), api
                 y = torch.ones_like(y)
                 ref = torch.ones_like(ref)
+            if zero_mask.any():
+                # all-zero rows: kernel and reference are exactly 0 (checked above / here); the cosine of two zero
+                # vectors is undefined -> contribute a neutral pair to the collective metrics
+                assert bool((ref[zero_mask] == 0).all()), api
+                y = y.clone(); ref = ref.clone()
+                y[zero_mask] = 1.0; ref[zero_mask] = 1.0
             metrics = _metrics(y, ref, group)
             if rank == 0:
                 print(
@@ -458,6 +545,15 @@ def main():
                              "assignment (one route per EP rank, weight 1/8) in the buffers the Mega reads; the reference uses the same routing")
     parser.add_argument("--frontend", choices=("none", "fe"), default="none",
                         help="fused APIs: route/quantise with the Fable frontend (fe)")
+    parser.add_argument("--zero-rows", type=int, default=0,
+                        help="all-zero hidden rows per rank (the first K rows of every --zero-ranks rank); with --frontend fe the "
+                             "ZERO_ROWS gate runs the pipeline with FE knob zero_row_unrouted 0 and 1 per seed")
+    parser.add_argument("--zero-ranks", default="all", help="comma-separated ranks that carry the --zero-rows rows (default all)")
+    parser.add_argument("--zero-row-unrouted", type=int, default=None,
+                        help="FE knob for the checked run (default: env DG_FE_ZERO_ROW_UNROUTED, 1)")
+    parser.add_argument("--zero-rows-y-ulp", type=int, default=0,
+                        help="ZERO_ROWS gate: bf16 ulps tolerated on the other rows between the knob-0 and knob-1 runs (0 = bit-identical; "
+                             "2 when the fused kernel's split-K tail DG_FP4_SPLITK_L1=1 may move between the two task sets)")
     args = parser.parse_args()
     if args.reference == "torch-moe":
         args.router_ref = "torch"

@@ -65,6 +65,9 @@ PROBE_DUMP = int(os.environ.get("PROBE_DUMP", "0"))
 # 1: rank0 prints the per-CTA task timeline of the last measured launch (kernel task log,
 # slots 64 + sm * 16 + ..., enabled by the magic word in slot 47; see the body).
 PROBE_TASKLOG = int(os.environ.get("PROBE_TASKLOG", "0"))
+# non-empty: every rank saves its raw stamp rows (all measured iterations, task log included) to
+# <dir>/stamps_<quant>_m<M>_rank<r>.pt for offline per-CTA timeline analysis (scripts/analyze_probe_tasklog.py)
+PROBE_DUMP_DIR = os.environ.get("PROBE_DUMP_DIR", "")
 TASKLOG_BASE, TASKLOG_PER_CTA, TASKLOG_MAX_SMS, TASKLOG_MAGIC = 64, 16, 160, 0x5441534B
 
 
@@ -139,6 +142,13 @@ def main():
                     help="the standalone FE runs eagerly before every replay (real routing / quant), the graph holds Mega only")
     ap.add_argument("--no-stamps", action="store_true",
                     help="launch without phase_stamps (wall-time only) to measure probe overhead")
+    ap.add_argument("--e2e-routing", action="store_true",
+                    help="per-iteration hidden rows exactly as tests/profile_four_api_h20.py run_e2e builds them "
+                         "(zero rows on the owner-layout inactive ranks, per-input seeds), the standalone FE runs "
+                         "eagerly before every replay (real top-8), the graph holds Mega only")
+    ap.add_argument("--all-ranks", action="store_true",
+                    help="print, for every rank and every measured iteration, the routed rows / pool blocks / task "
+                         "counts of that rank and its key stamps (first math, last L1, last L2, kernel end) + task log")
     args = ap.parse_args()
     args.backend = "fused"
 
@@ -176,6 +186,8 @@ def main():
             buffer.topk_weights[:active_rows].fill_(1.0 / P.TOPK)
         y = torch.empty(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
         router_weight = None
+        if args.e2e_routing:
+            args.fe_routing = True
         if args.fe_routing:
             torch.manual_seed(20260805)
             router_weight = (torch.randn(P.EXPERTS, P.HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.05).contiguous()
@@ -205,12 +217,17 @@ def main():
         rows = []
         raw_rows = []
         wall = []
+        routing_rows = []
         for i in range(args.warmup + args.iters):
             reset(stamps)
             P.flush_l2_cache()
+            if args.e2e_routing:
+                x.copy_(e2e_hidden_rows(rank, args.global_tokens, local_rows, i))
             if args.fe_routing:
                 deep_gemm.fable_router_quant_topk_frontend(x, router_weight, buffer, quant=args.quant)
             torch.cuda.synchronize()
+            if args.all_ranks:
+                routing_rows.append(buffer.topk_idx[:local_rows].clone())
             dist.barrier(group=group)
             start.record()
             run()
@@ -235,6 +252,13 @@ def main():
                           f"slot13 {row[13]:.2f} slot7_minus_16 {row[7] - row[16]:.2f} "
                           f"wall {wall[-1]:.2f}", flush=True)
         dist.barrier(group=group)
+        if PROBE_DUMP_DIR and not args.no_stamps:
+            os.makedirs(PROBE_DUMP_DIR, exist_ok=True)
+            torch.save({"raw": raw_rows, "wall": wall,
+                        "routing": [t.cpu() for t in routing_rows[len(routing_rows) - len(raw_rows):]] if routing_rows else []},
+                       os.path.join(PROBE_DUMP_DIR, f"stamps_{args.quant}_m{args.global_tokens}_rank{rank}.pt"))
+        if args.all_ranks and not args.no_stamps:
+            all_ranks_report(args, rank, group, local_rows, local_experts, routing_rows, raw_rows)
 
         if rank == 0 and args.no_stamps:
             print(f"\n=== fused {args.quant} M={args.global_tokens} NO-STAMPS wall (us): "
@@ -284,6 +308,117 @@ def main():
     finally:
         buffer.destroy()
         dist.destroy_process_group()
+
+
+def e2e_hidden_rows(rank, global_tokens, local_rows, input_id):
+    """x of ``rank`` for replay ``input_id`` as run_e2e's TP4 reduce-scatter delivers it: the 4 identical
+    partials sum to 4 x the token row; rows of tokens that do not exist (M < 8: TP positions >= M // 2) are zero."""
+    dp_rank = rank // P.TP
+    tp_pos = rank % P.TP
+    unique_per_dp = global_tokens // 2
+    x = torch.zeros(local_rows, P.HIDDEN, device="cuda", dtype=torch.bfloat16)
+    for token_id in range(unique_per_dp):
+        if token_id % P.TP != tp_pos:
+            continue
+        row = token_id // P.TP
+        torch.manual_seed(17000 + dp_rank * 1000003 + input_id * 7919 + token_id * 101)
+        t = torch.randn(P.HIDDEN, device="cuda", dtype=torch.bfloat16)
+        x[row] = (t.float() * 4.0).to(torch.bfloat16)
+    return x
+
+
+def tasklog_summary(s, t0):
+    """(num CTAs, tasks/CTA histogram, L1 task count, L2 task count, L1 end p100, L2 end p100, top-3 chains)."""
+    ctas = []
+    for sm in range(TASKLOG_MAX_SMS):
+        base = TASKLOG_BASE + sm * TASKLOG_PER_CTA
+        count = s[base + 15]
+        if count <= 0:
+            continue
+        entry = s[base + 14]
+        tasks = []
+        for t in range(min(count, 7)):
+            w0, w1 = s[base + 2 * t], s[base + 2 * t + 1]
+            meta = (w0 >> 32) & 0xffffffff
+            tasks.append(dict(l2=bool(meta >> 31 & 1), pb=(meta >> 24) & 0x7f, nb=(meta >> 16) & 0xff,
+                              ks=(meta >> 8) & 0xff, nks=meta & 0xff,
+                              start=(entry + (w0 & 0xffffffff) - t0) / 1000.0, end=(entry + w1 - t0) / 1000.0))
+        ctas.append((sm, count, tasks))
+    if not ctas:
+        return None
+    hist = {n: sum(1 for c in ctas if c[1] == n) for n in sorted(set(c[1] for c in ctas))}
+    n_l1 = sum(1 for c in ctas for t in c[2] if not t["l2"])
+    n_l2 = sum(1 for c in ctas for t in c[2] if t["l2"])
+    l1_end = max([t["end"] for c in ctas for t in c[2] if not t["l2"]] or [0.0])
+    l2_end = max([t["end"] for c in ctas for t in c[2] if t["l2"]] or [0.0])
+    ctas.sort(key=lambda c: -(c[2][-1]["end"] if c[2] else 0.0))
+    chains = []
+    for sm, count, tasks in ctas[:3]:
+        chains.append(f"sm{sm}:" + " ".join(
+            f"{'L2' if t['l2'] else 'L1'}[b{t['pb']},n{t['nb']}{('/' + str(t['ks']) + 'of' + str(t['nks'])) if t['nks'] > 1 else ''}]"
+            f"{t['start']:.1f}-{t['end']:.1f}" for t in tasks))
+    return len(ctas), hist, n_l1, n_l2, l1_end, l2_end, chains
+
+
+def all_ranks_report(args, rank, group, local_rows, local_experts, routing_rows, raw_rows):
+    """Every rank: routed (token, expert) pairs it received, pool blocks (distinct local experts, BM8), the resulting
+    L1 / L2 task counts, and its own stamps (us from its kernel entry) per measured iteration; rank 0 prints."""
+    world = dist.get_world_size(group)
+    n_meas = len(raw_rows)
+    idx_all = [torch.empty_like(routing_rows[0]) for _ in range(world)]
+    per_iter = []
+    for k in range(n_meas):
+        it = routing_rows[len(routing_rows) - n_meas + k]
+        dist.all_gather(idx_all, it, group=group)
+        flat = torch.cat([t.reshape(-1) for t in idx_all]).cpu()
+        flat = flat[flat >= 0]
+        mine = flat[(flat // local_experts) == rank]
+        counts = torch.bincount(mine % local_experts, minlength=local_experts)
+        blocks = int(((counts + 7) // 8).sum())
+        s = raw_rows[k]
+        t0 = s[0]
+        st = {sl: (s[sl] - t0) / 1000.0 for sl in (1, 3, 4, 5, 7)}
+        tl = tasklog_summary(s, t0) if PROBE_TASKLOG else None
+        per_iter.append(dict(pairs=int(mine.numel()), experts=int((counts > 0).sum()), blocks=blocks,
+                             max_tok=int(counts.max()) if counts.numel() else 0, st=st, tl=tl,
+                             tot_pairs=int(flat.numel())))
+    gathered = [None] * world
+    dist.all_gather_object(gathered, per_iter, group=group)
+    if rank != 0:
+        return
+    wide = args.global_tokens == 16
+    l1_per_block = 5 if wide else 10
+    print(f"\n=== ALL-RANKS {args.quant} M={args.global_tokens} e2e_routing={args.e2e_routing} "
+          f"({n_meas} measured iterations; us from each rank's kernel entry) ===")
+    for k in range(n_meas):
+        print(f"--- iter {k} (global routed pairs {gathered[0][k]['tot_pairs']}) ---")
+        print(f"{'rank':>4} {'pairs':>5} {'exp':>4} {'blk':>4} {'maxtok':>6} {'L1t':>5} {'L2t':>5} {'SK':>3} | "
+              f"{'route':>7} {'1stmath':>7} {'lastL1':>7} {'lastL2':>7} {'end':>7} | tasks/CTA hist, tasklog L1/L2 count, L1end, L2end")
+        for r in range(world):
+            d = gathered[r][k]
+            l1t = d["blocks"] * l1_per_block
+            l2t = d["blocks"] * 12
+            sk = "on" if (args.global_tokens <= 8 and l1t < 78) else "-"
+            tl = d["tl"]
+            tls = "" if tl is None else f"{tl[1]} {tl[2]}/{tl[3]} {tl[4]:.1f} {tl[5]:.1f}"
+            print(f"{r:>4} {d['pairs']:>5} {d['experts']:>4} {d['blocks']:>4} {d['max_tok']:>6} {l1t:>5} {l2t:>5} {sk:>3} | "
+                  f"{d['st'][1]:>7.1f} {d['st'][3]:>7.1f} {d['st'][4]:>7.1f} {d['st'][5]:>7.1f} {d['st'][7]:>7.1f} | {tls}")
+        if PROBE_TASKLOG:
+            for r in range(world):
+                tl = gathered[r][k]["tl"]
+                if tl:
+                    for c in tl[6][:2]:
+                        print(f"      r{r} {c}")
+    # medians over iterations per rank
+    print("--- per-rank median over iterations: blocks, kernel end (us), max over ranks of end ---")
+    ends = []
+    for r in range(world):
+        b = statistics.median(d["blocks"] for d in gathered[r])
+        e = statistics.median(d["st"][7] for d in gathered[r])
+        ends.append(e)
+        print(f"  rank {r}: blocks {b:.0f}  end {e:.1f}  lastL1 {statistics.median(d['st'][4] for d in gathered[r]):.1f}  "
+              f"lastL2 {statistics.median(d['st'][5] for d in gathered[r]):.1f}")
+    print(f"  slowest-rank end median {max(ends):.1f}  fastest {min(ends):.1f}")
 
 
 def deep_gemm_fused_kernel(quant):

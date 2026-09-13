@@ -22,7 +22,11 @@ constexpr size_t kFrontendStampsBytes = kFrontendMaxCTAs * 8 * sizeof(unsigned l
 //                 registers, compact 384-key array per token, relaxed atomic ticket, the last
 //                 router CTA selects top-8 + softmax; `select_in_mega` = 1 stops after the keys
 //                 and the fused MegaMoE prologue selects, deep_gemm/impls/fable_cc_select.cuh);
-//                 the spare CTA quantises the rows. Router weights sit in the persisting L2
+//                 the spare CTA quantises the rows. `zero_row_unrouted` = 1 (DG_FE_ZERO_ROW_UNROUTED,
+//                 the wrapper's default): an all-zero hidden row is left unrouted (topk_idx -1 /
+//                 weight 0, or all-zero keys under select_in_mega) instead of tie-broken onto
+//                 experts 0..7 -- exact, x = 0 gives y = 0 either way; the E2E harness's padding
+//                 rows on the ranks that own no token. Router weights sit in the persisting L2
 //                 set-aside when `l2_persist` = 1 (DG_FE_ROUTER_L2_PERSIST, the wrapper's
 //                 default on this path).
 //   kFEPathSwapAB m <= 16, h = 3072, top-8: legacy 96 x 4 grid (24 expert groups x 4 K-parts +
@@ -46,4 +50,4 @@ void launch_router_quant_topk_frontend(
     const void* hidden, const void* router_weight,
     void* x_bytes, void* x_sf, void* topk_idx, void* topk_weights,
     void* workspace, size_t workspace_bytes, int m, int h, int e, int topk, int mode,
-    int stamps_on, int l2_persist, int wlayout, int select_in_mega, cudaStream_t stream);
+    int stamps_on, int l2_persist, int wlayout, int select_in_mega, int zero_row_unrouted, cudaStream_t stream);
