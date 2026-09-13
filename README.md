@@ -204,7 +204,7 @@ measurement method).
 | FE kernel | both | 0-token rows ROUTED (no skip) | 2.5–2.7 | 2.5–2.7 | 2.5–2.7 | 2.8–3.0 |
 | FE kernel | both | **0-token rows UNROUTED (skip, default)** | 2.8 | 2.8–2.9 | 2.7–2.8 | 3.0–3.1 |
 
-0-token rows: at M2 / M4 only the ranks that own a token have a real input row; the other ranks' row is all-zero padding (a "0-token row"). **routed to experts** = `DG_FE_ZERO_ROW_UNROUTED=0`, the frontend treats the 0-token row like a real token and routes it (to experts 0..7 on rank 0), so the MegaMoE does useless work for it. **skipped** = the default `DG_FE_ZERO_ROW_UNROUTED=1`, the frontend detects the all-zero row and marks it as not routed; the MegaMoE dispatches nothing for it and writes a zero output (exact: x = 0 gives y = 0). Only the normal-routing rows at M2 / M4 are affected.
+0-token rows: at M2 / M4 only the ranks that own a token have a real input row; the other ranks' row is all-zero padding (a "0-token row"). **0-token rows ROUTED** = `DG_FE_ZERO_ROW_UNROUTED=0`, the frontend treats the 0-token row like a real token and routes it (to experts 0..7 on rank 0), so the MegaMoE does useless work for it. **0-token rows UNROUTED** = the default `DG_FE_ZERO_ROW_UNROUTED=1`, the frontend detects the all-zero row and marks it as not routed; the MegaMoE dispatches nothing for it and writes a zero output (exact: x = 0 gives y = 0). Only the normal-routing rows at M2 / M4 are affected.
 
 Rows: **E2E** = frontend kernel + fused MegaMoE kernel in one CUDA graph, span from the frontend
 start to the MegaMoE end; **normal routing** = the frontend's real top-8 of random hidden rows;
