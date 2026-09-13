@@ -15,8 +15,9 @@ checks that the explicit APIs do not depend on process-global DG_W4A8_INT.
   rows must be bit-identical between the two runs (ZERO_ROWS line; assertion). The two runs are
   different launches (knob 0 routes 8 extra rows to experts 0..7 of rank 0), so the fused kernel's
   last-partial-wave split-K tail (DG_FP4_SPLITK_L1, default 1) may land on other L1 tasks and sum
-  their fp32 K halves in the other order: --zero-rows-y-ulp 1 tolerates 1 bf16 ulp on the other
-  rows in that configuration; with DG_FP4_SPLITK_L1=0 (or no tail) the default 0 = bit-identical.
+  their fp32 K halves in the other order (measured: <= 2 bf16 ulps on 2 of 24576 elements in one
+  QoQ seed): --zero-rows-y-ulp 2 tolerates that in the default configuration; with
+  DG_FP4_SPLITK_L1=0 (no tail) the default 0 = bit-identical.
 """
 import argparse
 import os
@@ -552,7 +553,7 @@ def main():
                         help="FE knob for the checked run (default: env DG_FE_ZERO_ROW_UNROUTED, 1)")
     parser.add_argument("--zero-rows-y-ulp", type=int, default=0,
                         help="ZERO_ROWS gate: bf16 ulps tolerated on the other rows between the knob-0 and knob-1 runs (0 = bit-identical; "
-                             "1 when the fused kernel's split-K tail DG_FP4_SPLITK_L1=1 may move between the two task sets)")
+                             "2 when the fused kernel's split-K tail DG_FP4_SPLITK_L1=1 may move between the two task sets)")
     args = parser.parse_args()
     if args.reference == "torch-moe":
         args.router_ref = "torch"

@@ -203,10 +203,12 @@ def classify(name, quant, rows, raw_a, raw_b, zero_rows=0):
     first = int(elem_diff.flatten().nonzero()[0]) if n else int(diff_bytes.nonzero()[0])
     r, c = divmod(first, shape[1])
     rows_hit = sorted(set(elem_diff.nonzero()[:, 0].tolist()))
-    in_padding = all(rr >= rows for rr in rows_hit) if name not in ("ticket", "ticket_sel1", "keys") else False
+    # keys: token rows >= rows are not written by the launch (stale from an earlier cell) -> padding, like the other buffers
+    in_padding = all(rr >= rows for rr in rows_hit) if name not in ("ticket", "ticket_sel1") else False
     detail = f"rows_hit={rows_hit}{' (padding only)' if in_padding else ''}"
-    # 0. routing outputs of all-zero hidden rows only (DG_FE_ZERO_ROW_UNROUTED 0 vs 1)
-    if zero_rows > 0 and name in ("topk_idx", "topk_weights", "keys") and all(rr < min(zero_rows, rows) for rr in rows_hit):
+    # 0. routing outputs of all-zero hidden rows only (DG_FE_ZERO_ROW_UNROUTED 0 vs 1); written rows only
+    if zero_rows > 0 and name in ("topk_idx", "topk_weights", "keys") and not in_padding \
+            and all(rr < min(zero_rows, rows) for rr in rows_hit if rr < rows):
         return n, first, "zero-row routing", f"{detail} (zero rows only)"
     # 1. sentinel / uninitialised on one side
     if name not in ("ticket", "ticket_sel1", "keys"):
