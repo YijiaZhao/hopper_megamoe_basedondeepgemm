@@ -186,17 +186,26 @@ python3 tests/fe_dump_compare.py --root-a <reference checkout> --root-b . --seed
 
 Microseconds; M = global tokens over the 8 ranks (M2 / M4 / M8 = 1 row per rank, M16 = 2 rows);
 fused backend (`mxfp4_mega_moe_fused` / `qoq_mega_moe_fused`); GPU 0, median of the last 3
-replays, median over 3 passes.
+replays, median over the clean passes (inter-rank Mega-start skew <= 20 us; pass counts in the
+measurement method).
 
-| | Precision | M2 | M4 | M8 | M16 |
-|---|---|---:|---:|---:|---:|
-| E2E, normal routing | MXFP4 | 53.4 | 60.3 | 68.8 | 81.2 |
-| E2E, normal routing | QoQ | 52.1 | 58.7 | 66.7 | 80.0 |
-| E2E, forced-balanced | MXFP4 | 44.7 | 54.0 | 62.3 | 80.8 |
-| E2E, forced-balanced | QoQ | 46.1 | 54.4 | 60.6 | 80.5 |
-| Mega-only, balanced | MXFP4 | 38.3 | 46.9 | 56.8 | 74.4 |
-| Mega-only, balanced | QoQ | 37.4 | 46.4 | 53.3 | 73.0 |
-| FE kernel | both | 2.7–2.8 | 2.7–2.8 | 2.7–2.8 | 3.0–3.1 |
+| | Precision | Padding rows | M2 | M4 | M8 | M16 |
+|---|---|---|---:|---:|---:|---:|
+| E2E, normal routing | MXFP4 | routed | 64.0 | 64.4 | 68.0 | 80.9 |
+| E2E, normal routing | MXFP4 | unrouted (default) | 53.4 | 59.4 | 67.8 | 80.8 |
+| E2E, normal routing | QoQ | routed | 62.3 | 61.8 | 66.5 | 79.7 |
+| E2E, normal routing | QoQ | unrouted (default) | 51.8 | 59.1 | 66.4 | 79.6 |
+| E2E, forced-balanced | MXFP4 | routed | 45.0 | 53.9 | 63.0 | 80.7 |
+| E2E, forced-balanced | MXFP4 | unrouted (default) | 44.6 | 54.0 | 62.2 | 80.9 |
+| E2E, forced-balanced | QoQ | routed | 44.4 | 54.2 | 60.9 | 80.3 |
+| E2E, forced-balanced | QoQ | unrouted (default) | 44.8 | 54.2 | 60.4 | 80.6 |
+| Mega-only, balanced | MXFP4 | - | 38.8 | 47.4 | 56.7 | 76.2 |
+| Mega-only, balanced | QoQ | - | 37.1 | 45.2 | 54.0 | 72.6 |
+| FE kernel | both | routed | 2.5–2.7 | 2.5–2.7 | 2.5–2.7 | 2.8–3.0 |
+| FE kernel | both | unrouted (default) | 2.8 | 2.8–2.9 | 2.7–2.8 | 3.0–3.1 |
+
+Padding rows: routed = `DG_FE_ZERO_ROW_UNROUTED=0` (the all-zero padding rows of the token-less
+ranks are routed to experts 0..7 on rank 0); unrouted = the default `1` (exact: x = 0 gives y = 0).
 
 Rows: **E2E** = frontend kernel + fused MegaMoE kernel in one CUDA graph, span from the frontend
 start to the MegaMoE end; **normal routing** = the frontend's real top-8 of random hidden rows;
@@ -211,11 +220,13 @@ reduce-scatter and the TP4 all-gather sit between the replays, outside the graph
 
 **Measurement method:** host `10.6.131.8`, eight H20-3e with the SM clock locked at 1830 MHz
 (`nvidia-smi -lgc 1830,1830`, verified by the capture script), container `fe5c_build` (the
-pinned image above). E2E normal-routing and FE rows: kernels of `perf/zero-row-unrouted` `0a4b21e`
-(frontend build `6122017`; the default code paths of this tree), session 2026-09-13 03:45-04:12 UTC,
-5 interleaved passes; forced-balanced and Mega-only rows: `perf/phase-stamps-probe` `eba23b1`
-(build `fee8931`), session 2026-09-12 08:05-08:21 UTC -- the fused MegaMoE kernel is unchanged
-between the two builds and those rows do not depend on the frontend's routing of padding rows.
+pinned image above). All rows: `main` `9d2f7e9` (one build, `_C` extension sha256 `3acb4e2`;
+the default code paths of this tree), one session 2026-09-13 05:27-07:44 UTC: 5 interleaved
+passes (per pass: E2E normal routed, E2E normal unrouted, E2E forced-balanced routed, E2E
+forced-balanced unrouted, Mega-only; `tests/fe5_campaign_zr_interleave.sh`) plus 3 extra E2E
+passes for the cells with fewer than 3 clean passes; a cell is the median over its clean passes,
+i.e. the passes whose last 3 replays all have an inter-rank Mega-start skew <= 20 us (E2E and FE:
+5-8 clean of 8 passes per cell at M4 / M8 / M16, 2-7 of 8 at M2; Mega-only: 5 of 5).
 `scripts/capture_four_api_h20_timelines.sh` runs `tests/profile_four_api_h20.py` under Nsight
 Systems (`--trace=cuda,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none`) with
 `DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30`: after 2 warm-up replays, the 30 measured replays of a
@@ -224,9 +235,10 @@ all-gather; no per-iteration `torch.cuda.synchronize()` / `dist.barrier()`), so 
 through the on-stream collectives. `scripts/summarize_four_api_h20_last3.py` reads the report of
 GPU 0, takes the last 3 replays, measures each span (E2E: frontend kernel start -> MegaMoE kernel
 end; Mega-only: kernel start -> end; FE: frontend kernel start -> end) and reports their median;
-`tests/fe5_summarize_campaign.py` takes the median over the passes (Mega-only: 1 pass). Env of
+`tests/fe5_summarize_campaign.py` takes the median over the passes (Mega-only: 5 passes). Env of
 the runs: `DG_FE_SELECT_IN_MEGA=1 DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30`, plus
-`DG_PROFILE_FORCE_BALANCED=1` for the forced-balanced rows; every other knob at its library default.
+`DG_PROFILE_FORCE_BALANCED=1` for the forced-balanced rows and `DG_FE_ZERO_ROW_UNROUTED=0` for the
+routed rows; every other knob at its library default.
 
 Reproduce (inside the container, repo root; 8 idle GPUs, clock locked):
 
