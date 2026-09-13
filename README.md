@@ -191,18 +191,18 @@ measurement method).
 
 | | Precision | 0-token rows | M2 | M4 | M8 | M16 |
 |---|---|---|---:|---:|---:|---:|
-| E2E, normal routing | MXFP4 | routed to experts (before) | 64.0 | 64.4 | 68.0 | 80.9 |
-| E2E, normal routing | MXFP4 | skipped (default, now) | 53.4 | 59.4 | 67.8 | 80.8 |
-| E2E, normal routing | QoQ | routed to experts (before) | 62.3 | 61.8 | 66.5 | 79.7 |
-| E2E, normal routing | QoQ | skipped (default, now) | 51.8 | 59.1 | 66.4 | 79.6 |
-| E2E, forced-balanced | MXFP4 | routed to experts (before) | 45.0 | 53.9 | 63.0 | 80.7 |
-| E2E, forced-balanced | MXFP4 | skipped (default, now) | 44.6 | 54.0 | 62.2 | 80.9 |
-| E2E, forced-balanced | QoQ | routed to experts (before) | 44.4 | 54.2 | 60.9 | 80.3 |
-| E2E, forced-balanced | QoQ | skipped (default, now) | 44.8 | 54.2 | 60.4 | 80.6 |
+| E2E, normal routing | MXFP4 | 0-token rows ROUTED (no skip) | 64.0 | 64.4 | 68.0 | 80.9 |
+| E2E, normal routing | MXFP4 | **0-token rows UNROUTED (skip, default)** | 53.4 | 59.4 | 67.8 | 80.8 |
+| E2E, normal routing | QoQ | 0-token rows ROUTED (no skip) | 62.3 | 61.8 | 66.5 | 79.7 |
+| E2E, normal routing | QoQ | **0-token rows UNROUTED (skip, default)** | 51.8 | 59.1 | 66.4 | 79.6 |
+| E2E, forced-balanced | MXFP4 | 0-token rows ROUTED (no skip) | 45.0 | 53.9 | 63.0 | 80.7 |
+| E2E, forced-balanced | MXFP4 | **0-token rows UNROUTED (skip, default)** | 44.6 | 54.0 | 62.2 | 80.9 |
+| E2E, forced-balanced | QoQ | 0-token rows ROUTED (no skip) | 44.4 | 54.2 | 60.9 | 80.3 |
+| E2E, forced-balanced | QoQ | **0-token rows UNROUTED (skip, default)** | 44.8 | 54.2 | 60.4 | 80.6 |
 | Mega-only, balanced | MXFP4 | - | 38.8 | 47.4 | 56.7 | 76.2 |
 | Mega-only, balanced | QoQ | - | 37.1 | 45.2 | 54.0 | 72.6 |
-| FE kernel | both | routed to experts (before) | 2.5–2.7 | 2.5–2.7 | 2.5–2.7 | 2.8–3.0 |
-| FE kernel | both | skipped (default, now) | 2.8 | 2.8–2.9 | 2.7–2.8 | 3.0–3.1 |
+| FE kernel | both | 0-token rows ROUTED (no skip) | 2.5–2.7 | 2.5–2.7 | 2.5–2.7 | 2.8–3.0 |
+| FE kernel | both | **0-token rows UNROUTED (skip, default)** | 2.8 | 2.8–2.9 | 2.7–2.8 | 3.0–3.1 |
 
 0-token rows: at M2 / M4 only the ranks that own a token have a real input row; the other ranks' row is all-zero padding (a "0-token row"). **routed to experts** = `DG_FE_ZERO_ROW_UNROUTED=0`, the frontend treats the 0-token row like a real token and routes it (to experts 0..7 on rank 0), so the MegaMoE does useless work for it. **skipped** = the default `DG_FE_ZERO_ROW_UNROUTED=1`, the frontend detects the all-zero row and marks it as not routed; the MegaMoE dispatches nothing for it and writes a zero output (exact: x = 0 gives y = 0). Only the normal-routing rows at M2 / M4 are affected.
 
