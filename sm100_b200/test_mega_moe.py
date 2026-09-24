@@ -276,6 +276,29 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                       (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
 
+    # Hang probe: launch once with stamps on a side stream, read the stamps through another stream after a few seconds
+    if args.hang_probe:
+        import time
+        stamps = torch.zeros(32, dtype=torch.int64, device='cuda')
+        stamps[0] = stamps[3] = 0x7fffffffffffffff
+        os.environ['DG_SM100_PHASE_STAMPS_PTR'] = str(stamps.data_ptr())
+        torch.cuda.synchronize(); dist.barrier()
+        s_run = torch.cuda.Stream(); s_probe = torch.cuda.Stream()
+        with torch.cuda.stream(s_run):
+            run_fused()
+        time.sleep(args.hang_probe)
+        with torch.cuda.stream(s_probe):
+            host = torch.empty(32, dtype=torch.int64, pin_memory=True)
+            host.copy_(stamps, non_blocking=True)
+        s_probe.synchronize()
+        st = host.tolist(); t0 = st[0]
+        fmt = lambda i: ('-' if st[i] in (0, 0x7fffffffffffffff) else f'{(st[i]-t0)/1e3:.1f}')
+        print(f'HANGPROBE rank {rank_idx}: entry={"ok" if st[0] != 0x7fffffffffffffff else "-"} pushes={fmt(9)} DONEsig={fmt(10)} DONEacq={fmt(1)} poolready={fmt(2)} '
+              f'firstmath={fmt(3)} L1end={fmt(4)} L2end={fmt(5)} combbar={fmt(6)} combend={fmt(7)} tail={fmt(12)} '
+              f'L1tasks={st[21]} L2tasks={st[23]} done={s_run.query()}', flush=True)
+        time.sleep(1)
+        os._exit(0)
+
     # Phase stamps (single clean run after the warm-ups, GPU0 prints): slots per the kernel comment
     if args.phase_stamps:
         stamps = torch.zeros(32, dtype=torch.int64, device='cuda')
@@ -494,6 +517,7 @@ if __name__ == '__main__':
     parser.add_argument('--balanced', action='store_true', help='forced-balanced routing (slot s -> rank s), weights 1/topk')
     parser.add_argument('--bench-stream', type=int, default=0, help='streamed replay benchmark with N replays (0 = kineto)')
     parser.add_argument('--phase-stamps', action='store_true', help='print globaltimer phase breakdown of one run (GPU0)')
+    parser.add_argument('--hang-probe', type=float, default=0, help='launch once and read the phase stamps after N seconds (debug hangs)')
     parser.add_argument('--push', type=int, default=None, help='DG_SM100_PUSH_DISPATCH (1 = push dispatch + DONE flags, 0 = barrier/pull)')
     parser.add_argument('--no-clean-barrier', type=int, default=None, help='DG_SM100_NO_CLEAN_BARRIER (rotated pool, needs push)')
     parser.add_argument('--act-format', type=str, default='fp8', choices=['fp8', 'mxfp4', 'nvfp4'], help='activation format: fp8 (W-MXFP4 x A-FP8), mxfp4 / nvfp4 (W4A4)')

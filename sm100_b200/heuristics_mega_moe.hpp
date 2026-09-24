@@ -150,7 +150,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     // C/D output region: max of L1 FP8 (2 TMA stages, BLOCK_N/2 post-SwiGLU) and L2 BF16 (1 stage)
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
     const int smem_cd_l1 = num_epilogue_warpgroups * store_block_m * (fp4_acts ? block_n / 4 : block_n / 2) * kNumTMAStoreStages;
-    const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
+    const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m * block_n * static_cast<int>(sizeof(nv_bfloat16)) * (block_n == 64 ? 2 : 1);
     const int smem_cd = std::max(smem_cd_l1, smem_cd_l2);
 
     // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
@@ -189,7 +189,12 @@ static MegaMoEConfig get_mega_moe_config(
     // Block config
     const auto [cluster_size, block_m, store_block_m, num_epilogue_threads] =
         get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens);
-    const int block_n = 128;
+    // Half-N (DG_SM100_HALF_N, default 0: implemented, deadlocks at run time, under debug) for tiny M: BLOCK_N = 64 with one epilogue warpgroup doubles the L1/L2 task count
+    // (more SMs per expert) and halves the weight tile per pipeline stage (twice the stages -> full weight prefetch)
+    const bool half_n = fp4_acts and get_env<int>("DG_SM100_HALF_N", 0) != 0 and num_tokens * num_ranks <= 16 and block_m == 16 and
+                        get_env<int>("DG_SM100_PUSH_DISPATCH", 1) != 0 and get_env<int>("DG_SM100_STATIC_SLOTS", 1) != 0;
+    const int block_n = half_n ? 64 : 128;
+    const int num_epilogue_threads_used = half_n ? 128 : num_epilogue_threads;
     // BLOCK_K = 256 for both: FP4 x FP4 packed rows are one 128 B swizzle atom, FP8 x FP4 rows are two atoms per stage;
     // halves the per-task pipeline stage count
     const int block_k = 256;
@@ -219,7 +224,7 @@ static MegaMoEConfig get_mega_moe_config(
         num_experts, hidden,
         block_m, block_n, block_k, store_block_m,
         sf_block_m, sf_block_n,
-        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        num_dispatch_threads / 32, num_epilogue_threads_used / 32,
         fp4_acts, sf_vec_size);
 
     const auto config = MegaMoEConfig {
@@ -230,7 +235,7 @@ static MegaMoEConfig get_mega_moe_config(
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
         num_stages, smem_size,
-        num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads
+        num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads_used
     };
 
     // Print configs for the first time

@@ -169,7 +169,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kGranK = kSFVecSize;
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
     DG_STATIC_ASSERT(SF_BLOCK_M == math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_M");
-    DG_STATIC_ASSERT(SF_BLOCK_N == BLOCK_N, "No padding is needed for SFB");
+    DG_STATIC_ASSERT(SF_BLOCK_N == math::constexpr_align(BLOCK_N, kNumUTCCPAlignedElems), "Invalid SF_BLOCK_N");
 
     // UTCCP 4x32 transpose index mapping within each 128-element group
     const auto transform_sf_token_idx = [](const uint32_t& token_idx_in_expert) {
@@ -217,8 +217,17 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
-    constexpr uint32_t LAYOUT_AD_M = 128;
+    // Half-N mode (BLOCK_N = 64, tiny M): 2-CTA UMMA with M = 128 (64 rows per CTA) uses the "2x2" TMEM data path:
+    // the accumulator's N columns are split in halves over lanes [0, 64) and [64, 128), so tokens 0..7 live in lanes 0..63 and
+    // tokens 8..15 in lanes 64..127 (each over the CTA's 64 weight rows). One epilogue warpgroup: warp w handles weight rows
+    // 32 * (w % 2) .. +32 of token half w / 2. Scale factors: the weights' SF rows 0..63 are replicated into lane groups 2, 3 in
+    // smem before UTCCP; the tokens' SF words are written (by the dispatch and the L1 epilogue) at row t % 8, word (t / 8) * 2 (+1 replica).
+    constexpr bool kHalfN = BLOCK_N == 64;
+    constexpr uint32_t LAYOUT_AD_M = BLOCK_N;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * 2;
+    DG_STATIC_ASSERT(BLOCK_N == 128 or kHalfN, "Invalid block N");
+    DG_STATIC_ASSERT(!kHalfN || (kNumEpilogueWarpgroups == 1 and BLOCK_M == 16 and kPushDispatch and kStaticSlots),
+                     "Half-N mode needs one epilogue warpgroup, BLOCK_M = 16 and static-slot push dispatch");
     constexpr uint32_t UMMA_N = BLOCK_M;  // Swap AB
     constexpr uint32_t UMMA_K = 64;  // `kind::mxf4` / `kind::mxf4nvf4`
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / 2;  // Multicast on A
@@ -231,7 +240,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kSwizzleAMode = BLOCK_K_BYTES;  // 64B swizzle on packed FP4 rows
     constexpr uint32_t kSwizzleBMode = BLOCK_K_BYTES;
     constexpr uint32_t kSwizzleCDMode = 128;
-    DG_STATIC_ASSERT(BLOCK_N % kSwizzleCDMode == 0, "Invalid block N");
+    DG_STATIC_ASSERT((BLOCK_N * sizeof(nv_bfloat16)) % kSwizzleCDMode == 0, "Invalid block N");
 
     // Epilogue configs
     constexpr uint32_t kNumEpilogueStages = 2;
@@ -256,7 +265,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
     constexpr uint32_t SMEM_CD_L1_SIZE =
         kNumEpilogueWarpgroups * STORE_BLOCK_M * L1_OUT_BLOCK_N_BYTES * kNumTMAStoreStages;
     constexpr uint32_t SMEM_CD_L2_SIZE =
-        kNumEpilogueWarpgroups * STORE_BLOCK_M * BLOCK_N * sizeof(nv_bfloat16);
+        kNumEpilogueWarpgroups * STORE_BLOCK_M * BLOCK_N * sizeof(nv_bfloat16) * (kHalfN ? 2u : 1u);  // half-N: one tile per token half
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_L1_SIZE > SMEM_CD_L2_SIZE ? SMEM_CD_L1_SIZE : SMEM_CD_L2_SIZE;
     constexpr uint32_t SMEM_CD_L1_SIZE_PER_STAGE = SMEM_CD_L1_SIZE / kNumTMAStoreStages;
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
@@ -268,7 +277,8 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                      "Shared memory of CD must be aligned to 1024 bytes, A/B to 512 bytes");
 
     // Tensor memory size
-    constexpr uint32_t kNumAccumTmemCols = UMMA_N * kNumEpilogueStages;
+    constexpr uint32_t kAccumColsPerStage = kHalfN ? UMMA_N / 2 : UMMA_N;  // 2x2 data path: half the columns, both lane halves
+    constexpr uint32_t kNumAccumTmemCols = kAccumColsPerStage * kNumEpilogueStages;
     // NOTES: one SF word plane (4 bytes per row) takes `SF_BLOCK / 32` columns; NVFP4 needs 2 planes per BLOCK_K
     constexpr uint32_t kNumSFATmemColsPerPlane = SF_BLOCK_M / 32;
     constexpr uint32_t kNumSFBTmemColsPerPlane = SF_BLOCK_N / 32;
@@ -566,12 +576,17 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         // SF words into the destination's UTCCP-transposed MN-major SF pool
                         const auto src_sf = input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>();
                         const auto dst_sf = sym_buffer.map(l1_sf_buffer.get_base_ptr<uint32_t>(), dr);
-                        const uint32_t sf_pool_token_idx = expert_block_base * SF_BLOCK_M + transform_sf_token_idx(row_idx);
+                        const uint32_t sf_pool_token_idx = expert_block_base * SF_BLOCK_M +
+                            (kHalfN ? (row_idx % 8) * 4 + (row_idx / 8) * 2 : transform_sf_token_idx(row_idx));
                         #pragma unroll
                         for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++ i) {
                             const uint32_t j = i * 32 + lane_idx;
-                            if (j < kNumSFUint32)
-                                dst_sf[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = __ldg(src_sf + j);
+                            if (j < kNumSFUint32) {
+                                const uint32_t v = __ldg(src_sf + j);
+                                dst_sf[j * kNumPaddedSFPoolTokens + sf_pool_token_idx] = v;
+                                if constexpr (kHalfN)
+                                    dst_sf[j * kNumPaddedSFPoolTokens + sf_pool_token_idx + 1] = v;  // replica for the other subpartition
+                            }
                         }
 
                         // Top-k weight and source metadata (for the combine write-back)
@@ -995,13 +1010,10 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                 // guarantees L1's completion when L2 starts. So we remove it.
                 // In the future, if `num_experts_per_wave` is not large enough
                 // due to small `num_experts_per_rank`, we may need to add it back or add a switch
-                // NOTES: one L2 K block of BLOCK_K columns is produced by `BLOCK_K / L1_OUT_BLOCK_N` L1 output blocks
-                constexpr uint32_t kNumL1OutBlocksPerL2KBlock = BLOCK_K / L1_OUT_BLOCK_N;
-                DG_STATIC_ASSERT(BLOCK_K % L1_OUT_BLOCK_N == 0, "Invalid block sizes");
-                const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
-                const uint32_t num_bits = num_k_blocks * kNumL1OutBlocksPerL2KBlock;
-                const uint64_t expected = num_bits >= 64 ? ~0ull : ((1ull << num_bits) - 1);
-                while ((ptx::ld_acq_gpu(ptr) & expected) != expected);
+                // Wait for all L1 output blocks of this expert block (count in the low word of the L2 arrival word)
+                constexpr uint32_t kNumL1BlockNsTotal = L1_SHAPE_N / BLOCK_N;
+                const auto ptr = reinterpret_cast<const uint32_t*>(workspace.get_l2_arrival_mask_ptr(pool_block_idx));
+                while (ptx::ld_acq(ptr) < kNumL1BlockNsTotal);
                 if (lane_idx == 0) stamp_accumulate(25, stamp_now() - spin_t0, 0);
             }
 
@@ -1066,7 +1078,8 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                 // Compute weight offset
                 uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
                 uint32_t k_idx = k_block_idx * BLOCK_K;
-                uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
+                // The weights' SF is stored in UTCCP-transposed 128-row groups: load the group containing this N tile
+                uint32_t sfb_n_idx = (n_block_idx * BLOCK_N / SF_BLOCK_N) * SF_BLOCK_N;
                 // NOTES: `shape_sfb_k` already counts SF words (4 SF bytes each); only the k-block index scales with the words per BLOCK_K
                 uint32_t sfb_k_idx = local_expert_idx * shape_sfb_k + k_block_idx * kNumSFWordsPerBlockK;
 
@@ -1076,7 +1089,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx], k_idx / 2, n_idx, 2);
                     #pragma unroll
                     for (uint32_t w = 0; w < kNumSFWordsPerBlockK; ++ w) {
-                        tma::copy<BLOCK_N, 1, 0>(
+                        tma::copy<SF_BLOCK_N, 1, 0>(
                             tensor_map_sfb_ptr, full_barriers[stage_idx], smem_sfb[stage_idx] + w * SF_BLOCK_N,
                             sfb_n_idx, sfb_k_idx + w, 2);
                     }
@@ -1161,6 +1174,20 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
                     const auto a_desc_base_lo = ptx::exchange(a_desc_lo, stage_idx);
                     const auto b_desc_base_lo = ptx::exchange(b_desc_lo, stage_idx);
+                    if constexpr (kHalfN) {
+                        // The loaded 128-row SF group holds (per 16 B smem row r) the words of rows r, r+32, r+64, r+96.
+                        // This 64-row N tile is half h of the group: its rows are words (2h, 2h+1). Move them to words (0, 1)
+                        // and replicate into words (2, 3) so that lane groups 2, 3 (the second token half) see the same scales
+                        const uint32_t h = n_block_idx % 2;
+                        #pragma unroll
+                        for (uint32_t w = 0; w < kNumSFWordsPerBlockK; ++ w) {
+                            uint32_t* p = smem_sfb[stage_idx] + w * SF_BLOCK_N + lane_idx * 4;
+                            const uint32_t w0 = p[2 * h], w1 = p[2 * h + 1];
+                            p[0] = w0, p[1] = w1, p[2] = w0, p[3] = w1;
+                        }
+                        cutlass::arch::fence_view_async_shared();
+                        __syncwarp();
+                    }
                     if (cute::elect_one_sync()) {
                         // UTCCP copy SFA and SFB to TMEM, one plane (4 SF bytes per row) at a time
                         using cute_utccp_t = cute::SM100_UTCCP_4x32dp128bit_2cta;
@@ -1200,12 +1227,12 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                                 cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, smem_ab_t>(b_desc_base_lo, 0, k * UMMA_K / 2);
                             if constexpr (kIsNVFP4) {
                                 ptx::SM100_MMA_MXF4NVF4_2x1SM_SS::fma(
-                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    b_desc, a_desc, accum_stage_idx * kAccumColsPerStage,
                                     k_block_idx > 0 or k > 0, runtime_instr_desc,
                                     sfb_col, sfa_col);
                             } else {
                                 ptx::SM100_MMA_MXF4_2x1SM_SS::fma(
-                                    b_desc, a_desc, accum_stage_idx * UMMA_N,
+                                    b_desc, a_desc, accum_stage_idx * kAccumColsPerStage,
                                     k_block_idx > 0 or k > 0, runtime_instr_desc,
                                     sfb_col, sfa_col);
                             }
@@ -1261,7 +1288,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT(BLOCK_M % kNumEpilogueWarpgroups == 0, "Invalid block M");
         DG_STATIC_ASSERT(WG_BLOCK_M % STORE_BLOCK_M == 0, "Invalid warpgroup block M");
         DG_STATIC_ASSERT(STORE_BLOCK_M % ATOM_M == 0, "Invalid store block M");
-        DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
+        DG_STATIC_ASSERT(BLOCK_N == 128 or kHalfN, "Invalid block N");
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1301,6 +1328,9 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                         break;
                     }
+                    // Half-N: token half `s` belongs to warps 2s, 2s + 1 (lanes of that half); the other warps only keep the
+                    // barrier schedule
+                    const bool mine = (not kHalfN) or (s == warp_idx_in_wg / 2);
 
                     // Iterate all atoms in the store block
                     float2 swiglu_values[kNumAtomsPerStore * 2];
@@ -1308,34 +1338,46 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                     #pragma unroll
                     for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
                         const uint32_t j = s * kNumAtomsPerStore + i;
-
-                        // Load weights from global into register cache per 32 tokens
-                        DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
-                        if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
-                            stored_cached_weight = *l1_topk_weights_buffer
-                                .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
-                                .get_base_ptr<float>();
-                        }
-
-                        // Load weights from register cache
-                        const float2 weights = {
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
-                        };
-
-                        // Load from TMEM
-                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
                         uint32_t values[ATOM_M];
-                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
-                                                               values[0], values[1], values[2], values[3]);
-                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
-                                                               values[4], values[5], values[6], values[7]);
-                        cutlass::arch::fence_view_async_tmem_load();
+                        float2 weights = {0.0f, 0.0f};
+                        if (mine) {
+                            // Load weights from global into register cache per 32 tokens
+                            DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
+                            if constexpr (kHalfN) {
+                                stored_cached_weight = *l1_topk_weights_buffer
+                                    .get_data_buffer(m_idx + s * STORE_BLOCK_M + (lane_idx % 8))
+                                    .get_base_ptr<float>();
+                                weights = {ptx::exchange(stored_cached_weight, (lane_idx % 4) * 2 + 0),
+                                           ptx::exchange(stored_cached_weight, (lane_idx % 4) * 2 + 1)};
+                            } else {
+                                if ((j * ATOM_M) % 32 == 0 and (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                                    stored_cached_weight = *l1_topk_weights_buffer
+                                        .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
+                                        .get_base_ptr<float>();
+                                }
+                                // Load weights from register cache
+                                weights = {ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+                                           ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)};
+                            }
+
+                            // Load from TMEM
+                            const uint32_t tmem_addr = kHalfN ? accum_stage_idx * kAccumColsPerStage
+                                                              : accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
+                                                                   values[0], values[1], values[2], values[3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
+                                                                   values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
+                        }
 
                         // Signal tensor memory consumed on the last atom
                         if (j == WG_BLOCK_M / ATOM_M - 1) {
                             ptx::tcgen05_before_thread_sync();
                             tmem_empty_barriers[accum_stage_idx]->arrive(0u);
+                        }
+                        if (not mine) {
+                            __syncwarp();
+                            continue;
                         }
 
                         // Apply SwiGLU: silu(gate) * up
@@ -1393,7 +1435,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                     // Cast to packed FP4 E2M1 and store into shared memory
                     // Per lane per atom: rows (2 * (lane % 4), + 1) x output columns (lane / 4, lane / 4 + 8) within the warp's 16 columns
                     #pragma unroll
-                    for (uint32_t i = 0; i < kNumAtomsPerStore; ++ i) {
+                    for (uint32_t i = 0; i < kNumAtomsPerStore and mine; ++ i) {
                         // Reduce amax across the warp pair for 32-wide SF groups
                         if constexpr (not kIsNVFP4) {
                             const float2 wp_amax =
@@ -1439,7 +1481,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                             // Row-major packed tile: [STORE_BLOCK_M rows][L1_OUT_BLOCK_N_BYTES], no swizzle
                             const uint32_t row_x = i * ATOM_M + (lane_idx % 4) * 2;
                             const auto tile_ptr = smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N_BYTES
-                                                                          + warp_idx_in_wg * (16 / 2) + col / 2;
+                                                                          + (kHalfN ? warp_idx_in_wg % 2 : warp_idx_in_wg) * (16 / 2) + col / 2;
                             tile_ptr[(row_x + 0) * L1_OUT_BLOCK_N_BYTES + 0] = byte_x0;
                             tile_ptr[(row_x + 1) * L1_OUT_BLOCK_N_BYTES + 0] = byte_y0;
                             tile_ptr[(row_x + 0) * L1_OUT_BLOCK_N_BYTES + 4] = byte_x1;
@@ -1451,7 +1493,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         // NVFP4: every warp writes its own 16-wide group
                         // Each lane < 4 holds SF for 2 rows (sf.x and sf.y)
                         if ((kIsNVFP4 or warp_idx_in_wg % 2 == 0) and lane_idx < 4) {
-                            const uint32_t k_idx = kIsNVFP4 ? n_block_idx * 4 + warp_idx_in_wg : n_block_idx * 2 + warp_idx_in_wg / 2;
+                            const uint32_t k_idx = (n_block_idx * L1_OUT_BLOCK_N + (kHalfN ? warp_idx_in_wg % 2 : warp_idx_in_wg) * 16) / kSFVecSize;
                             const uint32_t k_uint_idx = k_idx / 4, byte_idx = k_idx % 4;
                             const uint32_t mn_stride = kNumPaddedSFPoolTokens * sizeof(uint32_t);
                             const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
@@ -1466,17 +1508,22 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                             const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
                             __builtin_assume(token_base_idx < BLOCK_M);
                             const auto sf_pool_token_idx = pool_block_idx * SF_BLOCK_M
-                                + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
+                                + (kHalfN ? s * 2 : transform_sf_token_idx(token_base_idx)) + (lane_idx * 2) * 4;
                             const auto sf_addr = k_uint_idx * mn_stride + sf_pool_token_idx * static_cast<uint32_t>(sizeof(uint32_t)) + byte_idx;
                             sf_base_ptr[sf_addr] = static_cast<uint8_t>(sf_byte_x);
                             sf_base_ptr[sf_addr + 4 * static_cast<uint32_t>(sizeof(uint32_t))] = static_cast<uint8_t>(sf_byte_y);
+                            if constexpr (kHalfN) {
+                                // Replica word for the other subpartition of this token half
+                                sf_base_ptr[sf_addr + static_cast<uint32_t>(sizeof(uint32_t))] = static_cast<uint8_t>(sf_byte_x);
+                                sf_base_ptr[sf_addr + 5 * static_cast<uint32_t>(sizeof(uint32_t))] = static_cast<uint8_t>(sf_byte_y);
+                            }
                         }
                         __syncwarp();
                     }
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
-                    // Issue TMA store after all atoms in this store block
-                    if (warp_idx_in_wg == 0 and cute::elect_one_sync()) {
+                    // Issue TMA store after all atoms in this store block (half-N: by the first warp of the owning pair)
+                    if (warp_idx_in_wg == (kHalfN ? 2 * s : 0u) and cute::elect_one_sync()) {
                         // NOTES: the L1 output tensor map is byte-typed over packed FP4 (inner dim = I / 2)
                         uint32_t out_n_idx = n_block_idx * L1_OUT_BLOCK_N_BYTES;
                         cute::tma_store_fence();
@@ -1495,11 +1542,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                 ptx::tma_store_wait<0>();
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
-                    DG_STATIC_ASSERT(L2_SHAPE_K <= 64 * L1_OUT_BLOCK_N, "L2 shape K is too large");
-                    ptx::red_or_rel_gpu(
-                        workspace.get_l2_arrival_mask_ptr(pool_block_idx),
-                        1ull << n_block_idx
-                    );
+                    ptx::red_add_rel(reinterpret_cast<uint32_t*>(workspace.get_l2_arrival_mask_ptr(pool_block_idx)), 1u);
                     stamp_max(4);
                 }
                 __syncwarp();
@@ -1520,17 +1563,21 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         break;
                     }
 
+                    const bool mine = (not kHalfN) or (s == warp_idx_in_wg / 2);
                     #pragma unroll
                     for (uint32_t i = 0; i < STORE_BLOCK_M / ATOM_M; ++ i) {
                         // Load from TMEM using .16x256b shape to satisfy STSM layout requirements
                         // Start from lane index 0 and 16
-                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                        const uint32_t tmem_addr = kHalfN ? accum_stage_idx * kAccumColsPerStage
+                                                          : accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
                         uint32_t values[ATOM_M];
-                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
-                                                               values[0], values[1], values[2], values[3]);
-                        cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
-                                                               values[4], values[5], values[6], values[7]);
-                        cutlass::arch::fence_view_async_tmem_load();
+                        if (mine) {
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
+                                                                   values[0], values[1], values[2], values[3]);
+                            cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
+                                                                   values[4], values[5], values[6], values[7]);
+                            cutlass::arch::fence_view_async_tmem_load();
+                        }
 
                         // Wait shared memory release from previous NVLink store
                         // NOTES: skip for the first store block since the prior full barrier already ensures completion
@@ -1542,6 +1589,9 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                             ptx::tcgen05_before_thread_sync();
                             tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                         }
+
+                        if (not mine)
+                            continue;
 
                         // Store into shared memory
                         // NOTES: only use first 16 lanes for address
@@ -1568,12 +1618,15 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
                     // Write into remote buffers
                     // One warp per row, now the layout is different from shared memory storing
-                    const uint32_t row_in_atom = (warp_idx_in_wg * 2 + lane_idx / 16) % ATOM_M;
+                    // Half-N: the owning warp pair writes 8 rows x 128 B (64 BF16), 4 rows per warp, 8 lanes x 16 B per row
+                    const uint32_t row_in_atom = kHalfN ? ((warp_idx_in_wg % 2) * 4 + lane_idx / 8) % ATOM_M
+                                                        : (warp_idx_in_wg * 2 + lane_idx / 16) % ATOM_M;
                     const uint32_t bank_group_idx = lane_idx % 8;
 
                     #pragma unroll
-                    for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
-                        const uint32_t row_in_store = j * 8 + warp_idx_in_wg * 2 + lane_idx / 16;
+                    for (uint32_t j = 0; j < kNumRowsPerWarp and mine; ++ j) {
+                        const uint32_t row_in_store = kHalfN ? (warp_idx_in_wg % 2) * 4 + lane_idx / 8
+                                                             : j * 8 + warp_idx_in_wg * 2 + lane_idx / 16;
                         const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + row_in_store;
 
                         // Skip padding rows beyond the actual token count for this expert
@@ -1593,7 +1646,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         // Read from shared memory
                         const auto smem_ptr = smem_cd_l2 +
                             epilogue_wg_idx * STORE_BLOCK_M * BLOCK_N * static_cast<uint32_t>(sizeof(nv_bfloat16)) +
-                            (lane_idx % 16 / 8) * STORE_BLOCK_M * kSwizzleCDMode +
+                            (kHalfN ? s : lane_idx % 16 / 8) * STORE_BLOCK_M * kSwizzleCDMode +
                             row_in_store * kSwizzleCDMode +
                             (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
                         const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
@@ -1603,7 +1656,8 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                                                .get_data_buffer(dst_token_idx);
                         const auto dst_ptr = math::advance_ptr<float4>(
                             dst_token.get_base_ptr(),
-                            n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
+                            n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) +
+                            (kHalfN ? bank_group_idx : lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
                         *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
                     }
                 }

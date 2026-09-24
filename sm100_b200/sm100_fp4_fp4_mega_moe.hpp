@@ -159,7 +159,7 @@ static void sm100_fp4_fp4_mega_moe(
     const auto l2_acts_u8 = l2_acts.view(torch::kUInt8);
     const auto l1_weights_u8 = l1_weights.view(torch::kUInt8);
     const auto l2_weights_u8 = l2_weights.view(torch::kUInt8);
-    DG_HOST_ASSERT(config.block_n == 128 and (config.block_k == 128 or config.block_k == 256));
+    DG_HOST_ASSERT((config.block_n == 128 or config.block_n == 64) and (config.block_k == 128 or config.block_k == 256));
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts_u8,
                                                      hidden / 2, config.num_max_pool_tokens,
                                                      config.block_k / 2, config.load_block_m,

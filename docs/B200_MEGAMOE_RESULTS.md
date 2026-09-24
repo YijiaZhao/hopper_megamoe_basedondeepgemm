@@ -130,3 +130,13 @@ shorter dispatch chain, not more MMA throughput.
 Repeating a cell gives a ±1.5–2 µs spread on GPU 0. GPU 0 is usually the first rank to enter the kernel, so its span includes
 the wait for the slowest rank; in runs where another rank enters first, GPU 0 reads 5–8 µs lower (e.g. MXFP4 M8 35.6 with the
 other ranks at ~60). The rank-median of the per-rank spans is the more stable kernel-time estimate (MXFP4 M2 ~34, M8 ~35–43).
+
+## In progress: half-N tiles (BLOCK_N = 64) for tiny M
+
+Implemented in `sm100_fp4_fp4_mega_moe.cuh` behind `DG_SM100_HALF_N` (default 0): 2-CTA UMMA with M = 128 (64 weight rows per CTA)
+on the "2x2" TMEM data path (tokens 0..7 in lanes 0..63, 8..15 in lanes 64..127), one epilogue warpgroup (warp w = weight rows
+32 (w % 2).. of token half w / 2), weights' SF group loaded per 128-row group and re-packed/replicated in smem for the second lane
+half, tokens' SF words written with a replica, L2 tiles of 64 BF16 columns, L1 -> L2 dependency as a count (80 output blocks do not
+fit a 64-bit mask). Expected: twice the tasks (80 SMs at M2) and twice the pipeline stages (full weight prefetch also for the FP8
+kernel once ported). Status: compiles, the kernel deadlocks at run time (1 rank and 8 ranks); the stamp-based hang probe could
+not be read back while the kernel spins, so the stuck stage is not yet known. Keep off until fixed.
