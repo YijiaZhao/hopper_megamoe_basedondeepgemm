@@ -90,3 +90,23 @@ python tests/test_mega_moe.py --num-processes 8 --num-experts 384 --hidden 3072 
   --num-max-tokens-per-rank 128 --num-correctness-tests 0 --balanced --torch-ref --bench-stream 30 \
   --act-format mxfp4 --num-tokens 1 --active-ranks 0,4          # M2 (M4: --active-ranks 0,1,4,5; M8: drop it; M16: --num-tokens 2)
 ```
+
+## Single-GPU Nsight Compute (what the kernel is bound by)
+
+NCU cannot replay the 8-rank kernel (the DONE counters wait on peers), so the profile is a 1-rank run with all 48 experts
+local, 1 token x top-8 (the same per-GPU GEMM work as global M8): `ncu --set full --kernel-name regex:mega_moe` on the
+W4A4 MXFP4 kernel (`ncu_mxfp4_1rank_m8.ncu-rep`, NCU locks the clock to 1.13 GHz, kernel 53.5 µs there).
+
+| Metric | Value |
+|---|---|
+| DRAM throughput / bytes read | 14 % of peak / 50.6 MB (= 8 experts x 5.9 MB of FP4 weights, read once) |
+| L2 throughput / SM throughput / issue slots busy | 14 % / 12 % / 12 % |
+| Schedulers: cycles with no eligible warp | 86 % (one instruction every 6.9 cycles per scheduler) |
+| Warp stall sampling | barrier 40 %, long scoreboard 27 %, wait 10 %, branch resolving 5 % |
+| Occupancy | 1 CTA/SM (512 threads, 128 regs/thread, 226 KB smem), 4 warps per scheduler, 1 wave |
+
+Neither memory bandwidth nor tensor-core throughput is close to saturated; the kernel is latency-bound: warp-specialised roles
+park at named barriers while the few active warps wait on TMA / mbarrier / flag round trips. That matches the phase stamps
+(a 196 KB-weight L1 task takes 3.5 µs at ~56 GB/s per SM regardless of how many SMs are idle). The levers are therefore more
+bytes per handshake (BLOCK_K 512 = two swizzle atoms for FP4), more SMs per expert at tiny M (split-K / BLOCK_N 64), and a
+shorter dispatch chain, not more MMA throughput.
