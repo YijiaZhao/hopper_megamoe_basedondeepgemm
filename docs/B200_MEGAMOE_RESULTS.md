@@ -121,3 +121,12 @@ shorter dispatch chain, not more MMA throughput.
 - **Per-K-block L2 dependency wait** (L2 K block k waits only for the L1 output blocks that feed it): neutral here, the L1
   tasks of an expert finish within ~1 µs of each other; it only moved the wait inside the L2 task.
 - **Concurrent SF / metadata stores with the row's bulk store**: within noise.
+- **L2 slots offset by half a grid** (static slots; L2 tasks start at SM 74 so that at tiny M they sit on SMs without L1 work
+  and their weights stream during L1): L2 task time drops (MXFP4 M2 4.4 -> 3.1 µs) but the L2 phase does not move (it is bound
+  by the L1 -> L2 dependency, the activation loads and the remote BF16 epilogue, not by the weights). Kept (harmless).
+
+## Run-to-run variance and what "GPU 0" means
+
+Repeating a cell gives a ±1.5–2 µs spread on GPU 0. GPU 0 is usually the first rank to enter the kernel, so its span includes
+the wait for the slowest rank; in runs where another rank enters first, GPU 0 reads 5–8 µs lower (e.g. MXFP4 M8 35.6 with the
+other ranks at ~60). The rank-median of the per-rank spans is the more stable kernel-time estimate (MXFP4 M2 ~34, M8 ~35–43).

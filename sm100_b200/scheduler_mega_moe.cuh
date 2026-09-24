@@ -222,6 +222,10 @@ struct MegaMoEScheduler {
                     // L1 for the current wave is complete, transition to L2
                     next_phase = BlockPhase::Linear2;
                     set_expert_idx(math::align<uint32_t, false>(current_local_expert_idx - 1, kNumExpertsPerWave));
+                    // Static slots: start the L2 slots half a grid away from the L1 slots, so that at tiny M the L2 tasks
+                    // land on SMs without L1 work and their weights stream during L1 (the stage ring is per SM)
+                    if (static_slots)
+                        block_idx = (blockIdx.x + kNumSMs / 2) % kNumSMs;
                 }
             } else {
                 if (fetch_next_l2_block()) {
