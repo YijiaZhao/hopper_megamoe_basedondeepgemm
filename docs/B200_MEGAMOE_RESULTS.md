@@ -23,10 +23,13 @@ Kernel span on GPU 0, µs, median of the last 3 of 30 streamed replays (nsc-svg-
 
 | Global M | W-MXFP4 x A-FP8 | W4A4 MXFP4 | W4A4 NVFP4 | H20 MXFP4 Mega-only (1830 MHz, [H20 doc](H20_MEGAMOE_RESULTS.md)) |
 |---|---:|---:|---:|---:|
-| 2  | 39.4 | 35.4 | 36.1 | 38.8 |
-| 4  | 43.0 | 39.9 | 40.2 | 47.4 |
-| 8  | 49.2 | 45.3 | 45.6 | 56.7 |
-| 16 | 55.8 | 53.9 | 51.6 | 76.2 |
+| 2  | 37.5 | 35.6 | 33.9 | 38.8 |
+| 4  | 42.6 | 41.3 | 41.5 | 47.4 |
+| 8  | 49.3 | 45.8 | 47.4 | 56.7 |
+| 16 | 55.2 | 52.5 | 52.7 | 76.2 |
+
+(2026-09-24 final code state: L1 K block 512 for the W4A4 kernels. Cell-to-cell repeat spread on GPU 0 is ±2 µs; the previous
+build measured 39.4 / 43.0 / 49.2 / 55.8, 35.4 / 39.9 / 45.3 / 53.9, 36.1 / 40.2 / 45.6 / 51.6.)
 
 Correctness: every cell has a relative RMSE of 0.23–0.25 % on every rank against a pure-torch reference (dequantised inputs,
 fp32 matmul, bf16-rounded gate/up with clamp 10, SwiGLU, the kernel's own per-group requantisation rule for the intermediate).
@@ -140,3 +143,12 @@ half, tokens' SF words written with a replica, L2 tiles of 64 BF16 columns, L1 -
 fit a 64-bit mask). Expected: twice the tasks (80 SMs at M2) and twice the pipeline stages (full weight prefetch also for the FP8
 kernel once ported). Status: compiles, the kernel deadlocks at run time (1 rank and 8 ranks); the stamp-based hang probe could
 not be read back while the kernel spins, so the stuck stage is not yet known. Keep off until fixed.
+
+## L1 K block 512 (W4A4 kernels)
+
+Per-phase K blocks: L1 uses BLOCK_K = 512 (two 128 B swizzle atoms per stage, per-atom UMMA descriptors, 4 SF word planes for MXFP4 /
+8 for NVFP4), L2 keeps 256 (1280 is not divisible by 512). 6 instead of 12 pipeline stages per L1 task: L1 task 3.5 -> 3.0 µs (M2),
+3.7 -> 3.15 µs (M8). On the GPU 0 kernel span this is within the run-to-run spread. Half-N (BLOCK_N = 64) was also brought to run
+(the hang was the weights-SF TMA box: 64 rows vs the 128-row UTCCP group the kernel expects) but its L1 task did not get faster
+(4.3–4.9 µs for half the bytes) and its numerics are still wrong, so it stays off: the per-stage pipeline overhead, not bytes or
+SM count, bounds an L1 task at this size.

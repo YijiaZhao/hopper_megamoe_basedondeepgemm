@@ -164,7 +164,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                         config.swizzle_weights_mode);
     const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
                                                            intermediate_hidden * 2, hidden,
-                                                           config.block_n, kGranK,
+                                                           config.sf_block_n, kGranK,  // the kernel loads whole UTCCP-aligned SF groups
                                                            num_experts_per_rank, 0);
     // NOTES: L1 output and L2 activations are essentially the same tensor.
     // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
@@ -190,7 +190,7 @@ static void sm100_fp8_fp4_mega_moe(
                                                         config.swizzle_weights_mode);
     const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
-                                                           config.block_n, kGranK,
+                                                           config.sf_block_n, kGranK,
                                                            num_experts_per_rank, 0);
 
     // Counter-based synchronisation knobs (see the kernel): DG_SM100_PUSH_DISPATCH (default 1),

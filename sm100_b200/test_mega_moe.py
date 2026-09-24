@@ -282,20 +282,24 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         stamps = torch.zeros(32, dtype=torch.int64, device='cuda')
         stamps[0] = stamps[3] = 0x7fffffffffffffff
         os.environ['DG_SM100_PHASE_STAMPS_PTR'] = str(stamps.data_ptr())
-        torch.cuda.synchronize(); dist.barrier()
+        # Allocate everything the probe needs BEFORE the launch (cudaHostAlloc may wait for an idle device)
+        host = torch.empty(32, dtype=torch.int64, device='cpu', pin_memory=True)
         s_run = torch.cuda.Stream(); s_probe = torch.cuda.Stream()
+        with torch.cuda.stream(s_probe):
+            host.copy_(stamps, non_blocking=True)
+        s_probe.synchronize()
+        torch.cuda.synchronize(); dist.barrier()
         with torch.cuda.stream(s_run):
             run_fused()
         time.sleep(args.hang_probe)
         with torch.cuda.stream(s_probe):
-            host = torch.empty(32, dtype=torch.int64, pin_memory=True)
             host.copy_(stamps, non_blocking=True)
         s_probe.synchronize()
         st = host.tolist(); t0 = st[0]
         fmt = lambda i: ('-' if st[i] in (0, 0x7fffffffffffffff) else f'{(st[i]-t0)/1e3:.1f}')
         print(f'HANGPROBE rank {rank_idx}: entry={"ok" if st[0] != 0x7fffffffffffffff else "-"} pushes={fmt(9)} DONEsig={fmt(10)} DONEacq={fmt(1)} poolready={fmt(2)} '
-              f'firstmath={fmt(3)} L1end={fmt(4)} L2end={fmt(5)} combbar={fmt(6)} combend={fmt(7)} tail={fmt(12)} '
-              f'L1tasks={st[21]} L2tasks={st[23]} done={s_run.query()}', flush=True)
+              f'firstmath={fmt(3)} L1end={fmt(4)} L2end={fmt(5)} combbar={fmt(6)} combend={fmt(7)} tail={fmt(12)} | '
+              f'progress: Aloader_stages={st[14]} Bloader_stages={st[15]} MMA_stages={st[13]} epi_blocks={st[16]} L1tasks={st[21]} L2tasks={st[23]} done={s_run.query()}', flush=True)
         time.sleep(1)
         os._exit(0)
 

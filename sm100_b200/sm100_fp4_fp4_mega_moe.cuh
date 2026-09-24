@@ -41,6 +41,7 @@ template <
     uint32_t kNumCombineSplits,
     bool kStaticSlots,
     bool kDeterministicSlots,
+    uint32_t kBlockKL2,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -80,8 +81,11 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kSFVecSize == 32 or kSFVecSize == 16, "Invalid SF vector size (32 = MXFP4/UE8M0, 16 = NVFP4/UE4M3)");
     constexpr bool kIsNVFP4 = kSFVecSize == 16;
     // Number of 32-bit SF words (4 SF bytes each) per token per BLOCK_K: 1 for MXFP4, 2 for NVFP4
+    // Per-phase K blocks: BLOCK_K for L1 (K = hidden), kBlockKL2 for L2 (K = intermediate); stage buffers are sized for the larger
     constexpr uint32_t kNumSFWordsPerBlockK = BLOCK_K / (kSFVecSize * 4);
+    constexpr uint32_t kNumSFWordsPerBlockKL2 = kBlockKL2 / (kSFVecSize * 4);
     DG_STATIC_ASSERT(kNumSFWordsPerBlockK * kSFVecSize * 4 == BLOCK_K, "Invalid SF words per block K");
+    DG_STATIC_ASSERT(kNumSFWordsPerBlockKL2 * kSFVecSize * 4 == kBlockKL2 and kBlockKL2 <= BLOCK_K, "Invalid L2 K block");
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -234,11 +238,17 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N;
     DG_STATIC_ASSERT(BLOCK_M % 16 == 0, "Invalid block M");
     DG_STATIC_ASSERT(BLOCK_N == LAYOUT_AD_M, "Invalid block N");
-    DG_STATIC_ASSERT(BLOCK_K == 128 or BLOCK_K == 256, "Invalid block K");  // packed rows: 64 B / 128 B (one swizzle atom)
+    DG_STATIC_ASSERT(BLOCK_K == 128 or BLOCK_K == 256 or BLOCK_K == 512, "Invalid block K");  // packed rows: 64 / 128 / 2 x 128 B
+    // 128 B swizzle atoms along K (packed FP4: 256 elements per atom)
+    constexpr uint32_t ATOM_K_BYTES = 128;
+    constexpr uint32_t kNumKAtoms = (BLOCK_K / 2) / ATOM_K_BYTES;
+    constexpr uint32_t kNumKAtomsL2 = (kBlockKL2 / 2) / ATOM_K_BYTES;
+    DG_STATIC_ASSERT(kNumKAtoms >= 1 and kNumKAtomsL2 >= 1 and (BLOCK_K / 2) % ATOM_K_BYTES == 0 or BLOCK_K == 128, "Invalid K atoms");
 
     // Swizzle configs
-    constexpr uint32_t kSwizzleAMode = BLOCK_K_BYTES;  // 64B swizzle on packed FP4 rows
-    constexpr uint32_t kSwizzleBMode = BLOCK_K_BYTES;
+    constexpr uint32_t kSwizzleAMode = BLOCK_K_BYTES >= ATOM_K_BYTES ? ATOM_K_BYTES : BLOCK_K_BYTES;  // 128 B atoms (64 B for BLOCK_K 128)
+    constexpr uint32_t kSwizzleBMode = kSwizzleAMode;
+    constexpr uint32_t kAtomBytes = kSwizzleAMode;
     constexpr uint32_t kSwizzleCDMode = 128;
     DG_STATIC_ASSERT((BLOCK_N * sizeof(nv_bfloat16)) % kSwizzleCDMode == 0, "Invalid block N");
 
@@ -386,7 +396,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
+        kNumSMs, kNumRanks, 2, BLOCK_M, kBlockKL2>(workspace);
 
     // ---------------------------------------------------------------------
     // Counter-based synchronisation (ported from the SM90 fused kernel, see its `kPushDispatch` notes).
@@ -988,6 +998,9 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
             const auto shape_k = block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_K : L1_SHAPE_K;
             const auto shape_sfa_k = math::ceil_div(shape_k, kGranK * 4u);
+            const bool is_l2 = block_phase == sched::BlockPhase::Linear2;
+            const uint32_t block_k_phase = is_l2 ? kBlockKL2 : BLOCK_K;
+            const uint32_t sf_words_phase = is_l2 ? kNumSFWordsPerBlockKL2 : kNumSFWordsPerBlockK;
 
             // Compute pool block offset for this expert
             const uint32_t pool_block_idx = pool_block_of(local_expert_idx, m_block_idx);
@@ -1023,7 +1036,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
                 // Compute token offset from pool block index
                 uint32_t m_idx = pool_block_idx * BLOCK_M;
-                uint32_t k_idx = k_block_idx * BLOCK_K;
+                uint32_t k_idx = k_block_idx * block_k_phase;
                 uint32_t sfa_m_idx = pool_block_idx * SF_BLOCK_M;
                 uint32_t sfa_k_idx = k_block_idx;
 
@@ -1033,20 +1046,26 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
                 // TMA copy tokens and SFA, then arrive at full barrier
                 if (cute::elect_one_sync()) {
-                    // NOTES: the activation tensor map is byte-typed over packed FP4 (inner dim = K / 2)
-                    tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_M, kSwizzleAMode, smem_ab_t>(
-                        tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx / 2, m_idx, 2);
-                    #pragma unroll
-                    for (uint32_t w = 0; w < kNumSFWordsPerBlockK; ++ w) {
+                    // NOTES: the activation tensor map is byte-typed over packed FP4 (inner dim = K / 2); one copy per 128 B atom
+                    if (is_l2) {
+                        tma::copy<kBlockKL2 / 2, LOAD_BLOCK_M, kSwizzleAMode, smem_ab_t>(
+                            tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx / 2, m_idx, 2);
+                    } else {
+                        tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_M, kSwizzleAMode, smem_ab_t>(
+                            tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx / 2, m_idx, 2);
+                    }
+                    for (uint32_t w = 0; w < sf_words_phase; ++ w) {
                         tma::copy<SF_BLOCK_M, 1, 0>(
                             tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx] + w * SF_BLOCK_M,
-                            sfa_m_idx, sfa_k_idx * kNumSFWordsPerBlockK + w, 2);
+                            sfa_m_idx, sfa_k_idx * sf_words_phase + w, 2);
                     }
                     if (is_leader_cta) {
-                        full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE * 2 + SMEM_SFA_SIZE_PER_STAGE * 2);
+                        const uint32_t a_bytes = LOAD_BLOCK_M * (block_k_phase / 2), sfa_bytes = SF_BLOCK_M * 4 * sf_words_phase;
+                        full_barriers[stage_idx]->arrive_and_expect_tx(a_bytes * 2 + sfa_bytes * 2);
                     } else {
                         full_barriers[stage_idx]->arrive(0u);
                     }
+                    stamp_accumulate(14, 1, 0);
                 }
                 __syncwarp();
             }
@@ -1070,6 +1089,9 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
             const auto shape_k = block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_K : L1_SHAPE_K;
             const auto shape_n = block_phase == sched::BlockPhase::Linear2 ? L2_SHAPE_N : L1_SHAPE_N;
             const auto shape_sfb_k = math::ceil_div(shape_k, kGranK * 4u);
+            const bool is_l2 = block_phase == sched::BlockPhase::Linear2;
+            const uint32_t block_k_phase = is_l2 ? kBlockKL2 : BLOCK_K;
+            const uint32_t sf_words_phase = is_l2 ? kNumSFWordsPerBlockKL2 : kNumSFWordsPerBlockK;
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
@@ -1077,18 +1099,22 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
                 // Compute weight offset
                 uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
-                uint32_t k_idx = k_block_idx * BLOCK_K;
+                uint32_t k_idx = k_block_idx * block_k_phase;
                 // The weights' SF is stored in UTCCP-transposed 128-row groups: load the group containing this N tile
                 uint32_t sfb_n_idx = (n_block_idx * BLOCK_N / SF_BLOCK_N) * SF_BLOCK_N;
                 // NOTES: `shape_sfb_k` already counts SF words (4 SF bytes each); only the k-block index scales with the words per BLOCK_K
-                uint32_t sfb_k_idx = local_expert_idx * shape_sfb_k + k_block_idx * kNumSFWordsPerBlockK;
+                uint32_t sfb_k_idx = local_expert_idx * shape_sfb_k + k_block_idx * sf_words_phase;
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, smem_ab_t>(
-                        tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx], k_idx / 2, n_idx, 2);
-                    #pragma unroll
-                    for (uint32_t w = 0; w < kNumSFWordsPerBlockK; ++ w) {
+                    if (is_l2) {
+                        tma::copy<kBlockKL2 / 2, LOAD_BLOCK_N, kSwizzleBMode, smem_ab_t>(
+                            tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx], k_idx / 2, n_idx, 2);
+                    } else {
+                        tma::copy<BLOCK_K_BYTES, LOAD_BLOCK_N, kSwizzleBMode, smem_ab_t>(
+                            tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx], k_idx / 2, n_idx, 2);
+                    }
+                    for (uint32_t w = 0; w < sf_words_phase; ++ w) {
                         tma::copy<SF_BLOCK_N, 1, 0>(
                             tensor_map_sfb_ptr, full_barriers[stage_idx], smem_sfb[stage_idx] + w * SF_BLOCK_N,
                             sfb_n_idx, sfb_k_idx + w, 2);
@@ -1096,10 +1122,12 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                     if (is_leader_cta) {
                         // NOTES: both CTAs load a full byte-typed B tile and signal the leader barrier (unlike the 16U4-typed
                         //        FP8xFP4 kernel, whose transaction count equals the packed global bytes, i.e. one tile in total)
-                        full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE * 2 + SMEM_SFB_SIZE_PER_STAGE * 2);
+                        const uint32_t b_bytes = LOAD_BLOCK_N * (block_k_phase / 2), sfb_bytes = SF_BLOCK_N * 4 * sf_words_phase;
+                        full_barriers[stage_idx]->arrive_and_expect_tx(b_bytes * 2 + sfb_bytes * 2);
                     } else {
                         full_barriers[stage_idx]->arrive(0u);
                     }
+                    stamp_accumulate(15, 1, 0);
                 }
                 __syncwarp();
             }
@@ -1120,8 +1148,9 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
             auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
             DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
-            auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, BLOCK_K_BYTES, kSwizzleAMode>(smem_a[0], 0, 0);
-            auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, BLOCK_K_BYTES, kSwizzleBMode>(smem_b[0], 0, 0);
+            // NOTES: descriptors describe one swizzle atom; k-steps advance across atoms (rows x atom bytes) and inside an atom
+            auto a_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_M, kAtomBytes, kSwizzleAMode>(smem_a[0], 0, 0);
+            auto b_desc = mma::sm100::make_umma_desc<cute::UMMA::Major::K, LOAD_BLOCK_N, kAtomBytes, kSwizzleBMode>(smem_b[0], 0, 0);
             uint32_t a_desc_lo = lane_idx < kNumStages ? a_desc.lo + lane_idx * SMEM_A_SIZE_PER_STAGE / 16 : 0u;
             uint32_t b_desc_lo = lane_idx < kNumStages ? b_desc.lo + lane_idx * SMEM_B_SIZE_PER_STAGE / 16 : 0u;
 
@@ -1141,6 +1170,9 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                 // Dynamic update of UMMA N based on effective M
                 mma::sm100::update_instr_desc_with_umma_n(instr_desc, scheduler.template get_valid_m<true>());
                 if (current_iter_idx == 0 and lane_idx == 0) stamp_min(3);
+                const bool is_l2 = block_phase == sched::BlockPhase::Linear2;
+                const uint32_t num_k_steps = (is_l2 ? kBlockKL2 : BLOCK_K) / UMMA_K;
+                const uint32_t sf_words_phase = is_l2 ? kNumSFWordsPerBlockKL2 : kNumSFWordsPerBlockK;
 
                 // Wait tensor memory empty barrier arrival
                 const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
@@ -1171,6 +1203,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                     // Wait TMA load completion
                     full_barriers[stage_idx]->wait(phase);
                     ptx::tcgen05_after_thread_sync();
+                    if (lane_idx == 0) stamp_accumulate(13, 1, 0);
 
                     const auto a_desc_base_lo = ptx::exchange(a_desc_lo, stage_idx);
                     const auto b_desc_base_lo = ptx::exchange(b_desc_lo, stage_idx);
@@ -1179,8 +1212,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         // This 64-row N tile is half h of the group: its rows are words (2h, 2h+1). Move them to words (0, 1)
                         // and replicate into words (2, 3) so that lane groups 2, 3 (the second token half) see the same scales
                         const uint32_t h = n_block_idx % 2;
-                        #pragma unroll
-                        for (uint32_t w = 0; w < kNumSFWordsPerBlockK; ++ w) {
+                        for (uint32_t w = 0; w < sf_words_phase; ++ w) {
                             uint32_t* p = smem_sfb[stage_idx] + w * SF_BLOCK_N + lane_idx * 4;
                             const uint32_t w0 = p[2 * h], w1 = p[2 * h + 1];
                             p[0] = w0, p[1] = w1, p[2] = w0, p[3] = w1;
@@ -1191,8 +1223,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                     if (cute::elect_one_sync()) {
                         // UTCCP copy SFA and SFB to TMEM, one plane (4 SF bytes per row) at a time
                         using cute_utccp_t = cute::SM100_UTCCP_4x32dp128bit_2cta;
-                        #pragma unroll
-                        for (uint32_t w = 0; w < kNumSFWordsPerBlockK; ++ w) {
+                        for (uint32_t w = 0; w < sf_words_phase; ++ w) {
                             #pragma unroll
                             for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i) {
                                 auto smem_ptr = smem_sfa[stage_idx] + w * SF_BLOCK_M + i * kNumUTCCPAlignedElems;
@@ -1213,7 +1244,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         //  - MXFP4 (block32): 2 SF bytes per UMMA, 2 k-steps per plane, SF ID = 0 / 2
                         //  - NVFP4 (block16): 4 SF bytes per UMMA, one plane per k-step, SF ID = 0
                         #pragma unroll
-                        for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
+                        for (uint32_t k = 0; k < num_k_steps; ++ k) {
                             constexpr uint32_t kPlaneK = kSFVecSize * 4;
                             const uint32_t sf_plane = (k * UMMA_K) / kPlaneK;
                             const uint32_t sf_id = ((k * UMMA_K) % kPlaneK) / kSFVecSize;
@@ -1221,10 +1252,11 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                             const uint32_t sfb_col = kTmemStartColOfSFB + sf_plane * kNumSFBTmemColsPerPlane;
                             const auto runtime_instr_desc =
                                 mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, sf_id, sf_id);
-                            a_desc.lo = mma::sm100::advance_umma_desc_lo<
-                                cute::UMMA::Major::K, LOAD_BLOCK_M, kSwizzleAMode, smem_ab_t>(a_desc_base_lo, 0, k * UMMA_K / 2);
-                            b_desc.lo = mma::sm100::advance_umma_desc_lo<
-                                cute::UMMA::Major::K, LOAD_BLOCK_N, kSwizzleBMode, smem_ab_t>(b_desc_base_lo, 0, k * UMMA_K / 2);
+                            // Byte offset of this k-step: atom index x (rows x atom bytes) + offset inside the atom
+                            const uint32_t k_bytes = k * UMMA_K / 2;
+                            const uint32_t atom = k_bytes / kAtomBytes, in_atom = k_bytes % kAtomBytes;
+                            a_desc.lo = a_desc_base_lo + (atom * LOAD_BLOCK_M * kAtomBytes + in_atom) / 16u;
+                            b_desc.lo = b_desc_base_lo + (atom * LOAD_BLOCK_N * kAtomBytes + in_atom) / 16u;
                             if constexpr (kIsNVFP4) {
                                 ptx::SM100_MMA_MXF4NVF4_2x1SM_SS::fma(
                                     b_desc, a_desc, accum_stage_idx * kAccumColsPerStage,
@@ -1312,6 +1344,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
             const uint32_t pool_block_idx = pool_block_of(local_expert_idx, m_block_idx);
             uint32_t m_idx = pool_block_idx * BLOCK_M;
             uint32_t n_idx = n_block_idx * BLOCK_N;
+            if (epilogue_thread_idx == 0) stamp_accumulate(16, 1, 0);
 
             if (block_phase == sched::BlockPhase::Linear1) {
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights

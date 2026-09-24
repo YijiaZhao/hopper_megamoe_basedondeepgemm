@@ -78,7 +78,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {}, {},
-        {}, {}, {}
+        {}, {}, {},
+        {}
     >);
 }};
 )", args.num_max_tokens_per_rank,
@@ -101,7 +102,8 @@ static void __instantiate_kernel() {{
     args.phase_stamps != nullptr ? "true" : "false",
     args.num_combine_splits,
     args.static_slots ? "true" : "false",
-    args.deterministic_slots ? "true" : "false");
+    args.deterministic_slots ? "true" : "false",
+    args.config.block_k_l2);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -159,7 +161,7 @@ static void sm100_fp4_fp4_mega_moe(
     const auto l2_acts_u8 = l2_acts.view(torch::kUInt8);
     const auto l1_weights_u8 = l1_weights.view(torch::kUInt8);
     const auto l2_weights_u8 = l2_weights.view(torch::kUInt8);
-    DG_HOST_ASSERT((config.block_n == 128 or config.block_n == 64) and (config.block_k == 128 or config.block_k == 256));
+    DG_HOST_ASSERT((config.block_n == 128 or config.block_n == 64) and (config.block_k == 128 or config.block_k == 256 or config.block_k == 512));
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts_u8,
                                                      hidden / 2, config.num_max_pool_tokens,
                                                      config.block_k / 2, config.load_block_m,
@@ -176,7 +178,7 @@ static void sm100_fp4_fp4_mega_moe(
                                                         config.swizzle_weights_mode);
     const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
                                                            intermediate_hidden * 2, hidden,
-                                                           config.block_n, kGranK,
+                                                           config.sf_block_n, kGranK,  // the kernel loads whole UTCCP-aligned SF groups
                                                            num_experts_per_rank, 0);
     // NOTES: L1 output and L2 activations are essentially the same tensor.
     // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
@@ -188,7 +190,7 @@ static void sm100_fp4_fp4_mega_moe(
                                                        0);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts_u8,
                                                      intermediate_hidden / 2, config.num_max_pool_tokens,
-                                                     config.block_k / 2, config.load_block_m,
+                                                     config.block_k_l2 / 2, config.load_block_m,
                                                      static_cast<int>(l2_acts_u8.stride(-2)),
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
@@ -197,12 +199,12 @@ static void sm100_fp4_fp4_mega_moe(
                                                         1, 0);
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights_u8,
                                                         intermediate_hidden / 2, num_experts_per_rank * hidden,
-                                                        config.block_k / 2, config.load_block_n,
+                                                        config.block_k_l2 / 2, config.load_block_n,
                                                         static_cast<int>(l2_weights_u8.stride(-2)),
                                                         config.swizzle_weights_mode);
     const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
-                                                           config.block_n, kGranK,
+                                                           config.sf_block_n, kGranK,
                                                            num_experts_per_rank, 0);
 
     // Counter-based synchronisation knobs (see the kernel):

@@ -31,6 +31,9 @@ struct MegaMoEConfig {
     // Number of experts to process per wave
     int num_experts_per_wave;
 
+    // L2 K block (may be smaller than block_k: the intermediate dim need not divide block_k)
+    int block_k_l2;
+
     // Pipeline stages and shared memory
     int num_stages, smem_size;
 
@@ -46,7 +49,7 @@ struct MegaMoEConfig {
            << ", num_max_pool_tokens=" << config.num_max_pool_tokens
            << ", num_padded_sf_pool_tokens=" << config.num_padded_sf_pool_tokens
            << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
-           << ", num_experts_per_wave=" << config.num_experts_per_wave
+           << ", num_experts_per_wave=" << config.num_experts_per_wave << ", block_k_l2=" << config.block_k_l2
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
@@ -195,9 +198,14 @@ static MegaMoEConfig get_mega_moe_config(
                         get_env<int>("DG_SM100_PUSH_DISPATCH", 1) != 0 and get_env<int>("DG_SM100_STATIC_SLOTS", 1) != 0;
     const int block_n = half_n ? 64 : 128;
     const int num_epilogue_threads_used = half_n ? 128 : num_epilogue_threads;
-    // BLOCK_K = 256 for both: FP4 x FP4 packed rows are one 128 B swizzle atom, FP8 x FP4 rows are two atoms per stage;
-    // halves the per-task pipeline stage count
-    const int block_k = 256;
+    // L1 K block: FP4 x FP4 uses 512 (two 128 B swizzle atoms per stage, 6 stages per L1 task; the per-stage pipeline overhead,
+    // not the bytes, bounds a task), FP8 x FP4 uses 256 (two atoms of 8-bit rows). L2 (K = intermediate) uses the largest of
+    // 512 / 256 / 128 dividing it, capped by the L1 block.
+    const int block_k = (fp4_acts and get_env<int>("DG_SM100_L1_BLOCK_K", 512) == 512) ? 512 : 256;
+    int block_k_l2 = block_k;
+    while (block_k_l2 > 128 and intermediate_hidden % block_k_l2 != 0)
+        block_k_l2 /= 2;
+    DG_HOST_ASSERT(intermediate_hidden % block_k_l2 == 0 and hidden % block_k == 0);
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
     const auto [sf_block_m, sf_block_n] = SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, MmaKind::MXFP8FP4);
@@ -234,6 +242,7 @@ static MegaMoEConfig get_mega_moe_config(
         num_max_pool_tokens, num_padded_sf_pool_tokens,
         swizzle_acts_mode, swizzle_weights_mode,
         num_experts_per_wave,
+        block_k_l2,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads_used
     };
