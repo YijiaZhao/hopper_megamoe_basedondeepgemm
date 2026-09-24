@@ -29,6 +29,7 @@ public:
         unsigned long long* phase_stamps;
         int num_combine_splits;
         bool static_slots;
+        bool deterministic_slots;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -75,7 +76,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {}, {},
-        {}, {}
+        {}, {}, {}
     >);
 }};
 )", args.num_max_tokens_per_rank,
@@ -96,7 +97,8 @@ static void __instantiate_kernel() {{
     args.no_clean_barrier ? "true" : "false",
     args.phase_stamps != nullptr ? "true" : "false",
     args.num_combine_splits,
-    args.static_slots ? "true" : "false");
+    args.static_slots ? "true" : "false",
+    args.deterministic_slots ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -206,6 +208,11 @@ static void sm100_fp8_fp4_mega_moe(
     // Static slots (DG_SM100_STATIC_SLOTS, default 1): tiny M where every expert's rows fit one M block
     const bool static_slots = push_dispatch and get_env<int>("DG_SM100_STATIC_SLOTS", 1) != 0 and
                               num_tokens * num_ranks <= config.block_m;
+    // Deterministic slots (DG_SM100_DETERMINISTIC_SLOTS, default 0: measured neutral, the ticket RTT was hidden behind the first-row prefetch): no remote ticket when every rank has at most
+    // block_m / ranks tokens (all ranks must take the same decision: the harness uses uniform token counts)
+    const bool deterministic_slots = static_slots and get_env<int>("DG_SM100_DETERMINISTIC_SLOTS", 0) != 0 and
+                                     config.block_m % num_ranks == 0 and config.block_m <= 16 and
+                                     num_tokens <= config.block_m / num_ranks;
     unsigned long long* phase_stamps = nullptr;
     if (const auto stamps_env = get_env<std::string>("DG_SM100_PHASE_STAMPS_PTR"); not stamps_env.empty())
         phase_stamps = reinterpret_cast<unsigned long long*>(std::stoull(stamps_env));
@@ -242,6 +249,7 @@ static void sm100_fp8_fp4_mega_moe(
         .phase_stamps = phase_stamps,
         .num_combine_splits = num_combine_splits,
         .static_slots = static_slots,
+        .deterministic_slots = deterministic_slots,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -264,7 +272,7 @@ static void sm100_fp8_fp4_mega_moe(
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
     const auto runtime = compiler->build(std::string("sm100_fp8_fp4_mega_moe") + (push_dispatch ? "_push" : "") +
                                          (no_clean_barrier ? "_rot" : "") + (phase_stamps != nullptr ? "_stamps" : "") +
-                                         (num_combine_splits > 0 ? "_cs" + std::to_string(num_combine_splits) : "") + (static_slots ? "_ss" : ""), code);
+                                         (num_combine_splits > 0 ? "_cs" + std::to_string(num_combine_splits) : "") + (static_slots ? "_ss" : "") + (deterministic_slots ? "_ds" : ""), code);
     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
 }
 

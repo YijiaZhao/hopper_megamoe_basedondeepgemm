@@ -40,6 +40,7 @@ template <
     bool kPushDispatch, bool kNoCleanBarrier, bool kPhaseStamps,
     uint32_t kNumCombineSplits,
     bool kStaticSlots,
+    bool kDeterministicSlots,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -428,6 +429,14 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
         }
     };
     DG_STATIC_ASSERT(!kStaticSlots || kPushDispatch, "Static slots require push dispatch");
+    // Deterministic slots (tiny M): with at most `BLOCK_M / kNumRanks` tokens per rank, the row of a routed token inside its
+    // expert's single block is `src_rank * kRowsPerSrcRank + token`, so no remote ticket round trip is needed: the source writes
+    // the row directly, stores the expert's count word (= BLOCK_M, idempotent) and `red.or`s the row's valid bit into the top 16
+    // bits of the block's L2 arrival mask (fire-and-forget); the L2 epilogue skips the hole rows.
+    DG_STATIC_ASSERT(!kDeterministicSlots || (kStaticSlots and BLOCK_M % kNumRanks == 0 and BLOCK_M <= 16),
+                     "Deterministic slots need static slots and BLOCK_M = ranks x rows (<= 16 rows: valid bits 48..63)");
+    constexpr uint32_t kRowsPerSrcRank = kDeterministicSlots ? BLOCK_M / kNumRanks : 0u;
+    constexpr uint32_t kRowValidShift = 48;
     const auto pool_block_of = [&](const uint32_t& local_expert_idx, const uint32_t& m_block_idx) {
         return kPushDispatch ? strided_pool_block_p(task_pool_parity, local_expert_idx, m_block_idx)
                              : scheduler.get_current_pool_block_offset() + m_block_idx;
@@ -515,8 +524,16 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                     if (expert_idx >= 0) {
                         const uint32_t dr = static_cast<uint32_t>(expert_idx) / kNumExpertsPerRank;
                         const uint32_t de = static_cast<uint32_t>(expert_idx) % kNumExpertsPerRank;
-                        lane_row_idx = static_cast<uint32_t>(ptx::atomic_add_sys(
-                            sym_buffer.map(recv_count_sum_base + de, dr), 1ull));
+                        if constexpr (kDeterministicSlots) {
+                            lane_row_idx = sym_buffer.rank_idx * kRowsPerSrcRank + r / kNumTopk;
+                            *sym_buffer.map(recv_count_sum_base + de, dr) = static_cast<uint64_t>(BLOCK_M);
+                            ptx::red_or_rel_sys(
+                                sym_buffer.map(workspace.get_l2_arrival_mask_ptr(strided_pool_block_p(dispatch_parity, de, 0)), dr),
+                                1ull << (kRowValidShift + lane_row_idx));
+                        } else {
+                            lane_row_idx = static_cast<uint32_t>(ptx::atomic_add_sys(
+                                sym_buffer.map(recv_count_sum_base + de, dr), 1ull));
+                        }
                     }
                     #pragma unroll 1
                     for (uint32_t mask = valid_mask; mask != 0; mask &= mask - 1) {
@@ -984,7 +1001,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                 const auto ptr = workspace.get_l2_arrival_mask_ptr(pool_block_idx);
                 const uint32_t num_bits = num_k_blocks * kNumL1OutBlocksPerL2KBlock;
                 const uint64_t expected = num_bits >= 64 ? ~0ull : ((1ull << num_bits) - 1);
-                while (ptx::ld_acq_gpu(ptr) != expected);
+                while ((ptx::ld_acq_gpu(ptr) & expected) != expected);
                 if (lane_idx == 0) stamp_accumulate(25, stamp_now() - spin_t0, 0);
             }
 
@@ -1489,6 +1506,8 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
             } else {
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
                 constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;
+                const uint64_t row_valid_bits = kDeterministicSlots ?
+                    (ptx::ld_acq_gpu(workspace.get_l2_arrival_mask_ptr(pool_block_idx)) >> kRowValidShift) : ~0ull;
 
                 // L2 BF16 epilogue: write GEMM output to remote combine buffer via NVLink
                 #pragma unroll
@@ -1560,6 +1579,11 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         // Skip padding rows beyond the actual token count for this expert
                         if (m_idx_in_block >= valid_m)
                             break;
+                        // Deterministic slots: skip the hole rows (no token routed to this (source rank, token) slot)
+                        if constexpr (kDeterministicSlots) {
+                            if (((row_valid_bits >> m_idx_in_block) & 1ull) == 0)
+                                continue;
+                        }
 
                         const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
                         const uint32_t dst_rank_idx = src_metadata.rank_idx;

@@ -53,7 +53,7 @@ GPU 0 starts first, so its span contains the wait for the slowest rank (~5–8 �
 | 2 | Parity-rotated pool: drops NVLink barrier #3 after the workspace cleanup | `DG_SM100_NO_CLEAN_BARRIER` | part of 1 |
 | 3 | DONE2: the CTA finishing the rank's last L2 task signals every rank; replaces NVLink barrier #2 before the combine | (with 1) | M2 -3 |
 | 4 | Combine hidden split: (token, chunk) work items over all combine warps, 512 B chunks | `DG_SM100_COMBINE_SPLITS` (auto) | combine 4 -> 2.5 |
-| 5 | BLOCK_K 128 -> 256: W4A4 packed rows are one 128 B swizzle atom; FP8-act rows span two atoms per stage (per-atom UMMA descriptors, two SF word planes) | heuristics | L1 task 5.3 -> 3.5 (W4A4), 4.9 -> 4.0 (FP8) |
+| 5 | BLOCK_K 128 -> 256 (FP8 act: 39.8 -> 39.4 at M2, within noise elsewhere): W4A4 packed rows are one 128 B swizzle atom; FP8-act rows span two atoms per stage (per-atom UMMA descriptors, two SF word planes) | heuristics | L1 task 5.3 -> 3.5 (W4A4), 4.9 -> 4.0 (FP8) |
 | 6 | First pushed row prefetched into smem before the ticket round trip | (with 1) | ~1 |
 | 7 | Static slots + early weight streaming: for tiny M every local expert owns one fixed (expert, n-block) -> SM slot set, empty experts are skipped at run time, and the weight loader starts streaming an expert's weights as soon as its live ticket count is nonzero (before DONE) | `DG_SM100_STATIC_SLOTS` (auto when `tokens * ranks <= BLOCK_M`) | M2 -4, M8 -4 |
 
@@ -110,3 +110,14 @@ park at named barriers while the few active warps wait on TMA / mbarrier / flag 
 (a 196 KB-weight L1 task takes 3.5 µs at ~56 GB/s per SM regardless of how many SMs are idle). The levers are therefore more
 bytes per handshake (BLOCK_K 512 = two swizzle atoms for FP4), more SMs per expert at tiny M (split-K / BLOCK_N 64), and a
 shorter dispatch chain, not more MMA throughput.
+
+## Tried and kept off
+
+- **Deterministic slots** (`DG_SM100_DETERMINISTIC_SLOTS=1`): for <= 2 tokens per rank the row of a routed token inside its expert
+  block is `src_rank * 2 + token`, so the remote ticket is replaced by a direct write plus a fire-and-forget `red.or` valid bit
+  (hole rows skipped in the L2 epilogue). Correct, but neutral: the ticket round trip was already hidden behind the first-row
+  prefetch, and the release-scoped `red.or` adds a fence ("pushes issued" 4.5 -> 5.6 µs). The dispatch chain is bound by the
+  remote row write + completion wait + DONE, not by the ticket.
+- **Per-K-block L2 dependency wait** (L2 K block k waits only for the L1 output blocks that feed it): neutral here, the L1
+  tasks of an expert finish within ~1 µs of each other; it only moved the wait inside the L2 task.
+- **Concurrent SF / metadata stores with the row's bulk store**: within noise.
