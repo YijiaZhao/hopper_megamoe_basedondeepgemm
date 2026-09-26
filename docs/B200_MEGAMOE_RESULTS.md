@@ -151,6 +151,22 @@ shorter dispatch chain, not more MMA throughput.
   and their weights stream during L1): L2 task time drops (MXFP4 M2 4.4 -> 3.1 µs) but the L2 phase does not move (it is bound
   by the L1 -> L2 dependency, the activation loads and the remote BF16 epilogue, not by the weights). Kept (harmless).
 
+- **Per-token fine-grained combine** (the H20 design: each L2 task adds 1 to the arrival counter of every row it wrote, the combine
+  warp waits per token): correct on 1 rank but slower (a sys-scope fence per L2 task delayed the following tasks, L2 phase +3 µs)
+  and hung on 8 ranks; dropped. The DONE2 design with the mailbox is within ~1 µs of the floor of that tail.
+- **Token tiles by `cp.async` instead of one TMA per K block** (all K blocks of a task issued at once): correct, slower (L1 task
+  3.0 -> 4.9 µs; the batched copies completed 2.6 µs after issue). **One SF TMA per K block** (box = all SF words) instead of one
+  per word: neutral. The K-block period is not the TMA count.
+- **What paces a K block** (SM 12, L1 task, globaltimer): full barrier passes every 0.29 µs = 0.19 µs to issue the 8 UTCCP + 8
+  `tcgen05.mma` (K = 64) of the block from one thread + 0.04 µs commit + 0.06 µs wait; the token tiles arrive at the same
+  cadence. Removing every UTCCP and MMA instruction (wrong numerics) shortens an L1 task only from 3.0 to 2.65 µs, so a 6-block
+  task is ~3 µs on either limiter. Fewer, larger tcgen05 issues (a wider UTCCP shape for the SF planes) would be the next
+  micro-lever; the two task waves (160 CTA tasks on 148 SMs) remain the structural one.
+- **Fusing L1 and L2 into one task** (SwiGLU output kept on chip as the K = 64 slice of the L2 GEMM, W2 slice streamed per task,
+  fp32 partials reduced across the 20 K-slice CTAs): weighed, not built. With one row per expert the partial traffic is small
+  (12 KB per CTA), but the win is bounded by the L2 phase (~3 µs) minus the extra W2 streaming per task (+98 KB, ~1.5 µs at the
+  per-SM feed rate), i.e. ~1.5–2 µs at M8, and it grows the two-wave imbalance. Not worth its size until the wave problem is solved.
+
 ## Run-to-run variance and what "GPU 0" means
 
 Repeating a cell gives a ±1.5–2 µs spread on GPU 0. GPU 0 is usually the first rank to enter the kernel, so its span includes
