@@ -21,7 +21,7 @@ weight 1/8), the same rule as the H20 table.
 
 Kernel span on GPU 0, µs, median of the last 3 of 30 streamed replays (nsc-svg-slurm-1 job 2033326, SM clock locked at 1965 MHz):
 
-| Global M | W-MXFP4 x A-FP8, optimised (upstream `sm100_fp8_fp4_mega_moe` + the 7 changes below) | W4A4 MXFP4, optimised (new kernel) | W4A4 NVFP4, optimised (new kernel) | W-MXFP4 x A-FP8, upstream DeepGEMM `fp8xfp4` as-is (main `78b6900`) | H20 MXFP4 Mega-only (1830 MHz, [H20 doc](H20_MEGAMOE_RESULTS.md)) |
+| Global M | W-MXFP4 x A-FP8 (optimised upstream kernel) | W4A4 MXFP4 (new kernel) | W4A4 NVFP4 (new kernel) | W-MXFP4 x A-FP8, upstream baseline (DeepGEMM main `78b6900`) | H20 MXFP4 Mega-only (1830 MHz, [H20 doc](H20_MEGAMOE_RESULTS.md)) |
 |---|---:|---:|---:|---:|---:|
 | 2  | 37.5 | 35.6 | 33.9 | 47.2 | 38.8 |
 | 4  | 42.6 | 41.3 | 41.5 | 50.5 | 47.4 |
@@ -37,8 +37,8 @@ fp32 matmul, bf16-rounded gate/up with clamp 10, SwiGLU, the kernel's own per-gr
 Unoptimised starting point (the same kernels on their original barrier/pull path, event-based timing that also contains ~10 µs
 of launch gaps): 56 / 57 / 62 / 68 (FP8 act), 56 / 57 / 64 / 67 (MXFP4), 59 / 60 / 67 / 73 (NVFP4).
 
-Upstream column: the official [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) `main` at `78b6900` (2026-09, includes the
-26/09 release), W4A8 `fp8xfp4` MegaMoE with no kernel changes, built in the same container (needs the `elfutils` headers on the include
+Upstream baseline column: the official [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) `main` at `78b6900` (2026-09, includes the
+26/09 release), W4A8 `fp8xfp4` MegaMoE kernel without modification, built in the same container (needs the `elfutils` headers on the include
 path for DeepJIT), run on the same node/job/clock with the same method. Its `tests/test_mega_moe.py` was only extended with the
 forced-balanced routing, `--active-ranks` and the streamed `KSPAN` benchmark ([`sm100_b200/upstream_test_mega_moe.py`](../sm100_b200/upstream_test_mega_moe.py));
 `--num-shared-experts 0`, no correctness reference in that run (the container has no DeepEP for the upstream legacy baseline).
