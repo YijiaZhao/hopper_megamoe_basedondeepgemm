@@ -21,12 +21,12 @@ weight 1/8), the same rule as the H20 table.
 
 Kernel span on GPU 0, µs, median of the last 3 of 30 streamed replays (nsc-svg-slurm-1 job 2033326, SM clock locked at 1965 MHz):
 
-| Global M | W-MXFP4 x A-FP8 | W4A4 MXFP4 | W4A4 NVFP4 | H20 MXFP4 Mega-only (1830 MHz, [H20 doc](H20_MEGAMOE_RESULTS.md)) |
-|---|---:|---:|---:|---:|
-| 2  | 37.5 | 35.6 | 33.9 | 38.8 |
-| 4  | 42.6 | 41.3 | 41.5 | 47.4 |
-| 8  | 49.3 | 45.8 | 47.4 | 56.7 |
-| 16 | 55.2 | 52.5 | 52.7 | 76.2 |
+| Global M | W-MXFP4 x A-FP8 | W4A4 MXFP4 | W4A4 NVFP4 | Upstream DeepGEMM `fp8xfp4`, unmodified (main `78b6900`) | H20 MXFP4 Mega-only (1830 MHz, [H20 doc](H20_MEGAMOE_RESULTS.md)) |
+|---|---:|---:|---:|---:|---:|
+| 2  | 37.5 | 35.6 | 33.9 | 47.2 | 38.8 |
+| 4  | 42.6 | 41.3 | 41.5 | 50.5 | 47.4 |
+| 8  | 49.3 | 45.8 | 47.4 | 53.2 | 56.7 |
+| 16 | 55.2 | 52.5 | 52.7 | 61.2 | 76.2 |
 
 (2026-09-24 final code state: L1 K block 512 for the W4A4 kernels. Cell-to-cell repeat spread on GPU 0 is ±2 µs; the previous
 build measured 39.4 / 43.0 / 49.2 / 55.8, 35.4 / 39.9 / 45.3 / 53.9, 36.1 / 40.2 / 45.6 / 51.6.)
@@ -36,6 +36,12 @@ fp32 matmul, bf16-rounded gate/up with clamp 10, SwiGLU, the kernel's own per-gr
 
 Unoptimised starting point (the same kernels on their original barrier/pull path, event-based timing that also contains ~10 µs
 of launch gaps): 56 / 57 / 62 / 68 (FP8 act), 56 / 57 / 64 / 67 (MXFP4), 59 / 60 / 67 / 73 (NVFP4).
+
+Upstream column: the official [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) `main` at `78b6900` (2026-09, includes the
+26/09 release), W4A8 `fp8xfp4` MegaMoE with no kernel changes, built in the same container (needs the `elfutils` headers on the include
+path for DeepJIT), run on the same node/job/clock with the same method. Its `tests/test_mega_moe.py` was only extended with the
+forced-balanced routing, `--active-ranks` and the streamed `KSPAN` benchmark ([`sm100_b200/upstream_test_mega_moe.py`](../sm100_b200/upstream_test_mega_moe.py));
+`--num-shared-experts 0`, no correctness reference in that run (the container has no DeepEP for the upstream legacy baseline).
 
 ## Measurement method
 
