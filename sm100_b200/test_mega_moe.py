@@ -110,7 +110,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
         topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
-        if args.balanced:
+        if args.balanced and num_ranks == 1:
+            g = torch.arange(num_tokens, device='cuda', dtype=torch.int64)
+            s_idx = torch.arange(num_topk, device='cuda', dtype=torch.int64)
+            topk_idx = ((g[:, None] * num_topk + s_idx[None, :]) % num_experts).to(topk_idx.dtype)
+            topk_weights = torch.full((num_tokens, num_topk), 1.0 / num_topk, dtype=torch.float, device='cuda')
+        elif args.balanced:
             # forced-balanced routing (same rule as the H20 harness): slot s -> rank s, expert = s*E_local + (g + 7 s) % E_local
             g = (torch.arange(num_tokens, device='cuda', dtype=torch.int64) + rank_idx * 1000003)  # distinct global ids
             s_idx = torch.arange(num_topk, device='cuda', dtype=torch.int64)
@@ -200,8 +205,12 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Only do NCU profiling
     if args.ncu_profile_only:
         create_inputs()
-        dist_print(f'Run fused kernel:', once_in_node=True)
-        run_fused()
+        dist_print(f'Run fused kernel x{args.ncu_iters}:', once_in_node=True)
+        flush_buf = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device='cuda')
+        for _ in range(args.ncu_iters):
+            flush_buf.zero_()
+            run_fused()
+        torch.cuda.synchronize()
         dist_print(f' > Done, exiting', once_in_node=True)
 
         # Destroy and exit
@@ -279,11 +288,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Hang probe: launch once with stamps on a side stream, read the stamps through another stream after a few seconds
     if args.hang_probe:
         import time
-        stamps = torch.zeros(32, dtype=torch.int64, device='cuda')
+        stamps = torch.zeros(64, dtype=torch.int64, device='cuda')
         stamps[0] = stamps[3] = 0x7fffffffffffffff
         os.environ['DG_SM100_PHASE_STAMPS_PTR'] = str(stamps.data_ptr())
         # Allocate everything the probe needs BEFORE the launch (cudaHostAlloc may wait for an idle device)
-        host = torch.empty(32, dtype=torch.int64, device='cpu', pin_memory=True)
+        host = torch.empty(64, dtype=torch.int64, device='cpu', pin_memory=True)
         s_run = torch.cuda.Stream(); s_probe = torch.cuda.Stream()
         with torch.cuda.stream(s_probe):
             host.copy_(stamps, non_blocking=True)
@@ -305,12 +314,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Phase stamps (single clean run after the warm-ups, GPU0 prints): slots per the kernel comment
     if args.phase_stamps:
-        stamps = torch.zeros(32, dtype=torch.int64, device='cuda')
+        stamps = torch.zeros(64, dtype=torch.int64, device='cuda')
+        stamps[17] = stamps[19] = stamps[55] = 0x7fffffffffffffff
         os.environ['DG_SM100_PHASE_STAMPS_PTR'] = str(stamps.data_ptr())
         for _ in range(3):
             run_fused()
         torch.cuda.synchronize(); dist.barrier()
-        stamps.zero_(); stamps[0] = stamps[3] = 0x7fffffffffffffff
+        stamps.zero_(); stamps[0] = stamps[3] = 0x7fffffffffffffff; stamps[17] = stamps[19] = stamps[55] = 0x7fffffffffffffff
         torch.cuda.synchronize(); dist.barrier()
         # align the ranks on the stream (as in the streamed benchmark) so the barrier waits reflect the kernel, not launch skew
         _flush = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device='cuda'); _flush.zero_()
@@ -320,9 +330,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         us = lambda i: (st[i] - t0) / 1e3 if st[i] not in (0, 0x7fffffffffffffff) else float('nan')
         names = {1: 'dispatch barrier#1/DONE acquired', 2: 'pool ready (arrival counts)', 3: 'first math task', 4: 'last L1 end',
                  5: 'last L2 end', 6: 'combine barrier#2 done', 7: 'combine end', 8: 'routing count done', 9: 'routing writes/pushes issued',
-                 10: 'grid sync/DONE signalled', 12: 'barrier#3 done (kernel tail)'}
+                 10: 'grid sync/DONE signalled', 12: 'barrier#3 done (kernel tail)', 11: 'DONE2 red issued (last L2 CTA)', 18: 'DONE2 red returned', 19: 'first CTA at DONE2 wait', 28: 'last CTA at DONE2 wait', 29: 'last CTA left task loop', 17: 'first CTA acquired DONE2'}
         if rank_idx == 0:
-            print('PHASES us (GPU0, from kernel entry): ' + ' | '.join(f'{names[i]}={us(i):.1f}' for i in [8, 9, 10, 1, 2, 3, 4, 5, 6, 7, 12]), flush=True)
+            print('PHASES us (GPU0, from kernel entry): ' + ' | '.join(f'{names[i]}={us(i):.1f}' for i in [8, 9, 10, 1, 2, 3, 4, 5, 29, 19, 28, 11, 18, 17, 6, 7, 12]), flush=True)
             avg = lambda a, b: (st[a] / max(st[b], 1)) / 1e3
             print(f'TASKS (GPU0, all SMs): L1 tasks={st[21]} avg={avg(20, 21):.2f}us | L2 tasks={st[23]} avg={avg(22, 23):.2f}us | '
                   f'A-loader L1 arrival spin sum={st[24] / 1e3:.1f}us L2 mask spin sum={st[25] / 1e3:.1f}us | TMEM-empty wait avg={avg(26, 27):.2f}us', flush=True)
@@ -512,6 +522,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test PyTorch symmetric memory')
 
     # Resource settings
+    parser.add_argument('--ncu-iters', type=int, default=8, help='kernel launches on the NCU-only path (L2 flushed before each)')
     parser.add_argument('--ncu-profile-only', action='store_true', help='Only run profiling without correctness test')
     parser.add_argument('--num-processes', type=int, default=8, help='Number of processes to spawn (default: 8)')
 

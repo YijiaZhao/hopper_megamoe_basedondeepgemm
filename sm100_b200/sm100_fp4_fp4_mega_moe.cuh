@@ -128,8 +128,12 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
     };
 
     // Prefetch TMA descriptors at the very beginning
+    // DONE broadcast to this CTA's task roles: [0, kNumExpertsPerRank) local expert counts, [64] flag (0 -> 1 once DONE was acquired)
+    DG_STATIC_ASSERT(kNumExpertsPerRank <= 64, "DONE broadcast: at most 64 local experts");
+    __shared__ __align__(16) uint32_t smem_done_bcast[65];
     if (warp_idx == 0) {
         if (lane_idx == 0) stamp_min(0);
+        if (lane_idx == 0) smem_done_bcast[64] = 0u, smem_done_bcast[63] = 0u;
         cute::prefetch_tma_descriptor(&tensor_map_l1_acts);
         cute::prefetch_tma_descriptor(&tensor_map_l1_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l1_weights);
@@ -444,6 +448,8 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
             task_epoch = epoch;
             task_pool_parity = epoch_pool_parity(epoch);
             scheduler.set_push_mode(workspace.get_push_done_count_ptr(), epoch_done_target(epoch), task_pool_parity);
+            if (not peek_counts)
+                scheduler.set_smem_counts(smem_done_bcast, smem_done_bcast + 64, 1u);
             if constexpr (kStaticSlots)
                 scheduler.set_static_slots(peek_counts);
         }
@@ -648,16 +654,24 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
             // SM e publishes expert e's L1 arrival counts once every rank's rows are in the local pool
             // (DONE acquired), one block per lane, with release.gpu: the loaders' acquire then covers the rows
-            if (warp_idx == 0 and sm_idx < kNumExpertsPerRank) {
+            if (warp_idx == 0) {
                 const int push_done_target = epoch_done_target(dispatch_epoch);
                 if (lane_idx == 0) {
-                    while (ptx::ld_volatile(workspace.get_push_done_count_ptr()) - push_done_target < 0);
                     while (ptx::ld_acq_sys(workspace.get_push_done_count_ptr()) - push_done_target < 0);
                     stamp_max(1);
                 }
                 __syncwarp();
-                const uint32_t num_recv_tokens = static_cast<uint32_t>(
-                    ptx::ld_volatile(recv_count_sum_ptr_p(dispatch_parity, sm_idx)));
+                // Broadcast DONE + the final local counts to this CTA's task roles through shared memory (one global
+                // poller per CTA instead of one per role warp; the roles then need no global loads to start)
+                for (uint32_t e = lane_idx; e < kNumExpertsPerRank; e += 32)
+                    smem_done_bcast[e] = static_cast<uint32_t>(ptx::ld_volatile(recv_count_sum_ptr_p(dispatch_parity, e)));
+                __syncwarp();
+                __threadfence_block();
+                if (lane_idx == 0)
+                    *reinterpret_cast<volatile uint32_t*>(smem_done_bcast + 64) = 1u;
+            }
+            if (warp_idx == 0 and sm_idx < kNumExpertsPerRank) {
+                const uint32_t num_recv_tokens = smem_done_bcast[sm_idx];
                 const uint32_t num_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
                 for (uint32_t b = lane_idx; b < num_blocks; b += 32)
                     ptx::red_add_rel(workspace.get_l1_arrival_count_ptr(strided_pool_block_p(dispatch_parity, sm_idx, b)),
@@ -910,6 +924,28 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
 
         if (thread_idx == 0) stamp_max(2);
         }  // pull dispatch
+
+        if constexpr (kPushDispatch) {
+            // DONE2 signal on behalf of the epilogue (mailbox in shared memory, see the L2 epilogue): warp 0 spins until this
+            // CTA finished the rank's last L2 task, or until DONE2 is complete (another CTA of this rank signalled)
+            if (warp_idx == 0) {
+                const int done2_target = epoch_done_target(dispatch_epoch);
+                bool signal = false;
+                if (lane_idx == 0) {
+                    while (true) {
+                        if (*reinterpret_cast<volatile uint32_t*>(smem_done_bcast + 63) != 0u) { signal = true; break; }
+                        if (ptx::ld_volatile(workspace.get_l2_done_count_ptr()) - done2_target >= 0) break;
+                    }
+                }
+                signal = __shfl_sync(0xffffffff, signal, 0);
+                if (signal) {
+                    __threadfence_block();
+                    if (lane_idx < kNumRanks)
+                        ptx::red_add_rel_sys(sym_buffer.map(workspace.get_l2_done_count_ptr(), lane_idx), 1);
+                }
+                __syncwarp();
+            }
+        }
 
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
@@ -1328,6 +1364,7 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
         enter_task_role();
+        uint32_t total_l2_tasks_cached = ~0u;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1704,7 +1741,9 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                 // CTA barrier + this warp's acq_rel add + the signaller's release)
                 if constexpr (kPushDispatch) {
                     if (epilogue_warp_idx == 0) {
-                        const uint32_t total_l2_tasks = scheduler.get_pool_block_offset(kNumExpertsPerRank) * kNumL2BlockNsLocal;
+                        if (total_l2_tasks_cached == ~0u)
+                            total_l2_tasks_cached = scheduler.get_pool_block_offset(kNumExpertsPerRank) * kNumL2BlockNsLocal;
+                        const uint32_t total_l2_tasks = total_l2_tasks_cached;
                         uint32_t arrived = 0;
                         if (lane_idx == 0)
                             arrived = ptx::atomic_add_acq_rel(workspace.get_l2_task_arrival_ptr(), 1u);
@@ -1712,8 +1751,14 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
                         if (arrived + 1 == total_l2_tasks) {
                             if (lane_idx == 0)
                                 *workspace.get_l2_task_arrival_ptr() = 0;
-                            if (lane_idx < kNumRanks)
-                                ptx::red_add_rel_sys(sym_buffer.map(workspace.get_l2_done_count_ptr(), lane_idx), 1);
+                            if (lane_idx == 0) stamp_max(11);
+                            // DONE2 mailbox: hand the sys-scope signal to dispatch warp 0 (its release fence would otherwise
+                            // stall this warp for ~2 us on the critical path); release.cta over the arrival chain
+                            if (lane_idx == 0) {
+                                __threadfence_block();
+                                *reinterpret_cast<volatile uint32_t*>(smem_done_bcast + 63) = 1u;
+                            }
+                            if (lane_idx == 0) stamp_max(18);
                         }
                         __syncwarp();
                     }
@@ -1730,17 +1775,15 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
             }
         }
 
-        // Deallocate tensor memory
-        // NOTES: must be called by the same logical warp ID on both CTAs
-        if (epilogue_warp_idx == 0)
-            Allocator().free(0, kNumTmemCols);
+        if (epilogue_thread_idx == 0) stamp_max(29);
 
         if constexpr (kPushDispatch) {
             // Wait for every rank's DONE2 (all L2 tasks of all ranks finished): one acquire.sys load per CTA
             if (epilogue_thread_idx == 0) {
                 const int target = epoch_done_target(task_epoch);
-                while (ptx::ld_volatile(workspace.get_l2_done_count_ptr()) - target < 0);
+                stamp_min(19); stamp_max(28);
                 while (ptx::ld_acq_sys(workspace.get_l2_done_count_ptr()) - target < 0);
+                stamp_min(17);
             }
             ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
         } else {
@@ -1897,6 +1940,11 @@ sm100_fp4_fp4_mega_moe_impl(void* y,
             ptx::tma_store_wait<0>();
             if (lane_idx == 0) stamp_max(7);
         }
+
+        // Deallocate tensor memory (after the combine, which only uses shared memory: keeps the free off the critical path)
+        // NOTES: must be called by the same logical warp ID on both CTAs
+        if (epilogue_warp_idx == 0)
+            Allocator().free(0, kNumTmemCols);
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

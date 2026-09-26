@@ -19,17 +19,20 @@ Scale: Experts 384 (48 local per rank), Hidden 3072, Intermediate 1280, top-8, E
 active rank; M2 / M4 = ranks 0,4 / 0,1,4,5; M16 = 2 tokens per rank). Forced-balanced routing (`expert = s*48 + (g + 7s) % 48`,
 weight 1/8), the same rule as the H20 table.
 
-Kernel span on GPU 0, µs, median of the last 3 of 30 streamed replays (nsc-svg-slurm-1 job 2033326, SM clock locked at 1965 MHz):
+Kernel span on GPU 0, µs, median of the last 3 of 30 streamed replays, and (for the optimised kernels) the median of three
+such runs (nsc-svg-slurm-1 jobs 2033326 / 2063323, SM clock locked at 1965 MHz):
 
 | Global M | W-MXFP4 x A-FP8 (optimised upstream kernel) | W4A4 MXFP4 (new kernel) | W4A4 NVFP4 (new kernel) | W-MXFP4 x A-FP8, upstream baseline (DeepGEMM main `78b6900`) | H20 MXFP4 Mega-only (1830 MHz, [H20 doc](H20_MEGAMOE_RESULTS.md)) |
 |---|---:|---:|---:|---:|---:|
-| 2  | 37.5 | 35.6 | 33.9 | 47.2 | 38.8 |
-| 4  | 42.6 | 41.3 | 41.5 | 50.5 | 47.4 |
-| 8  | 49.3 | 45.8 | 47.4 | 53.2 | 56.7 |
-| 16 | 55.2 | 52.5 | 52.7 | 61.2 | 76.2 |
+| 2  | 35.7 | 35.0 | 34.4 | 47.2 | 38.8 |
+| 4  | 38.9 | 38.3 | 39.5 | 50.5 | 47.4 |
+| 8  | 46.1 | 43.7 | 44.6 | 53.2 | 56.7 |
+| 16 | 54.0 | 47.6 | 50.8 | 61.2 | 76.2 |
 
-(2026-09-24 final code state: L1 K block 512 for the W4A4 kernels. Cell-to-cell repeat spread on GPU 0 is ±2 µs; the previous
-build measured 39.4 / 43.0 / 49.2 / 55.8, 35.4 / 39.9 / 45.3 / 53.9, 36.1 / 40.2 / 45.6 / 51.6.)
+(2026-09-26 code state: optimisations 1–11 below. The three runs per cell spread by ±1–2 µs on GPU 0; one FP8 M16 run in which a
+rank entered 30 µs late was excluded. The 2026-09-24 state (optimisations 1–7, single run) measured 37.5 / 42.6 / 49.3 / 55.2,
+35.6 / 41.3 / 45.8 / 52.5, 33.9 / 41.5 / 47.4 / 52.7. Single-GPU kernel time with all 48 experts local and the M8 work per GPU,
+i.e. without any NVLink wait: MXFP4 29–30 µs, FP8 activations 31–32 µs.)
 
 Correctness: every cell has a relative RMSE of 0.23–0.25 % on every rank against a pure-torch reference (dequantised inputs,
 fp32 matmul, bf16-rounded gate/up with clamp 10, SwiGLU, the kernel's own per-group requantisation rule for the intermediate).
@@ -65,10 +68,20 @@ GPU 0 starts first, so its span contains the wait for the slowest rank (~5–8 �
 | 5 | BLOCK_K 128 -> 256 (FP8 act: 39.8 -> 39.4 at M2, within noise elsewhere): W4A4 packed rows are one 128 B swizzle atom; FP8-act rows span two atoms per stage (per-atom UMMA descriptors, two SF word planes) | heuristics | L1 task 5.3 -> 3.5 (W4A4), 4.9 -> 4.0 (FP8) |
 | 6 | First pushed row prefetched into smem before the ticket round trip | (with 1) | ~1 |
 | 7 | Static slots + early weight streaming: for tiny M every local expert owns one fixed (expert, n-block) -> SM slot set, empty experts are skipped at run time, and the weight loader starts streaming an expert's weights as soon as its live ticket count is nonzero (before DONE) | `DG_SM100_STATIC_SLOTS` (auto when `tokens * ranks <= BLOCK_M`) | M2 -4, M8 -4 |
+| 8 | Closed-form static-slot schedule: with one expert wave the (expert, n-block) -> SM map is arithmetic, so every warp role enumerates only its own slots and skips empty experts through a 64-bit active-expert mask (built once the counts are final). Before, each role walked the 40 empty experts one scheduler iteration (warp reduce + shuffle) at a time after its last task, ~5 µs on the CTA that gates the combine | (with 7) | 1-GPU M8 33.2 -> 30.3 |
+| 9 | Tail: TMEM freed after the combine (the free waited on the 2-CTA peer on the critical path); the rank's L2 task total computed once per CTA instead of a warp reduction per task | — | ~1 |
+| 10 | DONE broadcast through shared memory: one dispatch warp per CTA acquires DONE (sys scope) and copies the 48 local counts into shared memory; the loader / MMA / epilogue warps spin on the shared flag and read the counts there instead of each polling the global DONE word and re-reading the counts (3 x 148 sys-scope pollers -> 148). Acquire loads in the DONE / DONE2 spins (one round trip less than relaxed spin + acquire) | — | DONE signalled -> acquired 2.5 -> 0.4 µs |
+| 11 | DONE2 mailbox: the epilogue warp that finishes the rank's last L2 task only writes a shared-memory flag; dispatch warp 0 (idle after the dispatch) issues the kNumRanks `red.release.sys`. The sys-scope release fence stalled the epilogue warp for ~2–3 µs after the signal, and that CTA's exit was the kernel end | — | ~1–2 |
 
-Phase breakdown (`--phase-stamps`, globaltimer, GPU 0, M2 MXFP4, µs from kernel entry): pushes issued 4.4 | DONE signalled ~6-8 |
-DONE acquired ~9 | first math task ~9.5 | last L1 end ~16.5 | last L2 end ~20.5 | all ranks' L2 done ~26 (wait on the slowest rank)
-| combine end ~28. What is left: the dispatch chain is three serial NVLink round trips (ticket, remote write completion, DONE;
+Phase breakdown (`--phase-stamps`, globaltimer, GPU 0, M2 MXFP4, µs from kernel entry, 2026-09-24 state): pushes issued 4.4 |
+DONE signalled ~6-8 | DONE acquired ~9 | first math task ~9.5 | last L1 end ~16.5 | last L2 end ~20.5 | all ranks' L2 done ~26 (wait
+on the slowest rank) | combine end ~28.
+
+Single-GPU timeline (1 rank, 48 local experts, 1 token x top-8 = the M8 work per GPU, MXFP4, 2026-09-26 state, µs): pushes issued
+2.6 | DONE signalled ~9 | DONE acquired 9.5 | first math 10.9 | last L1 end 21 | last L2 end 24 | combine end ~29. The L1 phase is two
+waves: 8 experts x 20 n-blocks (BLOCK_N 128) = 160 CTA tasks on 148 SMs, so 12 SMs run two ~3.5 µs tasks back to back (the L2 phase:
+192 tasks, 44 SMs run two). Finer tasks (BLOCK_N 64, split-K) are the remaining lever for the L1/L2 phases; the tail after the last
+L2 task (arrival atomic 0.9 + sys-scope release 1.6 + acquire 0.4 + combine 0.7 µs) is close to its floor with the DONE2 design. What is left: the dispatch chain is three serial NVLink round trips (ticket, remote write completion, DONE;
 floor ~7 µs); an L1 task is bound by the per-SM L2->SMEM feed rate (~56 GB/s per SM for 196 KB of weights) and only 40 of 148
 SMs have work at M2 (split-K or BLOCK_N = 64 would spread it); the FP8-activation kernel keeps half the pipeline depth because
 its FP4 weights occupy 8-bit smem containers.
@@ -103,8 +116,12 @@ python tests/test_mega_moe.py --num-processes 8 --num-experts 384 --hidden 3072 
 ## Single-GPU Nsight Compute (what the kernel is bound by)
 
 NCU cannot replay the 8-rank kernel (the DONE counters wait on peers), so the profile is a 1-rank run with all 48 experts
-local, 1 token x top-8 (the same per-GPU GEMM work as global M8): `ncu --set full --kernel-name regex:mega_moe` on the
-W4A4 MXFP4 kernel (`ncu_mxfp4_1rank_m8.ncu-rep`, NCU locks the clock to 1.13 GHz, kernel 53.5 µs there).
+local and the per-GPU work of global M (M2 = 1 token x top-2, M4 = top-4, M8 = top-8, M16 = 2 tokens x top-8; balanced routing,
+each expert one row): `ncu --set full --kernel-name regex:mega_moe --launch-skip 3 --launch-count 5` (five consecutive launches per
+report, L2 flushed before each; `tests/test_mega_moe.py --ncu-profile-only --ncu-iters 8`). Reports for the FP8-activation and
+W4A4 MXFP4 kernels at all four M and NVFP4 at M8 are kept outside the repository (`megamoe_b200/ncu5/`, 15–20 MB each). NCU locks
+the clock to ~1.15 GHz and replays ~40 passes, so its durations (MXFP4 M8: 48.6–49.2 µs) are not comparable with the table; the
+same run without NCU at 1965 MHz takes 29–30 µs. The numbers below are from the MXFP4 M8 report.
 
 | Metric | Value |
 |---|---|

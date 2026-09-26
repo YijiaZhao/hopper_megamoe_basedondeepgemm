@@ -79,6 +79,15 @@ struct MegaMoEScheduler {
     bool static_slots = false;
     bool peek = false;
     bool done_seen = false;
+    // Static slots: bit e = local expert e has tokens (valid once the counts are final). Lets the block walk skip
+    // empty experts with plain arithmetic instead of one scheduler iteration (warp reduce + shuffle) per expert.
+    uint64_t active_mask = 0;
+    bool active_mask_valid = false;
+    // Shared-memory DONE broadcast (push mode): one dispatch warp per CTA acquires DONE (sys scope) and copies the local
+    // expert counts into shared memory; the task roles spin on the shared flag instead of polling the global DONE word
+    const uint32_t* smem_counts = nullptr;
+    const uint32_t* smem_flag = nullptr;
+    uint32_t smem_flag_target = 0;
 
     CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
         block_idx = blockIdx.x;
@@ -86,6 +95,10 @@ struct MegaMoEScheduler {
 
     CUTLASS_DEVICE void set_push_mode(const int* done_ptr, const int& done_target, const uint32_t& parity) {
         push_done_ptr = done_ptr, push_done_target = done_target, push_parity = parity;
+    }
+
+    CUTLASS_DEVICE void set_smem_counts(const uint32_t* counts, const uint32_t* flag, const uint32_t& target) {
+        smem_counts = counts, smem_flag = flag, smem_flag_target = target;
     }
 
     CUTLASS_DEVICE void set_static_slots(const bool& peek_mode) {
@@ -177,6 +190,7 @@ struct MegaMoEScheduler {
 
     CUTLASS_DEVICE bool fetch_next_l1_block() {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
+        skip_empty_experts<kNumL1BlockNs>(wave_end_expert_idx);
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
             m_block_idx = block_idx / kNumL1BlockNs;
@@ -192,6 +206,7 @@ struct MegaMoEScheduler {
 
     CUTLASS_DEVICE bool fetch_next_l2_block() {
         const auto wave_end_expert_idx = get_wave_expert_end_idx();
+        skip_empty_experts<kNumL2BlockNs>(wave_end_expert_idx);
         while (current_local_expert_idx < wave_end_expert_idx) {
             const auto num_m_blocks = get_current_num_m_blocks();
             if (block_idx < num_m_blocks * kNumL2BlockNs) {
@@ -246,8 +261,41 @@ struct MegaMoEScheduler {
         return {BlockPhase::None, 0, 0, 0};
     }
 
+    CUTLASS_DEVICE void build_active_mask() {
+        DG_STATIC_ASSERT(kNumExpertsPerRank <= 64, "Active mask holds at most 64 experts");
+        active_mask = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const uint32_t bits = __ballot_sync(0xffffffff, stored_num_tokens_per_expert[i] != 0);
+            active_mask |= static_cast<uint64_t>(bits) << (i * 32);
+        }
+        active_mask_valid = true;
+    }
+
+    // Peek mode, after DONE: the counts are final, re-read them all once and build the mask
+    CUTLASS_DEVICE void finalize_counts_after_done() {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            uint64_t value = 0;
+            if (expert_idx < kNumExpertsPerRank)
+                value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx, push_parity));
+            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+        }
+        __syncwarp();
+        current_num_tokens = get_num_tokens(current_local_expert_idx);
+        build_active_mask();
+    }
+
     CUTLASS_DEVICE void fetch_expert_recv_count() {
-        if (push_done_ptr != nullptr and not peek) {
+        const bool use_smem = push_done_ptr != nullptr and not peek and smem_flag != nullptr;
+        if (use_smem) {
+            // Shared flag published (release.cta) by the CTA's DONE-acquiring warp: relaxed spin + fence = acquire
+            if (ptx::get_lane_idx() == 0)
+                while (*reinterpret_cast<const volatile uint32_t*>(smem_flag) != smem_flag_target);
+            __syncwarp();
+            __threadfence_block();
+        } else if (push_done_ptr != nullptr and not peek) {
             // Lane 0 relaxed spin, then one acquire.sys load; `__syncwarp` extends the ordering
             if (ptx::get_lane_idx() == 0) {
                 while (ptx::ld_volatile(push_done_ptr) - push_done_target < 0);
@@ -261,7 +309,9 @@ struct MegaMoEScheduler {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                if (push_done_ptr != nullptr) {
+                if (use_smem) {
+                    value = smem_counts[expert_idx];
+                } else if (push_done_ptr != nullptr) {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx, push_parity));
                 } else {
                     do {
@@ -272,6 +322,73 @@ struct MegaMoEScheduler {
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }
         __syncwarp();
+        if (static_slots and not peek)
+            build_active_mask();
+    }
+
+    // Static slots: skip the empty experts in front of the current one (same block_idx arithmetic as walking their
+    // slots one by one: an owned slot would be returned and skipped by the caller after `block_idx += kNumSMs`)
+    template <uint32_t kNumBlockNs>
+    CUTLASS_DEVICE void skip_empty_experts(const uint32_t& wave_end_expert_idx) {
+        if (not (static_slots and active_mask_valid))
+            return;
+        uint32_t e = current_local_expert_idx;
+        while (e < wave_end_expert_idx and ((active_mask >> e) & 1ull) == 0) {
+            block_idx = (block_idx < kNumBlockNs ? block_idx + kNumSMs : block_idx) - kNumBlockNs;
+            ++ e;
+        }
+        if (e != current_local_expert_idx) {
+            current_local_expert_idx = e;
+            current_num_tokens = e < kNumExpertsPerRank ? get_num_tokens(e) : 0u;
+        }
+    }
+
+    // Static slots, single wave: the (expert, n-block) -> SM map is closed-form. Slot g of phase P belongs to SM
+    // (base_P + g) % kNumSMs with base_L1 = blockIdx.x, base_L2 = blockIdx.x + kNumSMs / 2 (the same map as the
+    // slot walk of `get_next_block`, without one scheduler iteration per expert). Empty experts are skipped by
+    // arithmetic; in peek mode a zero count is confirmed by waiting for DONE and re-reading all counts once.
+    template <typename Func>
+    CUTLASS_DEVICE void for_each_static_slot(Func&& func) {
+        #pragma unroll 1
+        for (uint32_t phase = 0; phase < 2; ++ phase) {
+            const bool is_l2 = phase == 1;
+            const uint32_t per_expert = is_l2 ? kNumL2BlockNs : kNumL1BlockNs;
+            const uint32_t num_slots = kNumExpertsPerRank * per_expert;
+            const uint32_t base = is_l2 ? (blockIdx.x + kNumSMs / 2) % kNumSMs : blockIdx.x;
+            next_phase = is_l2 ? BlockPhase::Linear2 : BlockPhase::Linear1;
+            #pragma unroll 1
+            for (uint32_t g = base; g < num_slots; g += kNumSMs) {
+                const uint32_t e = g / per_expert, n = g - e * per_expert;
+                // Final counts: pure bit test for empty experts (no shuffle); otherwise read the count
+                if (active_mask_valid and ((active_mask >> e) & 1ull) == 0)
+                    continue;
+                uint32_t count = get_num_tokens(e);
+                if (count == 0) {
+                    if (peek and not active_mask_valid) {
+                        current_local_expert_idx = e;
+                        while (true) {
+                            refresh_current_count();
+                            if (current_num_tokens != 0 or is_done())
+                                break;
+                        }
+                        if (current_num_tokens == 0)
+                            finalize_counts_after_done();
+                        count = current_num_tokens;
+                    }
+                    if (count == 0)
+                        continue;
+                }
+                current_local_expert_idx = e;
+                current_num_tokens = count;
+                m_block_idx = 0, n_block_idx = n;
+                block_idx = g + kNumSMs;
+                current_pool_block_offset = active_mask_valid ?
+                    static_cast<uint32_t>(__popcll(active_mask & ((1ull << e) - 1ull))) : get_pool_block_offset(e);
+                func(next_phase, e, is_l2 ? kNumL2BlockKs : kNumL1BlockKs, 0u, n);
+            }
+        }
+        current_local_expert_idx = kNumExpertsPerRank;
+        next_phase = BlockPhase::Linear1;
     }
 
     template <typename Func>
@@ -281,6 +398,11 @@ struct MegaMoEScheduler {
 
         // Initialize current expert with 0
         set_expert_idx(0);
+
+        if constexpr (kNumExpertsPerWave == kNumExpertsPerRank) {
+            if (static_slots)
+                return for_each_static_slot(func);
+        }
 
         // Iterate over all blocks
         // TODO: add swizzle within expert waves for better L2 cache utilization
@@ -298,9 +420,9 @@ struct MegaMoEScheduler {
                             if (current_num_tokens != 0 or is_done())
                                 break;
                         }
-                        if (current_num_tokens == 0) {
-                            // Final zero (DONE seen): re-read once more after DONE to be sure
-                            refresh_current_count();
+                        if (current_num_tokens == 0 and not active_mask_valid) {
+                            // Final counts (DONE seen): re-read them all once, build the skip mask
+                            finalize_counts_after_done();
                         }
                     }
                     if (current_num_tokens == 0)
