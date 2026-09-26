@@ -189,10 +189,13 @@ Per-platform result documents (one table + measurement method + reproduce each):
 | Platform | Kernels | Mega-only, forced-balanced, GPU 0, µs at global M = 2 / 4 / 8 / 16 | Document |
 |---|---|---|---|
 | 8x H20-3e (SM90, 1830 MHz) | MXFP4 / QoQ fused (this repo) | 38.8 / 47.4 / 56.7 / 76.2 (MXFP4), 37.1 / 45.2 / 54.0 / 72.6 (QoQ) | [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md) |
-| 8x B200 (SM100, 1965 MHz) | W-MXFP4xA-FP8 / W4A4 MXFP4 / W4A4 NVFP4 (`sm100_b200/`, on AichenF DeepGEMM `megamoe_nvfp4_dev`) | 37.5 / 42.6 / 49.3 / 55.2 (FP8 act), 35.6 / 41.3 / 45.8 / 52.5 (MXFP4), 33.9 / 41.5 / 47.4 / 52.7 (NVFP4) | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
+| 8x B200 (SM100, 1965 MHz) | W-MXFP4xA-FP8 (optimised upstream kernel) / W4A4 MXFP4 / W4A4 NVFP4 (new kernels) (`sm100_b200/`, on AichenF DeepGEMM `megamoe_nvfp4_dev`) | 37.5 / 42.6 / 49.3 / 55.2 (FP8 act), 35.6 / 41.3 / 45.8 / 52.5 (MXFP4), 33.9 / 41.5 / 47.4 / 52.7 (NVFP4) | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
+| 8x B200 (SM100, 1965 MHz) | Upstream baseline: [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) main `78b6900` W-MXFP4xA-FP8 `fp8xfp4` MegaMoE, kernel unmodified | 47.2 / 50.5 / 53.2 / 61.2 | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
 
-Same model scale for both (E384 / 48 local, H3072, I1280, top-8, EP8) and the same forced-balanced routing; both columns are the
-kernel span on GPU 0, median of the last 3 of 30 streamed replays (nsys on H20, torch-profiler kernel durations on B200).
+Same model scale for all rows (E384 / 48 local, H3072, I1280, top-8, EP8) and the same forced-balanced routing; every column is the
+kernel span on GPU 0, median of the last 3 of 30 streamed replays (nsys on H20, torch-profiler kernel durations on B200). The two
+B200 rows were measured in the same Slurm job and container; upstream DeepGEMM has no Hopper MegaMoE and no FP4-activation (W4A4)
+MegaMoE, so those kernels have no upstream counterpart.
 
 ## Relevant source files
 
