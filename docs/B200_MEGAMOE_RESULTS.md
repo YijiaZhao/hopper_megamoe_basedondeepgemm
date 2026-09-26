@@ -21,7 +21,7 @@ weight 1/8), the same rule as the H20 table.
 
 Kernel span on GPU 0, µs, median of the last 3 of 30 streamed replays (nsc-svg-slurm-1 job 2033326, SM clock locked at 1965 MHz):
 
-| Global M | W-MXFP4 x A-FP8 | W4A4 MXFP4 | W4A4 NVFP4 | Upstream DeepGEMM `fp8xfp4`, unmodified (main `78b6900`) | H20 MXFP4 Mega-only (1830 MHz, [H20 doc](H20_MEGAMOE_RESULTS.md)) |
+| Global M | W-MXFP4 x A-FP8, optimised (upstream `sm100_fp8_fp4_mega_moe` + the 7 changes below) | W4A4 MXFP4, optimised (new kernel) | W4A4 NVFP4, optimised (new kernel) | W-MXFP4 x A-FP8, upstream DeepGEMM `fp8xfp4` as-is (main `78b6900`) | H20 MXFP4 Mega-only (1830 MHz, [H20 doc](H20_MEGAMOE_RESULTS.md)) |
 |---|---:|---:|---:|---:|---:|
 | 2  | 37.5 | 35.6 | 33.9 | 47.2 | 38.8 |
 | 4  | 42.6 | 41.3 | 41.5 | 50.5 | 47.4 |
