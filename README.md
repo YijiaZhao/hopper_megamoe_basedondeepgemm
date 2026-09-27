@@ -1,8 +1,46 @@
-# H20 MegaMoE Four-API Delivery
+# MegaMoE based on DeepGEMM (H20 / B200)
 
-This repository delivers four explicit Hopper/H20 MegaMoE APIs and one shared
-Fable dynamic-M frontend.  Split and Fused retain independent workspaces,
-layouts, schedulers, and ABI contracts.
+Expert-parallel MoE layer kernels for decode-size batches, built on DeepGEMM: four explicit
+Hopper/H20 APIs plus one shared Fable dynamic-M frontend, and the Blackwell/B200 kernels under
+`sm100_b200/`. Split and Fused retain independent workspaces, layouts, schedulers, and ABI contracts.
+
+Best measured MegaMoE kernel time (single kernel, forced-balanced, E384 / H3072 / I1280 / top-8 / EP8,
+GPU 0, median of the last 3 of 30 streamed replays, µs at global M = 2 / 4 / 8 / 16; full tables in
+[Performance results](#performance-results)):
+
+| Platform | Kernel | M2 | M4 | M8 | M16 |
+|---|---|---:|---:|---:|---:|
+| 8x B200 (1965 MHz) | W4A4 MXFP4, `sm100_b200/` | 35.0 | 38.3 | 43.7 | 47.6 |
+| 8x B200 (1965 MHz) | W4A4 NVFP4, `sm100_b200/` | 34.4 | 39.5 | 44.6 | 50.8 |
+| 8x B200 (1965 MHz) | W-MXFP4 x A-FP8, `sm100_b200/` | 35.7 | 38.9 | 46.1 | 54.0 |
+| 8x H20-3e (1830 MHz) | MXFP4 fused | 38.8 | 47.4 | 56.7 | 76.2 |
+| 8x H20-3e (1830 MHz) | QoQ (W4A8-int) fused | 37.1 | 45.2 | 54.0 | 72.6 |
+
+## Execution model: split (two kernels) versus fused (one kernel)
+
+| | `*_mega_moe_split` | `*_mega_moe_fused` and every B200 kernel |
+|---|---|---|
+| CUDA kernels per MoE layer | 2: `sm90_mxfp4_mega_moe_l1_impl` (dispatch + L1) then `sm90_mxfp4_mega_moe_l2_impl` (L2 + combine) | 1 persistent kernel: dispatch + L1 + L2 + combine |
+| L1 -> L2 hand-off | across the launch boundary through a ring workspace | inside the kernel: L1 epilogue TMA-stores the quantised SwiGLU output to a per-expert pool (resident in L2 cache) and releases an arrival counter; the L2 task acquires it |
+| Where the time is read (nsys) | L1 kernel start -> L2 kernel end, launch gap included | one kernel start -> end |
+| Frontend (router + quant + top-8) | separate kernel, both models | same |
+
+Same node, same session, Mega-only, GPU 0, median of the last 3 replays
+(`delivery/four_api_fable_timeline_last3_r4_20260909.md`; the fused kernel of that date, before its later optimisations):
+
+| Precision | M | Split (2 kernels) | Fused (1 kernel) |
+|---|---:|---:|---:|
+| MXFP4 | 2 | 53.9 | 46.9 |
+| MXFP4 | 8 | 97.3 | 59.1 |
+| MXFP4 | 16 | 147.8 | 74.0 |
+| QoQ | 2 | 49.5 | 43.8 |
+| QoQ | 8 | 88.0 | 54.9 |
+
+The split path was not optimised after 2026-09-03; the launch boundary alone is worth 6-7 µs at M = 2, and the fused
+kernel additionally overlaps L1 tails with L2 starts and L2 tails with the combine. Both split APIs pass the same 8-rank
+exact-quantised-reference gate as the fused ones (`delivery/four_api_correctness_h20_20260903.txt`: cos_min >= 0.99991,
+norm ratio 0.997-1.0000, all four APIs PASS). Correctness of the B200 kernels: relative RMSE 0.23-0.25 % on every rank
+against a pure-torch reference at every M (see the B200 document).
 
 ## Validated APIs
 
@@ -105,8 +143,8 @@ does it before launching the collector in the container).
 ```bash
 git clone --recursive \
   --branch main \
-  https://github.com/YijiaZhao/hopper_megamoe_basedondeepgemm.git
-cd hopper_megamoe_basedondeepgemm
+  https://github.com/YijiaZhao/megamoe_basedondeepgemm.git
+cd megamoe_basedondeepgemm
 
 export CUDA_HOME=/usr/local/cuda
 export DG_CUTLASS_INCLUDE_PATH=$PWD/third-party/cutlass/include
