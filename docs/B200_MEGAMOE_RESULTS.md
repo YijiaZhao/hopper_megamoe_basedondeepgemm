@@ -166,6 +166,14 @@ shorter dispatch chain, not more MMA throughput.
   fp32 partials reduced across the 20 K-slice CTAs): weighed, not built. With one row per expert the partial traffic is small
   (12 KB per CTA), but the win is bounded by the L2 phase (~3 µs) minus the extra W2 streaming per task (+98 KB, ~1.5 µs at the
   per-SM feed rate), i.e. ~1.5–2 µs at M8, and it grows the two-wave imbalance. Not worth its size until the wave problem is solved.
+- **Per-warpgroup L1 -> L2 signal** (the FlashInfer CuTeDSL MegaMoE pattern: each epilogue warpgroup releases its own rows after its
+  TMA stores complete, replacing the CTA-wide epilogue barrier plus one `red` per L1 block by two 128-thread barriers and two
+  `red`s; the L2 waiter expects 2 arrivals per L1 block): correct on 8 ranks for all three formats, neutral (same-node 3-run
+  medians within ±1 µs at every M for W-MXFP4 x A-FP8, MXFP4 and NVFP4). The FlashInfer kernel's other synchronisation tricks
+  (scheduler-warp counter peek, release-add batching across many tiles per CTA) do not apply at this scale: a CTA runs 1–2 L1
+  tasks, and the L2 spin exits on its first load once the count is complete. Its L1 -> L2 handoff is otherwise the same
+  structure as here (SwiGLU output quantised in the epilogue, TMA-stored to a global buffer in the layout the FC2 B-operand TMA
+  reads, per-token-block done counter); it does not keep the FC1 result in TMEM either.
 
 ## Run-to-run variance and what "GPU 0" means
 
