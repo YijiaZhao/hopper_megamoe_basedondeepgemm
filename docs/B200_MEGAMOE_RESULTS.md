@@ -174,6 +174,19 @@ shorter dispatch chain, not more MMA throughput.
   tasks, and the L2 spin exits on its first load once the count is complete. Its L1 -> L2 handoff is otherwise the same
   structure as here (SwiGLU output quantised in the epilogue, TMA-stored to a global buffer in the layout the FC2 B-operand TMA
   reads, per-token-block done counter); it does not keep the FC1 result in TMEM either.
+- **Split-K for the second L1 wave** (`DG_SM100_L1_SPLITK`, not merged): the active (expert, N-block) L1 slots numbered
+  densely, slot d on CTA d, and the slots beyond the grid (M8: 12 of 160 CTA slots, M16: 172 of 320) run as two K halves on
+  two CTA pairs; the first half to reach the epilogue hands its fp32 partial (8 KB per CTA) to the other through a scratch
+  buffer with a ticket / ready counter pair, the second adds it and runs the normal SwiGLU / store / signal. Correct on 8 ranks
+  at every M (after making the role CTA-uniform: with a per-warpgroup ticket the token-less second warpgroup of the first half
+  also signalled the L2 arrival counter, so the count completed one store early and M16 was wrong). Not faster: MXFP4 M8 GPU 0
+  42.8 vs 42.5, M16 57.0 vs 50.5 (same nodes, same day). Phase stamps show why: (1) the dense map needs the final counts, so
+  the weight loader can no longer stream the first slot's weights during the dispatch (first L1 wave 3.8 instead of ~2 µs after
+  DONE: L1 phase 13.7 vs 11.1 µs with the dense map alone); (2) the L1 wave is HBM-bound at 8 ranks (148 CTAs x 196 KB in
+  3.8 µs), and the half tasks then compete with the W2 prefetch of the CTAs that already moved on to L2 tasks, so a half
+  task measured 4.3 µs instead of the 2.2 expected. The H20 tree reached the same verdict for its tail split
+  (`DG_FP4_HOT_SPLIT`, removed). A variant that keeps the slot map (and the prefetch) for the first wave and only redistributes
+  the second-wave slots would recover (1) but not (2); expected <= 1 µs, not pursued.
 
 ## Run-to-run variance and what "GPU 0" means
 
