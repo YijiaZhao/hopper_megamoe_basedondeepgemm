@@ -42,6 +42,66 @@ exact-quantised-reference gate as the fused ones (`delivery/four_api_correctness
 norm ratio 0.997-1.0000, all four APIs PASS). Correctness of the B200 kernels: relative RMSE 0.23-0.25 % on every rank
 against a pure-torch reference at every M (see the B200 document).
 
+## Optimisation approach
+
+The workload is decode-size: 1–2 tokens per expert per rank, so every GEMM tile is a 16-token (padded) slab against
+128–256 weight rows. Almost no math; the kernel time is a chain of latencies (NVLink round trips, HBM weight
+streaming, intra-kernel dependencies) plus the wait for the slowest rank. The optimisation work followed four
+principles; the per-item tables with the measured effect of each change are in
+[docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) (B200, items 1–11) and
+[docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md) (H20, env-knob table).
+
+**1. Remove cross-rank round trips.** Each NVLink barrier costs a full round trip plus the wait for the slowest rank.
+The upstream design had three (before the dispatch pull, before the combine, after the workspace cleanup). They are
+replaced by counters embedded in the data flow: the source rank *pushes* routed rows straight into the destination's
+expert pool (one remote ticket per row, first row prefetched before the ticket returns), then adds 1 to every rank's
+DONE count; the CTA that finishes a rank's last L2 task adds 1 to every rank's DONE2 count (B200: through a
+shared-memory mailbox so the sys-scope release fence does not stall the epilogue warp); a parity-rotated pool removes
+the post-cleanup barrier. H20 additionally publishes per-token arrival counters so the combine warps start per token
+(fine combine; on B200 the same idea was slower and is off).
+
+**2. Start streaming weights before the routing is known.** Weight bytes dominate the L1 phase (31 MB of W1 plus 16 MB
+of W2 per rank at M8, HBM-bound over 148 SMs). For tiny M every local expert owns a fixed (expert, N-block) -> SM slot
+set (static slots), so the weight loader can stream an expert's rows as soon as its live count turns non-zero, during
+the dispatch, and empty experts are skipped at run time by a 64-bit active mask. The slot map is closed-form, so each
+warp role enumerates only its own slots (no scheduler iteration per expert). H20: stream-K unit ranges over all SMs
+when there are fewer L1 tasks than SMs, wide 512-row L1 tasks at M = 16, K-block prefetch into L2 while waiting for
+activations.
+
+**3. Shorten every intra-kernel hand-off.** DONE is acquired once per CTA by a dispatch warp and broadcast with the 48
+local counts through shared memory (the loader / MMA / epilogue warps spin on a shared flag instead of polling the
+global word); the L1 -> L2 dependency is a per-expert arrival count released by the L1 epilogue after its TMA store;
+TMEM is freed after the combine instead of on the critical path; per-task warp reductions are hoisted (L2 task total
+computed once). The combine work is split into (token, 512 B chunk) items over all combine warps.
+
+**4. Fit the tile to the tensor core, not the other way round.** swap-AB (weights on the MMA M side, tokens on N) so
+that the 16-token slab is the N = 16 operand; 2-CTA `tcgen05` block-scaled MMA with UTCCP-loaded scale planes (B200);
+K block 512 for the packed-FP4 rows (one 128 B swizzle atom per stage, 6 instead of 12 stages per L1 task); QoQ on
+H20 folds the second scale into the int8 weight at decode time.
+
+**Where the remaining time goes** (B200, MXFP4, M8, kernel-internal `globaltimer` stamps, the rank that enters last so
+no cross-rank wait is included; ~39 µs total):
+
+| Segment | ~µs | Bound by |
+|---|---:|---|
+| Dispatch chain: remote row write + completion wait + DONE | 7 | one NVLink round trip (latency, not bandwidth) |
+| L1 phase: 160 CTA tasks on 148 SMs, 2 waves | 11 | HBM streaming of W1 during the first wave; the second wave overlaps with the W2 prefetch |
+| L1 -> L2 hand-off + L2 phase | 5 | dependency wait + W2 streaming + remote BF16 stores |
+| DONE2 wait + combine | 5 | the slowest rank, one more NVLink round trip |
+| Kernel entry, barriers, cleanup | rest | |
+
+What GPU 0 reads on top of that (5–9 µs) is the wait for the other ranks to enter the kernel, i.e. launch skew outside
+the kernel.
+
+**Tried and dropped** (each measured on 8 ranks, details and numbers in the B200 document): half-N tiles (BLOCK_N 64,
+twice the tasks; a task is not shorter, the per-stage overhead dominates), split-K for the second L1 wave (correct;
+the dense slot map loses the early weight streaming and the half tasks compete with the W2 prefetch for HBM), fusing
+L1 and L2 into one task with the SwiGLU output kept on chip (bounded by the L2 phase minus the extra W2 streaming per
+task, ~1.5–2 µs at best; blocked on B200 by a tensor-core stall, measured slower on H20), per-token fine combine on
+B200, `cp.async` token tiles, one SF TMA per K block, deterministic dispatch slots, per-warpgroup L1 -> L2 signalling.
+FlashInfer's CuTeDSL MegaMoE (SM100 NVFP4) uses the same single-kernel structure with the FC1 output through a global
+buffer; its 128-token tiles leave it at DeepGEMM-upstream parity for this batch size.
+
 ## Validated APIs
 
 ```python
