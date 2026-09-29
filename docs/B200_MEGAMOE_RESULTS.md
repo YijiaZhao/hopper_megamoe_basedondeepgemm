@@ -57,6 +57,37 @@ host-barrier kineto method is 10–40 µs noisier for this collective kernel and
 
 GPU 0 starts first, so its span contains the wait for the slowest rank (~5–8 µs at M2); the H20 number has the same property.
 
+## End-to-end: frontend + MegaMoE (forced-balanced), 2026-09-28
+
+Same method as the H20 E2E rows: the Fable frontend kernel (bf16 router logits in fp32, deterministic top-8, softmax over the 8
+logits, activation quantisation written straight into the MegaMoE input views), then one D2D memcpy node that overrides its
+routing with the forced-balanced assignment (`slot s -> rank s`, expert `s * 48 + (g + 7 s) % 48`, weight 1/8), then the MegaMoE
+kernel, all in one CUDA graph. The frontend is the H20 `router_cc_lean_kernel` (CUDA-core K-split router, 128 router CTAs x 3
+experts on the 148 SMs, plus one CTA that quantises the rows) built for `sm_100a` with three new quantisation modes for the B200
+input formats (FP8 + per-32 UE8M0, MXFP4 + per-32 UE8M0, NVFP4 + per-16 UE4M3; `sm100_b200/fe_sm100/`). Ranks without a token
+run the frontend on one all-zero row (left unrouted). Timing from the torch profiler on GPU 0, 30 streamed replays (L2 flush,
+on-stream all-reduce, graph replay), median of the last 3; one pass per cell. **E2E** = frontend kernel start -> MegaMoE kernel
+end; **Mega** = the MegaMoE kernel inside that graph; **FE** = frontend kernel; **gap** = frontend end -> MegaMoE start (the two
+memcpy nodes plus the launch gap; 0.5 µs on ranks without a token, which have no memcpy). Correctness: relative RMSE 0.23–0.25 %
+on every rank against the pure-torch reference fed with the frontend's quantised activation (M2 / M4 / M8 / M16, all formats).
+
+| Kernel | Metric | M2 | M4 | M8 | M16 |
+|---|---|---:|---:|---:|---:|
+| W-MXFP4 x A-FP8 | **E2E** | **44.0** | **48.5** | **53.8** | **63.0** |
+| | Mega | 36.1 | 40.7 | 46.5 | 54.6 |
+| | FE / gap | 4.4 / 3.4 | 4.5 / 3.3 | 4.5 / 3.3 | 4.5 / 3.3 |
+| W4A4 MXFP4 | **E2E** | **40.8** | **44.8** | **51.5** | **58.9** |
+| | Mega | 32.9 | 37.0 | 43.6 | 50.5 |
+| | FE / gap | 4.5 / 3.4 | 4.6 / 3.3 | 4.5 / 3.3 | 5.2 / 3.4 |
+| W4A4 NVFP4 | **E2E** | **41.7** | **46.4** | **52.3** | **60.0** |
+| | Mega | 33.9 | 38.8 | 44.7 | 51.7 |
+| | FE / gap | 4.5 / 3.2 | 4.5 / 3.1 | 4.5 / 3.1 | 4.9 / 3.4 |
+
+E2E = Mega + FE + gap within 0.1 µs in every cell. The frontend costs 4.5–5 µs (H20: 2.8; the B200 build has not been tuned:
+the router streams the 2.4 MB bf16 router weight from HBM with 128 CTAs, the persisting-L2 window is on) and the forced-balanced
+memcpy nodes 3 µs, so the E2E overhead over the kernel is ~8 µs at this scale. Reproduce: `bash sm100_b200/fe_sm100/run_e2e.sh
+<fp8|mxfp4|nvfp4>` (builds the frontend extension with torch's JIT loader on first use, `TORCH_EXTENSIONS_DIR`).
+
 ## Optimisations (all three kernels, env knobs, defaults on)
 
 | # | Change | Knob | Effect |

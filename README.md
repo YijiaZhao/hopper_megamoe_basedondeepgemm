@@ -289,9 +289,13 @@ Per-platform result documents (one table + measurement method + reproduce each):
 | 8x H20-3e (SM90, 1830 MHz) | MXFP4 / QoQ fused (this repo) | 38.8 / 47.4 / 56.7 / 76.2 (MXFP4), 37.1 / 45.2 / 54.0 / 72.6 (QoQ) | [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md) |
 | 8x B200 (SM100, 1965 MHz) | W-MXFP4xA-FP8 (optimised upstream kernel) / W4A4 MXFP4 / W4A4 NVFP4 (new kernels) (`sm100_b200/`, on AichenF DeepGEMM `megamoe_nvfp4_dev`) | 35.7 / 38.9 / 46.1 / 54.0 (FP8 act), 35.0 / 38.3 / 43.7 / 47.6 (MXFP4), 34.4 / 39.5 / 44.6 / 50.8 (NVFP4) | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
 | 8x B200 (SM100, 1965 MHz) | Upstream baseline: [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) main `78b6900` W-MXFP4xA-FP8 `fp8xfp4` MegaMoE, kernel unmodified | 47.2 / 50.5 / 53.2 / 61.2 | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
+| 8x B200 (SM100, 1965 MHz) | **E2E** (frontend kernel + forced-balanced memcpy + MegaMoE, one CUDA graph): W-MXFP4xA-FP8 / W4A4 MXFP4 / W4A4 NVFP4 | 44.0 / 48.5 / 53.8 / 63.0 (FP8 act), 40.8 / 44.8 / 51.5 / 58.9 (MXFP4), 41.7 / 46.4 / 52.3 / 60.0 (NVFP4) | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
+| 8x H20-3e (SM90, 1830 MHz) | **E2E** (same graph, padding rows unrouted): MXFP4 / QoQ fused | 44.6 / 54.0 / 62.2 / 80.9 (MXFP4), 44.8 / 54.2 / 60.4 / 80.6 (QoQ) | [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md) |
 
 Same model scale for all rows (E384 / 48 local, H3072, I1280, top-8, EP8) and the same forced-balanced routing; every column is the
-kernel span on GPU 0, median of the last 3 of 30 streamed replays (nsys on H20, torch-profiler kernel durations on B200). The two
+kernel span on GPU 0, median of the last 3 of 30 streamed replays (nsys on H20, torch-profiler kernel durations on B200). The E2E
+rows span from the start of the frontend kernel (router + top-8 + softmax + activation quantisation) to the end of the MegaMoE
+kernel, with the forced-balanced routing written by one memcpy node in between (frontend sources for B200: `sm100_b200/fe_sm100/`). The two
 B200 rows were measured in the same Slurm job and container; upstream DeepGEMM has no Hopper MegaMoE and no FP4-activation (W4A4)
 MegaMoE, so those kernels have no upstream counterpart.
 
